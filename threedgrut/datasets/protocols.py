@@ -29,6 +29,7 @@ class Batch:
     rays_in_world_space: bool = False  # True if rays are already in world space (no transform needed)
     rgb_gt: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
+    sky_mask: Optional[torch.Tensor] = None
     intrinsics: Optional[list] = None
     intrinsics_OpenCVPinholeCameraModelParameters: Optional[dict] = None
     intrinsics_OpenCVFisheyeCameraModelParameters: Optional[dict] = None
@@ -53,6 +54,9 @@ class Batch:
         if self.mask is not None:
             assert self.mask.ndim == 4, "mask must be a 3D tensor [B, H, W, 1]"
             assert self.mask.shape[0] == batch_size, "mask must have the same batch size"
+        if self.sky_mask is not None:
+            assert self.sky_mask.ndim == 4, "sky_mask must be a 4D tensor [B, H, W, 1]"
+            assert self.sky_mask.shape[0] == batch_size, "sky_mask must have the same batch size"
         if self.intrinsics:
             assert isinstance(self.intrinsics, list), "intrinsics must be a list"
             assert len(self.intrinsics) == 4, "intrinsics must have 4 elements [fx, fy, cx, cy]"

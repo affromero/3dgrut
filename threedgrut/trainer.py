@@ -23,6 +23,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
 from addict import Dict
 from omegaconf import DictConfig, OmegaConf
@@ -37,6 +38,7 @@ from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, Poi
 from threedgrut.model.losses import ssim
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
+from threedgrut.post_processing import LuminanceAffine
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
 from threedgrut.utils.logger import logger
@@ -75,6 +77,242 @@ def _tensor_to_bgr_image(image: torch.Tensor) -> np.ndarray:
         .numpy()
     )
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def _ensure_bhwc(image: torch.Tensor) -> tuple[torch.Tensor, bool]:
+    """Return a batched BHWC tensor and whether a batch dim was added."""
+    if image.ndim == 3:
+        return image.unsqueeze(0), True
+    return image, False
+
+
+def _restore_image_rank(image: torch.Tensor, squeezed: bool) -> torch.Tensor:
+    """Restore an image tensor to its original rank."""
+    if squeezed:
+        return image.squeeze(0)
+    return image
+
+
+def _rgb_to_luma(image: torch.Tensor) -> torch.Tensor:
+    """Convert RGB image tensor in BHWC/HWC layout to luma."""
+    weights = torch.tensor(
+        [0.299, 0.587, 0.114],
+        device=image.device,
+        dtype=image.dtype,
+    )
+    return (image[..., :3] * weights).sum(dim=-1, keepdim=True)
+
+
+def _box_blur_bhwc(image: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Apply a per-channel box low-pass filter to a BHWC/HWC image tensor."""
+    batched, squeezed = _ensure_bhwc(image)
+    bchw = batched.permute(0, 3, 1, 2)
+    blurred = F.avg_pool2d(
+        bchw,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+        count_include_pad=False,
+    )
+    return _restore_image_rank(blurred.permute(0, 2, 3, 1), squeezed)
+
+
+def _sobel_grad_bhwc(image: torch.Tensor) -> torch.Tensor:
+    """Return Sobel gradient magnitude for a BHWC/HWC scalar image."""
+    batched, squeezed = _ensure_bhwc(image)
+    bchw = batched.permute(0, 3, 1, 2)
+    kernel_x = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        device=image.device,
+        dtype=image.dtype,
+    ).reshape(1, 1, 3, 3)
+    kernel_y = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        device=image.device,
+        dtype=image.dtype,
+    ).reshape(1, 1, 3, 3)
+    grad_x = F.conv2d(bchw, kernel_x, padding=1)
+    grad_y = F.conv2d(bchw, kernel_y, padding=1)
+    grad = torch.sqrt(torch.clamp_min(grad_x.square() + grad_y.square(), 1e-12))
+    return _restore_image_rank(grad.permute(0, 2, 3, 1), squeezed)
+
+
+def _laplacian_bhwc(image: torch.Tensor) -> torch.Tensor:
+    """Return Laplacian response for a BHWC/HWC scalar image."""
+    batched, squeezed = _ensure_bhwc(image)
+    bchw = batched.permute(0, 3, 1, 2)
+    kernel = torch.tensor(
+        [[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]],
+        device=image.device,
+        dtype=image.dtype,
+    ).reshape(1, 1, 3, 3)
+    response = F.conv2d(bchw, kernel, padding=1)
+    return _restore_image_rank(response.permute(0, 2, 3, 1), squeezed)
+
+
+def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """Compute a mean over valid pixels and channels."""
+    if mask is None:
+        return value.mean()
+    denominator = torch.clamp_min(mask.sum() * value.shape[-1], 1.0)
+    return (value * mask).sum() / denominator
+
+
+def _frequency_high_ratio(
+    rgb_pred: torch.Tensor,
+    rgb_gt: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Return predicted/GT high-frequency FFT energy ratio on luma."""
+    pred_luma = _rgb_to_luma(rgb_pred)
+    gt_luma = _rgb_to_luma(rgb_gt)
+    if mask is not None:
+        pred_luma = pred_luma * mask
+        gt_luma = gt_luma * mask
+    pred_fft = torch.fft.rfft2(pred_luma.squeeze(-1), norm="ortho")
+    gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
+    height = pred_luma.shape[1]
+    width = pred_luma.shape[2]
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
+    fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
+    high_mask = (torch.sqrt(fx.square() + fy.square()) > 0.18).to(pred_luma.dtype)
+    pred_energy = (pred_fft.abs().square() * high_mask).mean()
+    gt_energy = (gt_fft.abs().square() * high_mask).mean()
+    return pred_energy / torch.clamp_min(gt_energy, 1e-12)
+
+
+def _frequency_band_ratios(
+    rgb_pred: torch.Tensor,
+    rgb_gt: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """Return predicted/GT FFT energy ratios over radial frequency bands."""
+    pred_luma = _rgb_to_luma(rgb_pred)
+    gt_luma = _rgb_to_luma(rgb_gt)
+    if mask is not None:
+        pred_luma = pred_luma * mask
+        gt_luma = gt_luma * mask
+
+    pred_fft = torch.fft.rfft2(pred_luma.squeeze(-1), norm="ortho")
+    gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
+    height = pred_luma.shape[1]
+    width = pred_luma.shape[2]
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
+    fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
+    radius = torch.sqrt(fx.square() + fy.square())
+    pred_energy = pred_fft.abs().square()
+    gt_energy = gt_fft.abs().square()
+
+    bands = {
+        "fft_energy_ratio_low": (0.00, 0.08),
+        "fft_energy_ratio_mid": (0.08, 0.16),
+        "fft_energy_ratio_high": (0.16, 0.28),
+        "fft_energy_ratio_ultra": (0.28, float("inf")),
+    }
+    ratios = {}
+    for name, (lower, upper) in bands.items():
+        band_mask = (radius >= lower) & (radius < upper)
+        band_mask = band_mask.to(pred_luma.dtype)
+        pred_band_energy = (pred_energy * band_mask).mean()
+        gt_band_energy = (gt_energy * band_mask).mean()
+        ratios[name] = pred_band_energy / torch.clamp_min(gt_band_energy, 1e-12)
+    return ratios
+
+
+def _tensor_distribution_stats(
+    *,
+    prefix: str,
+    values: torch.Tensor,
+) -> dict[str, float]:
+    """Return compact distribution stats for a model-space tensor."""
+    flat = values.detach().float().reshape(-1)
+    finite = flat[torch.isfinite(flat)]
+    if finite.numel() == 0:
+        return {}
+    quantiles = torch.quantile(
+        finite,
+        torch.tensor([0.5, 0.95, 0.99], device=finite.device),
+    )
+    return {
+        f"{prefix}_mean": finite.mean().item(),
+        f"{prefix}_p50": quantiles[0].item(),
+        f"{prefix}_p95": quantiles[1].item(),
+        f"{prefix}_p99": quantiles[2].item(),
+        f"{prefix}_max": finite.max().item(),
+    }
+
+
+def _gaussian_geometry_metrics(model: MixtureOfGaussians) -> dict[str, float]:
+    """Measure Gaussian geometry to expose representation failure modes."""
+    with torch.no_grad():
+        scales = model.get_scale().detach().float()
+        density = model.get_density().detach().float()
+        min_axis = torch.clamp_min(scales.min(dim=1).values, 1e-12)
+        max_axis = scales.max(dim=1).values
+        geom_mean_scale = torch.clamp_min(scales.prod(dim=1), 1e-36).pow(1.0 / 3.0)
+        anisotropy = max_axis / min_axis
+
+        metrics = {
+            "num_gaussians": float(model.num_gaussians),
+            "scale_axis_min": min_axis.min().item(),
+            "scale_axis_max": max_axis.max().item(),
+        }
+        metrics.update(
+            _tensor_distribution_stats(
+                prefix="scale_geom",
+                values=geom_mean_scale,
+            )
+        )
+        metrics.update(
+            _tensor_distribution_stats(
+                prefix="scale_anisotropy",
+                values=anisotropy,
+            )
+        )
+        metrics.update(
+            _tensor_distribution_stats(
+                prefix="density",
+                values=density,
+            )
+        )
+    return metrics
+
+
+def _diagnostic_metrics(
+    *,
+    rgb_gt: torch.Tensor,
+    rgb_pred: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> dict[str, float]:
+    """Compute validation diagnostics that separate failure modes."""
+    low_gt = _box_blur_bhwc(rgb_gt, 31)
+    low_pred = _box_blur_bhwc(rgb_pred, 31)
+    high_gt = rgb_gt - low_gt
+    high_pred = rgb_pred - low_pred
+    luma_gt = _rgb_to_luma(rgb_gt)
+    luma_pred = _rgb_to_luma(rgb_pred)
+    grad_gt = _sobel_grad_bhwc(luma_gt)
+    grad_pred = _sobel_grad_bhwc(luma_pred)
+    lap_gt = _laplacian_bhwc(luma_gt)
+    lap_pred = _laplacian_bhwc(luma_pred)
+    metrics = {
+        "low_freq_l1": _masked_mean(torch.abs(low_pred - low_gt), mask).item(),
+        "high_freq_l1": _masked_mean(torch.abs(high_pred - high_gt), mask).item(),
+        "gradient_l1": _masked_mean(torch.abs(grad_pred - grad_gt), mask).item(),
+        "laplacian_l1": _masked_mean(torch.abs(lap_pred - lap_gt), mask).item(),
+        "fft_high_energy_ratio": _frequency_high_ratio(rgb_pred, rgb_gt, mask).item(),
+    }
+    metrics.update(
+        {
+            key: value.item()
+            for key, value in _frequency_band_ratios(
+                rgb_pred,
+                rgb_gt,
+                mask,
+            ).items()
+        }
+    )
+    return metrics
 
 
 def _fit_image_to_panel(
@@ -193,6 +431,7 @@ def _make_validation_image_tiles(
     pred_opacity: torch.Tensor,
     hit_counts: torch.Tensor,
     mask: torch.Tensor | None,
+    sky_mask: torch.Tensor | None,
     max_hit_count: int,
 ) -> dict[str, torch.Tensor]:
     """Build aligned validation tiles for grouped W&B image grids."""
@@ -209,19 +448,43 @@ def _make_validation_image_tiles(
     if valid_mask is not None:
         error = error * valid_mask
 
+    low_gt = _box_blur_bhwc(rgb_gt, 31)
+    low_pred = _box_blur_bhwc(rgb_pred, 31)
+    low_error = torch.abs(low_pred - low_gt).mean(dim=2, keepdim=True)
+    high_gt = rgb_gt - low_gt
+    high_pred = rgb_pred - low_pred
+    high_error = torch.abs(high_pred - high_gt).mean(dim=2, keepdim=True)
+    edge_error = torch.abs(
+        _sobel_grad_bhwc(_rgb_to_luma(rgb_pred))
+        - _sobel_grad_bhwc(_rgb_to_luma(rgb_gt))
+    )
+    if valid_mask is not None:
+        low_error = low_error * valid_mask
+        high_error = high_error * valid_mask
+        edge_error = edge_error * valid_mask
+
     error_rgb = jet_map(error, 0.25)
+    low_error_rgb = jet_map(low_error, 0.25)
+    high_error_rgb = jet_map(high_error, 0.12)
+    edge_error_rgb = jet_map(edge_error, 1.0)
     depth_rgb = _robust_jet_map(pred_dist, valid_mask)
     opacity_rgb = jet_map(pred_opacity, 1)
     hits_rgb = jet_map(hit_counts, max_hit_count)
-    return {
+    tiles = {
         "input_rgb": rgb_gt,
         "training_mask": mask_rgb,
         "prediction_rgb": rgb_pred,
         "rgb_error": error_rgb,
+        "low_freq_error": low_error_rgb,
+        "high_freq_error": high_error_rgb,
+        "edge_error": edge_error_rgb,
         "predicted_depth": depth_rgb,
         "opacity": opacity_rgb,
         "ray_hits": hits_rgb,
     }
+    if sky_mask is not None:
+        tiles["sky_opacity_mask"] = sky_mask.clip(0, 1.0).expand_as(rgb_gt)
+    return tiles
 
 
 class Trainer3DGRUT:
@@ -602,6 +865,34 @@ class Trainer3DGRUT:
             )
 
             logger.info(f"📷 {method.upper()} initialized: {num_cameras} cameras, {num_frames} frames")
+        elif method == "luminance_affine":
+            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            num_cameras = len(frames_per_camera)
+            num_frames = sum(frames_per_camera)
+
+            self.post_processing = LuminanceAffine(
+                num_cameras=num_cameras,
+                num_frames=num_frames,
+                lr=conf.post_processing.get("lr", 1e-3),
+                reg_lambda=conf.post_processing.get("reg_lambda", 1e-2),
+                use_frame_residual=conf.post_processing.get(
+                    "use_frame_residual",
+                    False,
+                ),
+                max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
+                max_bias=conf.post_processing.get("max_bias", 0.10),
+            ).to(self.device)
+
+            self.post_processing_optimizers = self.post_processing.create_optimizers()
+            self.post_processing_schedulers = self.post_processing.create_schedulers(
+                self.post_processing_optimizers,
+                max_optimization_iters=conf.n_iterations,
+            )
+
+            logger.info(
+                f"📷 LUMINANCE_AFFINE initialized: {num_cameras} cameras, "
+                f"{num_frames} frames"
+            )
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
 
@@ -689,8 +980,17 @@ class Trainer3DGRUT:
             with torch.cuda.nvtx.range(f"criterions_lpips"):
                 metrics["lpips"] = lpips(pred_rgb_full_clipped, rgb_gt_full).item()
 
+            metrics.update(
+                _diagnostic_metrics(
+                    rgb_gt=rgb_gt,
+                    rgb_pred=rgb_pred,
+                    mask=gpu_batch.mask,
+                )
+            )
+
             if iteration in self._validation_log_image_views():
                 mask = gpu_batch.mask[-1] if gpu_batch.mask is not None else None
+                sky_mask = gpu_batch.sky_mask[-1] if gpu_batch.sky_mask is not None else None
                 metrics["eval_image_path"] = gpu_batch.image_path
                 metrics["img_eval_tiles"] = _make_validation_image_tiles(
                     rgb_gt=gpu_batch.rgb_gt[-1],
@@ -699,6 +999,7 @@ class Trainer3DGRUT:
                     pred_opacity=outputs["pred_opacity"][-1],
                     hit_counts=outputs["hits_count"][-1],
                     mask=mask,
+                    sky_mask=sky_mask,
                     max_hit_count=self.conf.writer.max_num_hits,
                 )
 
@@ -782,8 +1083,25 @@ class Trainer3DGRUT:
                 loss_scale = torch.abs(self.model.get_scale()).mean()
                 lambda_scale = self.conf.loss.lambda_scale
 
+        loss_sky_opacity = torch.zeros(1, device=self.device)
+        lambda_sky_opacity = 0.0
+        if self.conf.loss.use_sky_opacity:
+            if gpu_batch.sky_mask is None:
+                raise RuntimeError("loss.use_sky_opacity requires dataset.sky_mask_folder.")
+            with torch.cuda.nvtx.range(f"loss-sky-opacity"):
+                sky_mask = gpu_batch.sky_mask
+                sky_denominator = torch.clamp(sky_mask.sum(), min=1.0)
+                loss_sky_opacity = (outputs["pred_opacity"] * sky_mask).sum() / sky_denominator
+                lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
+
         # Total loss
-        loss = lambda_l1 * loss_l1 + lambda_ssim * loss_ssim + lambda_opacity * loss_opacity + lambda_scale * loss_scale
+        loss = (
+            lambda_l1 * loss_l1
+            + lambda_ssim * loss_ssim
+            + lambda_opacity * loss_opacity
+            + lambda_scale * loss_scale
+            + lambda_sky_opacity * loss_sky_opacity
+        )
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
@@ -791,6 +1109,8 @@ class Trainer3DGRUT:
             ssim_loss=lambda_ssim * loss_ssim,
             opacity_loss=lambda_opacity * loss_opacity,
             scale_loss=lambda_scale * loss_scale,
+            sky_opacity_loss=lambda_sky_opacity * loss_sky_opacity,
+            sky_opacity_loss_raw=loss_sky_opacity,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -835,13 +1155,18 @@ class Trainer3DGRUT:
             grid_columns = [
                 "input_rgb",
                 "training_mask",
+                "sky_opacity_mask",
                 "prediction_rgb",
                 "rgb_error",
+                "low_freq_error",
+                "high_freq_error",
+                "edge_error",
                 "predicted_depth",
                 "opacity",
                 "ray_hits",
             ]
             tile_groups = metrics["img_eval_tiles"]
+            grid_columns = [column for column in grid_columns if column in tile_groups]
             image_paths = metrics["eval_image_path"]
             group_size = int(self.conf.writer.get("eval_image_group_size", 5))
             if group_size < 1:
@@ -878,62 +1203,144 @@ class Trainer3DGRUT:
         if "timings" in metrics:
             for time_key in metrics["timings"]:
                 mean_timings[time_key] = np.mean(metrics["timings"][time_key])
-                writer.add_scalar("time/" + time_key + "/val", mean_timings[time_key], global_step)
+                writer.add_scalar(f"time/val/{time_key}", mean_timings[time_key], global_step)
 
         writer.add_scalar(
-            "metrics/val/num_particles",
+            "geometry/num_gaussians",
             self.model.num_gaussians,
             self.global_step,
         )
 
         mean_psnr = np.mean(metrics["psnr"])
-        writer.add_scalar("metrics/val/psnr", mean_psnr, global_step)
+        writer.add_scalar("val/psnr", mean_psnr, global_step)
         if "masked_psnr" in metrics:
             writer.add_scalar(
-                "metrics/val/masked_psnr",
+                "val/masked_psnr",
                 np.mean(metrics["masked_psnr"]),
                 global_step,
             )
         if "mask_coverage" in metrics:
             writer.add_scalar(
-                "metrics/val/mask_coverage",
+                "val/mask_coverage",
                 np.mean(metrics["mask_coverage"]),
                 global_step,
             )
-        writer.add_scalar("metrics/val/ssim", np.mean(metrics["ssim"]), global_step)
-        writer.add_scalar("metrics/val/lpips", np.mean(metrics["lpips"]), global_step)
+        writer.add_scalar("val/ssim", np.mean(metrics["ssim"]), global_step)
+        writer.add_scalar("val/lpips", np.mean(metrics["lpips"]), global_step)
         writer.add_scalar(
-            "metrics/val/hits_min",
+            "diagnostics/residual/low_freq_l1",
+            np.mean(metrics["low_freq_l1"]),
+            global_step,
+        )
+        writer.add_scalar(
+            "diagnostics/residual/high_freq_l1",
+            np.mean(metrics["high_freq_l1"]),
+            global_step,
+        )
+        writer.add_scalar(
+            "diagnostics/residual/gradient_l1",
+            np.mean(metrics["gradient_l1"]),
+            global_step,
+        )
+        writer.add_scalar(
+            "diagnostics/residual/laplacian_l1",
+            np.mean(metrics["laplacian_l1"]),
+            global_step,
+        )
+        writer.add_scalar(
+            "diagnostics/frequency/ratio_high_legacy",
+            np.mean(metrics["fft_high_energy_ratio"]),
+            global_step,
+        )
+        frequency_metric_names = (
+            ("fft_energy_ratio_low", "diagnostics/frequency/ratio_low"),
+            ("fft_energy_ratio_mid", "diagnostics/frequency/ratio_mid"),
+            ("fft_energy_ratio_high", "diagnostics/frequency/ratio_high"),
+            ("fft_energy_ratio_ultra", "diagnostics/frequency/ratio_ultra"),
+        )
+        for metric_name, wandb_name in frequency_metric_names:
+            writer.add_scalar(
+                wandb_name,
+                np.mean(metrics[metric_name]),
+                global_step,
+            )
+        geometry_metric_names = (
+            ("num_gaussians", "geometry/num_gaussians"),
+            ("scale_axis_min", "geometry/scale/axis_min"),
+            ("scale_axis_max", "geometry/scale/axis_max"),
+            ("scale_geom_mean", "geometry/scale/geom_mean"),
+            ("scale_geom_p50", "geometry/scale/geom_p50"),
+            ("scale_geom_p95", "geometry/scale/geom_p95"),
+            ("scale_geom_p99", "geometry/scale/geom_p99"),
+            ("scale_geom_max", "geometry/scale/geom_max"),
+            ("scale_anisotropy_mean", "geometry/anisotropy/mean"),
+            ("scale_anisotropy_p50", "geometry/anisotropy/p50"),
+            ("scale_anisotropy_p95", "geometry/anisotropy/p95"),
+            ("scale_anisotropy_p99", "geometry/anisotropy/p99"),
+            ("scale_anisotropy_max", "geometry/anisotropy/max"),
+            ("density_mean", "geometry/density/mean"),
+            ("density_p50", "geometry/density/p50"),
+            ("density_p95", "geometry/density/p95"),
+            ("density_p99", "geometry/density/p99"),
+            ("density_max", "geometry/density/max"),
+        )
+        geometry_metrics = _gaussian_geometry_metrics(self.model)
+        for metric_name, wandb_name in geometry_metric_names:
+            if metric_name in geometry_metrics:
+                writer.add_scalar(wandb_name, geometry_metrics[metric_name], global_step)
+        writer.add_scalar(
+            "val/hits/min",
             np.mean(metrics["hits_min"]),
             global_step,
         )
         writer.add_scalar(
-            "metrics/val/hits_max",
+            "val/hits/max",
             np.mean(metrics["hits_max"]),
             global_step,
         )
         writer.add_scalar(
-            "metrics/val/hits_mean",
+            "val/hits/mean",
             np.mean(metrics["hits_mean"]),
             global_step,
         )
 
         loss = np.mean(metrics["losses"]["total_loss"])
-        writer.add_scalar("metrics/val/loss_total", loss, global_step)
+        writer.add_scalar("val/loss/total", loss, global_step)
         if self.conf.loss.use_l1:
             l1_loss = np.mean(metrics["losses"]["l1_loss"])
-            writer.add_scalar("metrics/val/loss_l1", l1_loss, global_step)
+            writer.add_scalar("val/loss/l1", l1_loss, global_step)
         if self.conf.loss.use_l2:
             l2_loss = np.mean(metrics["losses"]["l2_loss"])
-            writer.add_scalar("metrics/val/loss_l2", l2_loss, global_step)
+            writer.add_scalar("val/loss/l2", l2_loss, global_step)
         if self.conf.loss.use_ssim:
             ssim_loss = np.mean(metrics["losses"]["ssim_loss"])
-            writer.add_scalar("metrics/val/loss_ssim", ssim_loss, global_step)
+            writer.add_scalar("val/loss/ssim", ssim_loss, global_step)
+        if self.conf.loss.use_sky_opacity:
+            sky_opacity_loss = np.mean(metrics["losses"]["sky_opacity_loss"])
+            sky_opacity_loss_raw = np.mean(metrics["losses"]["sky_opacity_loss_raw"])
+            writer.add_scalar("val/loss/sky_opacity", sky_opacity_loss, global_step)
+            writer.add_scalar("val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step)
 
         table = {
             k: np.mean(v)
             for k, v in metrics.items()
-            if k in ("psnr", "masked_psnr", "ssim", "lpips", "mask_coverage")
+            if k
+            in (
+                "psnr",
+                "masked_psnr",
+                "ssim",
+                "lpips",
+                "mask_coverage",
+                "low_freq_l1",
+                "high_freq_l1",
+                "gradient_l1",
+                "laplacian_l1",
+                "fft_high_energy_ratio",
+                "fft_energy_ratio_low",
+                "fft_energy_ratio_mid",
+                "fft_energy_ratio_high",
+                "fft_energy_ratio_ultra",
+            )
         }
         for time_key in mean_timings:
             table[time_key] = f"{'{:.2f}'.format(mean_timings[time_key])}" + " ms/it"
@@ -959,48 +1366,53 @@ class Trainer3DGRUT:
 
         if self.conf.enable_writer and global_step > 0 and global_step % self.conf.log_frequency == 0:
             loss = np.mean(batch_metrics["losses"]["total_loss"])
-            writer.add_scalar("loss/total/train", loss, global_step)
+            writer.add_scalar("train/loss/total", loss, global_step)
             if self.conf.loss.use_l1:
                 l1_loss = np.mean(batch_metrics["losses"]["l1_loss"])
-                writer.add_scalar("loss/l1/train", l1_loss, global_step)
+                writer.add_scalar("train/loss/l1", l1_loss, global_step)
             if self.conf.loss.use_l2:
                 l2_loss = np.mean(batch_metrics["losses"]["l2_loss"])
-                writer.add_scalar("loss/l2/train", l2_loss, global_step)
+                writer.add_scalar("train/loss/l2", l2_loss, global_step)
             if self.conf.loss.use_ssim:
                 ssim_loss = np.mean(batch_metrics["losses"]["ssim_loss"])
-                writer.add_scalar("loss/ssim/train", ssim_loss, global_step)
+                writer.add_scalar("train/loss/ssim", ssim_loss, global_step)
             if self.conf.loss.use_opacity:
                 opacity_loss = np.mean(batch_metrics["losses"]["opacity_loss"])
-                writer.add_scalar("loss/opacity/train", opacity_loss, global_step)
+                writer.add_scalar("train/loss/opacity", opacity_loss, global_step)
             if self.conf.loss.use_scale:
                 scale_loss = np.mean(batch_metrics["losses"]["scale_loss"])
-                writer.add_scalar("loss/scale/train", scale_loss, global_step)
+                writer.add_scalar("train/loss/scale", scale_loss, global_step)
+            if self.conf.loss.use_sky_opacity:
+                sky_opacity_loss = np.mean(batch_metrics["losses"]["sky_opacity_loss"])
+                sky_opacity_loss_raw = np.mean(batch_metrics["losses"]["sky_opacity_loss_raw"])
+                writer.add_scalar("train/loss/sky_opacity", sky_opacity_loss, global_step)
+                writer.add_scalar("train/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step)
             if self.post_processing is not None and "post_processing_reg_loss" in batch_metrics["losses"]:
                 post_processing_reg_loss = np.mean(batch_metrics["losses"]["post_processing_reg_loss"])
                 writer.add_scalar(
-                    "loss/post_processing_reg/train",
+                    "train/loss/post_processing_reg",
                     post_processing_reg_loss,
                     global_step,
                 )
             if "psnr" in batch_metrics:
-                writer.add_scalar("psnr/train", batch_metrics["psnr"], self.global_step)
+                writer.add_scalar("train/psnr", batch_metrics["psnr"], self.global_step)
             if "ssim" in batch_metrics:
-                writer.add_scalar("ssim/train", batch_metrics["ssim"], self.global_step)
+                writer.add_scalar("train/ssim", batch_metrics["ssim"], self.global_step)
             if "lpips" in batch_metrics:
-                writer.add_scalar("lpips/train", batch_metrics["lpips"], self.global_step)
+                writer.add_scalar("train/lpips", batch_metrics["lpips"], self.global_step)
             if "hits_mean" in batch_metrics:
-                writer.add_scalar("hits/mean/train", batch_metrics["hits_mean"], self.global_step)
+                writer.add_scalar("train/hits/mean", batch_metrics["hits_mean"], self.global_step)
             if "hits_std" in batch_metrics:
-                writer.add_scalar("hits/std/train", batch_metrics["hits_std"], self.global_step)
+                writer.add_scalar("train/hits/std", batch_metrics["hits_std"], self.global_step)
             if "hits_min" in batch_metrics:
-                writer.add_scalar("hits/min/train", batch_metrics["hits_min"], self.global_step)
+                writer.add_scalar("train/hits/min", batch_metrics["hits_min"], self.global_step)
             if "hits_max" in batch_metrics:
-                writer.add_scalar("hits/max/train", batch_metrics["hits_max"], self.global_step)
+                writer.add_scalar("train/hits/max", batch_metrics["hits_max"], self.global_step)
 
             if "timings" in batch_metrics:
                 for time_key in batch_metrics["timings"]:
                     writer.add_scalar(
-                        "time/" + time_key + "/train",
+                        f"time/train/{time_key}",
                         batch_metrics["timings"][time_key],
                         self.global_step,
                     )
@@ -1008,10 +1420,9 @@ class Trainer3DGRUT:
             writer.add_scalar("train/iteration", self.global_step, self.global_step)
             if hasattr(self, "_training_start_time"):
                 elapsed_seconds = time.perf_counter() - self._training_start_time
-                writer.add_scalar("time/elapsed_seconds/train", elapsed_seconds, self.global_step)
+                writer.add_scalar("time/train/elapsed_seconds", elapsed_seconds, self.global_step)
 
-            writer.add_scalar("num_particles/train", self.model.num_gaussians, self.global_step)
-            writer.add_scalar("train/num_GS", self.model.num_gaussians, self.global_step)
+            writer.add_scalar("geometry/num_gaussians", self.model.num_gaussians, self.global_step)
 
             # # NOTE: hack to easily compare with 3DGS
             # writer.add_scalar("train_loss_patches/total_loss", loss, global_step)

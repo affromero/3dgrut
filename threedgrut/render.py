@@ -26,6 +26,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 import threedgrut.datasets as datasets
 from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.post_processing import LuminanceAffine
 from threedgrut.utils.color_correct import color_correct_affine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import create_summary_writer
@@ -147,6 +148,27 @@ class Renderer:
             num_cameras = post_processing.crf_params.shape[0]
             num_frames = post_processing.exposure_params.shape[0]
             logger.info(f"📷 {method.upper()} loaded from checkpoint: {num_cameras} cameras, {num_frames} frames")
+        elif "post_processing" in checkpoint and method == "luminance_affine":
+            state = checkpoint["post_processing"]["module"]
+            num_cameras = state["camera_log_gain"].shape[0]
+            num_frames = state["frame_log_gain"].shape[0]
+            post_processing = LuminanceAffine(
+                num_cameras=num_cameras,
+                num_frames=num_frames,
+                lr=conf.post_processing.get("lr", 1e-3),
+                reg_lambda=conf.post_processing.get("reg_lambda", 1e-2),
+                use_frame_residual=conf.post_processing.get(
+                    "use_frame_residual",
+                    False,
+                ),
+                max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
+                max_bias=conf.post_processing.get("max_bias", 0.10),
+            ).to("cuda")
+            post_processing.load_state_dict(state)
+            logger.info(
+                f"📷 {method.upper()} loaded from checkpoint: "
+                f"{num_cameras} cameras, {num_frames} frames"
+            )
 
         return Renderer(
             model=model,
@@ -380,21 +402,21 @@ class Renderer:
         logger.log_table(f"⭐ Test Metrics - Step {self.global_step}", record=table)
 
         if self.writer is not None:
-            self.writer.add_scalar("psnr/test", mean_psnr, self.global_step)
+            self.writer.add_scalar("test/psnr", mean_psnr, self.global_step)
             if mean_masked_psnr is not None:
-                self.writer.add_scalar("psnr/masked/test", mean_masked_psnr, self.global_step)
+                self.writer.add_scalar("test/masked_psnr", mean_masked_psnr, self.global_step)
             if mean_mask_coverage is not None:
-                self.writer.add_scalar("mask/coverage/test", mean_mask_coverage, self.global_step)
-            self.writer.add_scalar("ssim/test", mean_ssim, self.global_step)
-            self.writer.add_scalar("lpips/test", mean_lpips, self.global_step)
-            self.writer.add_scalar("cc_psnr/test", mean_cc_psnr, self.global_step)
-            self.writer.add_scalar("cc_ssim/test", mean_cc_ssim, self.global_step)
-            self.writer.add_scalar("cc_lpips/test", mean_cc_lpips, self.global_step)
-            self.writer.add_scalar("time/inference/test", mean_inference_time, self.global_step)
+                self.writer.add_scalar("test/mask_coverage", mean_mask_coverage, self.global_step)
+            self.writer.add_scalar("test/ssim", mean_ssim, self.global_step)
+            self.writer.add_scalar("test/lpips", mean_lpips, self.global_step)
+            self.writer.add_scalar("test/color_corrected_psnr", mean_cc_psnr, self.global_step)
+            self.writer.add_scalar("test/color_corrected_ssim", mean_cc_ssim, self.global_step)
+            self.writer.add_scalar("test/color_corrected_lpips", mean_cc_lpips, self.global_step)
+            self.writer.add_scalar("time/test/inference", mean_inference_time, self.global_step)
 
             if best_psnr_img is not None:
                 self.writer.add_images(
-                    "image/best_psnr/test",
+                    "test/image/best_psnr",
                     torch.stack([best_psnr_img, best_psnr_img_gt]),
                     self.global_step,
                     dataformats="NHWC",
@@ -402,7 +424,7 @@ class Renderer:
 
             if worst_psnr_img is not None:
                 self.writer.add_images(
-                    "image/worst_psnr/test",
+                    "test/image/worst_psnr",
                     torch.stack([worst_psnr_img, worst_psnr_img_gt]),
                     self.global_step,
                     dataformats="NHWC",

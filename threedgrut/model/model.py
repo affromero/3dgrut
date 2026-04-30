@@ -20,6 +20,7 @@ from typing import Any
 
 import msgpack
 import numpy as np
+import sklearn.neighbors
 import torch
 from plyfile import PlyData, PlyElement
 
@@ -43,6 +44,70 @@ from threedgrut.utils.misc import (
     to_torch,
 )
 from threedgrut.utils.render import RGB2SH
+
+
+def _rotation_matrix_to_quaternion_wxyz(rotation: torch.Tensor) -> torch.Tensor:
+    """Convert rotation matrices to normalized WXYZ quaternions."""
+    trace = rotation[:, 0, 0] + rotation[:, 1, 1] + rotation[:, 2, 2]
+    quat = torch.empty(
+        (rotation.shape[0], 4),
+        dtype=rotation.dtype,
+        device=rotation.device,
+    )
+    positive_trace = trace > 0.0
+    if positive_trace.any():
+        selected = rotation[positive_trace]
+        selected_trace = trace[positive_trace]
+        scale = torch.sqrt(selected_trace + 1.0) * 2.0
+        quat[positive_trace, 0] = 0.25 * scale
+        quat[positive_trace, 1] = (selected[:, 2, 1] - selected[:, 1, 2]) / scale
+        quat[positive_trace, 2] = (selected[:, 0, 2] - selected[:, 2, 0]) / scale
+        quat[positive_trace, 3] = (selected[:, 1, 0] - selected[:, 0, 1]) / scale
+
+    remaining = ~positive_trace
+    if remaining.any():
+        selected = rotation[remaining]
+        diag = torch.stack(
+            [selected[:, 0, 0], selected[:, 1, 1], selected[:, 2, 2]],
+            dim=1,
+        )
+        largest = torch.argmax(diag, dim=1)
+        selected_quat = torch.empty(
+            (selected.shape[0], 4),
+            dtype=rotation.dtype,
+            device=rotation.device,
+        )
+        for axis in range(3):
+            axis_mask = largest == axis
+            if not axis_mask.any():
+                continue
+            matrix = selected[axis_mask]
+            if axis == 0:
+                scale = torch.sqrt(
+                    1.0 + matrix[:, 0, 0] - matrix[:, 1, 1] - matrix[:, 2, 2]
+                ) * 2.0
+                selected_quat[axis_mask, 0] = (matrix[:, 2, 1] - matrix[:, 1, 2]) / scale
+                selected_quat[axis_mask, 1] = 0.25 * scale
+                selected_quat[axis_mask, 2] = (matrix[:, 0, 1] + matrix[:, 1, 0]) / scale
+                selected_quat[axis_mask, 3] = (matrix[:, 0, 2] + matrix[:, 2, 0]) / scale
+            elif axis == 1:
+                scale = torch.sqrt(
+                    1.0 + matrix[:, 1, 1] - matrix[:, 0, 0] - matrix[:, 2, 2]
+                ) * 2.0
+                selected_quat[axis_mask, 0] = (matrix[:, 0, 2] - matrix[:, 2, 0]) / scale
+                selected_quat[axis_mask, 1] = (matrix[:, 0, 1] + matrix[:, 1, 0]) / scale
+                selected_quat[axis_mask, 2] = 0.25 * scale
+                selected_quat[axis_mask, 3] = (matrix[:, 1, 2] + matrix[:, 2, 1]) / scale
+            else:
+                scale = torch.sqrt(
+                    1.0 + matrix[:, 2, 2] - matrix[:, 0, 0] - matrix[:, 1, 1]
+                ) * 2.0
+                selected_quat[axis_mask, 0] = (matrix[:, 1, 0] - matrix[:, 0, 1]) / scale
+                selected_quat[axis_mask, 1] = (matrix[:, 0, 2] + matrix[:, 2, 0]) / scale
+                selected_quat[axis_mask, 2] = (matrix[:, 1, 2] + matrix[:, 2, 1]) / scale
+                selected_quat[axis_mask, 3] = 0.25 * scale
+        quat[remaining] = selected_quat
+    return torch.nn.functional.normalize(quat, dim=1)
 
 
 class MixtureOfGaussians(torch.nn.Module, ExportableModel):
@@ -543,6 +608,100 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             use_observer_pts=self.conf.initialization.use_observation_points,
         )
 
+    def _surface_aligned_rotation_and_scale(self, pts, fallback_scale, fallback_rots):
+        """Estimate local tangent-plane Gaussian orientation and scale via PCA."""
+        conf = self.conf.surface_aligned_init
+        points = to_np(pts).astype(np.float32, copy=False)
+        n_points = points.shape[0]
+        n_neighbors = int(conf.n_neighbors)
+        chunk_size = int(conf.chunk_size)
+        tangent_scale_multiplier = float(conf.tangent_scale_multiplier)
+        normal_scale_multiplier = float(conf.normal_scale_multiplier)
+        min_scale = float(conf.min_scale)
+        max_scale = float(conf.max_scale)
+        min_planarity = float(conf.min_planarity)
+        max_scattering = float(conf.max_scattering)
+        use_confidence_gating = bool(conf.use_confidence_gating)
+
+        logger.info(
+            "Surface-aligned PCA init: "
+            f"{n_points} points, k={n_neighbors}, chunk={chunk_size}, "
+            f"normal_scale_multiplier={normal_scale_multiplier}, "
+            f"use_confidence_gating={use_confidence_gating}"
+        )
+        tree = sklearn.neighbors.KDTree(points)
+        fallback_np = to_np(fallback_scale).astype(np.float32, copy=False)
+        rotations = np.repeat(
+            np.eye(3, dtype=np.float32)[None, :, :],
+            repeats=n_points,
+            axis=0,
+        )
+        scales = np.repeat(fallback_np[:, None], repeats=3, axis=1)
+        accepted_mask_all = np.zeros(n_points, dtype=bool)
+        accepted_count = 0
+
+        for start in range(0, n_points, chunk_size):
+            end = min(start + chunk_size, n_points)
+            _, neighbor_indices = tree.query(points[start:end], k=n_neighbors)
+            neighbors = points[neighbor_indices]
+            centered = neighbors - neighbors.mean(axis=1, keepdims=True)
+            covariance = np.einsum("nki,nkj->nij", centered, centered)
+            covariance /= max(n_neighbors - 1, 1)
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+
+            tangent_0 = eigenvectors[:, :, 2]
+            tangent_1 = eigenvectors[:, :, 1]
+            normal = eigenvectors[:, :, 0]
+            orientation = np.stack([tangent_0, tangent_1, normal], axis=2)
+            determinant = np.linalg.det(orientation)
+            orientation[determinant < 0.0, :, 2] *= -1.0
+
+            local_scale = np.sqrt(np.maximum(eigenvalues, 1e-12))
+            tangent_scale_0 = local_scale[:, 2] * tangent_scale_multiplier
+            tangent_scale_1 = local_scale[:, 1] * tangent_scale_multiplier
+            normal_scale = np.minimum(
+                local_scale[:, 0],
+                np.maximum(tangent_scale_0, tangent_scale_1)
+                * normal_scale_multiplier,
+            )
+            chunk_scales = np.stack(
+                [tangent_scale_0, tangent_scale_1, normal_scale],
+                axis=1,
+            )
+            fallback_chunk = fallback_np[start:end, None]
+            chunk_scales = np.where(np.isfinite(chunk_scales), chunk_scales, fallback_chunk)
+            chunk_scales = np.clip(chunk_scales, min_scale, max_scale)
+
+            if use_confidence_gating:
+                denom = np.maximum(eigenvalues[:, 2], 1e-12)
+                planarity = (eigenvalues[:, 1] - eigenvalues[:, 0]) / denom
+                scattering = eigenvalues[:, 0] / denom
+                accepted = (planarity >= min_planarity) & (scattering <= max_scattering)
+            else:
+                accepted = np.ones(end - start, dtype=bool)
+
+            chunk_indices = np.arange(start, end)
+            accepted_indices = chunk_indices[accepted]
+            rotations[accepted_indices] = orientation[accepted]
+            scales[accepted_indices] = chunk_scales.astype(np.float32)[accepted]
+            accepted_mask_all[accepted_indices] = True
+            accepted_count += int(accepted.sum())
+
+        if use_confidence_gating:
+            accepted_ratio = accepted_count / max(n_points, 1)
+            logger.info(
+                "Surface-aligned PCA confidence gate accepted "
+                f"{accepted_count}/{n_points} points ({accepted_ratio:.2%})"
+            )
+
+        rotations_torch = torch.tensor(rotations, dtype=torch.float32, device=self.device)
+        scales_torch = torch.tensor(scales, dtype=torch.float32, device=self.device)
+        pca_quaternions = _rotation_matrix_to_quaternion_wxyz(rotations_torch)
+        quaternions = fallback_rots.clone()
+        accepted_mask = torch.tensor(accepted_mask_all, dtype=torch.bool, device=self.device)
+        quaternions[accepted_mask] = pca_quaternions[accepted_mask]
+        return quaternions, self.scale_activation_inv(scales_torch)
+
     def default_initialize_from_points(self, pts, observer_pts, colors=None, use_observer_pts=True):
         """
         Given an Nx3 array of points (and optionally Nx3 rgb colors),
@@ -572,7 +731,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         observation_scale = observation_scale * self.conf.model.default_scale_factor
 
-        scales = self.scale_activation_inv(observation_scale)[:, None].repeat(1, 3)
+        if self.conf.surface_aligned_init.enabled:
+            rots, scales = self._surface_aligned_rotation_and_scale(
+                pts,
+                observation_scale,
+                rots,
+            )
+        else:
+            scales = self.scale_activation_inv(observation_scale)[:, None].repeat(1, 3)
 
         # set density as a constant
         opacities = self.density_activation_inv(

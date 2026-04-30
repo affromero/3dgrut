@@ -58,6 +58,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         test_split_interval=8,
         ray_jitter=None,
         exif_exposures: Optional[list[Optional[float]]] = None,
+        sky_mask_folder: Optional[str] = None,
     ):
         self.path = path
         self.device = device
@@ -66,6 +67,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.ray_jitter = ray_jitter
         self.test_split_interval = test_split_interval
         self._all_exif_exposures = exif_exposures  # Exposure values for all frames (pre-split)
+        self.sky_mask_folder = sky_mask_folder
 
         # Worker-based GPU cache for multiprocessing compatibility
         self._worker_gpu_cache = {}
@@ -103,6 +105,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # numpy str array of image paths and mask paths
         self.image_paths = self.image_paths[indices]
         self.mask_paths = self.mask_paths[indices]
+        if self.sky_mask_paths is not None:
+            self.sky_mask_paths = self.sky_mask_paths[indices]
 
         self.camera_centers = self.camera_centers[indices]
         self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
@@ -141,11 +145,20 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
         return f"masks{downsample_suffix}"
 
+    def get_sky_masks_folder(self):
+        if self.sky_mask_folder is not None:
+            return self.sky_mask_folder
+        downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
+        return f"sky_masks{downsample_suffix}"
+
     def resolve_mask_path(self, image_path, image_name):
         colmap_mask_path = os.path.join(self.path, self.get_masks_folder(), image_name)
         if os.path.exists(colmap_mask_path):
             return colmap_mask_path
         return os.path.splitext(image_path)[0] + "_mask.png"
+
+    def resolve_sky_mask_path(self, image_name):
+        return os.path.join(self.path, self.get_sky_masks_folder(), image_name)
 
     def load_b2g_camera_rotations(self):
         metadata_path = os.path.join(self.path, "b2g_camera_models.json")
@@ -448,6 +461,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.poses = []
         self.image_paths = []
         self.mask_paths = []
+        self.sky_mask_paths = [] if self.sky_mask_folder is not None else None
 
         cam_centers = []
         for extr in logger.track(
@@ -468,6 +482,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             image_path = os.path.join(self.path, self.get_images_folder(), extr.name)
             self.image_paths.append(image_path)
             self.mask_paths.append(self.resolve_mask_path(image_path, extr.name))
+            if self.sky_mask_paths is not None:
+                self.sky_mask_paths.append(self.resolve_sky_mask_path(extr.name))
 
         self.camera_centers = np.array(cam_centers)
         _, diagonal = get_center_and_diag(self.camera_centers)
@@ -477,6 +493,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         self.image_paths = np.stack(self.image_paths, dtype=str)
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
+        if self.sky_mask_paths is not None:
+            self.sky_mask_paths = np.stack(self.sky_mask_paths, dtype=str)
 
     def _lazy_worker_intrinsics_cache(self):
         """Create intrinsics cache for a specific worker."""
@@ -641,6 +659,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, actual_h, actual_w, 1)
             output_dict["mask"] = mask
 
+        if self.sky_mask_paths is not None:
+            sky_mask_path = self.sky_mask_paths[idx]
+            if not os.path.exists(sky_mask_path):
+                raise FileNotFoundError(f"Sky mask sidecar not found: {sky_mask_path}")
+            sky_mask = torch.from_numpy(np.array(Image.open(sky_mask_path).convert("L"))).reshape(
+                1, actual_h, actual_w, 1
+            )
+            output_dict["sky_mask"] = sky_mask
+
         # Add EXIF exposure if available for this frame
         if self.exif_exposures is not None and self.exif_exposures[idx] is not None:
             output_dict["exposure"] = torch.tensor(self.exif_exposures[idx], dtype=torch.float32)
@@ -678,6 +705,11 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
             mask = (mask > 0.5).to(torch.float32)
             sample["mask"] = mask
+
+        if "sky_mask" in batch:
+            sky_mask = batch["sky_mask"][0].to(self.device, non_blocking=True) / 255.0
+            sky_mask = (sky_mask > 0.5).to(torch.float32)
+            sample["sky_mask"] = sky_mask
 
         # Add exposure prior from EXIF if available (move to GPU)
         if "exposure" in batch and batch["exposure"][0] is not None:
