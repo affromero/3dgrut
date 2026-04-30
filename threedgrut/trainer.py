@@ -35,6 +35,7 @@ import wandb
 import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
+from threedgrut.model.camera_residual import CameraResidual
 from threedgrut.model.losses import ssim
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
@@ -278,6 +279,69 @@ def _gaussian_geometry_metrics(model: MixtureOfGaussians) -> dict[str, float]:
     return metrics
 
 
+def _camera_focal_mean(gpu_batch) -> float:
+    camera_params = (
+        gpu_batch.intrinsics_OpenCVPinholeCameraModelParameters
+        or gpu_batch.intrinsics_OpenCVFisheyeCameraModelParameters
+        or gpu_batch.intrinsics_RationalCameraModelParameters
+    )
+    if camera_params is None:
+        return 1.0
+    focal_length = camera_params.get("focal_length", np.array([1.0, 1.0]))
+    return float(np.asarray(focal_length, dtype=np.float32).mean())
+
+
+def _screen_space_footprint_metrics(
+    *,
+    model: MixtureOfGaussians,
+    gpu_batch,
+    max_samples: int,
+) -> dict[str, float]:
+    """Approximate projected Gaussian footprint distribution for one view."""
+    with torch.no_grad():
+        positions = model.get_positions().detach()
+        scales = model.get_scale().detach().float().amax(dim=1)
+        sample_count = min(max_samples, positions.shape[0])
+        if sample_count <= 0:
+            return {}
+        if sample_count < positions.shape[0]:
+            sample_idx = torch.linspace(
+                0,
+                positions.shape[0] - 1,
+                steps=sample_count,
+                device=positions.device,
+            ).long()
+            positions = positions[sample_idx]
+            scales = scales[sample_idx]
+        pose = gpu_batch.T_to_world.squeeze(0)
+        world_to_camera = torch.linalg.inv(pose)
+        homogeneous = torch.cat(
+            (positions, torch.ones_like(positions[:, :1])),
+            dim=1,
+        )
+        camera_positions = homogeneous @ world_to_camera.transpose(0, 1)
+        depth = camera_positions[:, 2]
+        in_front = depth > 1e-3
+        if not in_front.any():
+            return {"footprint_front_fraction": 0.0}
+        focal_mean = _camera_focal_mean(gpu_batch)
+        projected_radius = scales[in_front] * focal_mean / depth[in_front].clamp_min(1e-3)
+        quantiles = torch.quantile(
+            projected_radius,
+            torch.tensor([0.5, 0.95, 0.99], device=projected_radius.device),
+        )
+        return {
+            "footprint_front_fraction": in_front.float().mean().item(),
+            "footprint_radius_px_mean": projected_radius.mean().item(),
+            "footprint_radius_px_p50": quantiles[0].item(),
+            "footprint_radius_px_p95": quantiles[1].item(),
+            "footprint_radius_px_p99": quantiles[2].item(),
+            "footprint_radius_px_max": projected_radius.max().item(),
+            "footprint_radius_lt_0p5_fraction": (projected_radius < 0.5).float().mean().item(),
+            "footprint_radius_gt_8_fraction": (projected_radius > 8.0).float().mean().item(),
+        }
+
+
 def _diagnostic_metrics(
     *,
     rgb_gt: torch.Tensor,
@@ -470,6 +534,11 @@ def _make_validation_image_tiles(
     depth_rgb = _robust_jet_map(pred_dist, valid_mask)
     opacity_rgb = jet_map(pred_opacity, 1)
     hits_rgb = jet_map(hit_counts, max_hit_count)
+    hit_coverage = (hit_counts > 0).to(rgb_gt.dtype)
+    opacity_coverage = (pred_opacity > 0.01).to(rgb_gt.dtype)
+    if valid_mask is not None:
+        hit_coverage = hit_coverage * valid_mask
+        opacity_coverage = opacity_coverage * valid_mask
     tiles = {
         "input_rgb": rgb_gt,
         "training_mask": mask_rgb,
@@ -481,6 +550,8 @@ def _make_validation_image_tiles(
         "predicted_depth": depth_rgb,
         "opacity": opacity_rgb,
         "ray_hits": hits_rgb,
+        "hit_coverage": hit_coverage.expand_as(rgb_gt),
+        "opacity_coverage": opacity_coverage.expand_as(rgb_gt),
     }
     if sky_mask is not None:
         tiles["sky_opacity_mask"] = sky_mask.clip(0, 1.0).expand_as(rgb_gt)
@@ -525,6 +596,12 @@ class Trainer3DGRUT:
 
     post_processing_schedulers: Optional[list] = None
     """ Schedulers for post-processing module optimizers """
+
+    camera_residual: Optional[CameraResidual] = None
+    """ Optional camera residual module """
+
+    camera_residual_optimizer: Optional[torch.optim.Optimizer] = None
+    """ Optimizer for camera residual module """
 
     _distillation_start_step: int = -1
     """ Step at which distillation starts (-1 means disabled) """
@@ -573,9 +650,10 @@ class Trainer3DGRUT:
         self.init_densification_and_pruning_strategy(conf)
         logger.log_rule("Setup Model Weights & Training")
         self.init_metrics()
+        self.init_post_processing(conf)
+        self.init_camera_residual(conf)
         self.setup_training(conf, self.model, self.train_dataset)
         self.init_experiments_tracking(conf)
-        self.init_post_processing(conf)
         self.init_gui(conf, self.model, self.train_dataset, self.val_dataset, self.scene_bbox)
 
     def init_dataloaders(self, conf: DictConfig):
@@ -684,6 +762,12 @@ class Trainer3DGRUT:
                 ):
                     sched.load_state_dict(sched_state)
                 logger.info("📷 Post-processing state restored from checkpoint")
+            if "camera_residual" in checkpoint and self.camera_residual is not None:
+                self.camera_residual.load_state_dict(checkpoint["camera_residual"]["module"])
+                self.camera_residual_optimizer.load_state_dict(
+                    checkpoint["camera_residual"]["optimizer"]
+                )
+                logger.info("📷 Camera residual state restored from checkpoint")
         elif conf.import_ply.enabled:
             ply_path = (
                 conf.import_ply.path
@@ -896,6 +980,31 @@ class Trainer3DGRUT:
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
 
+    def init_camera_residual(self, conf: DictConfig) -> None:
+        """Initialize optional bounded camera residual calibration."""
+        if not conf.camera_residual.enabled:
+            return
+        frames_per_camera = self.train_dataset.get_frames_per_camera()
+        self.camera_residual = CameraResidual(
+            num_cameras=len(frames_per_camera),
+            lr=conf.camera_residual.lr,
+            reg_lambda=conf.camera_residual.reg_lambda,
+            max_rotation_rad=conf.camera_residual.max_rotation_rad,
+            max_translation_m=conf.camera_residual.max_translation_m,
+            optimize_global=conf.camera_residual.optimize_global,
+            optimize_per_camera=conf.camera_residual.optimize_per_camera,
+        ).to(self.device)
+        self.camera_residual_optimizer = self.camera_residual.create_optimizer()
+        logger.warning(
+            "📷 CAMERA_RESIDUAL enabled. Current 3DGUT CUDA backward does not "
+            "return ray/sensor gradients; monitor camera_residual/max_abs_grad."
+        )
+
+    def _apply_camera_residual(self, gpu_batch):
+        if self.camera_residual is None:
+            return gpu_batch
+        return self.camera_residual(gpu_batch)
+
     def _validation_log_image_views(self) -> set[int]:
         """Return validation iteration indices to log as W&B image grids."""
         eval_image_count = int(self.conf.writer.get("eval_image_count", 5))
@@ -954,6 +1063,16 @@ class Trainer3DGRUT:
             metrics["hits_std"] = outputs["hits_count"].std().item()
             metrics["hits_min"] = outputs["hits_count"].min().item()
             metrics["hits_max"] = outputs["hits_count"].max().item()
+            hit_mask = (outputs["hits_count"] > 0).float()
+            opacity_mask = (outputs["pred_opacity"] > 0.01).float()
+            if gpu_batch.mask is not None:
+                valid = gpu_batch.mask
+                valid_denominator = torch.clamp_min(valid.sum(), 1.0)
+                metrics["valid_hit_coverage"] = ((hit_mask * valid).sum() / valid_denominator).item()
+                metrics["valid_opacity_coverage"] = ((opacity_mask * valid).sum() / valid_denominator).item()
+            else:
+                metrics["valid_hit_coverage"] = hit_mask.mean().item()
+                metrics["valid_opacity_coverage"] = opacity_mask.mean().item()
 
         if is_compute_validation_metrics:
             with torch.cuda.nvtx.range(f"criterions_psnr"):
@@ -985,6 +1104,13 @@ class Trainer3DGRUT:
                     rgb_gt=rgb_gt,
                     rgb_pred=rgb_pred,
                     mask=gpu_batch.mask,
+                )
+            )
+            metrics.update(
+                _screen_space_footprint_metrics(
+                    model=self.model,
+                    gpu_batch=gpu_batch,
+                    max_samples=int(self.conf.writer.get("footprint_sample_count", 200000)),
                 )
             )
 
@@ -1164,6 +1290,8 @@ class Trainer3DGRUT:
                 "predicted_depth",
                 "opacity",
                 "ray_hits",
+                "hit_coverage",
+                "opacity_coverage",
             ]
             tile_groups = metrics["img_eval_tiles"]
             grid_columns = [column for column in grid_columns if column in tile_groups]
@@ -1288,6 +1416,13 @@ class Trainer3DGRUT:
         for metric_name, wandb_name in geometry_metric_names:
             if metric_name in geometry_metrics:
                 writer.add_scalar(wandb_name, geometry_metrics[metric_name], global_step)
+        if self.camera_residual is not None:
+            for metric_name, value in self.camera_residual.stats().items():
+                writer.add_scalar(
+                    f"camera_residual/{metric_name}",
+                    value,
+                    global_step,
+                )
         writer.add_scalar(
             "val/hits/min",
             np.mean(metrics["hits_min"]),
@@ -1303,6 +1438,37 @@ class Trainer3DGRUT:
             np.mean(metrics["hits_mean"]),
             global_step,
         )
+        if "valid_hit_coverage" in metrics:
+            writer.add_scalar(
+                "diagnostics/coverage/valid_hit_fraction",
+                np.mean(metrics["valid_hit_coverage"]),
+                global_step,
+            )
+        if "valid_opacity_coverage" in metrics:
+            writer.add_scalar(
+                "diagnostics/coverage/valid_opacity_fraction",
+                np.mean(metrics["valid_opacity_coverage"]),
+                global_step,
+            )
+        footprint_metric_names = (
+            ("footprint_front_fraction", "diagnostics/footprint/front_fraction"),
+            ("footprint_radius_px_mean", "diagnostics/footprint/radius_px_mean"),
+            ("footprint_radius_px_p50", "diagnostics/footprint/radius_px_p50"),
+            ("footprint_radius_px_p95", "diagnostics/footprint/radius_px_p95"),
+            ("footprint_radius_px_p99", "diagnostics/footprint/radius_px_p99"),
+            ("footprint_radius_px_max", "diagnostics/footprint/radius_px_max"),
+            (
+                "footprint_radius_lt_0p5_fraction",
+                "diagnostics/footprint/radius_lt_0p5_fraction",
+            ),
+            (
+                "footprint_radius_gt_8_fraction",
+                "diagnostics/footprint/radius_gt_8_fraction",
+            ),
+        )
+        for metric_name, wandb_name in footprint_metric_names:
+            if metric_name in metrics:
+                writer.add_scalar(wandb_name, np.mean(metrics[metric_name]), global_step)
 
         loss = np.mean(metrics["losses"]["total_loss"])
         writer.add_scalar("val/loss/total", loss, global_step)
@@ -1394,6 +1560,19 @@ class Trainer3DGRUT:
                     post_processing_reg_loss,
                     global_step,
                 )
+            if self.camera_residual is not None and "camera_residual_reg_loss" in batch_metrics["losses"]:
+                camera_residual_reg_loss = np.mean(batch_metrics["losses"]["camera_residual_reg_loss"])
+                writer.add_scalar(
+                    "train/loss/camera_residual_reg",
+                    camera_residual_reg_loss,
+                    global_step,
+                )
+                for metric_name, value in self.camera_residual.stats().items():
+                    writer.add_scalar(
+                        f"camera_residual/{metric_name}",
+                        value,
+                        global_step,
+                    )
             if "psnr" in batch_metrics:
                 writer.add_scalar("train/psnr", batch_metrics["psnr"], self.global_step)
             if "ssim" in batch_metrics:
@@ -1408,6 +1587,18 @@ class Trainer3DGRUT:
                 writer.add_scalar("train/hits/min", batch_metrics["hits_min"], self.global_step)
             if "hits_max" in batch_metrics:
                 writer.add_scalar("train/hits/max", batch_metrics["hits_max"], self.global_step)
+            if "valid_hit_coverage" in batch_metrics:
+                writer.add_scalar(
+                    "diagnostics/coverage/train_valid_hit_fraction",
+                    batch_metrics["valid_hit_coverage"],
+                    self.global_step,
+                )
+            if "valid_opacity_coverage" in batch_metrics:
+                writer.add_scalar(
+                    "diagnostics/coverage/train_valid_opacity_fraction",
+                    batch_metrics["valid_opacity_coverage"],
+                    self.global_step,
+                )
 
             if "timings" in batch_metrics:
                 for time_key in batch_metrics["timings"]:
@@ -1552,6 +1743,11 @@ class Trainer3DGRUT:
                 "optimizers": [opt.state_dict() for opt in self.post_processing_optimizers],
                 "schedulers": [sched.state_dict() for sched in self.post_processing_schedulers],
             }
+        if self.camera_residual is not None:
+            parameters["camera_residual"] = {
+                "module": self.camera_residual.state_dict(),
+                "optimizer": self.camera_residual_optimizer.state_dict(),
+            }
 
         os.makedirs(os.path.join(out_dir, f"ours_{int(global_step)}"), exist_ok=True)
         if not last_checkpoint:
@@ -1610,6 +1806,7 @@ class Trainer3DGRUT:
         # Access the GPU-cache batch data
         with torch.cuda.nvtx.range(f"train_iter{global_step}_get_gpu_batch"):
             gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(batch)
+            gpu_batch = self._apply_camera_residual(gpu_batch)
 
         # Perform validation if required
         is_time_to_validate = (global_step > 0 or conf.validate_first) and (global_step % self.val_frequency == 0)
@@ -1635,6 +1832,10 @@ class Trainer3DGRUT:
                 post_processing_reg_loss = self.post_processing.get_regularization_loss()
                 batch_losses["total_loss"] = batch_losses["total_loss"] + post_processing_reg_loss
                 batch_losses["post_processing_reg_loss"] = post_processing_reg_loss
+            if self.camera_residual is not None:
+                camera_residual_reg_loss = self.camera_residual.get_regularization_loss()
+                batch_losses["total_loss"] = batch_losses["total_loss"] + camera_residual_reg_loss
+                batch_losses["camera_residual_reg_loss"] = camera_residual_reg_loss
 
         # Backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_pre_bwd"):
@@ -1685,6 +1886,10 @@ class Trainer3DGRUT:
                     opt.zero_grad()
                 for sched in self.post_processing_schedulers:
                     sched.step()
+        if self.camera_residual_optimizer is not None:
+            with torch.cuda.nvtx.range(f"train_{global_step}_camera_residual_opt"):
+                self.camera_residual_optimizer.step()
+                self.camera_residual_optimizer.zero_grad()
 
         # Post backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_post_opt_step"):
@@ -1786,6 +1991,7 @@ class Trainer3DGRUT:
         for val_iteration, batch_idx in enumerate(self.val_dataloader):
             # Access the GPU-cache batch data
             gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
+            gpu_batch = self._apply_camera_residual(gpu_batch)
 
             # Compute the outputs of a single batch
             with torch.cuda.nvtx.range(f"train.validation_step_{self.global_step}"):

@@ -31,6 +31,7 @@ writer:
   log_image_views: ${int_list:[ 0, 13, 27, 43, 78 ]}
   eval_image_count: 5
   eval_image_group_size: 5
+  footprint_sample_count: 200000
 
 export_ply:
   enabled: false
@@ -51,6 +52,15 @@ surface_aligned_init:
   max_scattering: 0.15
   min_scale: 0.002
   max_scale: 0.05
+
+camera_residual:
+  enabled: false
+  lr: 0.0001
+  reg_lambda: 1.0
+  max_rotation_rad: 0.0174533
+  max_translation_m: 0.02
+  optimize_global: true
+  optimize_per_camera: false
   
 export_usd:
   enabled: false
