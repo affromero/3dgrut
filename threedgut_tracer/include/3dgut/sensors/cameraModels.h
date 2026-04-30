@@ -47,6 +47,18 @@ struct FThetaProjectionParameters {
     tcnn::vec<3> linear_cde; // Coefficients of the constrained linear term :math:`\begin{bmatrix} c & d \\ e & 1 \end{bmatrix}` transforming between sensor coordinates (in mm) to image coordinates (in px) (float32, [3,])
 };
 
+struct RationalProjectionParameters {
+    tcnn::vec2 principalPoint;
+    tcnn::vec2 focalLength;
+    tcnn::vec2 nativeResolution;
+    tcnn::vec3 numeratorCoeffs;
+    tcnn::vec3 denominatorCoeffs;
+    tcnn::vec2 affineCoeffs;
+    tcnn::vec2 tangentialCoeffs;
+    float skew;
+    int imageRotationQuadrantsCw;
+};
+
 struct CameraModelParameters {
     enum ShutterType {
         RollingTopToBottomShutter,
@@ -60,6 +72,7 @@ struct CameraModelParameters {
         OpenCVPinholeModel,
         OpenCVFisheyeModel,
         FThetaModel,
+        RationalModel,
         EmptyModel,
         Unsupported
     } modelType = EmptyModel;
@@ -68,6 +81,7 @@ struct CameraModelParameters {
         OpenCVPinholeProjectionParameters ocvPinholeParams;
         OpenCVFisheyeProjectionParameters ocvFisheyeParams;
         FThetaProjectionParameters fthetaParams;
+        RationalProjectionParameters rationalParams;
     };
 };
 

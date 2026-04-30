@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import json
 import os
 import platform
 from typing import Optional
@@ -136,6 +137,28 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
         return f"images{downsample_suffix}"
 
+    def get_masks_folder(self):
+        downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
+        return f"masks{downsample_suffix}"
+
+    def resolve_mask_path(self, image_path, image_name):
+        colmap_mask_path = os.path.join(self.path, self.get_masks_folder(), image_name)
+        if os.path.exists(colmap_mask_path):
+            return colmap_mask_path
+        return os.path.splitext(image_path)[0] + "_mask.png"
+
+    def load_b2g_camera_rotations(self):
+        metadata_path = os.path.join(self.path, "b2g_camera_models.json")
+        if not os.path.exists(metadata_path):
+            return {}
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        cameras = metadata.get("cameras", {})
+        return {
+            int(camera_id): int(camera.get("image_rotation_quadrants_cw", 0)) % 4
+            for camera_id, camera in cameras.items()
+        }
+
     def load_camera_data(self):
         """
         Load the camera data and generate rays for each camera.
@@ -245,7 +268,107 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 pixel_coords,
             )
 
+        def rational_project_xy(x, y, params):
+            fx, fy, cx, cy = params[:4]
+            b1, b2, b3 = params[4:7]
+            d1, d2, d3 = params[7:10]
+            a1, a2 = params[10:12]
+            p1, p2 = params[12:14]
+            skew = params[14]
+            r2 = x * x + y * y
+            r4 = r2 * r2
+            r6 = r4 * r2
+            numerator = 1.0 + b1 * r2 + b2 * r4 + b3 * r6
+            denominator = 1.0 + d1 * r2 + d2 * r4 + d3 * r6
+            denominator = np.where(np.abs(denominator) > 1e-12, denominator, 1.0)
+            radial = numerator / denominator
+            affine = 1.0 + a1 * r2 + a2 * r4
+            x_distorted = x * radial + affine * (p2 * (r2 + 2.0 * x * x) + 2.0 * p1 * x * y)
+            y_distorted = y * radial + affine * (p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y)
+            u = fx * x_distorted + skew * y_distorted + cx
+            v = fy * y_distorted + cy
+            return u, v
+
+        def invert_rational_pixels(u, v, params, num_iterations=8):
+            fx, fy, cx, cy = params[:4]
+            skew = params[14]
+            y_distorted = (v - cy) / fy
+            x_distorted = (u - cx - skew * y_distorted) / fx
+            x = x_distorted.copy()
+            y = y_distorted.copy()
+            eps = 1e-5
+
+            for _ in range(num_iterations):
+                pred_u, pred_v = rational_project_xy(x, y, params)
+                residual_u = pred_u - u
+                residual_v = pred_v - v
+
+                pred_u_dx, pred_v_dx = rational_project_xy(x + eps, y, params)
+                pred_u_dy, pred_v_dy = rational_project_xy(x, y + eps, params)
+                j00 = (pred_u_dx - pred_u) / eps
+                j10 = (pred_v_dx - pred_v) / eps
+                j01 = (pred_u_dy - pred_u) / eps
+                j11 = (pred_v_dy - pred_v) / eps
+                determinant = j00 * j11 - j01 * j10
+                valid = np.abs(determinant) > 1e-12
+                delta_x = np.zeros_like(x)
+                delta_y = np.zeros_like(y)
+                delta_x[valid] = (j11[valid] * residual_u[valid] - j01[valid] * residual_v[valid]) / determinant[valid]
+                delta_y[valid] = (-j10[valid] * residual_u[valid] + j00[valid] * residual_v[valid]) / determinant[valid]
+                x -= delta_x
+                y -= delta_y
+            return x, y
+
+        def stored_to_native_pixels(u_stored, v_stored, w, h, rotation):
+            if rotation == 1:
+                return v_stored, (w - 1.0) - u_stored
+            if rotation == 2:
+                return (w - 1.0) - u_stored, (h - 1.0) - v_stored
+            if rotation == 3:
+                return (h - 1.0) - v_stored, u_stored
+            return u_stored, v_stored
+
+        def native_resolution(w, h, rotation):
+            if rotation % 2 == 1:
+                return h, w
+            return w, h
+
+        def create_rational_camera(params, w, h, rotation):
+            u_stored = np.tile(np.arange(w) + 0.5, h)
+            v_stored = (np.arange(h) + 0.5).repeat(w)
+            u_native, v_native = stored_to_native_pixels(
+                u_stored, v_stored, w, h, rotation
+            )
+            native_w, native_h = native_resolution(w, h, rotation)
+            out_shape = (1, h, w, 3)
+            x, y = invert_rational_pixels(u_native, v_native, params)
+            ray_lookat = np.stack((x, y, np.ones_like(x)), axis=-1)
+            rays_d_cam = ray_lookat / np.linalg.norm(ray_lookat, axis=-1, keepdims=True)
+            rays_o_cam = np.zeros_like(rays_d_cam)
+            pixel_coords = create_pixel_coords(w, h)
+            params_dict = {
+                "resolution": np.array([w, h], dtype=np.uint64),
+                "native_resolution": np.array([native_w, native_h], dtype=np.uint64),
+                "image_rotation_quadrants_cw": int(rotation),
+                "shutter_type": ShutterType.GLOBAL.name,
+                "principal_point": params[2:4].astype(np.float32),
+                "focal_length": params[:2].astype(np.float32),
+                "numerator_coeffs": params[4:7].astype(np.float32),
+                "denominator_coeffs": params[7:10].astype(np.float32),
+                "affine_coeffs": params[10:12].astype(np.float32),
+                "tangential_coeffs": params[12:14].astype(np.float32),
+                "skew": float(params[14]),
+            }
+            return (
+                params_dict,
+                torch.tensor(rays_o_cam, dtype=torch.float32).reshape(out_shape),
+                torch.tensor(rays_d_cam, dtype=torch.float32).reshape(out_shape),
+                "RationalCameraModelParameters",
+                pixel_coords,
+            )
+
         cam_id_to_image_name = {extr.camera_id: extr.name for extr in self.cam_extrinsics}
+        b2g_camera_rotations = self.load_b2g_camera_rotations()
 
         for intr in self.cam_intrinsics.values():
             full_width = intr.width
@@ -307,10 +430,18 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 params[:4] = params[:4] / scaling_factor
                 self.intrinsics[intr.id] = create_fisheye_camera(params, width, height)
 
+            elif intr.model == "RATIONAL":
+                params = copy.deepcopy(intr.params)
+                params[:4] = params[:4] / scaling_factor
+                rotation = b2g_camera_rotations.get(intr.id, 0)
+                self.intrinsics[intr.id] = create_rational_camera(
+                    params, width, height, rotation
+                )
+
             else:
                 assert False, (
                     f"Colmap camera model '{intr.model}' not handled: supported camera models are "
-                    "PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, and OPENCV_FISHEYE."
+                    "PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, OPENCV_FISHEYE, and RATIONAL."
                 )
 
         # Load poses and paths
@@ -336,7 +467,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
             image_path = os.path.join(self.path, self.get_images_folder(), extr.name)
             self.image_paths.append(image_path)
-            self.mask_paths.append(os.path.splitext(image_path)[0] + "_mask.png")
+            self.mask_paths.append(self.resolve_mask_path(image_path, extr.name))
 
         self.camera_centers = np.array(cam_centers)
         _, diagonal = get_center_and_diag(self.camera_centers)
@@ -475,6 +606,16 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     def __len__(self) -> int:
         return self.n_frames
 
+    @staticmethod
+    def _first_scalar(value):
+        if torch.is_tensor(value):
+            return value.reshape(-1)[0].item()
+        if isinstance(value, np.ndarray):
+            return value.reshape(-1)[0].item()
+        if isinstance(value, (list, tuple)):
+            return ColmapDataset._first_scalar(value[0])
+        return value
+
     @torch.cuda.nvtx.range("colmap_dataset::_getitem")
     def __getitem__(self, idx) -> dict:
         # Load image and get its actual dimensions
@@ -492,6 +633,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "intr": self.get_intrinsics_idx(idx),
             "camera_idx": self.get_camera_idx(idx),
             "frame_idx": idx,
+            "image_path": self.image_paths[idx],
         }
 
         # Only add mask to dictionary if it exists
@@ -510,7 +652,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         data = batch["data"][0].to(self.device, non_blocking=True) / 255.0
         pose = batch["pose"][0].to(self.device, non_blocking=True)
-        intr = batch["intr"][0].item()
+        intr = int(self._first_scalar(batch["intr"]))
 
         assert data.dtype == torch.float32
         assert pose.dtype == torch.float32
@@ -526,8 +668,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "rays_dir": rays_dir,
             "T_to_world": pose,
             f"intrinsics_{camera_name}": camera_params_dict,
-            "camera_idx": batch["camera_idx"][0].item(),
-            "frame_idx": batch["frame_idx"][0].item(),
+            "camera_idx": int(self._first_scalar(batch["camera_idx"])),
+            "frame_idx": int(self._first_scalar(batch["frame_idx"])),
+            "image_path": batch["image_path"][0],
             "pixel_coords": pixel_coords,
         }
 

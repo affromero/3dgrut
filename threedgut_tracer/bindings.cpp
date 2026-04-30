@@ -100,6 +100,41 @@ fromFThetaCameraModelParameters(std::array<uint64_t, 2> _resolution,
     return params;
 }
 
+threedgut::CameraModelParameters
+fromRationalCameraModelParameters(std::array<uint64_t, 2> _resolution,
+                                  threedgut::CameraModelParameters::ShutterType shutter_type,
+                                  std::array<uint64_t, 2> native_resolution,
+                                  int image_rotation_quadrants_cw,
+                                  std::array<float, 2> principal_point,
+                                  std::array<float, 2> focal_length,
+                                  std::array<float, 3> numerator_coeffs,
+                                  std::array<float, 3> denominator_coeffs,
+                                  std::array<float, 2> affine_coeffs,
+                                  std::array<float, 2> tangential_coeffs,
+                                  float skew) {
+    threedgut::CameraModelParameters params;
+    params.shutterType = static_cast<threedgut::CameraModelParameters::ShutterType>(shutter_type);
+    params.modelType   = threedgut::CameraModelParameters::RationalModel;
+    std::array<float, 2> native_resolution_float = {static_cast<float>(native_resolution[0]), static_cast<float>(native_resolution[1])};
+    static_assert(sizeof(principal_point) == sizeof(tcnn::vec2), "[3dgut] typing size mismatch");
+    static_assert(sizeof(focal_length) == sizeof(tcnn::vec2), "[3dgut] typing size mismatch");
+    static_assert(sizeof(native_resolution_float) == sizeof(tcnn::vec2), "[3dgut] typing size mismatch");
+    static_assert(sizeof(numerator_coeffs) == sizeof(tcnn::vec3), "[3dgut] typing size mismatch");
+    static_assert(sizeof(denominator_coeffs) == sizeof(tcnn::vec3), "[3dgut] typing size mismatch");
+    static_assert(sizeof(affine_coeffs) == sizeof(tcnn::vec2), "[3dgut] typing size mismatch");
+    static_assert(sizeof(tangential_coeffs) == sizeof(tcnn::vec2), "[3dgut] typing size mismatch");
+    params.rationalParams.principalPoint    = *reinterpret_cast<const tcnn::vec2*>(principal_point.data());
+    params.rationalParams.focalLength       = *reinterpret_cast<const tcnn::vec2*>(focal_length.data());
+    params.rationalParams.nativeResolution  = *reinterpret_cast<const tcnn::vec2*>(native_resolution_float.data());
+    params.rationalParams.numeratorCoeffs   = *reinterpret_cast<const tcnn::vec3*>(numerator_coeffs.data());
+    params.rationalParams.denominatorCoeffs = *reinterpret_cast<const tcnn::vec3*>(denominator_coeffs.data());
+    params.rationalParams.affineCoeffs      = *reinterpret_cast<const tcnn::vec2*>(affine_coeffs.data());
+    params.rationalParams.tangentialCoeffs  = *reinterpret_cast<const tcnn::vec2*>(tangential_coeffs.data());
+    params.rationalParams.skew              = skew;
+    params.rationalParams.imageRotationQuadrantsCw = image_rotation_quadrants_cw % 4;
+    return params;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     pybind11::class_<SplatRaster>(m, "SplatRaster")
@@ -148,4 +183,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("angle_to_pixeldist_poly"),
           py::arg("max_angle"),
           py::arg("linear_cde"));
+
+    m.def("fromRationalCameraModelParameters", &fromRationalCameraModelParameters,
+          py::arg("resolution"),
+          py::arg("shutter_type"),
+          py::arg("native_resolution"),
+          py::arg("image_rotation_quadrants_cw"),
+          py::arg("principal_point"),
+          py::arg("focal_length"),
+          py::arg("numerator_coeffs"),
+          py::arg("denominator_coeffs"),
+          py::arg("affine_coeffs"),
+          py::arg("tangential_coeffs"),
+          py::arg("skew"));
 }

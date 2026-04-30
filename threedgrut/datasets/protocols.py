@@ -33,9 +33,11 @@ class Batch:
     intrinsics_OpenCVPinholeCameraModelParameters: Optional[dict] = None
     intrinsics_OpenCVFisheyeCameraModelParameters: Optional[dict] = None
     intrinsics_FThetaCameraModelParameters: Optional[dict] = None
+    intrinsics_RationalCameraModelParameters: Optional[dict] = None
     # Camera/frame indices for post-processing
     camera_idx: int = -1  # 0-based camera index
     frame_idx: int = -1  # 0-based frame index (global across split)
+    image_path: str = ""  # Source image path for logging and diagnostics
     # Pixel coordinates for post-processing
     pixel_coords: Optional[torch.Tensor] = None  # [B, H, W, 2] (x, y) with +0.5 center offset
     # Exposure prior from EXIF metadata (mean-normalized log2 exposure [1], None if unavailable)

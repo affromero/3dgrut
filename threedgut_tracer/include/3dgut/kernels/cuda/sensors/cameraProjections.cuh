@@ -145,6 +145,60 @@ static inline __device__ bool projectPoint(const OpenCVFisheyeProjectionParamete
     return (theta < sensorParams.maxAngle) && withinResolution(resolution, tolerance, projected);
 }
 
+static inline __device__ bool projectPoint(const RationalProjectionParameters& sensorParams,
+                                           const tcnn::ivec2& resolution,
+                                           const tcnn::vec3& position,
+                                           float tolerance,
+                                           tcnn::vec2& projected) {
+    if (position.z <= 0.f) {
+        projected = tcnn::vec2::zero();
+        return false;
+    }
+
+    const tcnn::vec2 uvNormalized = position.xy() / position.z;
+    const float x                 = uvNormalized.x;
+    const float y                 = uvNormalized.y;
+    const float r2                = x * x + y * y;
+    const float r4                = r2 * r2;
+    const float r6                = r4 * r2;
+    const float numerator =
+        1.f + sensorParams.numeratorCoeffs[0] * r2 + sensorParams.numeratorCoeffs[1] * r4 + sensorParams.numeratorCoeffs[2] * r6;
+    float denominator =
+        1.f + sensorParams.denominatorCoeffs[0] * r2 + sensorParams.denominatorCoeffs[1] * r4 + sensorParams.denominatorCoeffs[2] * r6;
+    if (fabsf(denominator) <= 1e-12f) {
+        denominator = 1.f;
+    }
+    const float radial = numerator / denominator;
+    const float affine = 1.f + sensorParams.affineCoeffs[0] * r2 + sensorParams.affineCoeffs[1] * r4;
+    const float p1     = sensorParams.tangentialCoeffs[0];
+    const float p2     = sensorParams.tangentialCoeffs[1];
+
+    const float xDistorted = x * radial + affine * (p2 * (r2 + 2.f * x * x) + 2.f * p1 * x * y);
+    const float yDistorted = y * radial + affine * (p1 * (r2 + 2.f * y * y) + 2.f * p2 * x * y);
+
+    const float nativeX = sensorParams.focalLength.x * xDistorted + sensorParams.skew * yDistorted + sensorParams.principalPoint.x;
+    const float nativeY = sensorParams.focalLength.y * yDistorted + sensorParams.principalPoint.y;
+    const tcnn::vec2 nativeProjected = {nativeX, nativeY};
+    const bool withinNativeResolution = withinResolution(sensorParams.nativeResolution, tolerance, nativeProjected);
+
+    const int rotation = ((sensorParams.imageRotationQuadrantsCw % 4) + 4) % 4;
+    if (rotation == 1) {
+        projected.x = static_cast<float>(resolution.x - 1) - nativeY;
+        projected.y = nativeX;
+    } else if (rotation == 2) {
+        projected.x = static_cast<float>(resolution.x - 1) - nativeX;
+        projected.y = static_cast<float>(resolution.y - 1) - nativeY;
+    } else if (rotation == 3) {
+        projected.x = nativeY;
+        projected.y = static_cast<float>(resolution.y - 1) - nativeX;
+    } else {
+        projected.x = nativeX;
+        projected.y = nativeY;
+    }
+
+    return withinNativeResolution && withinResolution(resolution, tolerance, projected);
+}
+
 template <int NumNewtonIterations = 3>
 static inline __device__ bool projectPoint(const FThetaProjectionParameters& sensorParams,
                                            const tcnn::ivec2& resolution,
@@ -209,6 +263,8 @@ static inline __device__ bool projectPoint(const TSensorModel& sensorModel,
         return projectPoint(sensorModel.ocvFisheyeParams, resolution, position, tolerance, projected);
     case TSensorModel::FThetaModel:
         return projectPoint(sensorModel.fthetaParams, resolution, position, tolerance, projected);
+    case TSensorModel::RationalModel:
+        return projectPoint(sensorModel.rationalParams, resolution, position, tolerance, projected);
     default:
         projected = tcnn::vec2::zero();
         return false;

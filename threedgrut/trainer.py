@@ -19,6 +19,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional, Union
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,6 +29,7 @@ from omegaconf import DictConfig, OmegaConf
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+import wandb
 
 import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
@@ -41,6 +43,185 @@ from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import check_step_condition, create_summary_writer, jet_map
 from threedgrut.utils.render import apply_post_processing
 from threedgrut.utils.timer import CudaTimer
+
+
+def _robust_jet_map(
+    value_map: torch.Tensor,
+    validity_mask: torch.Tensor | None = None,
+    *,
+    quantile: float = 0.95,
+) -> torch.Tensor:
+    """Colorize a scalar map with per-frame robust scaling."""
+    finite_mask = torch.isfinite(value_map)
+    if validity_mask is not None:
+        finite_mask = finite_mask & (validity_mask > 0.5)
+
+    valid_values = value_map[finite_mask]
+    if valid_values.numel() == 0:
+        max_value = torch.tensor(1.0, device=value_map.device, dtype=value_map.dtype)
+    else:
+        max_value = torch.quantile(valid_values, quantile).clamp_min(1e-6)
+    return jet_map(value_map, max_value)
+
+
+def _tensor_to_bgr_image(image: torch.Tensor) -> np.ndarray:
+    """Convert an HWC RGB float tensor to a BGR uint8 image."""
+    rgb = (
+        image.detach()
+        .clip(0, 1)
+        .mul(255)
+        .to(torch.uint8)
+        .cpu()
+        .numpy()
+    )
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def _fit_image_to_panel(
+    image: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    bg_color: tuple[int, int, int] = (18, 18, 18),
+) -> np.ndarray:
+    """Letterbox one BGR image into a fixed-size panel."""
+    panel = np.full((height, width, 3), bg_color, dtype=np.uint8)
+    image_h, image_w = image.shape[:2]
+    scale = min(width / float(image_w), height / float(image_h))
+    resized = cv2.resize(
+        image,
+        (
+            max(1, round(image_w * scale)),
+            max(1, round(image_h * scale)),
+        ),
+        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+    )
+    y0 = (height - resized.shape[0]) // 2
+    x0 = (width - resized.shape[1]) // 2
+    panel[y0 : y0 + resized.shape[0], x0 : x0 + resized.shape[1]] = resized
+    return panel
+
+
+def _text_panel(
+    label: str,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Create a readable row-label panel."""
+    panel = np.full((height, width, 3), (12, 12, 12), dtype=np.uint8)
+    cv2.putText(
+        panel,
+        label,
+        (12, height // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return panel
+
+
+def _save_validation_grid_jpeg(
+    *,
+    tile_groups: dict[str, torch.Tensor],
+    image_paths: list[str],
+    column_names: list[str],
+    row_start: int,
+    row_end: int,
+    output_path: str,
+    panel_width: int = 360,
+    panel_height: int = 480,
+    quality: int = 85,
+) -> str:
+    """Save one grouped validation grid as a JPEG image."""
+    gap_px = 8
+    label_width = 220
+    header_height = 54
+    rows = row_end - row_start
+    grid_width = (
+        label_width
+        + gap_px
+        + len(column_names) * (panel_width + gap_px)
+        + gap_px
+    )
+    grid_height = header_height + rows * (panel_height + gap_px) + gap_px
+    grid = np.full((grid_height, grid_width, 3), (8, 8, 8), dtype=np.uint8)
+
+    for column_idx, column_name in enumerate(column_names):
+        x = label_width + gap_px + column_idx * (panel_width + gap_px)
+        header = np.full((header_height, panel_width, 3), (0, 0, 0), dtype=np.uint8)
+        cv2.putText(
+            header,
+            column_name,
+            (10, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        grid[0:header_height, x : x + panel_width] = header
+
+    for row_offset, row_idx in enumerate(range(row_start, row_end)):
+        y = header_height + row_offset * (panel_height + gap_px)
+        row_label = os.path.splitext(os.path.basename(image_paths[row_idx]))[0]
+        grid[y : y + panel_height, 0:label_width] = _text_panel(
+            row_label,
+            width=label_width,
+            height=panel_height,
+        )
+        for column_idx, column_name in enumerate(column_names):
+            x = label_width + gap_px + column_idx * (panel_width + gap_px)
+            panel = _fit_image_to_panel(
+                _tensor_to_bgr_image(tile_groups[column_name][row_idx]),
+                width=panel_width,
+                height=panel_height,
+            )
+            grid[y : y + panel_height, x : x + panel_width] = panel
+
+    cv2.imwrite(output_path, grid, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    return output_path
+
+
+def _make_validation_image_tiles(
+    *,
+    rgb_gt: torch.Tensor,
+    rgb_pred: torch.Tensor,
+    pred_dist: torch.Tensor,
+    pred_opacity: torch.Tensor,
+    hit_counts: torch.Tensor,
+    mask: torch.Tensor | None,
+    max_hit_count: int,
+) -> dict[str, torch.Tensor]:
+    """Build aligned validation tiles for grouped W&B image grids."""
+    rgb_gt = rgb_gt.clip(0, 1.0)
+    rgb_pred = rgb_pred.clip(0, 1.0)
+    if mask is None:
+        mask_rgb = torch.ones_like(rgb_gt)
+        valid_mask = None
+    else:
+        valid_mask = mask.clip(0, 1.0)
+        mask_rgb = valid_mask.expand_as(rgb_gt)
+
+    error = torch.abs(rgb_pred - rgb_gt).mean(dim=2, keepdim=True)
+    if valid_mask is not None:
+        error = error * valid_mask
+
+    error_rgb = jet_map(error, 0.25)
+    depth_rgb = _robust_jet_map(pred_dist, valid_mask)
+    opacity_rgb = jet_map(pred_opacity, 1)
+    hits_rgb = jet_map(hit_counts, max_hit_count)
+    return {
+        "input_rgb": rgb_gt,
+        "training_mask": mask_rgb,
+        "prediction_rgb": rgb_pred,
+        "rgb_error": error_rgb,
+        "predicted_depth": depth_rgb,
+        "opacity": opacity_rgb,
+        "ray_hits": hits_rgb,
+    }
 
 
 class Trainer3DGRUT:
@@ -424,6 +605,23 @@ class Trainer3DGRUT:
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
 
+    def _validation_log_image_views(self) -> set[int]:
+        """Return validation iteration indices to log as W&B image grids."""
+        eval_image_count = int(self.conf.writer.get("eval_image_count", 5))
+        if eval_image_count <= 0:
+            return {int(idx) for idx in self.conf.writer.log_image_views}
+        total_views = len(self.val_dataloader)
+        if total_views <= 0:
+            return set()
+        selected_count = min(eval_image_count, total_views)
+        indices = np.linspace(
+            0,
+            total_views - 1,
+            num=selected_count,
+            dtype=np.int64,
+        )
+        return {int(idx) for idx in indices}
+
     @torch.cuda.nvtx.range("get_metrics")
     def get_metrics(
         self,
@@ -469,6 +667,18 @@ class Trainer3DGRUT:
         if is_compute_validation_metrics:
             with torch.cuda.nvtx.range(f"criterions_psnr"):
                 metrics["psnr"] = psnr(rgb_pred, rgb_gt).item()
+                if gpu_batch.mask is not None:
+                    mask = gpu_batch.mask
+                    masked_error = torch.square(rgb_pred - rgb_gt) * mask
+                    masked_denominator = torch.clamp_min(
+                        mask.sum() * rgb_gt.shape[-1],
+                        1.0,
+                    )
+                    masked_mse = masked_error.sum() / masked_denominator
+                    metrics["masked_psnr"] = (
+                        -10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))
+                    ).item()
+                    metrics["mask_coverage"] = mask.mean().item()
 
             rgb_gt_full = rgb_gt.permute(0, 3, 1, 2)
             pred_rgb_full = rgb_pred.permute(0, 3, 1, 2)
@@ -479,12 +689,18 @@ class Trainer3DGRUT:
             with torch.cuda.nvtx.range(f"criterions_lpips"):
                 metrics["lpips"] = lpips(pred_rgb_full_clipped, rgb_gt_full).item()
 
-            if iteration in self.conf.writer.log_image_views:
-                metrics["img_hit_counts"] = jet_map(outputs["hits_count"][-1], self.conf.writer.max_num_hits)
-                metrics["img_gt"] = gpu_batch.rgb_gt[-1].clip(0, 1.0)
-                metrics["img_pred"] = outputs["pred_rgb"][-1].clip(0, 1.0)
-                metrics["img_pred_dist"] = jet_map(outputs["pred_dist"][-1], 100)
-                metrics["img_pred_opacity"] = jet_map(outputs["pred_opacity"][-1], 1)
+            if iteration in self._validation_log_image_views():
+                mask = gpu_batch.mask[-1] if gpu_batch.mask is not None else None
+                metrics["eval_image_path"] = gpu_batch.image_path
+                metrics["img_eval_tiles"] = _make_validation_image_tiles(
+                    rgb_gt=gpu_batch.rgb_gt[-1],
+                    rgb_pred=outputs["pred_rgb"][-1],
+                    pred_dist=outputs["pred_dist"][-1],
+                    pred_opacity=outputs["pred_opacity"][-1],
+                    hit_counts=outputs["hits_count"][-1],
+                    mask=mask,
+                    max_hit_count=self.conf.writer.max_num_hits,
+                )
 
         if profilers:
             timings = {}
@@ -510,18 +726,25 @@ class Trainer3DGRUT:
         rgb_gt = gpu_batch.rgb_gt
         rgb_pred = outputs["pred_rgb"]
         mask = gpu_batch.mask
+        loss_denominator = torch.tensor(
+            rgb_gt.numel(), dtype=rgb_gt.dtype, device=self.device
+        )
 
         # Mask out the invalid pixels if the mask is provided
         if mask is not None:
             rgb_gt = rgb_gt * mask
             rgb_pred = rgb_pred * mask
+            loss_denominator = torch.clamp(
+                mask.sum() * rgb_gt.shape[-1],
+                min=1.0,
+            )
 
         # L1 loss
         loss_l1 = torch.zeros(1, device=self.device)
         lambda_l1 = 0.0
         if self.conf.loss.use_l1:
             with torch.cuda.nvtx.range(f"loss-l1"):
-                loss_l1 = torch.abs(rgb_pred - rgb_gt).mean()
+                loss_l1 = torch.abs(rgb_pred - rgb_gt).sum() / loss_denominator
                 lambda_l1 = self.conf.loss.lambda_l1
 
         # L2 loss
@@ -529,7 +752,8 @@ class Trainer3DGRUT:
         lambda_l2 = 0.0
         if self.conf.loss.use_l2:
             with torch.cuda.nvtx.range(f"loss-l2"):
-                loss_l2 = torch.nn.functional.mse_loss(outputs["pred_rgb"], rgb_gt)
+                squared_error = torch.square(rgb_pred - rgb_gt)
+                loss_l2 = squared_error.sum() / loss_denominator
                 lambda_l2 = self.conf.loss.lambda_l2
 
         # DSSIM loss
@@ -601,41 +825,54 @@ class Trainer3DGRUT:
         writer = self.tracking.writer
         global_step = self.global_step
 
-        if "img_pred" in metrics:
-            writer.add_images(
-                "image/pred/val",
-                torch.stack(metrics["img_pred"]),
-                global_step,
-                dataformats="NHWC",
+        if self.conf.use_wandb and "img_eval_tiles" in metrics:
+            jpg_dir = os.path.join(
+                self.tracking.output_dir,
+                "wandb_eval_jpg",
+                f"step_{global_step:06d}",
             )
-        if "img_gt" in metrics:
-            writer.add_images(
-                "image/gt",
-                torch.stack(metrics["img_gt"]),
-                global_step,
-                dataformats="NHWC",
-            )
-        if "img_hit_counts" in metrics:
-            writer.add_images(
-                "image/hit_counts/val",
-                torch.stack(metrics["img_hit_counts"]),
-                global_step,
-                dataformats="NHWC",
-            )
-        if "img_pred_dist" in metrics:
-            writer.add_images(
-                "image/dist/val",
-                torch.stack(metrics["img_pred_dist"]),
-                global_step,
-                dataformats="NHWC",
-            )
-        if "img_pred_opacity" in metrics:
-            writer.add_images(
-                "image/opacity/val",
-                torch.stack(metrics["img_pred_opacity"]),
-                global_step,
-                dataformats="NHWC",
-            )
+            os.makedirs(jpg_dir, exist_ok=True)
+            grid_columns = [
+                "input_rgb",
+                "training_mask",
+                "prediction_rgb",
+                "rgb_error",
+                "predicted_depth",
+                "opacity",
+                "ray_hits",
+            ]
+            tile_groups = metrics["img_eval_tiles"]
+            image_paths = metrics["eval_image_path"]
+            group_size = int(self.conf.writer.get("eval_image_group_size", 5))
+            if group_size < 1:
+                group_size = len(image_paths)
+            for group_start in range(0, len(image_paths), group_size):
+                group_idx = group_start // group_size
+                group_end = min(group_start + group_size, len(image_paths))
+                grid_path = os.path.join(
+                    jpg_dir,
+                    f"group_{group_idx:03d}.jpg",
+                )
+                _save_validation_grid_jpeg(
+                    tile_groups=tile_groups,
+                    image_paths=image_paths,
+                    column_names=grid_columns,
+                    row_start=group_start,
+                    row_end=group_end,
+                    output_path=grid_path,
+                )
+                caption = (
+                    "rows=image path, columns="
+                    f"{', '.join(grid_columns)}"
+                )
+                wandb.log(
+                    {
+                        f"eval/image_grid/group_{group_idx:03d}": wandb.Image(
+                            grid_path,
+                            caption=caption,
+                        )
+                    }
+                )
 
         mean_timings = {}
         if "timings" in metrics:
@@ -643,29 +880,61 @@ class Trainer3DGRUT:
                 mean_timings[time_key] = np.mean(metrics["timings"][time_key])
                 writer.add_scalar("time/" + time_key + "/val", mean_timings[time_key], global_step)
 
-        writer.add_scalar("num_particles/val", self.model.num_gaussians, self.global_step)
+        writer.add_scalar(
+            "metrics/val/num_particles",
+            self.model.num_gaussians,
+            self.global_step,
+        )
 
         mean_psnr = np.mean(metrics["psnr"])
-        writer.add_scalar("psnr/val", mean_psnr, global_step)
-        writer.add_scalar("ssim/val", np.mean(metrics["ssim"]), global_step)
-        writer.add_scalar("lpips/val", np.mean(metrics["lpips"]), global_step)
-        writer.add_scalar("hits/min/val", np.mean(metrics["hits_min"]), global_step)
-        writer.add_scalar("hits/max/val", np.mean(metrics["hits_max"]), global_step)
-        writer.add_scalar("hits/mean/val", np.mean(metrics["hits_mean"]), global_step)
+        writer.add_scalar("metrics/val/psnr", mean_psnr, global_step)
+        if "masked_psnr" in metrics:
+            writer.add_scalar(
+                "metrics/val/masked_psnr",
+                np.mean(metrics["masked_psnr"]),
+                global_step,
+            )
+        if "mask_coverage" in metrics:
+            writer.add_scalar(
+                "metrics/val/mask_coverage",
+                np.mean(metrics["mask_coverage"]),
+                global_step,
+            )
+        writer.add_scalar("metrics/val/ssim", np.mean(metrics["ssim"]), global_step)
+        writer.add_scalar("metrics/val/lpips", np.mean(metrics["lpips"]), global_step)
+        writer.add_scalar(
+            "metrics/val/hits_min",
+            np.mean(metrics["hits_min"]),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/val/hits_max",
+            np.mean(metrics["hits_max"]),
+            global_step,
+        )
+        writer.add_scalar(
+            "metrics/val/hits_mean",
+            np.mean(metrics["hits_mean"]),
+            global_step,
+        )
 
         loss = np.mean(metrics["losses"]["total_loss"])
-        writer.add_scalar("loss/total/val", loss, global_step)
+        writer.add_scalar("metrics/val/loss_total", loss, global_step)
         if self.conf.loss.use_l1:
             l1_loss = np.mean(metrics["losses"]["l1_loss"])
-            writer.add_scalar("loss/l1/val", l1_loss, global_step)
+            writer.add_scalar("metrics/val/loss_l1", l1_loss, global_step)
         if self.conf.loss.use_l2:
             l2_loss = np.mean(metrics["losses"]["l2_loss"])
-            writer.add_scalar("loss/l2/val", l2_loss, global_step)
+            writer.add_scalar("metrics/val/loss_l2", l2_loss, global_step)
         if self.conf.loss.use_ssim:
             ssim_loss = np.mean(metrics["losses"]["ssim_loss"])
-            writer.add_scalar("loss/ssim/val", ssim_loss, global_step)
+            writer.add_scalar("metrics/val/loss_ssim", ssim_loss, global_step)
 
-        table = {k: np.mean(v) for k, v in metrics.items() if k in ("psnr", "ssim", "lpips")}
+        table = {
+            k: np.mean(v)
+            for k, v in metrics.items()
+            if k in ("psnr", "masked_psnr", "ssim", "lpips", "mask_coverage")
+        }
         for time_key in mean_timings:
             table[time_key] = f"{'{:.2f}'.format(mean_timings[time_key])}" + " ms/it"
         logger.log_table(f"📊 Validation Metrics - Step {global_step}", record=table)
@@ -735,6 +1004,11 @@ class Trainer3DGRUT:
                         batch_metrics["timings"][time_key],
                         self.global_step,
                     )
+
+            writer.add_scalar("train/iteration", self.global_step, self.global_step)
+            if hasattr(self, "_training_start_time"):
+                elapsed_seconds = time.perf_counter() - self._training_start_time
+                writer.add_scalar("time/elapsed_seconds/train", elapsed_seconds, self.global_step)
 
             writer.add_scalar("num_particles/train", self.model.num_gaussians, self.global_step)
             writer.add_scalar("train/num_GS", self.model.num_gaussians, self.global_step)
@@ -1157,6 +1431,7 @@ class Trainer3DGRUT:
         logger.log_rule(f"Training {conf.render.method.upper()}")
 
         # Training loop
+        self._training_start_time = time.perf_counter()
         logger.start_progress(task_name="Training", total_steps=conf.n_iterations, color="spring_green1")
 
         for epoch_idx in range(self.n_epochs):

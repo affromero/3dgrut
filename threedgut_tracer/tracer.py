@@ -485,6 +485,22 @@ class Tracer:
             )
             return camera_model_parameters, Tracer.__create_sensor_pose_from_R_T(R_start, T_start, R_end, T_end)
 
+        elif (K := gpu_batch.intrinsics_RationalCameraModelParameters) is not None:
+            camera_model_parameters = _3dgut_plugin.fromRationalCameraModelParameters(
+                resolution=K["resolution"],
+                shutter_type=SHUTTER_TYPE_MAP[K["shutter_type"]],
+                native_resolution=K["native_resolution"],
+                image_rotation_quadrants_cw=K["image_rotation_quadrants_cw"],
+                principal_point=K["principal_point"],
+                focal_length=K["focal_length"],
+                numerator_coeffs=K["numerator_coeffs"],
+                denominator_coeffs=K["denominator_coeffs"],
+                affine_coeffs=K["affine_coeffs"],
+                tangential_coeffs=K["tangential_coeffs"],
+                skew=K["skew"],
+            )
+            return camera_model_parameters, Tracer.__create_sensor_pose_from_R_T(R_start, T_start, R_end, T_end)
+
         raise ValueError(
             f"Camera intrinsics unavailable or unsupported, input keys are [{', '.join(gpu_batch.keys())}]"
         )

@@ -29,6 +29,8 @@ writer:
   hit_stat_frequency: 999999
   max_num_hits: 128
   log_image_views: ${int_list:[ 0, 13, 27, 43, 78 ]}
+  eval_image_count: 5
+  eval_image_group_size: 5
 
 export_ply:
   enabled: false

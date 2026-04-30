@@ -211,6 +211,8 @@ class Renderer:
             os.makedirs(output_path_gt, exist_ok=True)
 
         psnr = []
+        masked_psnr = []
+        mask_coverage = []
         ssim = []
         lpips = []
         cc_psnr = []
@@ -261,7 +263,26 @@ class Renderer:
             # Compute the loss
             psnr_single_img = criterions["psnr"](outputs["pred_rgb"], gpu_batch.rgb_gt).item()
             psnr.append(psnr_single_img)  # evaluation on valid rays only
-            logger.info(f"Frame {iteration}, PSNR: {psnr[-1]}")
+            progress_psnr = psnr[-1]
+            if gpu_batch.mask is not None:
+                mask = gpu_batch.mask
+                masked_error = torch.square(outputs["pred_rgb"] - gpu_batch.rgb_gt) * mask
+                masked_denominator = torch.clamp_min(
+                    mask.sum() * gpu_batch.rgb_gt.shape[-1],
+                    1.0,
+                )
+                masked_mse = masked_error.sum() / masked_denominator
+                masked_psnr_single_img = (
+                    -10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))
+                ).item()
+                masked_psnr.append(masked_psnr_single_img)
+                mask_coverage.append(mask.mean().item())
+                progress_psnr = masked_psnr[-1]
+                logger.info(
+                    f"Frame {iteration}, PSNR: {psnr[-1]}, masked PSNR: {masked_psnr[-1]}"
+                )
+            else:
+                logger.info(f"Frame {iteration}, PSNR: {psnr[-1]}")
 
             if psnr_single_img > best_psnr:
                 best_psnr = psnr_single_img
@@ -306,11 +327,13 @@ class Renderer:
             # Record the time
             inference_time.append(outputs["frame_time_ms"])
 
-            logger.log_progress(task_name="Rendering", advance=1, iteration=f"{str(iteration)}", psnr=psnr[-1])
+            logger.log_progress(task_name="Rendering", advance=1, iteration=f"{str(iteration)}", psnr=progress_psnr)
 
         logger.end_progress(task_name="Rendering")
 
         mean_psnr = np.mean(psnr)
+        mean_masked_psnr = np.mean(masked_psnr) if masked_psnr else None
+        mean_mask_coverage = np.mean(mask_coverage) if mask_coverage else None
         mean_ssim = np.mean(ssim)
         mean_lpips = np.mean(lpips)
         mean_cc_psnr = np.mean(cc_psnr)
@@ -328,6 +351,10 @@ class Renderer:
             mean_cc_lpips=mean_cc_lpips,
             std_psnr=std_psnr,
         )
+        if mean_masked_psnr is not None:
+            table["mean_masked_psnr"] = mean_masked_psnr
+        if mean_mask_coverage is not None:
+            table["mean_mask_coverage"] = mean_mask_coverage
 
         if self.conf.render.enable_kernel_timings:
             table["mean_inference_time"] = f"{'{:.2f}'.format(mean_inference_time)}" + " ms/frame"
@@ -341,6 +368,10 @@ class Renderer:
             mean_cc_ssim=float(mean_cc_ssim),
             mean_cc_lpips=float(mean_cc_lpips),
         )
+        if mean_masked_psnr is not None:
+            metrics_json["mean_masked_psnr"] = float(mean_masked_psnr)
+        if mean_mask_coverage is not None:
+            metrics_json["mean_mask_coverage"] = float(mean_mask_coverage)
         metrics_path = os.path.join(self.out_dir, "metrics.json")
         with open(metrics_path, "w") as f:
             json.dump(metrics_json, f, indent=2)
@@ -350,6 +381,10 @@ class Renderer:
 
         if self.writer is not None:
             self.writer.add_scalar("psnr/test", mean_psnr, self.global_step)
+            if mean_masked_psnr is not None:
+                self.writer.add_scalar("psnr/masked/test", mean_masked_psnr, self.global_step)
+            if mean_mask_coverage is not None:
+                self.writer.add_scalar("mask/coverage/test", mean_mask_coverage, self.global_step)
             self.writer.add_scalar("ssim/test", mean_ssim, self.global_step)
             self.writer.add_scalar("lpips/test", mean_lpips, self.global_step)
             self.writer.add_scalar("cc_psnr/test", mean_cc_psnr, self.global_step)
