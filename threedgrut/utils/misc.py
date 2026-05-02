@@ -149,11 +149,19 @@ def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb
         import wandb
 
         wandb.login()
+        wandb_run_id = getattr(conf, "wandb_run_id", "")
+        wandb_resume = getattr(conf, "wandb_resume", "allow")
+        wandb_resume_kwargs = (
+            {"id": wandb_run_id, "resume": wandb_resume}
+            if wandb_run_id
+            else {}
+        )
         wandb.init(
             config=OmegaConf.to_container(DictConfig(conf)),
             project=conf.wandb_project,
             group=experiment_name,
             name=run_name,
+            **wandb_resume_kwargs,
         )
         wandb.tensorboard.patch(root_logdir=out_dir, save=False)
 

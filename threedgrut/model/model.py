@@ -740,22 +740,70 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         else:
             scales = self.scale_activation_inv(observation_scale)[:, None].repeat(1, 3)
 
-        # set density as a constant
-        opacities = self.density_activation_inv(
-            torch.full(
-                (N, 1),
-                fill_value=self.conf.model.default_density,
-                dtype=dtype,
-                device=self.device,
-            )
-        )
-
-        # set colors, random if they weren't given
         if colors is None:
             colors = torch.randint(0, 256, (N, 3), dtype=torch.uint8, device=self.device, generator=rng)
 
+        density_values = torch.full(
+            (N, 1),
+            fill_value=self.conf.model.default_density,
+            dtype=dtype,
+            device=self.device,
+        )
+
+        if self.conf.micro_splat_init.enabled:
+            fraction = float(self.conf.micro_splat_init.fraction)
+            duplicate_count = min(N, max(1, int(round(N * fraction))))
+            indices = torch.randperm(N, device=self.device, generator=rng)[:duplicate_count]
+            base_micro_scales = torch.clamp_min(
+                self.scale_activation(scales[indices])
+                * float(self.conf.micro_splat_init.scale_multiplier),
+                float(self.conf.micro_splat_init.min_scale),
+            )
+            micro_positions = positions[indices]
+            jitter_multiplier = float(self.conf.micro_splat_init.jitter_multiplier)
+            if jitter_multiplier > 0.0:
+                jitter = (
+                    torch.randn(
+                        micro_positions.shape,
+                        dtype=dtype,
+                        device=self.device,
+                        generator=rng,
+                    )
+                    * base_micro_scales
+                    * jitter_multiplier
+                )
+                micro_positions = micro_positions + jitter
+            micro_density = torch.full(
+                (duplicate_count, 1),
+                fill_value=(
+                    self.conf.model.default_density
+                    * float(self.conf.micro_splat_init.density_multiplier)
+                ),
+                dtype=dtype,
+                device=self.device,
+            )
+            positions = torch.cat([positions, micro_positions], dim=0)
+            rots = torch.cat([rots, rots[indices].clone()], dim=0)
+            scales = torch.cat(
+                [
+                    scales,
+                    self.scale_activation_inv(base_micro_scales),
+                ],
+                dim=0,
+            )
+            density_values = torch.cat([density_values, micro_density], dim=0)
+            colors = torch.cat([colors, colors[indices]], dim=0)
+            logger.info(
+                "Micro-splat init duplicated "
+                f"{duplicate_count:,}/{N:,} points "
+                f"({duplicate_count / max(N, 1):.2%}) with "
+                f"scale_multiplier={self.conf.micro_splat_init.scale_multiplier}"
+            )
+
+        opacities = self.density_activation_inv(density_values)
         features_albedo = to_torch(RGB2SH(to_np(colors.float() / 255.0)), device=self.device)
 
+        N = positions.shape[0]
         num_specular_dims = sh_degree_to_specular_dim(self.max_n_features)
         features_specular = torch.zeros((N, num_specular_dims))
 

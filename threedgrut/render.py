@@ -163,6 +163,22 @@ class Renderer:
                 ),
                 max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
                 max_bias=conf.post_processing.get("max_bias", 0.10),
+                use_residual_grid=conf.post_processing.get(
+                    "use_residual_grid",
+                    False,
+                ),
+                residual_grid_size=conf.post_processing.get(
+                    "residual_grid_size",
+                    32,
+                ),
+                residual_grid_max=conf.post_processing.get(
+                    "residual_grid_max",
+                    0.05,
+                ),
+                residual_grid_reg_lambda=conf.post_processing.get(
+                    "residual_grid_reg_lambda",
+                    0.01,
+                ),
             ).to("cuda")
             post_processing.load_state_dict(state)
             logger.info(
