@@ -185,7 +185,15 @@ class Tracer:
                 * sensor_poses.timestamps_us[0]
             )
 
-            ray_radiance_density, ray_hit_distance, ray_hit_count, mog_visibility = tracer_wrapper.trace(
+            (
+                ray_radiance_density,
+                ray_hit_distance,
+                ray_hit_count,
+                mog_visibility,
+                mog_projected_position,
+                mog_projected_extent,
+                mog_tiles_count,
+            ) = tracer_wrapper.trace(
                 frame_id,
                 n_active_features,
                 particle_density,
@@ -221,6 +229,9 @@ class Tracer:
                 ray_hit_distance,
                 ray_hit_count,
                 mog_visibility,
+                mog_projected_position,
+                mog_projected_extent,
+                mog_tiles_count,
             )
 
         @staticmethod
@@ -230,6 +241,9 @@ class Tracer:
             ray_hit_distance_grd,
             ray_hit_count_grd_UNUSED,
             mog_visibility_grd_UNUSED,
+            mog_projected_position_grd_UNUSED,
+            mog_projected_extent_grd_UNUSED,
+            mog_tiles_count_grd_UNUSED,
         ):
             (
                 ray_ori,
@@ -314,6 +328,9 @@ class Tracer:
                 pred_dist,
                 hits_count,
                 mog_visibility,
+                mog_projected_position,
+                mog_projected_extent,
+                mog_tiles_count,
             ) = Tracer._Autograd.apply(
                 self.tracer_wrapper,
                 frame_id,
@@ -348,6 +365,9 @@ class Tracer:
             "hits_count": hits_count,
             "frame_time_ms": timings["forward_render"] if "forward_render" in timings else 0.0,
             "mog_visibility": mog_visibility,
+            "mog_projected_position": mog_projected_position,
+            "mog_projected_extent": mog_projected_extent,
+            "mog_tiles_count": mog_tiles_count,
         }
 
     @staticmethod

@@ -245,6 +245,9 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                                                         float* worldHitDistanceCudaPtr,
                                                         vec4* radianceDensityCudaPtr,
                                                         int* particlesVisibilityCudaPtr,
+                                                        vec2* particlesProjectedPositionCudaPtr,
+                                                        vec2* particlesProjectedExtentCudaPtr,
+                                                        int* particlesTilesCountCudaPtr,
                                                         Parameters& parameters,
                                                         int cudaDeviceIndex,
                                                         cudaStream_t cudaStream) {
@@ -292,6 +295,37 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
             particlesVisibilityCudaPtr,
             parameters.m_dptrParametersBuffer);
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
+    }
+
+    if (particlesProjectedPositionCudaPtr != nullptr) {
+        CUDA_CHECK_RETURN(
+            cudaMemcpyAsync(
+                particlesProjectedPositionCudaPtr,
+                m_forwardContext->particlesProjectedPosition.data(),
+                numParticles * sizeof(vec2),
+                cudaMemcpyDeviceToDevice,
+                cudaStream),
+            m_logger);
+    }
+    if (particlesProjectedExtentCudaPtr != nullptr) {
+        CUDA_CHECK_RETURN(
+            cudaMemcpyAsync(
+                particlesProjectedExtentCudaPtr,
+                m_forwardContext->particlesProjectedExtent.data(),
+                numParticles * sizeof(vec2),
+                cudaMemcpyDeviceToDevice,
+                cudaStream),
+            m_logger);
+    }
+    if (particlesTilesCountCudaPtr != nullptr) {
+        CUDA_CHECK_RETURN(
+            cudaMemcpyAsync(
+                particlesTilesCountCudaPtr,
+                m_forwardContext->particlesTilesCount.data(),
+                numParticles * sizeof(uint32_t),
+                cudaMemcpyDeviceToDevice,
+                cudaStream),
+            m_logger);
     }
 
     deviceLaunchesLogger.push("render::prepare-expand");
