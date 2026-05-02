@@ -15,6 +15,10 @@ class LuminanceAffine(nn.Module):
         use_frame_residual: bool = False,
         max_log_gain: float = 0.25,
         max_bias: float = 0.10,
+        use_residual_grid: bool = False,
+        residual_grid_size: int = 32,
+        residual_grid_max: float = 0.05,
+        residual_grid_reg_lambda: float = 0.01,
     ) -> None:
         super().__init__()
         self.lr = lr
@@ -22,9 +26,22 @@ class LuminanceAffine(nn.Module):
         self.use_frame_residual = use_frame_residual
         self.max_log_gain = max_log_gain
         self.max_bias = max_bias
+        self.use_residual_grid = use_residual_grid
+        self.residual_grid_size = residual_grid_size
+        self.residual_grid_max = residual_grid_max
+        self.residual_grid_reg_lambda = residual_grid_reg_lambda
 
         self.camera_log_gain = nn.Parameter(torch.zeros(num_cameras, 3))
         self.camera_bias = nn.Parameter(torch.zeros(num_cameras, 3))
+        if use_residual_grid:
+            self.residual_grid = nn.Parameter(
+                torch.zeros(num_cameras, 3, residual_grid_size, residual_grid_size)
+            )
+        else:
+            self.register_buffer(
+                "residual_grid",
+                torch.zeros(num_cameras, 3, residual_grid_size, residual_grid_size),
+            )
         if use_frame_residual:
             self.frame_log_gain = nn.Parameter(torch.zeros(num_frames, 3))
             self.frame_bias = nn.Parameter(torch.zeros(num_frames, 3))
@@ -56,6 +73,8 @@ class LuminanceAffine(nn.Module):
                 self.frame_log_gain.square().mean()
                 + self.frame_bias.square().mean()
             )
+        if self.use_residual_grid:
+            loss = loss + self.residual_grid_reg_lambda * self.residual_grid.square().mean()
         return self.reg_lambda * loss
 
     @staticmethod
@@ -87,4 +106,34 @@ class LuminanceAffine(nn.Module):
 
         gain = torch.exp(log_gain.clamp(-self.max_log_gain, self.max_log_gain))
         bounded_bias = bias.clamp(-self.max_bias, self.max_bias)
-        return (pred_rgb * gain + bounded_bias).clamp(0.0, 1.0)
+        corrected = pred_rgb * gain + bounded_bias
+        if self.use_residual_grid:
+            corrected = corrected + self.sample_residual_grid(
+                pixel_coords=pixel_coords,
+                resolution=resolution,
+                camera_index=camera_index,
+            )
+        return corrected.clamp(0.0, 1.0)
+
+    def sample_residual_grid(
+        self,
+        *,
+        pixel_coords: torch.Tensor,
+        resolution: tuple[int, int],
+        camera_index: int,
+    ) -> torch.Tensor:
+        """Sample a bounded per-camera residual grid in image coordinates."""
+        width, height = resolution
+        grid = self.residual_grid[camera_index].unsqueeze(0)
+        norm_x = 2.0 * pixel_coords[:, 0] / max(width - 1, 1) - 1.0
+        norm_y = 2.0 * pixel_coords[:, 1] / max(height - 1, 1) - 1.0
+        sample_grid = torch.stack((norm_x, norm_y), dim=-1).view(1, -1, 1, 2)
+        sampled = torch.nn.functional.grid_sample(
+            grid,
+            sample_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        sampled = sampled.squeeze(0).squeeze(-1).transpose(0, 1)
+        return sampled.clamp(-self.residual_grid_max, self.residual_grid_max)

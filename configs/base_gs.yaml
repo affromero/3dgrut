@@ -17,8 +17,12 @@ val_frequency: 5000
 num_workers: 24
 use_wandb: false
 wandb_project: "3dgrt"
+wandb_run_id: ""
+wandb_resume: "allow"
 test_last: true
 validate_first: false
+validate_final: true
+validate_only: false
 log_frequency: 1
 compute_extra_metrics: true
 
@@ -53,6 +57,14 @@ surface_aligned_init:
   min_scale: 0.002
   max_scale: 0.05
 
+micro_splat_init:
+  enabled: false
+  fraction: 0.10
+  scale_multiplier: 0.25
+  density_multiplier: 0.50
+  jitter_multiplier: 0.0
+  min_scale: 0.002
+
 camera_residual:
   enabled: false
   lr: 0.0001
@@ -61,6 +73,28 @@ camera_residual:
   max_translation_m: 0.02
   optimize_global: true
   optimize_per_camera: false
+  fail_on_zero_grad: true
+  fail_after_steps: 5
+  min_abs_grad: 1.e-12
+  finite_difference_audit:
+    enabled: false
+    max_views: 12
+    rotation_step_rad: 0.001
+    translation_step_m: 0.002
+    exit_after: true
+
+camera_intrinsics_audit:
+  enabled: false
+  camera_indices: [0, 2]
+  max_views_per_camera: 8
+  focal_delta_fraction: 0.002
+  principal_delta_px: 2.0
+  skew_delta_px: 0.5
+  numerator_delta: 0.005
+  denominator_delta: 0.005
+  affine_delta: 0.001
+  tangential_delta: 0.001
+  exit_after: true
   
 export_usd:
   enabled: false
@@ -149,6 +183,18 @@ loss:
   use_sky_opacity: false
   lambda_sky_opacity: 0.0
 
+  use_foundation_feature: false
+  lambda_foundation_feature: 0.0
+
+foundation_features:
+  enabled: false
+  method: "dinov2_vitl14"
+  repo_dir: ""
+  weights: ""
+  image_size: 224
+  eval_on_logged_views_only: false
+  log_error_tile: true
+
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp", "luminance_affine"
@@ -166,6 +212,10 @@ post_processing:
   use_frame_residual: false
   max_log_gain: 0.25
   max_bias: 0.10
+  use_residual_grid: false
+  residual_grid_size: 32
+  residual_grid_max: 0.05
+  residual_grid_reg_lambda: 0.01
 
 hydra:
   output_subdir: null
