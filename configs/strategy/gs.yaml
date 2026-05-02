@@ -13,6 +13,63 @@ densify:
   split:
     n_gaussians: 2 # Hardcoded to 2 in 3DGS
 
+footprint_control:
+  enabled: false
+  min_radius_px: 0.75
+  max_radius_px: 8.0
+  subpixel_grad_boost: 3.0
+  oversized_grad_boost: 3.0
+  log_frequency: 100
+
+footprint_scale_control:
+  enabled: false
+  frequency: 100
+  start_iteration: 100
+  end_iteration: 3000
+  min_radius_px: 0.5
+  max_radius_px: 12.0
+  grow_subpixel: true
+  max_update_factor: 1.1
+  log_frequency: 100
+
+residual_density_control:
+  enabled: false
+  area_source: projected_extent
+  tile_area_px: 256.0
+  max_area_px: 65536.0
+  use_visibility: true
+  use_masked_residual: true
+  residual_reference: 0.05
+  residual_power: 0.5
+  residual_min_weight: 0.5
+  residual_max_weight: 2.0
+  area_reference_px: 4.0
+  area_power: 0.5
+  area_min_weight: 0.25
+  area_max_weight: 4.0
+  color_grad_weight: 0.5
+  density_grad_weight: 0.25
+  gradient_max_weight: 3.0
+  use_edge_error_weight: false
+  edge_error_reference: 0.05
+  edge_error_power: 0.5
+  edge_error_min_weight: 0.5
+  edge_error_max_weight: 3.0
+  min_total_weight: 0.25
+  max_total_weight: 6.0
+  max_candidate_fraction: 0.001
+  max_clone_candidates_per_step: 50000
+  max_split_candidates_per_step: 50000
+  clone_scale_multiplier: 1.0
+  clone_density_multiplier: 1.0
+  clone_min_scale: 0.0
+  use_camera_balance: false
+  camera_balance_ema_decay: 0.95
+  camera_balance_power: 1.0
+  camera_balance_min_weight: 0.75
+  camera_balance_max_weight: 2.0
+  log_frequency: 100
+
 # They use the same values for pruning and densification so check the above values
 prune:
   frequency: 100
