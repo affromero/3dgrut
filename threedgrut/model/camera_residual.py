@@ -78,6 +78,91 @@ class CameraResidual(nn.Module):
         translation = torch.tanh(translation) * self.max_translation_m
         return rotation, translation
 
+    def set_global_delta(
+        self,
+        *,
+        rotation: torch.Tensor,
+        translation: torch.Tensor,
+    ) -> None:
+        """Set a fixed global bounded residual for finite-difference audits."""
+        if rotation.shape != (3,):
+            raise ValueError(f"Expected rotation shape (3,), got {rotation.shape}.")
+        if translation.shape != (3,):
+            raise ValueError(
+                f"Expected translation shape (3,), got {translation.shape}."
+            )
+        eps = 1.0e-6
+        rotation_raw = torch.atanh(
+            (rotation / self.max_rotation_rad).clamp(-1.0 + eps, 1.0 - eps)
+        )
+        translation_raw = torch.atanh(
+            (translation / self.max_translation_m).clamp(
+                -1.0 + eps,
+                1.0 - eps,
+            )
+        )
+        with torch.no_grad():
+            self.global_rotation_raw.zero_()
+            self.global_translation_raw.zero_()
+            self.global_rotation_raw[0].copy_(
+                rotation_raw.to(
+                    device=self.global_rotation_raw.device,
+                    dtype=self.global_rotation_raw.dtype,
+                )
+            )
+            self.global_translation_raw[0].copy_(
+                translation_raw.to(
+                    device=self.global_translation_raw.device,
+                    dtype=self.global_translation_raw.dtype,
+                )
+            )
+            self.camera_rotation_raw.zero_()
+            self.camera_translation_raw.zero_()
+
+    def set_camera_delta(
+        self,
+        *,
+        camera_idx: int,
+        rotation: torch.Tensor,
+        translation: torch.Tensor,
+    ) -> None:
+        """Set one fixed per-camera bounded residual for audits."""
+        if camera_idx < 0 or camera_idx >= self.camera_rotation_raw.shape[0]:
+            raise ValueError(f"Invalid camera_idx for CameraResidual: {camera_idx}.")
+        if rotation.shape != (3,):
+            raise ValueError(f"Expected rotation shape (3,), got {rotation.shape}.")
+        if translation.shape != (3,):
+            raise ValueError(
+                f"Expected translation shape (3,), got {translation.shape}."
+            )
+        eps = 1.0e-6
+        rotation_raw = torch.atanh(
+            (rotation / self.max_rotation_rad).clamp(-1.0 + eps, 1.0 - eps)
+        )
+        translation_raw = torch.atanh(
+            (translation / self.max_translation_m).clamp(
+                -1.0 + eps,
+                1.0 - eps,
+            )
+        )
+        with torch.no_grad():
+            self.global_rotation_raw.zero_()
+            self.global_translation_raw.zero_()
+            self.camera_rotation_raw.zero_()
+            self.camera_translation_raw.zero_()
+            self.camera_rotation_raw[camera_idx].copy_(
+                rotation_raw.to(
+                    device=self.camera_rotation_raw.device,
+                    dtype=self.camera_rotation_raw.dtype,
+                )
+            )
+            self.camera_translation_raw[camera_idx].copy_(
+                translation_raw.to(
+                    device=self.camera_translation_raw.device,
+                    dtype=self.camera_translation_raw.dtype,
+                )
+            )
+
     def forward(self, batch: Batch) -> Batch:
         rotation, translation = self._bounded(batch.camera_idx)
         rotation_matrix = _axis_angle_to_matrix(rotation)[0]
@@ -106,20 +191,22 @@ class CameraResidual(nn.Module):
             lr=self.lr,
         )
 
-    def stats(self) -> dict[str, float]:
-        camera_idx = 0
-        rotation, translation = self._bounded(camera_idx)
+    def max_abs_grad(self) -> float:
+        """Return the maximum absolute gradient over trainable residual params."""
         grad_values = [
             parameter.grad.detach().abs().max()
             for parameter in self.parameters()
             if parameter.requires_grad and parameter.grad is not None
         ]
-        if grad_values:
-            max_grad = torch.stack(grad_values).max().item()
-        else:
-            max_grad = 0.0
+        if not grad_values:
+            return 0.0
+        return torch.stack(grad_values).max().item()
+
+    def stats(self) -> dict[str, float]:
+        camera_idx = 0
+        rotation, translation = self._bounded(camera_idx)
         return {
             "rotation_norm_rad": rotation.norm().item(),
             "translation_norm_m": translation.norm().item(),
-            "max_abs_grad": max_grad,
+            "max_abs_grad": self.max_abs_grad(),
         }
