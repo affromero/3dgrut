@@ -38,7 +38,11 @@ import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
 from threedgrut.model.camera_residual import CameraResidual
-from threedgrut.model.losses import dense_depth_l1_loss, ssim
+from threedgrut.model.losses import (
+    dense_depth_l1_loss,
+    equirect_consistency_l1_loss,
+    ssim,
+)
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.post_processing import LuminanceAffine
@@ -2281,6 +2285,106 @@ class Trainer3DGRUT:
                     )
                 lambda_dense_depth = self.conf.loss.lambda_dense_depth
 
+        # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps)
+        loss_equirect_consistency = torch.zeros(1, device=self.device)
+        lambda_equirect_consistency = 0.0
+        if self.conf.loss.use_equirect_consistency:
+            warp_dir = self.conf.loss.equirect_warp_dir
+            image_dir = self.conf.loss.equirect_image_dir
+            if not warp_dir or not image_dir:
+                raise RuntimeError(
+                    "loss.use_equirect_consistency requires "
+                    "loss.equirect_warp_dir and loss.equirect_image_dir."
+                )
+            with torch.cuda.nvtx.range(f"loss-equirect-consistency"):
+                image_path = getattr(gpu_batch, "image_path", "")
+                stem = (
+                    os.path.splitext(os.path.basename(image_path))[0]
+                    if image_path
+                    else ""
+                )
+                warp_cache = getattr(self, "_equirect_warp_cache", None)
+                if warp_cache is None:
+                    warp_cache = {}
+                    self._equirect_warp_cache = warp_cache
+                eq_image_cache = getattr(self, "_equirect_image_cache", None)
+                if eq_image_cache is None:
+                    eq_image_cache = {}
+                    self._equirect_image_cache = eq_image_cache
+                warp_overlap = warp_cache.get(stem) if stem else None
+                if warp_overlap is None and stem:
+                    npz_path = os.path.join(warp_dir, f"{stem}.npz")
+                    if os.path.exists(npz_path):
+                        payload = np.load(npz_path)
+                        warp_np = payload["warp_AB"].astype("float32")
+                        overlap_np = payload["overlap_AB"].astype("float32")
+                        warp_t = torch.from_numpy(warp_np).to(self.device)
+                        overlap_t = torch.from_numpy(overlap_np).to(self.device)
+                        warp_cache[stem] = (warp_t, overlap_t)
+                        warp_overlap = (warp_t, overlap_t)
+                # Frame index from stem (e.g. "front_0009" -> "0009").
+                eq_image_t = None
+                if stem:
+                    parts = stem.split("_")
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        frame_key = parts[-1]
+                        eq_image_t = eq_image_cache.get(frame_key)
+                        if eq_image_t is None:
+                            eq_path = os.path.join(image_dir, f"{frame_key}.png")
+                            if os.path.exists(eq_path):
+                                from PIL import Image
+                                arr = (
+                                    np.asarray(
+                                        Image.open(eq_path).convert("RGB")
+                                    ).astype("float32")
+                                    / 255.0
+                                )
+                                eq_image_t = (
+                                    torch.from_numpy(arr)
+                                    .permute(2, 0, 1)
+                                    .unsqueeze(0)
+                                    .to(self.device)
+                                )
+                                eq_image_cache[frame_key] = eq_image_t
+                if warp_overlap is not None and eq_image_t is not None:
+                    warp_t, overlap_t = warp_overlap
+                    h_p, w_p = rgb_pred.shape[1], rgb_pred.shape[2]
+                    if warp_t.shape[0] != h_p or warp_t.shape[1] != w_p:
+                        # Resize warp + overlap to render resolution if needed.
+                        warp_b = warp_t.permute(2, 0, 1).unsqueeze(0)
+                        warp_b = torch.nn.functional.interpolate(
+                            warp_b, size=(h_p, w_p), mode="bilinear",
+                            align_corners=False,
+                        )
+                        warp_t = warp_b[0].permute(1, 2, 0).contiguous()
+                        overlap_b = overlap_t.unsqueeze(0).unsqueeze(0)
+                        overlap_b = torch.nn.functional.interpolate(
+                            overlap_b, size=(h_p, w_p), mode="bilinear",
+                            align_corners=False,
+                        )
+                        overlap_t = overlap_b[0, 0].contiguous()
+                    # Sample equirect GT into fisheye coords.
+                    sampled = torch.nn.functional.grid_sample(
+                        eq_image_t,
+                        warp_t.unsqueeze(0),
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=False,
+                    )
+                    sampled = sampled[0].permute(1, 2, 0).unsqueeze(0)
+                    threshold = float(
+                        self.conf.loss.equirect_consistency_overlap_threshold
+                    )
+                    loss_equirect_consistency = equirect_consistency_l1_loss(
+                        rgb_pred,
+                        sampled,
+                        overlap_t.unsqueeze(0),
+                        threshold,
+                    )
+                lambda_equirect_consistency = (
+                    self.conf.loss.lambda_equirect_consistency
+                )
+
         # Total loss
         loss = (
             lambda_l1 * loss_l1
@@ -2290,6 +2394,7 @@ class Trainer3DGRUT:
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
             + lambda_dense_depth * loss_dense_depth
+            + lambda_equirect_consistency * loss_equirect_consistency
         )
         return dict(
             total_loss=loss,
@@ -2298,6 +2403,10 @@ class Trainer3DGRUT:
             ssim_loss=lambda_ssim * loss_ssim,
             dense_depth_loss=lambda_dense_depth * loss_dense_depth,
             dense_depth_loss_raw=loss_dense_depth,
+            equirect_consistency_loss=(
+                lambda_equirect_consistency * loss_equirect_consistency
+            ),
+            equirect_consistency_loss_raw=loss_equirect_consistency,
             foundation_feature_loss=(
                 lambda_foundation_feature * loss_foundation_feature
             ),

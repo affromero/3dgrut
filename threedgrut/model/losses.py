@@ -54,3 +54,25 @@ def dense_depth_l1_loss(pred_dist, gt_depth, valid_mask):
         return torch.zeros(1, device=pred_dist.device, dtype=pred_dist.dtype)
     diff = (pred_dist - gt_depth).abs()
     return (diff * valid_mask.to(diff.dtype)).sum() / valid_mask.sum().clamp_min(1.0)
+
+@torch.cuda.nvtx.range("equirect_consistency_l1_loss")
+def equirect_consistency_l1_loss(pred_rgb, equirect_at_fisheye, overlap, threshold):
+    """L1 loss between fisheye render and equirect-sampled colors at overlap.
+
+    Args:
+        pred_rgb: [B, H, W, 3] rendered fisheye RGB in [0, 1].
+        equirect_at_fisheye: [B, H, W, 3] equirect GT sampled into fisheye
+            coordinates via `F.grid_sample(equirect_gt_NCHW, warp_AB)`. Must be
+            in [0, 1] and aligned to `pred_rgb`.
+        overlap: [B, H, W] RoMa fisheye-equirect overlap confidence in [0, 1].
+        threshold: Pixels with `overlap >= threshold` contribute to the loss;
+            others are masked out so non-overlapping rim pixels don't dominate.
+    Returns:
+        Scalar masked-mean L1; zero tensor on the predicted device when no
+        pixels exceed threshold.
+    """
+    valid = overlap >= threshold
+    if not valid.any():
+        return torch.zeros(1, device=pred_rgb.device, dtype=pred_rgb.dtype)
+    diff = (pred_rgb - equirect_at_fisheye).abs()
+    return (diff * valid.unsqueeze(-1).to(diff.dtype)).sum() / valid.sum().clamp_min(1.0).mul(diff.shape[-1])
