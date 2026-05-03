@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Optional
 
+import numpy as np
 import torch
 
 from threedgrut.model.model import MixtureOfGaussians
@@ -46,7 +48,11 @@ class GSStrategy(BaseStrategy):
         self.residual_density_stats = {}
         self.edge_error_density_stats = {}
         self.camera_balance_density_stats = {}
+        self.roma_precision_density_stats: dict = {}
         self.camera_balance_residual_ema = torch.empty((0,), device=self.model.device)
+        # Per-image RoMa precision tensors keyed by image stem (e.g. "left_0009").
+        # Lazily filled on first read; small (~3 * frame_count entries).
+        self._roma_precision_cache: dict = {}
 
     def get_strategy_parameters(self) -> dict:
         params = {}
@@ -365,11 +371,13 @@ class GSStrategy(BaseStrategy):
 
         gradient_weight = self.compute_responsibility_gradient_weight(mask)
         edge_error_weight = self.compute_edge_error_weight(mask, batch, outputs)
+        roma_precision_weight = self.compute_roma_precision_weight(mask, batch, outputs)
         total_weight = (
             area_weight
             * residual_weight
             * gradient_weight
             * edge_error_weight
+            * roma_precision_weight
             * camera_balance_weight
         )
         total_weight = torch.clamp(
@@ -390,11 +398,14 @@ class GSStrategy(BaseStrategy):
             "gradient_weight_max": gradient_weight.max().item(),
             "edge_error_weight_mean": edge_error_weight.mean().item(),
             "edge_error_weight_max": edge_error_weight.max().item(),
+            "roma_precision_weight_mean": roma_precision_weight.mean().item(),
+            "roma_precision_weight_max": roma_precision_weight.max().item(),
             "camera_balance_weight": float(camera_balance_weight),
             "total_weight_mean": total_weight.mean().item(),
             "total_weight_max": total_weight.max().item(),
         }
         self.residual_density_stats.update(self.edge_error_density_stats)
+        self.residual_density_stats.update(self.roma_precision_density_stats)
         self.residual_density_stats.update(self.camera_balance_density_stats)
         if "mog_tiles_count" in outputs:
             tiles_count = outputs["mog_tiles_count"][mask].float()
@@ -466,6 +477,89 @@ class GSStrategy(BaseStrategy):
             "edge_error_valid_fraction": valid.float().mean().item(),
             "edge_error_mean": sampled_error[valid].mean().item() if valid.any() else 0.0,
             "edge_error_p95": torch.quantile(sampled_error[valid], 0.95).item()
+            if valid.any()
+            else 0.0,
+        }
+        return weights
+
+    @torch.no_grad()
+    def _load_roma_precision_for_image(self, image_path: str) -> Optional[torch.Tensor]:
+        """Load and cache a per-image RoMa precision map.
+
+        The map is a precomputed [H, W] tensor at the raw-fisheye image resolution,
+        produced by `blk_windows.process_b2g.priors.roma_per_image_precision`.
+        Indexed by image stem (e.g. "left_0009"); returns None if missing so the
+        density-control weight collapses to 1.0 for that frame.
+        """
+        precision_dir = self.residual_density_control.get("roma_precision_dir", "")
+        if not precision_dir or not image_path:
+            return None
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        if stem in self._roma_precision_cache:
+            return self._roma_precision_cache[stem]
+        candidate = os.path.join(precision_dir, f"{stem}.npy")
+        if not os.path.exists(candidate):
+            self._roma_precision_cache[stem] = None
+            return None
+        array = np.load(candidate).astype(np.float32)
+        tensor = torch.from_numpy(array).to(self.model.device)
+        self._roma_precision_cache[stem] = tensor
+        return tensor
+
+    @torch.no_grad()
+    def compute_roma_precision_weight(self, mask: torch.Tensor, batch, outputs) -> torch.Tensor:
+        """Per-splat density-control weight from per-image RoMa overlap precision.
+
+        Mirrors `compute_edge_error_weight`: looks up a [H, W] precision map at each
+        splat's projected pixel position. Splats projecting into a high-precision
+        pixel (cross-view-confirmed by RoMa) get up-weighted; rim / texture-poor
+        splats where RoMa says nothing matches get down-weighted. Phase 3a target.
+
+        Returns torch.ones (neutral multiplier) when the feature is disabled, the
+        sidecar is missing, or no projected positions are available.
+        """
+        selected_count = int(mask.sum().item())
+        self.roma_precision_density_stats = {}
+        weights = torch.ones((selected_count,), device=self.model.device)
+        if selected_count == 0:
+            return weights
+        if not self.residual_density_control.get("use_roma_precision_weight", False):
+            return weights
+        if "mog_projected_position" not in outputs:
+            return weights
+        precision_map = self._load_roma_precision_for_image(getattr(batch, "image_path", ""))
+        if precision_map is None:
+            return weights
+
+        positions = outputs["mog_projected_position"][mask].float()
+        x = torch.round(positions[:, 0]).long()
+        y = torch.round(positions[:, 1]).long()
+        height, width = precision_map.shape
+        valid = torch.logical_and(
+            torch.logical_and(x >= 0, x < width),
+            torch.logical_and(y >= 0, y < height),
+        )
+        if "mog_visibility" in outputs:
+            visible = outputs["mog_visibility"][mask].reshape(-1) > 0
+            valid = torch.logical_and(valid, visible)
+
+        sampled = torch.zeros_like(weights)
+        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        if valid_indices.numel() > 0:
+            sampled[valid_indices] = precision_map[y[valid_indices], x[valid_indices]]
+
+        reference = float(self.residual_density_control.get("roma_precision_reference", 0.5))
+        power = float(self.residual_density_control.get("roma_precision_power", 1.0))
+        weights = torch.pow(sampled / max(reference, 1e-6), power)
+        weights = torch.clamp(
+            weights,
+            min=float(self.residual_density_control.get("roma_precision_min_weight", 0.5)),
+            max=float(self.residual_density_control.get("roma_precision_max_weight", 3.0)),
+        )
+        self.roma_precision_density_stats = {
+            "roma_precision_valid_fraction": valid.float().mean().item(),
+            "roma_precision_mean": sampled[valid].mean().item() if valid.any() else 0.0,
+            "roma_precision_p95": torch.quantile(sampled[valid], 0.95).item()
             if valid.any()
             else 0.0,
         }

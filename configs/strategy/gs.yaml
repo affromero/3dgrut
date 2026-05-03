@@ -55,6 +55,15 @@ residual_density_control:
   edge_error_power: 0.5
   edge_error_min_weight: 0.5
   edge_error_max_weight: 3.0
+  # RoMa-guided density control (Phase 3a): per-image precision lookup
+  # Hydra struct mode rejects unknown keys, so all defaults must be
+  # declared here even when the feature is off (use_roma_precision_weight=false).
+  use_roma_precision_weight: false
+  roma_precision_dir: ""
+  roma_precision_reference: 0.5
+  roma_precision_power: 1.0
+  roma_precision_min_weight: 0.5
+  roma_precision_max_weight: 3.0
   min_total_weight: 0.25
   max_total_weight: 6.0
   max_candidate_fraction: 0.001
