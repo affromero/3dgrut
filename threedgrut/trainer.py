@@ -38,7 +38,7 @@ import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
 from threedgrut.model.camera_residual import CameraResidual
-from threedgrut.model.losses import ssim
+from threedgrut.model.losses import dense_depth_l1_loss, ssim
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.post_processing import LuminanceAffine
@@ -2221,6 +2221,66 @@ class Trainer3DGRUT:
                 loss_sky_opacity = (outputs["pred_opacity"] * sky_mask).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
+        # Dense depth supervision (Phase 3c: DA3 z-extended)
+        loss_dense_depth = torch.zeros(1, device=self.device)
+        lambda_dense_depth = 0.0
+        if self.conf.loss.use_dense_depth:
+            dense_depth_dir = self.conf.loss.dense_depth_dir
+            if not dense_depth_dir:
+                raise RuntimeError(
+                    "loss.use_dense_depth requires loss.dense_depth_dir."
+                )
+            with torch.cuda.nvtx.range(f"loss-dense-depth"):
+                image_path = getattr(gpu_batch, "image_path", "")
+                stem = (
+                    os.path.splitext(os.path.basename(image_path))[0]
+                    if image_path
+                    else ""
+                )
+                cache = getattr(self, "_dense_depth_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._dense_depth_cache = cache
+                gt_depth = cache.get(stem) if stem else None
+                if gt_depth is None and stem:
+                    npy_path = os.path.join(dense_depth_dir, f"{stem}.npy")
+                    if os.path.exists(npy_path):
+                        gt_arr = np.load(npy_path).astype("float32")
+                        gt_depth = torch.from_numpy(gt_arr).to(self.device)
+                        cache[stem] = gt_depth
+                if gt_depth is not None:
+                    pred_dist = outputs["pred_dist"]
+                    if pred_dist.dim() == 4 and pred_dist.shape[-1] == 1:
+                        pred_dist_2d = pred_dist[0, ..., 0]
+                    else:
+                        pred_dist_2d = pred_dist[0]
+                    if pred_dist_2d.shape != gt_depth.shape:
+                        # Renderer sometimes pads/crops; align to GT shape.
+                        h = min(pred_dist_2d.shape[0], gt_depth.shape[0])
+                        w = min(pred_dist_2d.shape[1], gt_depth.shape[1])
+                        pred_dist_2d = pred_dist_2d[:h, :w]
+                        gt_depth = gt_depth[:h, :w]
+                    valid_mask = gt_depth > 0.0
+                    if mask is not None:
+                        m = mask
+                        if m.dim() == 4:
+                            m = m[0]
+                        m = m.squeeze(-1) > 0.5
+                        if m.shape != valid_mask.shape:
+                            mh = min(m.shape[0], valid_mask.shape[0])
+                            mw = min(m.shape[1], valid_mask.shape[1])
+                            m = m[:mh, :mw]
+                            valid_mask = valid_mask[:mh, :mw]
+                            pred_dist_2d = pred_dist_2d[:mh, :mw]
+                            gt_depth = gt_depth[:mh, :mw]
+                        valid_mask = valid_mask & m
+                    loss_dense_depth = dense_depth_l1_loss(
+                        pred_dist_2d.unsqueeze(0),
+                        gt_depth.unsqueeze(0),
+                        valid_mask.unsqueeze(0),
+                    )
+                lambda_dense_depth = self.conf.loss.lambda_dense_depth
+
         # Total loss
         loss = (
             lambda_l1 * loss_l1
@@ -2229,12 +2289,15 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
+            + lambda_dense_depth * loss_dense_depth
         )
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
             l2_loss=lambda_l2 * loss_l2,
             ssim_loss=lambda_ssim * loss_ssim,
+            dense_depth_loss=lambda_dense_depth * loss_dense_depth,
+            dense_depth_loss_raw=loss_dense_depth,
             foundation_feature_loss=(
                 lambda_foundation_feature * loss_foundation_feature
             ),

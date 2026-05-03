@@ -186,6 +186,14 @@ loss:
   use_foundation_feature: false
   lambda_foundation_feature: 0.0
 
+  # Dense depth supervision (Phase 3c: DA3 z-extended).
+  # Stem-keyed [H, W] float32 metric depth .npy files in `dense_depth_dir`,
+  # one per image (e.g. `left_0009.npy`). Pixels with `gt > 0` contribute
+  # to a masked L1 against `outputs["pred_dist"]`.
+  use_dense_depth: false
+  lambda_dense_depth: 0.0
+  dense_depth_dir: ""
+
 foundation_features:
   enabled: false
   method: "dinov2_vitl14"
