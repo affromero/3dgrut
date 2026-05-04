@@ -26,7 +26,7 @@ setup(
     long_description_content_type="text/markdown",
     py_modules=["threedgrut", "threedgrt_tracer", "threedgut_tracer", "playground"],
     packages=find_packages(where="libs"),
-    python_requires=">=3.11",
+    python_requires=">=3.10",
     install_requires=[],
     classifiers=["Operating System :: OS Independent"],
 )

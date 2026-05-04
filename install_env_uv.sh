@@ -108,7 +108,12 @@ error_with_color_and_exit() {
 # Step 1: Initialize git submodules
 # ==========================================
 echo "[1/8] Initializing git submodules..."
-git submodule update --init --recursive
+if git -C "${SCRIPT_DIR}" rev-parse --is-inside-work-tree &> /dev/null; then
+    git -C "${SCRIPT_DIR}" submodule update --init --recursive
+else
+    echo "  Skipping git submodule update; no git metadata is available."
+    echo "  Using the 3DGRUT checkout and submodules from the current tree."
+fi
 echo ""
 
 # ==========================================

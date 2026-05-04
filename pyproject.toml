@@ -21,10 +21,10 @@ build-backend = "setuptools.build_meta"
 name = "threedgrut"
 version = "0.0.2"
 description = "Official implementation of 3DGRT and 3DGUT"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 
 dependencies = [
-    "setuptools==78.1.1",
+    "setuptools>=78.1.1",
     "pillow",
     "ninja",
     "plyfile",
@@ -39,7 +39,7 @@ dependencies = [
     "msgpack",
     "numpy",
     "omegaconf",
-    "opencv-python",
+    "opencv-python<4.12.0",
     "piexif",
     "rich",
     "scikit-learn",
@@ -47,6 +47,7 @@ dependencies = [
     "torch",
     "torchvision",
     "tqdm",
+    "typing-extensions",
     "wandb",
     "simplejpeg",
     "nvidia-ncore>=19.0.0",
@@ -95,7 +96,7 @@ url = "https://pypi.org/simple"
 # url = "https://download.pytorch.org/whl"
 
 [tool.black]
-target-version = ["py311"]
+target-version = ["py310"]
 line-length = 120
 extend-exclude = '''
 /(

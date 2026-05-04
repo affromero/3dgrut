@@ -19,7 +19,9 @@ import logging
 import time
 from dataclasses import dataclass, field
 from types import TracebackType
-from typing import Callable, Final, Optional, Self, Type, TypeVar, cast
+from typing import Callable, Final, Optional, Type, TypeVar, cast
+
+from typing_extensions import Self
 
 import torch
 
