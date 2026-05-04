@@ -782,8 +782,9 @@ def _tensor_distribution_stats(
     finite = flat[torch.isfinite(flat)]
     if finite.numel() == 0:
         return {}
+    quantile_values = _quantile_values(finite)
     quantiles = torch.quantile(
-        finite,
+        quantile_values,
         torch.tensor([0.5, 0.95, 0.99], device=finite.device),
     )
     return {
@@ -2332,9 +2333,9 @@ class Trainer3DGRUT:
                             "gradient_l1",
                             "high_ratio",
                         ],
-                    )
+                    ),
+                    "train/iteration": self.global_step,
                 },
-                step=self.global_step,
             )
 
     def _validation_log_image_views(self) -> set[int]:
@@ -3089,11 +3090,12 @@ class Trainer3DGRUT:
                 caption = f"rows=image path, columns={', '.join(grid_columns)}"
                 wandb.log(
                     {
+                        "train/iteration": global_step,
                         f"eval/image_grid/group_{group_idx:03d}": wandb.Image(
                             grid_path,
                             caption=caption,
                         )
-                    }
+                    },
                 )
 
         mean_timings = {}

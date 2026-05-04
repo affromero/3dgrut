@@ -180,13 +180,15 @@ def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb
             if wandb_run_id
             else {}
         )
-        wandb.init(
+        wandb_run = wandb.init(
             config=OmegaConf.to_container(DictConfig(conf)),
             project=conf.wandb_project,
             group=experiment_name,
             name=run_name,
             **wandb_resume_kwargs,
         )
+        wandb_run.define_metric("train/iteration")
+        wandb_run.define_metric("*", step_metric="train/iteration")
         wandb.tensorboard.patch(root_logdir=out_dir, save=False)
 
     writer = SummaryWriter(log_dir=out_dir)
