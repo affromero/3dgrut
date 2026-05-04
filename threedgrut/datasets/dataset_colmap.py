@@ -59,6 +59,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         ray_jitter=None,
         exif_exposures: Optional[list[Optional[float]]] = None,
         sky_mask_folder: Optional[str] = None,
+        train_exclude_image_list_path: Optional[str] = None,
     ):
         self.path = path
         self.device = device
@@ -68,6 +69,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.test_split_interval = test_split_interval
         self._all_exif_exposures = exif_exposures  # Exposure values for all frames (pre-split)
         self.sky_mask_folder = sky_mask_folder
+        self.train_exclude_image_list_path = train_exclude_image_list_path
 
         # Worker-based GPU cache for multiprocessing compatibility
         self._worker_gpu_cache = {}
@@ -89,41 +91,93 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         self.n_frames = len(self.cam_extrinsics)
         self.load_camera_data()
-        indices = np.arange(self.n_frames)
+        all_indices = np.arange(self.n_frames)
+        split_mask = np.ones(self.n_frames, dtype=bool)
 
         # If test_split_interval is set, every test_split_interval frame will be excluded from the training set
         # If test_split_interval is non-positive, all images will be used for training and testing
         if self.test_split_interval > 0:
             if self.split == "train":
-                indices = np.mod(indices, self.test_split_interval) != 0
+                split_mask = np.mod(all_indices, self.test_split_interval) != 0
             else:
-                indices = np.mod(indices, self.test_split_interval) == 0
+                split_mask = np.mod(all_indices, self.test_split_interval) == 0
 
-        self.cam_extrinsics = [self.cam_extrinsics[i] for i in np.where(indices)[0]]
-        self.poses = self.poses[indices].astype(np.float32)
+        selected_indices = all_indices[split_mask]
+        self.cam_extrinsics = [self.cam_extrinsics[i] for i in selected_indices]
+        self.poses = self.poses[split_mask].astype(np.float32)
 
         # numpy str array of image paths and mask paths
-        self.image_paths = self.image_paths[indices]
-        self.mask_paths = self.mask_paths[indices]
+        self.image_paths = self.image_paths[split_mask]
+        self.mask_paths = self.mask_paths[split_mask]
         if self.sky_mask_paths is not None:
-            self.sky_mask_paths = self.sky_mask_paths[indices]
+            self.sky_mask_paths = self.sky_mask_paths[split_mask]
 
-        self.camera_centers = self.camera_centers[indices]
+        self.camera_centers = self.camera_centers[split_mask]
         self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
 
         # Apply split indices to EXIF exposures
         if self._all_exif_exposures is not None:
             self.exif_exposures: Optional[list[Optional[float]]] = [
-                self._all_exif_exposures[i] for i in np.where(indices)[0]
+                self._all_exif_exposures[i] for i in selected_indices
             ]
         else:
             self.exif_exposures = None
+
+        if self.split == "train":
+            self.apply_train_exclude_image_list()
 
         # Update the number of frames to only include the samples from the split
         self.n_frames = self.poses.shape[0]
 
         # Clear existing worker caches to force recreation with new intrinsics
         self._worker_gpu_cache.clear()
+
+    def load_train_exclude_image_names(self):
+        if not self.train_exclude_image_list_path:
+            return set()
+        if not os.path.exists(self.train_exclude_image_list_path):
+            raise FileNotFoundError(
+                f"Train exclude image list not found: {self.train_exclude_image_list_path}"
+            )
+        excluded = set()
+        with open(self.train_exclude_image_list_path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    excluded.add(stripped)
+        return excluded
+
+    def apply_train_exclude_image_list(self):
+        excluded = self.load_train_exclude_image_names()
+        if not excluded:
+            return
+        image_names = np.array(
+            [os.path.basename(path) for path in self.image_paths],
+            dtype=object,
+        )
+        keep = np.array([name not in excluded for name in image_names], dtype=bool)
+        if np.all(keep):
+            logger.warning(
+                f"Train exclude image list matched no images: {self.train_exclude_image_list_path}"
+            )
+            return
+        dropped = int(np.count_nonzero(~keep))
+        logger.info(
+            f"Excluded {dropped} train images from {self.train_exclude_image_list_path}"
+        )
+        self.cam_extrinsics = [
+            extrinsic for extrinsic, keep_item in zip(self.cam_extrinsics, keep) if keep_item
+        ]
+        self.poses = self.poses[keep].astype(np.float32)
+        self.image_paths = self.image_paths[keep]
+        self.mask_paths = self.mask_paths[keep]
+        if self.sky_mask_paths is not None:
+            self.sky_mask_paths = self.sky_mask_paths[keep]
+        self.camera_centers = self.camera_centers[keep]
+        if self.exif_exposures is not None:
+            self.exif_exposures = [
+                exposure for exposure, keep_item in zip(self.exif_exposures, keep) if keep_item
+            ]
 
     def load_intrinsics_and_extrinsics(self):
         try:

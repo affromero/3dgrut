@@ -88,9 +88,33 @@ def quaternion_to_so3(r):
     return R
 
 
-def exponential_scheduler(lr_init, lr_final, max_steps=1000000, type=""):
-    def helper(step):
+def exponential_scheduler(
+    lr_init: float,
+    lr_final: float,
+    max_steps: int = 1000000,
+    type: str = "",
+) -> Callable[[int], float]:
+    lr_init = float(lr_init)
+    lr_final = float(lr_final)
+    max_steps = max(int(max_steps), 1)
+    if not np.isfinite(lr_init) or not np.isfinite(lr_final):
+        raise ValueError(
+            f"Invalid exponential scheduler LR endpoints: {lr_init}, {lr_final}"
+        )
+    if lr_init < 0.0 or lr_final < 0.0:
+        raise ValueError(
+            "Exponential scheduler requires non-negative LR endpoints: "
+            f"{lr_init}, {lr_final}"
+        )
+
+    def helper(step: int) -> float:
         t = np.clip(step / max_steps, 0, 1)
+        if lr_init == 0.0 and lr_final == 0.0:
+            return 0.0
+        if lr_init == 0.0:
+            return lr_final * t
+        if lr_final == 0.0:
+            return lr_init * (1.0 - t)
         log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
         return log_lerp
 

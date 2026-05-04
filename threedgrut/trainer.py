@@ -19,26 +19,31 @@ import time
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data
+import wandb
 from addict import Dict
 from omegaconf import DictConfig, OmegaConf
+from torch import nn
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-import wandb
 
-import threedgrut.datasets as datasets
+from threedgrut import datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
-from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
+from threedgrut.datasets.utils import (
+    DEFAULT_DEVICE,
+    MultiEpochsDataLoader,
+    PointCloud,
+)
 from threedgrut.model.camera_residual import CameraResidual
 from threedgrut.model.losses import (
+    dense_depth_gradient_l1_loss,
     dense_depth_l1_loss,
     equirect_consistency_l1_loss,
     ssim,
@@ -49,9 +54,26 @@ from threedgrut.post_processing import LuminanceAffine
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
 from threedgrut.utils.logger import logger
-from threedgrut.utils.misc import check_step_condition, create_summary_writer, jet_map
+from threedgrut.utils.misc import (
+    check_step_condition,
+    create_summary_writer,
+    jet_map,
+)
 from threedgrut.utils.render import apply_post_processing
 from threedgrut.utils.timer import CudaTimer
+
+
+DIAGNOSTIC_QUANTILE_MAX_SAMPLES = 1_000_000
+
+
+def _quantile_values(value: torch.Tensor) -> torch.Tensor:
+    """Bound tensor size before quantile diagnostics on dense point clouds."""
+    if value.numel() <= DIAGNOSTIC_QUANTILE_MAX_SAMPLES:
+        return value
+    step = (
+        value.numel() + DIAGNOSTIC_QUANTILE_MAX_SAMPLES - 1
+    ) // DIAGNOSTIC_QUANTILE_MAX_SAMPLES
+    return value[::step]
 
 
 def _robust_jet_map(
@@ -67,22 +89,95 @@ def _robust_jet_map(
 
     valid_values = value_map[finite_mask]
     if valid_values.numel() == 0:
-        max_value = torch.tensor(1.0, device=value_map.device, dtype=value_map.dtype)
+        max_value = torch.tensor(
+            1.0, device=value_map.device, dtype=value_map.dtype
+        )
     else:
         max_value = torch.quantile(valid_values, quantile).clamp_min(1e-6)
     return jet_map(value_map, max_value)
 
 
+def _scalar_tensor_stats(
+    value: torch.Tensor,
+    prefix: str,
+    validity_mask: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """Return finite scalar statistics for a tensor."""
+    detached = value.detach()
+    finite_mask = torch.isfinite(detached)
+    if validity_mask is not None:
+        valid = validity_mask.detach()
+        if valid.shape != detached.shape:
+            valid = valid.expand_as(detached)
+        finite_mask = finite_mask & (valid > 0.5)
+
+    total_count = max(float(detached.numel()), 1.0)
+    finite_fraction = float(finite_mask.sum().item()) / total_count
+    if not finite_mask.any():
+        return {
+            f"{prefix}_finite_fraction": finite_fraction,
+            f"{prefix}_nonzero_fraction": 0.0,
+        }
+
+    values = detached[finite_mask].float()
+    nonzero_fraction = float((values.abs() > 0.0).sum().item()) / max(
+        float(values.numel()), 1.0
+    )
+    quantile_values = _quantile_values(values)
+    return {
+        f"{prefix}_finite_fraction": finite_fraction,
+        f"{prefix}_nonzero_fraction": nonzero_fraction,
+        f"{prefix}_min": values.min().item(),
+        f"{prefix}_mean": values.mean().item(),
+        f"{prefix}_p50": torch.quantile(quantile_values, 0.50).item(),
+        f"{prefix}_p95": torch.quantile(quantile_values, 0.95).item(),
+        f"{prefix}_p99": torch.quantile(quantile_values, 0.99).item(),
+        f"{prefix}_max": values.max().item(),
+    }
+
+
+def _gradient_tensor_stats(
+    parameter: torch.nn.Parameter,
+    prefix: str,
+) -> dict[str, float]:
+    """Return finite scalar statistics for an optimizer parameter gradient."""
+    if parameter.grad is None:
+        return {
+            f"{prefix}/has_grad": 0.0,
+            f"{prefix}/finite_fraction": 0.0,
+            f"{prefix}/nonzero_fraction": 0.0,
+        }
+
+    grad = parameter.grad.detach().abs().float()
+    finite_mask = torch.isfinite(grad)
+    total_count = max(float(grad.numel()), 1.0)
+    if not finite_mask.any():
+        return {
+            f"{prefix}/has_grad": 1.0,
+            f"{prefix}/finite_fraction": 0.0,
+            f"{prefix}/nonzero_fraction": 0.0,
+        }
+    values = grad[finite_mask]
+    nonzero_fraction = float((values > 0.0).sum().item()) / max(
+        float(values.numel()), 1.0
+    )
+    quantile_values = _quantile_values(values)
+    return {
+        f"{prefix}/has_grad": 1.0,
+        f"{prefix}/finite_fraction": float(finite_mask.sum().item())
+        / total_count,
+        f"{prefix}/nonzero_fraction": nonzero_fraction,
+        f"{prefix}/mean": values.mean().item(),
+        f"{prefix}/p50": torch.quantile(quantile_values, 0.50).item(),
+        f"{prefix}/p95": torch.quantile(quantile_values, 0.95).item(),
+        f"{prefix}/p99": torch.quantile(quantile_values, 0.99).item(),
+        f"{prefix}/max": values.max().item(),
+    }
+
+
 def _tensor_to_bgr_image(image: torch.Tensor) -> np.ndarray:
     """Convert an HWC RGB float tensor to a BGR uint8 image."""
-    rgb = (
-        image.detach()
-        .clip(0, 1)
-        .mul(255)
-        .to(torch.uint8)
-        .cpu()
-        .numpy()
-    )
+    rgb = image.detach().clip(0, 1).mul(255).to(torch.uint8).cpu().numpy()
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
@@ -140,7 +235,9 @@ def _sobel_grad_bhwc(image: torch.Tensor) -> torch.Tensor:
     ).reshape(1, 1, 3, 3)
     grad_x = F.conv2d(bchw, kernel_x, padding=1)
     grad_y = F.conv2d(bchw, kernel_y, padding=1)
-    grad = torch.sqrt(torch.clamp_min(grad_x.square() + grad_y.square(), 1e-12))
+    grad = torch.sqrt(
+        torch.clamp_min(grad_x.square() + grad_y.square(), 1e-12)
+    )
     return _restore_image_rank(grad.permute(0, 2, 3, 1), squeezed)
 
 
@@ -157,7 +254,9 @@ def _laplacian_bhwc(image: torch.Tensor) -> torch.Tensor:
     return _restore_image_rank(response.permute(0, 2, 3, 1), squeezed)
 
 
-def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+def _masked_mean(
+    value: torch.Tensor, mask: torch.Tensor | None
+) -> torch.Tensor:
     """Compute a mean over valid pixels and channels."""
     if mask is None:
         return value.mean()
@@ -257,9 +356,13 @@ class FoundationFeatureProbe(nn.Module):
                 weights=weights,
             )
         else:
-            model = torch.hub.load(repo, method, source=source, pretrained=True)
+            model = torch.hub.load(
+                repo, method, source=source, pretrained=True
+            )
         if not isinstance(model, nn.Module):
-            msg = f"Foundation feature method did not return nn.Module: {method}"
+            msg = (
+                f"Foundation feature method did not return nn.Module: {method}"
+            )
             raise TypeError(msg)
         return model
 
@@ -318,7 +421,9 @@ class FoundationFeatureProbe(nn.Module):
         )
         return (resized - self.mean.to(resized)) / self.std.to(resized)
 
-    def _features(self, image: torch.Tensor, mask: torch.Tensor | None) -> dict[str, torch.Tensor]:
+    def _features(
+        self, image: torch.Tensor, mask: torch.Tensor | None
+    ) -> dict[str, torch.Tensor]:
         if self.method == "tuna_pixel_patch":
             return self._pixel_patch_features(image, mask)
         prepared = self._prepare(image, mask)
@@ -409,7 +514,9 @@ def _region_mask(
     upper: float,
 ) -> torch.Tensor:
     """Return a BHWC-compatible radial region mask."""
-    return ((radius >= lower) & (radius < upper)).to(radius.dtype)[None, :, :, None]
+    return ((radius >= lower) & (radius < upper)).to(radius.dtype)[
+        None, :, :, None
+    ]
 
 
 def _radial_residual_metrics(
@@ -422,7 +529,9 @@ def _radial_residual_metrics(
     batched_gt, squeezed_gt = _ensure_bhwc(rgb_gt)
     batched_pred, squeezed_pred = _ensure_bhwc(rgb_pred)
     if squeezed_gt != squeezed_pred:
-        raise RuntimeError("GT and prediction rank mismatch in radial diagnostics.")
+        raise RuntimeError(
+            "GT and prediction rank mismatch in radial diagnostics."
+        )
 
     height = batched_gt.shape[1]
     width = batched_gt.shape[2]
@@ -463,7 +572,9 @@ def _radial_residual_metrics(
     metrics = {}
     for band_name, (lower, upper) in bands.items():
         radial_mask = _region_mask(radius, lower=lower, upper=upper)
-        combined_mask = radial_mask if batched_mask is None else radial_mask * batched_mask
+        combined_mask = (
+            radial_mask if batched_mask is None else radial_mask * batched_mask
+        )
         metrics[f"radial_{band_name}_rgb_l1"] = _masked_mean(
             rgb_abs,
             combined_mask,
@@ -499,9 +610,13 @@ def _frequency_high_ratio(
     gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
     height = pred_luma.shape[1]
     width = pred_luma.shape[2]
-    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(
+        1, height, 1
+    )
     fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
-    high_mask = (torch.sqrt(fx.square() + fy.square()) > 0.18).to(pred_luma.dtype)
+    high_mask = (torch.sqrt(fx.square() + fy.square()) > 0.18).to(
+        pred_luma.dtype
+    )
     pred_energy = (pred_fft.abs().square() * high_mask).mean()
     gt_energy = (gt_fft.abs().square() * high_mask).mean()
     return pred_energy / torch.clamp_min(gt_energy, 1e-12)
@@ -523,7 +638,9 @@ def _frequency_band_ratios(
     gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
     height = pred_luma.shape[1]
     width = pred_luma.shape[2]
-    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(
+        1, height, 1
+    )
     fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
     radius = torch.sqrt(fx.square() + fy.square())
     pred_energy = pred_fft.abs().square()
@@ -541,7 +658,9 @@ def _frequency_band_ratios(
         band_mask = band_mask.to(pred_luma.dtype)
         pred_band_energy = (pred_energy * band_mask).mean()
         gt_band_energy = (gt_energy * band_mask).mean()
-        ratios[name] = pred_band_energy / torch.clamp_min(gt_band_energy, 1e-12)
+        ratios[name] = pred_band_energy / torch.clamp_min(
+            gt_band_energy, 1e-12
+        )
     return ratios
 
 
@@ -561,7 +680,9 @@ def _frequency_band_errors(
     gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
     height = pred_luma.shape[1]
     width = pred_luma.shape[2]
-    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(
+        1, height, 1
+    )
     fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
     radius = torch.sqrt(fx.square() + fy.square())
     error_energy = (pred_fft - gt_fft).abs().square()
@@ -681,7 +802,9 @@ def _gaussian_geometry_metrics(model: MixtureOfGaussians) -> dict[str, float]:
         density = model.get_density().detach().float()
         min_axis = torch.clamp_min(scales.min(dim=1).values, 1e-12)
         max_axis = scales.max(dim=1).values
-        geom_mean_scale = torch.clamp_min(scales.prod(dim=1), 1e-36).pow(1.0 / 3.0)
+        geom_mean_scale = torch.clamp_min(scales.prod(dim=1), 1e-36).pow(
+            1.0 / 3.0
+        )
         anisotropy = max_axis / min_axis
 
         metrics = {
@@ -756,7 +879,9 @@ def _screen_space_footprint_metrics(
         if not in_front.any():
             return {"footprint_front_fraction": 0.0}
         focal_mean = _camera_focal_mean(gpu_batch)
-        projected_radius = scales[in_front] * focal_mean / depth[in_front].clamp_min(1e-3)
+        projected_radius = (
+            scales[in_front] * focal_mean / depth[in_front].clamp_min(1e-3)
+        )
         quantiles = torch.quantile(
             projected_radius,
             torch.tensor([0.5, 0.95, 0.99], device=projected_radius.device),
@@ -768,8 +893,14 @@ def _screen_space_footprint_metrics(
             "footprint_radius_px_p95": quantiles[1].item(),
             "footprint_radius_px_p99": quantiles[2].item(),
             "footprint_radius_px_max": projected_radius.max().item(),
-            "footprint_radius_lt_0p5_fraction": (projected_radius < 0.5).float().mean().item(),
-            "footprint_radius_gt_8_fraction": (projected_radius > 8.0).float().mean().item(),
+            "footprint_radius_lt_0p5_fraction": (projected_radius < 0.5)
+            .float()
+            .mean()
+            .item(),
+            "footprint_radius_gt_8_fraction": (projected_radius > 8.0)
+            .float()
+            .mean()
+            .item(),
         }
 
 
@@ -792,10 +923,18 @@ def _diagnostic_metrics(
     lap_pred = _laplacian_bhwc(luma_pred)
     metrics = {
         "low_freq_l1": _masked_mean(torch.abs(low_pred - low_gt), mask).item(),
-        "high_freq_l1": _masked_mean(torch.abs(high_pred - high_gt), mask).item(),
-        "gradient_l1": _masked_mean(torch.abs(grad_pred - grad_gt), mask).item(),
-        "laplacian_l1": _masked_mean(torch.abs(lap_pred - lap_gt), mask).item(),
-        "fft_high_energy_ratio": _frequency_high_ratio(rgb_pred, rgb_gt, mask).item(),
+        "high_freq_l1": _masked_mean(
+            torch.abs(high_pred - high_gt), mask
+        ).item(),
+        "gradient_l1": _masked_mean(
+            torch.abs(grad_pred - grad_gt), mask
+        ).item(),
+        "laplacian_l1": _masked_mean(
+            torch.abs(lap_pred - lap_gt), mask
+        ).item(),
+        "fft_high_energy_ratio": _frequency_high_ratio(
+            rgb_pred, rgb_gt, mask
+        ).item(),
     }
     metrics.update(
         {
@@ -908,7 +1047,9 @@ def _save_validation_grid_jpeg(
 
     for column_idx, column_name in enumerate(column_names):
         x = label_width + gap_px + column_idx * (panel_width + gap_px)
-        header = np.full((header_height, panel_width, 3), (0, 0, 0), dtype=np.uint8)
+        header = np.full(
+            (header_height, panel_width, 3), (0, 0, 0), dtype=np.uint8
+        )
         cv2.putText(
             header,
             column_name,
@@ -952,6 +1093,7 @@ def _make_validation_image_tiles(
     mask: torch.Tensor | None,
     sky_mask: torch.Tensor | None,
     max_hit_count: int,
+    gt_depth: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build aligned validation tiles for grouped W&B image grids."""
     rgb_gt = rgb_gt.clip(0, 1.0)
@@ -989,11 +1131,17 @@ def _make_validation_image_tiles(
     depth_rgb = _robust_jet_map(pred_dist, valid_mask)
     opacity_rgb = jet_map(pred_opacity, 1)
     hits_rgb = jet_map(hit_counts, max_hit_count)
-    hit_coverage = (hit_counts > 0).to(rgb_gt.dtype)
-    opacity_coverage = (pred_opacity > 0.01).to(rgb_gt.dtype)
+    # Diagnostic inversions: the binary `hit > 0` and `opacity > 0.01`
+    # coverage panels go all-white once the model is dense (~12M splats),
+    # carrying no information. Flip them to expose the *minority* pixels
+    # that are diagnostically interesting — sparse-ray regions and
+    # low-opacity regions, which usually mark missing geometry, edges,
+    # and rim degeneracies.
+    hits_sparse = (hit_counts < 4).to(rgb_gt.dtype)
+    opacity_low = (pred_opacity < 0.5).to(rgb_gt.dtype)
     if valid_mask is not None:
-        hit_coverage = hit_coverage * valid_mask
-        opacity_coverage = opacity_coverage * valid_mask
+        hits_sparse = hits_sparse * valid_mask
+        opacity_low = opacity_low * valid_mask
     tiles = {
         "input_rgb": rgb_gt,
         "training_mask": mask_rgb,
@@ -1005,11 +1153,29 @@ def _make_validation_image_tiles(
         "predicted_depth": depth_rgb,
         "opacity": opacity_rgb,
         "ray_hits": hits_rgb,
-        "hit_coverage": hit_coverage.expand_as(rgb_gt),
-        "opacity_coverage": opacity_coverage.expand_as(rgb_gt),
+        "hits_sparse": hits_sparse.expand_as(rgb_gt),
+        "opacity_low": opacity_low.expand_as(rgb_gt),
     }
     if sky_mask is not None:
         tiles["sky_opacity_mask"] = sky_mask.clip(0, 1.0).expand_as(rgb_gt)
+    if gt_depth is not None:
+        # `_robust_jet_map` / `jet_map` expect the same shape `pred_dist`
+        # has at this point — sliced last batch element, ``[H, W, 1]``.
+        # Anything else silently produces a black panel.
+        gt = gt_depth
+        if gt.dim() == 4:
+            gt = gt[0]
+        if gt.dim() == 2:
+            gt = gt.unsqueeze(-1)
+        gt_valid = (gt > 0.0).to(gt.dtype)
+        if valid_mask is not None and gt_valid.shape == valid_mask.shape:
+            gt_valid = gt_valid * valid_mask
+        if gt.shape[:2] != depth_rgb.shape[:2]:
+            h = min(gt.shape[0], depth_rgb.shape[0])
+            w = min(gt.shape[1], depth_rgb.shape[1])
+            gt = gt[:h, :w]
+            gt_valid = gt_valid[:h, :w]
+        tiles["depth_gt"] = _robust_jet_map(gt, gt_valid)
     return tiles
 
 
@@ -1043,22 +1209,22 @@ class Trainer3DGRUT:
     tracking: Dict
     """ Contains all components used to report progress of training """
 
-    post_processing: Optional[nn.Module] = None
+    post_processing: nn.Module | None = None
     """ Post-processing module """
 
-    post_processing_optimizers: Optional[list] = None
+    post_processing_optimizers: list | None = None
     """ Optimizers for post-processing module """
 
-    post_processing_schedulers: Optional[list] = None
+    post_processing_schedulers: list | None = None
     """ Schedulers for post-processing module optimizers """
 
-    camera_residual: Optional[CameraResidual] = None
+    camera_residual: CameraResidual | None = None
     """ Optional camera residual module """
 
-    camera_residual_optimizer: Optional[torch.optim.Optimizer] = None
+    camera_residual_optimizer: torch.optim.Optimizer | None = None
     """ Optimizer for camera residual module """
 
-    foundation_feature_probe: Optional[FoundationFeatureProbe] = None
+    foundation_feature_probe: FoundationFeatureProbe | None = None
     """ Optional frozen foundation-model probe for feature diagnostics """
 
     _distillation_start_step: int = -1
@@ -1067,7 +1233,6 @@ class Trainer3DGRUT:
     @staticmethod
     def create_from_checkpoint(resume: str, conf: DictConfig):
         """Create a new trainer from a checkpoint file"""
-
         conf.resume = resume
         conf.import_ply.enabled = False
         return Trainer3DGRUT(conf)
@@ -1075,7 +1240,6 @@ class Trainer3DGRUT:
     @staticmethod
     def create_from_ply(ply_path: str, conf: DictConfig):
         """Create a new trainer from a PLY file"""
-
         conf.resume = ""
         conf.import_ply.enabled = True
         conf.import_ply.path = ply_path
@@ -1084,7 +1248,6 @@ class Trainer3DGRUT:
     @torch.cuda.nvtx.range("setup-trainer")
     def __init__(self, conf: DictConfig, device=None):
         """Set up a new training session, or continue an existing one based on configuration"""
-
         # Keep track of useful fields
         self.conf = conf
         """ Global configuration of model, scene, optimization, etc"""
@@ -1113,12 +1276,20 @@ class Trainer3DGRUT:
         self.init_camera_residual(conf)
         self.setup_training(conf, self.model, self.train_dataset)
         self.init_experiments_tracking(conf)
-        self.init_gui(conf, self.model, self.train_dataset, self.val_dataset, self.scene_bbox)
+        self.init_gui(
+            conf,
+            self.model,
+            self.train_dataset,
+            self.val_dataset,
+            self.scene_bbox,
+        )
 
     def init_dataloaders(self, conf: DictConfig):
         from threedgrut.datasets.utils import configure_dataloader_for_platform
 
-        train_dataset, val_dataset = datasets.make(name=conf.dataset.type, config=conf, ray_jitter=None)
+        train_dataset, val_dataset = datasets.make(
+            name=conf.dataset.type, config=conf, ray_jitter=None
+        )
         train_dataloader_kwargs = configure_dataloader_for_platform(
             {
                 "num_workers": conf.num_workers,
@@ -1139,8 +1310,12 @@ class Trainer3DGRUT:
             }
         )
 
-        train_dataloader = MultiEpochsDataLoader(train_dataset, **train_dataloader_kwargs)
-        val_dataloader = torch.utils.data.DataLoader(val_dataset, **val_dataloader_kwargs)
+        train_dataloader = MultiEpochsDataLoader(
+            train_dataset, **train_dataloader_kwargs
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset, **val_dataloader_kwargs
+        )
 
         self.train_dataset = train_dataset
         self.train_dataloader = train_dataloader
@@ -1157,8 +1332,12 @@ class Trainer3DGRUT:
         if self.val_dataset is not None:
             del self.val_dataset
 
-    def init_scene_extents(self, train_dataset: BoundedMultiViewDataset) -> None:
-        scene_bbox: tuple[torch.Tensor, torch.Tensor]  # Tuple of vec3 (min,max)
+    def init_scene_extents(
+        self, train_dataset: BoundedMultiViewDataset
+    ) -> None:
+        scene_bbox: tuple[
+            torch.Tensor, torch.Tensor
+        ]  # Tuple of vec3 (min,max)
         scene_extent = train_dataset.get_scene_extent()
         scene_bbox = train_dataset.get_scene_bbox()
         self.scene_extent = scene_extent
@@ -1168,7 +1347,9 @@ class Trainer3DGRUT:
         """Initializes the gaussian model and the optix context"""
         self.model = MixtureOfGaussians(conf, scene_extent=scene_extent)
 
-    def init_densification_and_pruning_strategy(self, conf: DictConfig) -> None:
+    def init_densification_and_pruning_strategy(
+        self, conf: DictConfig
+    ) -> None:
         """Set pre-train / post-train iteration logic. i.e. densification and pruning"""
         assert self.model is not None
         match self.conf.strategy.method:
@@ -1183,7 +1364,9 @@ class Trainer3DGRUT:
                 self.strategy = MCMCStrategy(conf, self.model)
                 logger.info("🔆 Using MCMC strategy")
             case _:
-                raise ValueError(f"unrecognized model.strategy {conf.strategy.method}")
+                raise ValueError(
+                    f"unrecognized model.strategy {conf.strategy.method}"
+                )
 
     def setup_training(
         self,
@@ -1191,42 +1374,58 @@ class Trainer3DGRUT:
         model: MixtureOfGaussians,
         train_dataset: BoundedMultiViewDataset,
     ):
-        """
-        Performs required steps to setup the optimization:
+        """Performs required steps to setup the optimization:
         1. Initialize the gaussian model fields: load previous weights from checkpoint, or initialize from scratch.
         2. Build BVH acceleration structure for gaussian model, if not loaded with checkpoint
         3. Set up the optimizer to optimize the gaussian model params
         4. Initialize the densification buffers in the densificaiton strategy
         """
-
         # Initialize
         if conf.resume:  # Load a checkpoint
-            logger.info(f"🤸 Loading a pretrained checkpoint from {conf.resume}!")
+            logger.info(
+                f"🤸 Loading a pretrained checkpoint from {conf.resume}!"
+            )
             checkpoint = torch.load(conf.resume, weights_only=False)
             model.init_from_checkpoint(checkpoint)
             self.strategy.init_densification_buffer(checkpoint)
             global_step = checkpoint["global_step"]
 
             # Restore post-processing state
-            if "post_processing" in checkpoint and self.post_processing is not None:
-                self.post_processing.load_state_dict(checkpoint["post_processing"]["module"])
+            if (
+                "post_processing" in checkpoint
+                and self.post_processing is not None
+            ):
+                self.post_processing.load_state_dict(
+                    checkpoint["post_processing"]["module"]
+                )
                 for opt, opt_state in zip(
                     self.post_processing_optimizers,
                     checkpoint["post_processing"]["optimizers"],
+                    strict=False,
                 ):
                     opt.load_state_dict(opt_state)
                 for sched, sched_state in zip(
                     self.post_processing_schedulers,
                     checkpoint["post_processing"]["schedulers"],
+                    strict=False,
                 ):
                     sched.load_state_dict(sched_state)
-                logger.info("📷 Post-processing state restored from checkpoint")
-            if "camera_residual" in checkpoint and self.camera_residual is not None:
-                self.camera_residual.load_state_dict(checkpoint["camera_residual"]["module"])
+                logger.info(
+                    "📷 Post-processing state restored from checkpoint"
+                )
+            if (
+                "camera_residual" in checkpoint
+                and self.camera_residual is not None
+            ):
+                self.camera_residual.load_state_dict(
+                    checkpoint["camera_residual"]["module"]
+                )
                 self.camera_residual_optimizer.load_state_dict(
                     checkpoint["camera_residual"]["optimizer"]
                 )
-                logger.info("📷 Camera residual state restored from checkpoint")
+                logger.info(
+                    "📷 Camera residual state restored from checkpoint"
+                )
         elif conf.import_ply.enabled:
             ply_path = (
                 conf.import_ply.path
@@ -1239,7 +1438,7 @@ class Trainer3DGRUT:
             model.build_acc()
             global_step = conf.import_ply.init_global_step
         else:
-            logger.info(f"🤸 Initiating new 3dgrut training..")
+            logger.info("🤸 Initiating new 3dgrut training..")
             match conf.initialization.method:
                 case "random":
                     model.init_from_random_point_cloud(
@@ -1261,8 +1460,12 @@ class Trainer3DGRUT:
                         device=self.device,
                     )
                     ply_path = conf.initialization.fused_point_cloud_path
-                    logger.info(f"Initializing from accumulated point cloud: {ply_path}")
-                    model.init_from_fused_point_cloud(ply_path, observer_points)
+                    logger.info(
+                        f"Initializing from accumulated point cloud: {ply_path}"
+                    )
+                    model.init_from_fused_point_cloud(
+                        ply_path, observer_points
+                    )
                 case "point_cloud":
                     try:
                         ply_path = os.path.join(conf.path, "point_cloud.ply")
@@ -1271,23 +1474,42 @@ class Trainer3DGRUT:
                         logger.error(e)
                         raise e
                 case "checkpoint":
-                    checkpoint = torch.load(conf.initialization.path, weights_only=False)
-                    model.init_from_checkpoint(checkpoint, setup_optimizer=False)
-                    if "post_processing" in checkpoint and self.post_processing is not None:
-                        self.post_processing.load_state_dict(checkpoint["post_processing"]["module"])
-                        logger.info("📷 Post-processing module restored from initialization checkpoint")
+                    checkpoint = torch.load(
+                        conf.initialization.path, weights_only=False
+                    )
+                    model.init_from_checkpoint(
+                        checkpoint, setup_optimizer=False
+                    )
+                    if (
+                        "post_processing" in checkpoint
+                        and self.post_processing is not None
+                    ):
+                        self.post_processing.load_state_dict(
+                            checkpoint["post_processing"]["module"]
+                        )
+                        logger.info(
+                            "📷 Post-processing module restored from initialization checkpoint"
+                        )
                 case "lidar":
-                    assert isinstance(
-                        train_dataset, datasets.NCoreDataset
-                    ), "can only initialize from lidar with NCoreDataset"
+                    assert isinstance(train_dataset, datasets.NCoreDataset), (
+                        "can only initialize from lidar with NCoreDataset"
+                    )
                     pc = PointCloud.from_sequence(
-                        list(train_dataset.get_point_clouds(step_frame=1, non_dynamic_points_only=True)),
+                        list(
+                            train_dataset.get_point_clouds(
+                                step_frame=1, non_dynamic_points_only=True
+                            )
+                        ),
                         device="cpu",
                     )
                     if conf.initialization.num_points < len(pc.xyz_end):
                         # Deterministically random subsample points if there are more points than the specified number of gaussians
-                        rng = torch.Generator().manual_seed(conf.seed_initialization)
-                        idxs = torch.randperm(len(pc.xyz_end), generator=rng)[: conf.initialization.num_points]
+                        rng = torch.Generator().manual_seed(
+                            conf.seed_initialization
+                        )
+                        idxs = torch.randperm(len(pc.xyz_end), generator=rng)[
+                            : conf.initialization.num_points
+                        ]
                         pc = pc.selected_idxs(idxs)
                     observer_points = torch.tensor(
                         train_dataset.get_observer_points(),
@@ -1307,7 +1529,9 @@ class Trainer3DGRUT:
             global_step = 0
 
         self.global_step = global_step
-        self.n_epochs = int((conf.n_iterations + len(train_dataset) - 1) / len(train_dataset))
+        self.n_epochs = int(
+            (conf.n_iterations + len(train_dataset) - 1) / len(train_dataset)
+        )
 
     def init_gui(
         self,
@@ -1334,8 +1558,12 @@ class Trainer3DGRUT:
     def init_metrics(self):
         self.criterions = Dict(
             psnr=PeakSignalNoiseRatio(data_range=1).to(self.device),
-            ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
-            lpips=LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=True).to(self.device),
+            ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(
+                self.device
+            ),
+            lpips=LearnedPerceptualImagePatchSimilarity(
+                net_type="vgg", normalize=True
+            ).to(self.device),
         )
 
     def init_foundation_feature_probe(self, conf: DictConfig) -> None:
@@ -1359,7 +1587,11 @@ class Trainer3DGRUT:
         # Initialize the tensorboard writer
         object_name = Path(conf.path).stem
         writer, out_dir, run_name = create_summary_writer(
-            conf, object_name, conf.out_dir, conf.experiment_name, conf.use_wandb
+            conf,
+            object_name,
+            conf.out_dir,
+            conf.experiment_name,
+            conf.use_wandb,
         )
         logger.info(f"📊 Training logs & will be saved to: {out_dir}")
 
@@ -1393,13 +1625,19 @@ class Trainer3DGRUT:
 
             # Distillation mode: controller activates after main training
             # Total iterations = n_iterations, distillation starts at n_iterations - n_distillation_steps
-            n_distillation_steps = conf.post_processing.get("n_distillation_steps", 5000)
+            n_distillation_steps = conf.post_processing.get(
+                "n_distillation_steps", 5000
+            )
             if use_controller and n_distillation_steps > 0:
                 main_training_steps = conf.n_iterations - n_distillation_steps
-                controller_activation_ratio = main_training_steps / conf.n_iterations
+                controller_activation_ratio = (
+                    main_training_steps / conf.n_iterations
+                )
                 controller_distillation = True
                 self._distillation_start_step = main_training_steps
-                logger.info(f"📷 PPISP distillation mode: controller activates at step {main_training_steps}")
+                logger.info(
+                    f"📷 PPISP distillation mode: controller activates at step {main_training_steps}"
+                )
             elif use_controller:
                 controller_activation_ratio = 0.8
                 controller_distillation = False
@@ -1421,13 +1659,19 @@ class Trainer3DGRUT:
                 config=ppisp_config,
             ).to(self.device)
 
-            self.post_processing_optimizers = self.post_processing.create_optimizers()
-            self.post_processing_schedulers = self.post_processing.create_schedulers(
-                self.post_processing_optimizers,
-                max_optimization_iters=conf.n_iterations,
+            self.post_processing_optimizers = (
+                self.post_processing.create_optimizers()
+            )
+            self.post_processing_schedulers = (
+                self.post_processing.create_schedulers(
+                    self.post_processing_optimizers,
+                    max_optimization_iters=conf.n_iterations,
+                )
             )
 
-            logger.info(f"📷 {method.upper()} initialized: {num_cameras} cameras, {num_frames} frames")
+            logger.info(
+                f"📷 {method.upper()} initialized: {num_cameras} cameras, {num_frames} frames"
+            )
         elif method == "luminance_affine":
             frames_per_camera = self.train_dataset.get_frames_per_camera()
             num_cameras = len(frames_per_camera)
@@ -1462,10 +1706,14 @@ class Trainer3DGRUT:
                 ),
             ).to(self.device)
 
-            self.post_processing_optimizers = self.post_processing.create_optimizers()
-            self.post_processing_schedulers = self.post_processing.create_schedulers(
-                self.post_processing_optimizers,
-                max_optimization_iters=conf.n_iterations,
+            self.post_processing_optimizers = (
+                self.post_processing.create_optimizers()
+            )
+            self.post_processing_schedulers = (
+                self.post_processing.create_schedulers(
+                    self.post_processing_optimizers,
+                    max_optimization_iters=conf.n_iterations,
+                )
             )
 
             logger.info(
@@ -1489,7 +1737,9 @@ class Trainer3DGRUT:
             optimize_global=conf.camera_residual.optimize_global,
             optimize_per_camera=conf.camera_residual.optimize_per_camera,
         ).to(self.device)
-        self.camera_residual_optimizer = self.camera_residual.create_optimizer()
+        self.camera_residual_optimizer = (
+            self.camera_residual.create_optimizer()
+        )
         logger.warning(
             "📷 CAMERA_RESIDUAL enabled. Current 3DGUT CUDA backward does not "
             "return ray/sensor gradients; monitor camera_residual/max_abs_grad."
@@ -1601,13 +1851,24 @@ class Trainer3DGRUT:
         audit_conf = self.conf.camera_residual.finite_difference_audit
         max_views = int(audit_conf.max_views)
         if max_views <= 0:
-            raise ValueError("camera_residual.finite_difference_audit.max_views must be positive.")
+            raise ValueError(
+                "camera_residual.finite_difference_audit.max_views must be positive."
+            )
 
-        original_rotation = self.camera_residual.global_rotation_raw.detach().clone()
-        original_translation = self.camera_residual.global_translation_raw.detach().clone()
+        original_rotation = (
+            self.camera_residual.global_rotation_raw.detach().clone()
+        )
+        original_translation = (
+            self.camera_residual.global_translation_raw.detach().clone()
+        )
         rows = []
         try:
-            for name, camera_idx, rotation, translation in self._camera_residual_audit_candidates():
+            for (
+                name,
+                camera_idx,
+                rotation,
+                translation,
+            ) in self._camera_residual_audit_candidates():
                 if camera_idx is None:
                     self.camera_residual.set_global_delta(
                         rotation=rotation,
@@ -1621,10 +1882,17 @@ class Trainer3DGRUT:
                     )
                 psnr_values = []
                 masked_psnr_values = []
-                logger.info(f"Camera residual finite-difference candidate: {name}")
+                logger.info(
+                    f"Camera residual finite-difference candidate: {name}"
+                )
                 for _, batch_idx in enumerate(self.val_dataloader):
-                    gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
-                    if camera_idx is not None and gpu_batch.camera_idx != camera_idx:
+                    gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
+                        batch_idx
+                    )
+                    if (
+                        camera_idx is not None
+                        and gpu_batch.camera_idx != camera_idx
+                    ):
                         continue
                     if len(psnr_values) >= max_views:
                         break
@@ -1637,19 +1905,37 @@ class Trainer3DGRUT:
                             gpu_batch,
                             training=False,
                         )
-                    rgb_error = torch.square(outputs["pred_rgb"] - gpu_batch.rgb_gt)
+                    rgb_error = torch.square(
+                        outputs["pred_rgb"] - gpu_batch.rgb_gt
+                    )
                     psnr_values.append(
-                        (-10.0 * torch.log10(torch.clamp_min(rgb_error.mean(), 1e-12))).item()
+                        (
+                            -10.0
+                            * torch.log10(
+                                torch.clamp_min(rgb_error.mean(), 1e-12)
+                            )
+                        ).item()
                     )
                     if gpu_batch.mask is not None:
                         mask = gpu_batch.mask
                         masked_error = rgb_error * mask
-                        denominator = torch.clamp_min(mask.sum() * gpu_batch.rgb_gt.shape[-1], 1.0)
+                        denominator = torch.clamp_min(
+                            mask.sum() * gpu_batch.rgb_gt.shape[-1], 1.0
+                        )
                         masked_mse = masked_error.sum() / denominator
                         masked_psnr_values.append(
-                            (-10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))).item()
+                            (
+                                -10.0
+                                * torch.log10(
+                                    torch.clamp_min(masked_mse, 1e-12)
+                                )
+                            ).item()
                         )
-                mean_psnr = float(np.mean(psnr_values)) if psnr_values else float("nan")
+                mean_psnr = (
+                    float(np.mean(psnr_values))
+                    if psnr_values
+                    else float("nan")
+                )
                 mean_masked_psnr = (
                     float(np.mean(masked_psnr_values))
                     if masked_psnr_values
@@ -1671,8 +1957,12 @@ class Trainer3DGRUT:
                 )
         finally:
             with torch.no_grad():
-                self.camera_residual.global_rotation_raw.copy_(original_rotation)
-                self.camera_residual.global_translation_raw.copy_(original_translation)
+                self.camera_residual.global_rotation_raw.copy_(
+                    original_rotation
+                )
+                self.camera_residual.global_translation_raw.copy_(
+                    original_translation
+                )
                 self.camera_residual.camera_rotation_raw.zero_()
                 self.camera_residual.camera_translation_raw.zero_()
 
@@ -1685,7 +1975,9 @@ class Trainer3DGRUT:
             baseline_name = f"camera_{best['camera_idx']}_baseline"
         else:
             baseline_name = "global_baseline"
-        baseline = next(row for row in rows if row["candidate"] == baseline_name)
+        baseline = next(
+            row for row in rows if row["candidate"] == baseline_name
+        )
         for row in rows:
             display_row = {
                 key: str(value) if isinstance(value, int) else value
@@ -1716,23 +2008,75 @@ class Trainer3DGRUT:
             f"baseline={baseline[score_key]:.6f}; "
             f"delta={best[score_key] - baseline[score_key]:.6f}"
         )
-        logger.info(f"Camera residual finite-difference audit JSON: {output_path}")
+        logger.info(
+            f"Camera residual finite-difference audit JSON: {output_path}"
+        )
 
     def _camera_intrinsics_audit_candidates(self) -> list[dict[str, Any]]:
         """Return renderer-side RATIONAL intrinsics perturbation candidates."""
         audit_conf = self.conf.camera_intrinsics_audit
-        candidates = [{"name": "baseline", "target": "", "index": -1, "scale": 0.0}]
+        candidates = [
+            {"name": "baseline", "target": "", "index": -1, "scale": 0.0}
+        ]
         candidate_specs = (
-            ("fx", "focal_length", 0, float(audit_conf.focal_delta_fraction), True),
-            ("fy", "focal_length", 1, float(audit_conf.focal_delta_fraction), True),
-            ("cx", "principal_point", 0, float(audit_conf.principal_delta_px), False),
-            ("cy", "principal_point", 1, float(audit_conf.principal_delta_px), False),
+            (
+                "fx",
+                "focal_length",
+                0,
+                float(audit_conf.focal_delta_fraction),
+                True,
+            ),
+            (
+                "fy",
+                "focal_length",
+                1,
+                float(audit_conf.focal_delta_fraction),
+                True,
+            ),
+            (
+                "cx",
+                "principal_point",
+                0,
+                float(audit_conf.principal_delta_px),
+                False,
+            ),
+            (
+                "cy",
+                "principal_point",
+                1,
+                float(audit_conf.principal_delta_px),
+                False,
+            ),
             ("skew", "skew", 0, float(audit_conf.skew_delta_px), False),
-            ("b1", "numerator_coeffs", 0, float(audit_conf.numerator_delta), False),
-            ("d1", "denominator_coeffs", 0, float(audit_conf.denominator_delta), False),
+            (
+                "b1",
+                "numerator_coeffs",
+                0,
+                float(audit_conf.numerator_delta),
+                False,
+            ),
+            (
+                "d1",
+                "denominator_coeffs",
+                0,
+                float(audit_conf.denominator_delta),
+                False,
+            ),
             ("a1", "affine_coeffs", 0, float(audit_conf.affine_delta), False),
-            ("p1", "tangential_coeffs", 0, float(audit_conf.tangential_delta), False),
-            ("p2", "tangential_coeffs", 1, float(audit_conf.tangential_delta), False),
+            (
+                "p1",
+                "tangential_coeffs",
+                0,
+                float(audit_conf.tangential_delta),
+                False,
+            ),
+            (
+                "p2",
+                "tangential_coeffs",
+                1,
+                float(audit_conf.tangential_delta),
+                False,
+            ),
         )
         for label, target, index, scale, relative in candidate_specs:
             for sign in (-1.0, 1.0):
@@ -1747,11 +2091,15 @@ class Trainer3DGRUT:
                 )
         return candidates
 
-    def _with_intrinsics_audit_delta(self, gpu_batch, candidate: dict[str, Any]):
+    def _with_intrinsics_audit_delta(
+        self, gpu_batch, candidate: dict[str, Any]
+    ):
         """Return a batch with one renderer-side RATIONAL intrinsic delta."""
         params = gpu_batch.intrinsics_RationalCameraModelParameters
         if params is None:
-            raise RuntimeError("camera_intrinsics_audit requires RATIONAL cameras.")
+            raise RuntimeError(
+                "camera_intrinsics_audit requires RATIONAL cameras."
+            )
         if candidate["name"] == "baseline":
             return gpu_batch
 
@@ -1768,13 +2116,17 @@ class Trainer3DGRUT:
         if target == "skew":
             updated_params[target] = float(updated_params[target]) + scale
         else:
-            values = np.asarray(updated_params[target], dtype=np.float32).copy()
+            values = np.asarray(
+                updated_params[target], dtype=np.float32
+            ).copy()
             delta = scale
             if bool(candidate.get("relative", False)):
                 delta = float(values[index]) * scale
             values[index] = values[index] + delta
             updated_params[target] = values
-        return replace(gpu_batch, intrinsics_RationalCameraModelParameters=updated_params)
+        return replace(
+            gpu_batch, intrinsics_RationalCameraModelParameters=updated_params
+        )
 
     @torch.no_grad()
     def _camera_intrinsics_candidate_metrics(
@@ -1787,10 +2139,14 @@ class Trainer3DGRUT:
         """Evaluate one intrinsics candidate on one camera head."""
         metrics = []
         for batch_idx in self.val_dataloader:
-            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
+            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
+                batch_idx
+            )
             if int(gpu_batch.camera_idx) != camera_idx:
                 continue
-            audited_batch = self._with_intrinsics_audit_delta(gpu_batch, candidate)
+            audited_batch = self._with_intrinsics_audit_delta(
+                gpu_batch, candidate
+            )
             outputs = self.model(audited_batch, train=False)
             if self.post_processing is not None:
                 outputs = apply_post_processing(
@@ -1805,7 +2161,9 @@ class Trainer3DGRUT:
             if audited_batch.mask is not None:
                 mask = audited_batch.mask
                 rgb_error = rgb_error * mask
-                denominator = torch.clamp_min(mask.sum() * rgb_gt.shape[-1], 1.0)
+                denominator = torch.clamp_min(
+                    mask.sum() * rgb_gt.shape[-1], 1.0
+                )
             else:
                 denominator = torch.tensor(
                     rgb_gt.numel(),
@@ -1820,18 +2178,26 @@ class Trainer3DGRUT:
             )
             metrics.append(
                 {
-                    "masked_psnr": (-10.0 * torch.log10(torch.clamp_min(mse, 1e-12))).item(),
+                    "masked_psnr": (
+                        -10.0 * torch.log10(torch.clamp_min(mse, 1e-12))
+                    ).item(),
                     "gradient_l1": diagnostics["gradient_l1"],
                     "high_ratio": diagnostics["fft_energy_ratio_high"],
                     "rim_rgb_l1": diagnostics["radial_rim_rgb_l1"],
-                    "rim_edge_ratio": diagnostics["radial_rim_edge_energy_ratio"],
-                    "center_edge_ratio": diagnostics["radial_center_edge_energy_ratio"],
+                    "rim_edge_ratio": diagnostics[
+                        "radial_rim_edge_energy_ratio"
+                    ],
+                    "center_edge_ratio": diagnostics[
+                        "radial_center_edge_energy_ratio"
+                    ],
                 }
             )
             if len(metrics) >= max_views:
                 break
         if not metrics:
-            raise RuntimeError(f"No validation views found for camera {camera_idx}.")
+            raise RuntimeError(
+                f"No validation views found for camera {camera_idx}."
+            )
         return {
             "camera_idx": camera_idx,
             "candidate": str(candidate["name"]),
@@ -1840,8 +2206,12 @@ class Trainer3DGRUT:
             "gradient_l1": float(np.mean([m["gradient_l1"] for m in metrics])),
             "high_ratio": float(np.mean([m["high_ratio"] for m in metrics])),
             "rim_rgb_l1": float(np.mean([m["rim_rgb_l1"] for m in metrics])),
-            "rim_edge_ratio": float(np.mean([m["rim_edge_ratio"] for m in metrics])),
-            "center_edge_ratio": float(np.mean([m["center_edge_ratio"] for m in metrics])),
+            "rim_edge_ratio": float(
+                np.mean([m["rim_edge_ratio"] for m in metrics])
+            ),
+            "center_edge_ratio": float(
+                np.mean([m["center_edge_ratio"] for m in metrics])
+            ),
         }
 
     @torch.no_grad()
@@ -1850,7 +2220,9 @@ class Trainer3DGRUT:
         audit_conf = self.conf.camera_intrinsics_audit
         max_views = int(audit_conf.max_views_per_camera)
         if max_views <= 0:
-            raise ValueError("camera_intrinsics_audit.max_views_per_camera must be positive.")
+            raise ValueError(
+                "camera_intrinsics_audit.max_views_per_camera must be positive."
+            )
         camera_indices = [int(idx) for idx in audit_conf.camera_indices]
         rows = []
         for camera_idx in camera_indices:
@@ -1871,13 +2243,22 @@ class Trainer3DGRUT:
         }
         for row in rows:
             baseline = baselines[int(row["camera_idx"])]
-            row["delta_masked_psnr"] = float(row["masked_psnr"]) - float(baseline["masked_psnr"])
-            row["delta_rim_edge_ratio"] = float(row["rim_edge_ratio"]) - float(baseline["rim_edge_ratio"])
-            row["delta_rim_rgb_l1"] = float(row["rim_rgb_l1"]) - float(baseline["rim_rgb_l1"])
+            row["delta_masked_psnr"] = float(row["masked_psnr"]) - float(
+                baseline["masked_psnr"]
+            )
+            row["delta_rim_edge_ratio"] = float(row["rim_edge_ratio"]) - float(
+                baseline["rim_edge_ratio"]
+            )
+            row["delta_rim_rgb_l1"] = float(row["rim_rgb_l1"]) - float(
+                baseline["rim_rgb_l1"]
+            )
 
         ranked_rows = sorted(
             rows,
-            key=lambda row: (int(row["camera_idx"]), -float(row["delta_masked_psnr"])),
+            key=lambda row: (
+                int(row["camera_idx"]),
+                -float(row["delta_masked_psnr"]),
+            ),
         )
         report = {
             "note": (
@@ -1894,7 +2275,9 @@ class Trainer3DGRUT:
         )
         with open(output_path, "w", encoding="utf-8") as fp:
             json.dump(report, fp, indent=2)
-        logger.info(f"Camera intrinsics finite-difference audit JSON: {output_path}")
+        logger.info(
+            f"Camera intrinsics finite-difference audit JSON: {output_path}"
+        )
         for camera_idx in camera_indices:
             best = next(
                 row
@@ -1909,7 +2292,9 @@ class Trainer3DGRUT:
                     "masked_psnr": float(best["masked_psnr"]),
                     "delta_masked_psnr": float(best["delta_masked_psnr"]),
                     "rim_edge_ratio": float(best["rim_edge_ratio"]),
-                    "delta_rim_edge_ratio": float(best["delta_rim_edge_ratio"]),
+                    "delta_rim_edge_ratio": float(
+                        best["delta_rim_edge_ratio"]
+                    ),
                     "rim_rgb_l1": float(best["rim_rgb_l1"]),
                     "delta_rim_rgb_l1": float(best["delta_rim_rgb_l1"]),
                 },
@@ -1977,17 +2362,20 @@ class Trainer3DGRUT:
         losses: dict[str, torch.Tensor],
         profilers: dict[str, CudaTimer],
         split: str = "training",
-        iteration: Optional[int] = None,
-    ) -> dict[str, Union[int, float]]:
+        iteration: int | None = None,
+    ) -> dict[str, int | float]:
         """Computes dictionary of single batch metrics based on current batch output.
+
         Args:
             gpu_batch: GT data of current batch
             output: model prediction for current batch
             losses: dictionary of loss terms computed for current batch
             split: name of split metrics are computed for - 'training' or 'validation'
             iteration: optional, local iteration number within the current pass, e.g 0 <= iter < len(dataset).
+
         Returns:
             Dictionary of metrics
+
         """
         metrics = dict()
         step = self.global_step
@@ -2002,7 +2390,9 @@ class Trainer3DGRUT:
         # Move losses to cpu once
         metrics["losses"] = {k: v.detach().item() for k, v in losses.items()}
 
-        is_compute_train_hit_metrics = (split == "training") and (step % self.conf.writer.hit_stat_frequency == 0)
+        is_compute_train_hit_metrics = (split == "training") and (
+            step % self.conf.writer.hit_stat_frequency == 0
+        )
         is_compute_validation_metrics = split == "validation"
 
         if is_compute_train_hit_metrics or is_compute_validation_metrics:
@@ -2010,20 +2400,39 @@ class Trainer3DGRUT:
             metrics["hits_std"] = outputs["hits_count"].std().item()
             metrics["hits_min"] = outputs["hits_count"].min().item()
             metrics["hits_max"] = outputs["hits_count"].max().item()
+            stats_mask = gpu_batch.mask if gpu_batch.mask is not None else None
+            metrics.update(
+                _scalar_tensor_stats(
+                    outputs["pred_opacity"],
+                    "pred_opacity",
+                    stats_mask,
+                )
+            )
+            metrics.update(
+                _scalar_tensor_stats(
+                    outputs["pred_dist"],
+                    "pred_dist",
+                    stats_mask,
+                )
+            )
             hit_mask = (outputs["hits_count"] > 0).float()
             opacity_mask = (outputs["pred_opacity"] > 0.01).float()
             if gpu_batch.mask is not None:
                 valid = gpu_batch.mask
                 valid_denominator = torch.clamp_min(valid.sum(), 1.0)
-                metrics["valid_hit_coverage"] = ((hit_mask * valid).sum() / valid_denominator).item()
-                metrics["valid_opacity_coverage"] = ((opacity_mask * valid).sum() / valid_denominator).item()
+                metrics["valid_hit_coverage"] = (
+                    (hit_mask * valid).sum() / valid_denominator
+                ).item()
+                metrics["valid_opacity_coverage"] = (
+                    (opacity_mask * valid).sum() / valid_denominator
+                ).item()
             else:
                 metrics["valid_hit_coverage"] = hit_mask.mean().item()
                 metrics["valid_opacity_coverage"] = opacity_mask.mean().item()
 
         if is_compute_validation_metrics:
             metrics["camera_idx"] = int(gpu_batch.camera_idx)
-            with torch.cuda.nvtx.range(f"criterions_psnr"):
+            with torch.cuda.nvtx.range("criterions_psnr"):
                 metrics["psnr"] = psnr(rgb_pred, rgb_gt).item()
                 if gpu_batch.mask is not None:
                     mask = gpu_batch.mask
@@ -2042,10 +2451,12 @@ class Trainer3DGRUT:
             pred_rgb_full = rgb_pred.permute(0, 3, 1, 2)
             pred_rgb_full_clipped = rgb_pred.clip(0, 1).permute(0, 3, 1, 2)
 
-            with torch.cuda.nvtx.range(f"criterions_ssim"):
+            with torch.cuda.nvtx.range("criterions_ssim"):
                 metrics["ssim"] = ssim(pred_rgb_full, rgb_gt_full).item()
-            with torch.cuda.nvtx.range(f"criterions_lpips"):
-                metrics["lpips"] = lpips(pred_rgb_full_clipped, rgb_gt_full).item()
+            with torch.cuda.nvtx.range("criterions_lpips"):
+                metrics["lpips"] = lpips(
+                    pred_rgb_full_clipped, rgb_gt_full
+                ).item()
 
             foundation_feature_error_map = None
             feature_conf = self.conf.get("foundation_features", {})
@@ -2080,14 +2491,49 @@ class Trainer3DGRUT:
                 _screen_space_footprint_metrics(
                     model=self.model,
                     gpu_batch=gpu_batch,
-                    max_samples=int(self.conf.writer.get("footprint_sample_count", 200000)),
+                    max_samples=int(
+                        self.conf.writer.get("footprint_sample_count", 200000)
+                    ),
                 )
             )
 
             if is_logged_view:
-                mask = gpu_batch.mask[-1] if gpu_batch.mask is not None else None
-                sky_mask = gpu_batch.sky_mask[-1] if gpu_batch.sky_mask is not None else None
+                mask = (
+                    gpu_batch.mask[-1] if gpu_batch.mask is not None else None
+                )
+                sky_mask = (
+                    gpu_batch.sky_mask[-1]
+                    if gpu_batch.sky_mask is not None
+                    else None
+                )
                 metrics["eval_image_path"] = gpu_batch.image_path
+                gt_depth_for_tile = None
+                dense_depth_dir = (
+                    self.conf.loss.get("dense_depth_dir", "")
+                    if hasattr(self.conf.loss, "get")
+                    else getattr(self.conf.loss, "dense_depth_dir", "")
+                )
+                if dense_depth_dir:
+                    image_path = getattr(gpu_batch, "image_path", "")
+                    stem = (
+                        os.path.splitext(os.path.basename(image_path))[0]
+                        if image_path
+                        else ""
+                    )
+                    cache = getattr(self, "_dense_depth_cache", None)
+                    if cache is None:
+                        cache = {}
+                        self._dense_depth_cache = cache
+                    if stem and stem in cache:
+                        gt_depth_for_tile = cache[stem]
+                    elif stem:
+                        npy_path = os.path.join(dense_depth_dir, f"{stem}.npy")
+                        if os.path.exists(npy_path):
+                            gt_arr = np.load(npy_path).astype("float32")
+                            gt_depth_for_tile = torch.from_numpy(gt_arr).to(
+                                self.device
+                            )
+                            cache[stem] = gt_depth_for_tile
                 metrics["img_eval_tiles"] = _make_validation_image_tiles(
                     rgb_gt=gpu_batch.rgb_gt[-1],
                     rgb_pred=outputs["pred_rgb"][-1],
@@ -2097,10 +2543,10 @@ class Trainer3DGRUT:
                     mask=mask,
                     sky_mask=sky_mask,
                     max_hit_count=self.conf.writer.max_num_hits,
+                    gt_depth=gt_depth_for_tile,
                 )
-                if (
-                    foundation_feature_error_map is not None
-                    and bool(feature_conf.get("log_error_tile", True))
+                if foundation_feature_error_map is not None and bool(
+                    feature_conf.get("log_error_tile", True)
                 ):
                     error_map = foundation_feature_error_map[-1]
                     metrics["img_eval_tiles"]["foundation_feature_error"] = (
@@ -2119,14 +2565,18 @@ class Trainer3DGRUT:
 
     @torch.cuda.nvtx.range("get_losses")
     def get_losses(
-        self, gpu_batch: dict[str, torch.Tensor], outputs: dict[str, torch.Tensor]
+        self,
+        gpu_batch: dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor],
     ) -> dict[str, torch.Tensor]:
         """Computes dictionary of losses for current batch.
+
         Args:
             gpu_batch: GT data of current batch
             outputs: model prediction for current batch
         Returns:
             losses: dictionary of loss terms computed for current batch.
+
         """
         rgb_gt = gpu_batch.rgb_gt
         rgb_pred = outputs["pred_rgb"]
@@ -2148,7 +2598,7 @@ class Trainer3DGRUT:
         loss_l1 = torch.zeros(1, device=self.device)
         lambda_l1 = 0.0
         if self.conf.loss.use_l1:
-            with torch.cuda.nvtx.range(f"loss-l1"):
+            with torch.cuda.nvtx.range("loss-l1"):
                 loss_l1 = torch.abs(rgb_pred - rgb_gt).sum() / loss_denominator
                 lambda_l1 = self.conf.loss.lambda_l1
 
@@ -2156,7 +2606,7 @@ class Trainer3DGRUT:
         loss_l2 = torch.zeros(1, device=self.device)
         lambda_l2 = 0.0
         if self.conf.loss.use_l2:
-            with torch.cuda.nvtx.range(f"loss-l2"):
+            with torch.cuda.nvtx.range("loss-l2"):
                 squared_error = torch.square(rgb_pred - rgb_gt)
                 loss_l2 = squared_error.sum() / loss_denominator
                 lambda_l2 = self.conf.loss.lambda_l2
@@ -2165,7 +2615,7 @@ class Trainer3DGRUT:
         loss_ssim = torch.zeros(1, device=self.device)
         lambda_ssim = 0.0
         if self.conf.loss.use_ssim:
-            with torch.cuda.nvtx.range(f"loss-ssim"):
+            with torch.cuda.nvtx.range("loss-ssim"):
                 rgb_gt_full = torch.permute(rgb_gt, (0, 3, 1, 2))
                 pred_rgb_full = torch.permute(rgb_pred, (0, 3, 1, 2))
                 loss_ssim = 1.0 - ssim(pred_rgb_full, rgb_gt_full)
@@ -2180,7 +2630,7 @@ class Trainer3DGRUT:
                     "foundation_features.enabled=true."
                 )
                 raise RuntimeError(msg)
-            with torch.cuda.nvtx.range(f"loss-foundation-feature"):
+            with torch.cuda.nvtx.range("loss-foundation-feature"):
                 feature_metrics = self.foundation_feature_probe.compare(
                     rgb_pred=rgb_pred.clip(0, 1),
                     rgb_gt=rgb_gt.clip(0, 1),
@@ -2202,7 +2652,7 @@ class Trainer3DGRUT:
         loss_opacity = torch.zeros(1, device=self.device)
         lambda_opacity = 0.0
         if self.conf.loss.use_opacity:
-            with torch.cuda.nvtx.range(f"loss-opacity"):
+            with torch.cuda.nvtx.range("loss-opacity"):
                 loss_opacity = torch.abs(self.model.get_density()).mean()
                 lambda_opacity = self.conf.loss.lambda_opacity
 
@@ -2210,7 +2660,7 @@ class Trainer3DGRUT:
         loss_scale = torch.zeros(1, device=self.device)
         lambda_scale = 0.0
         if self.conf.loss.use_scale:
-            with torch.cuda.nvtx.range(f"loss-scale"):
+            with torch.cuda.nvtx.range("loss-scale"):
                 loss_scale = torch.abs(self.model.get_scale()).mean()
                 lambda_scale = self.conf.loss.lambda_scale
 
@@ -2218,11 +2668,15 @@ class Trainer3DGRUT:
         lambda_sky_opacity = 0.0
         if self.conf.loss.use_sky_opacity:
             if gpu_batch.sky_mask is None:
-                raise RuntimeError("loss.use_sky_opacity requires dataset.sky_mask_folder.")
-            with torch.cuda.nvtx.range(f"loss-sky-opacity"):
+                raise RuntimeError(
+                    "loss.use_sky_opacity requires dataset.sky_mask_folder."
+                )
+            with torch.cuda.nvtx.range("loss-sky-opacity"):
                 sky_mask = gpu_batch.sky_mask
                 sky_denominator = torch.clamp(sky_mask.sum(), min=1.0)
-                loss_sky_opacity = (outputs["pred_opacity"] * sky_mask).sum() / sky_denominator
+                loss_sky_opacity = (
+                    outputs["pred_opacity"] * sky_mask
+                ).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
         # Dense depth supervision (Phase 3c: DA3 z-extended)
@@ -2234,7 +2688,7 @@ class Trainer3DGRUT:
                 raise RuntimeError(
                     "loss.use_dense_depth requires loss.dense_depth_dir."
                 )
-            with torch.cuda.nvtx.range(f"loss-dense-depth"):
+            with torch.cuda.nvtx.range("loss-dense-depth"):
                 image_path = getattr(gpu_batch, "image_path", "")
                 stem = (
                     os.path.splitext(os.path.basename(image_path))[0]
@@ -2258,6 +2712,26 @@ class Trainer3DGRUT:
                         pred_dist_2d = pred_dist[0, ..., 0]
                     else:
                         pred_dist_2d = pred_dist[0]
+                    # `pred_dist` is hit distance ALONG the ray; `gt_depth`
+                    # is z-depth (DA3 inferred at the pinhole proxy then
+                    # remapped to fisheye coords). For ~180° fisheyes those
+                    # differ by a per-pixel `cos(theta)` factor that ranges
+                    # from 1.0 at the optical axis to ~0.17 near the rim;
+                    # without this conversion the loss compares apples to
+                    # oranges and silently fights the cosine rather than
+                    # the geometry.
+                    rays_dir = getattr(gpu_batch, "rays_dir", None)
+                    if (
+                        rays_dir is not None
+                        and not getattr(
+                            gpu_batch, "rays_in_world_space", False
+                        )
+                        and rays_dir.dim() == 4
+                        and rays_dir.shape[-1] == 3
+                    ):
+                        cos_theta = rays_dir[0, ..., 2]
+                        if cos_theta.shape == pred_dist_2d.shape:
+                            pred_dist_2d = pred_dist_2d * cos_theta
                     if pred_dist_2d.shape != gt_depth.shape:
                         # Renderer sometimes pads/crops; align to GT shape.
                         h = min(pred_dist_2d.shape[0], gt_depth.shape[0])
@@ -2285,6 +2759,87 @@ class Trainer3DGRUT:
                     )
                 lambda_dense_depth = self.conf.loss.lambda_dense_depth
 
+        # Dense depth gradient supervision (Phase 3c-redesign)
+        loss_dense_depth_gradient = torch.zeros(1, device=self.device)
+        lambda_dense_depth_gradient = 0.0
+        if self.conf.loss.use_dense_depth_gradient:
+            dense_depth_dir = self.conf.loss.dense_depth_dir
+            if not dense_depth_dir:
+                raise RuntimeError(
+                    "loss.use_dense_depth_gradient requires loss.dense_depth_dir."
+                )
+            with torch.cuda.nvtx.range("loss-dense-depth-gradient"):
+                image_path = getattr(gpu_batch, "image_path", "")
+                stem = (
+                    os.path.splitext(os.path.basename(image_path))[0]
+                    if image_path
+                    else ""
+                )
+                cache = getattr(self, "_dense_depth_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._dense_depth_cache = cache
+                gt_depth = cache.get(stem) if stem else None
+                if gt_depth is None and stem:
+                    npy_path = os.path.join(dense_depth_dir, f"{stem}.npy")
+                    if os.path.exists(npy_path):
+                        gt_arr = np.load(npy_path).astype("float32")
+                        gt_depth = torch.from_numpy(gt_arr).to(self.device)
+                        cache[stem] = gt_depth
+                if gt_depth is not None:
+                    pred_dist = outputs["pred_dist"]
+                    if pred_dist.dim() == 4 and pred_dist.shape[-1] == 1:
+                        pred_dist_2d = pred_dist[0, ..., 0]
+                    else:
+                        pred_dist_2d = pred_dist[0]
+                    # `pred_dist` is hit distance ALONG the ray; `gt_depth`
+                    # is z-depth (DA3 inferred at the pinhole proxy then
+                    # remapped to fisheye coords). For ~180° fisheyes those
+                    # differ by a per-pixel `cos(theta)` factor that ranges
+                    # from 1.0 at the optical axis to ~0.17 near the rim;
+                    # without this conversion the loss compares apples to
+                    # oranges and silently fights the cosine rather than
+                    # the geometry.
+                    rays_dir = getattr(gpu_batch, "rays_dir", None)
+                    if (
+                        rays_dir is not None
+                        and not getattr(
+                            gpu_batch, "rays_in_world_space", False
+                        )
+                        and rays_dir.dim() == 4
+                        and rays_dir.shape[-1] == 3
+                    ):
+                        cos_theta = rays_dir[0, ..., 2]
+                        if cos_theta.shape == pred_dist_2d.shape:
+                            pred_dist_2d = pred_dist_2d * cos_theta
+                    if pred_dist_2d.shape != gt_depth.shape:
+                        h = min(pred_dist_2d.shape[0], gt_depth.shape[0])
+                        w = min(pred_dist_2d.shape[1], gt_depth.shape[1])
+                        pred_dist_2d = pred_dist_2d[:h, :w]
+                        gt_depth = gt_depth[:h, :w]
+                    valid_mask = gt_depth > 0.0
+                    if mask is not None:
+                        m = mask
+                        if m.dim() == 4:
+                            m = m[0]
+                        m = m.squeeze(-1) > 0.5
+                        if m.shape != valid_mask.shape:
+                            mh = min(m.shape[0], valid_mask.shape[0])
+                            mw = min(m.shape[1], valid_mask.shape[1])
+                            m = m[:mh, :mw]
+                            valid_mask = valid_mask[:mh, :mw]
+                            pred_dist_2d = pred_dist_2d[:mh, :mw]
+                            gt_depth = gt_depth[:mh, :mw]
+                        valid_mask = valid_mask & m
+                    loss_dense_depth_gradient = dense_depth_gradient_l1_loss(
+                        pred_dist_2d.unsqueeze(0),
+                        gt_depth.unsqueeze(0),
+                        valid_mask.unsqueeze(0),
+                    )
+                lambda_dense_depth_gradient = (
+                    self.conf.loss.lambda_dense_depth_gradient
+                )
+
         # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps)
         loss_equirect_consistency = torch.zeros(1, device=self.device)
         lambda_equirect_consistency = 0.0
@@ -2296,7 +2851,7 @@ class Trainer3DGRUT:
                     "loss.use_equirect_consistency requires "
                     "loss.equirect_warp_dir and loss.equirect_image_dir."
                 )
-            with torch.cuda.nvtx.range(f"loss-equirect-consistency"):
+            with torch.cuda.nvtx.range("loss-equirect-consistency"):
                 image_path = getattr(gpu_batch, "image_path", "")
                 stem = (
                     os.path.splitext(os.path.basename(image_path))[0]
@@ -2319,7 +2874,9 @@ class Trainer3DGRUT:
                         warp_np = payload["warp_AB"].astype("float32")
                         overlap_np = payload["overlap_AB"].astype("float32")
                         warp_t = torch.from_numpy(warp_np).to(self.device)
-                        overlap_t = torch.from_numpy(overlap_np).to(self.device)
+                        overlap_t = torch.from_numpy(overlap_np).to(
+                            self.device
+                        )
                         warp_cache[stem] = (warp_t, overlap_t)
                         warp_overlap = (warp_t, overlap_t)
                 # Frame index from stem (e.g. "front_0009" -> "0009").
@@ -2330,9 +2887,12 @@ class Trainer3DGRUT:
                         frame_key = parts[-1]
                         eq_image_t = eq_image_cache.get(frame_key)
                         if eq_image_t is None:
-                            eq_path = os.path.join(image_dir, f"{frame_key}.png")
+                            eq_path = os.path.join(
+                                image_dir, f"{frame_key}.png"
+                            )
                             if os.path.exists(eq_path):
                                 from PIL import Image
+
                                 arr = (
                                     np.asarray(
                                         Image.open(eq_path).convert("RGB")
@@ -2353,13 +2913,17 @@ class Trainer3DGRUT:
                         # Resize warp + overlap to render resolution if needed.
                         warp_b = warp_t.permute(2, 0, 1).unsqueeze(0)
                         warp_b = torch.nn.functional.interpolate(
-                            warp_b, size=(h_p, w_p), mode="bilinear",
+                            warp_b,
+                            size=(h_p, w_p),
+                            mode="bilinear",
                             align_corners=False,
                         )
                         warp_t = warp_b[0].permute(1, 2, 0).contiguous()
                         overlap_b = overlap_t.unsqueeze(0).unsqueeze(0)
                         overlap_b = torch.nn.functional.interpolate(
-                            overlap_b, size=(h_p, w_p), mode="bilinear",
+                            overlap_b,
+                            size=(h_p, w_p),
+                            mode="bilinear",
                             align_corners=False,
                         )
                         overlap_t = overlap_b[0, 0].contiguous()
@@ -2386,6 +2950,21 @@ class Trainer3DGRUT:
                 )
 
         # Total loss
+        camera_loss_weight = torch.ones(1, device=self.device)
+        if self.conf.loss.use_camera_loss_weights:
+            camera_idx = int(gpu_batch.camera_idx)
+            configured_weights = list(self.conf.loss.camera_loss_weights)
+            if camera_idx >= len(configured_weights):
+                msg = (
+                    "loss.camera_loss_weights must include one weight per "
+                    f"camera. Missing index {camera_idx}."
+                )
+                raise RuntimeError(msg)
+            camera_loss_weight = torch.tensor(
+                float(configured_weights[camera_idx]),
+                device=self.device,
+                dtype=rgb_pred.dtype,
+            )
         loss = (
             lambda_l1 * loss_l1
             + lambda_ssim * loss_ssim
@@ -2394,15 +2973,22 @@ class Trainer3DGRUT:
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
             + lambda_dense_depth * loss_dense_depth
+            + lambda_dense_depth_gradient * loss_dense_depth_gradient
             + lambda_equirect_consistency * loss_equirect_consistency
         )
+        loss = loss * camera_loss_weight
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
             l2_loss=lambda_l2 * loss_l2,
             ssim_loss=lambda_ssim * loss_ssim,
+            camera_loss_weight=camera_loss_weight,
             dense_depth_loss=lambda_dense_depth * loss_dense_depth,
             dense_depth_loss_raw=loss_dense_depth,
+            dense_depth_gradient_loss=(
+                lambda_dense_depth_gradient * loss_dense_depth_gradient
+            ),
+            dense_depth_gradient_loss_raw=loss_dense_depth_gradient,
             equirect_consistency_loss=(
                 lambda_equirect_consistency * loss_equirect_consistency
             ),
@@ -2423,19 +3009,21 @@ class Trainer3DGRUT:
         gpu_batch: dict[str, torch.Tensor],
         outputs: dict[str, torch.Tensor],
         batch_metrics: dict[str, Any],
-        iteration: Optional[int] = None,
+        iteration: int | None = None,
     ) -> None:
         """Log information after a single validation iteration.
+
         Args:
             gpu_batch: GT data of current batch
             outputs: model prediction for current batch
             batch_metrics: dictionary of metrics computed for current batch
             iteration: optional, local iteration number within the current pass, e.g 0 <= iter < len(dataset).
+
         """
         logger.log_progress(
             task_name="Validation",
             advance=1,
-            iteration=f"{str(iteration)}",
+            iteration=f"{iteration!s}",
             psnr=batch_metrics["psnr"],
             loss=batch_metrics["losses"]["total_loss"],
         )
@@ -2443,8 +3031,10 @@ class Trainer3DGRUT:
     @torch.cuda.nvtx.range("log_validation_pass")
     def log_validation_pass(self, metrics: dict[str, Any]) -> None:
         """Log information after a single validation pass.
+
         Args:
             metrics: dictionary of aggregated metrics for all batches in current pass.
+
         """
         writer = self.tracking.writer
         global_step = self.global_step
@@ -2466,14 +3056,17 @@ class Trainer3DGRUT:
                 "high_freq_error",
                 "edge_error",
                 "foundation_feature_error",
+                "depth_gt",
                 "predicted_depth",
                 "opacity",
                 "ray_hits",
-                "hit_coverage",
-                "opacity_coverage",
+                "hits_sparse",
+                "opacity_low",
             ]
             tile_groups = metrics["img_eval_tiles"]
-            grid_columns = [column for column in grid_columns if column in tile_groups]
+            grid_columns = [
+                column for column in grid_columns if column in tile_groups
+            ]
             image_paths = metrics["eval_image_path"]
             group_size = int(self.conf.writer.get("eval_image_group_size", 5))
             if group_size < 1:
@@ -2493,10 +3086,7 @@ class Trainer3DGRUT:
                     row_end=group_end,
                     output_path=grid_path,
                 )
-                caption = (
-                    "rows=image path, columns="
-                    f"{', '.join(grid_columns)}"
-                )
+                caption = f"rows=image path, columns={', '.join(grid_columns)}"
                 wandb.log(
                     {
                         f"eval/image_grid/group_{group_idx:03d}": wandb.Image(
@@ -2510,7 +3100,9 @@ class Trainer3DGRUT:
         if "timings" in metrics:
             for time_key in metrics["timings"]:
                 mean_timings[time_key] = np.mean(metrics["timings"][time_key])
-                writer.add_scalar(f"time/val/{time_key}", mean_timings[time_key], global_step)
+                writer.add_scalar(
+                    f"time/val/{time_key}", mean_timings[time_key], global_step
+                )
 
         writer.add_scalar(
             "geometry/num_gaussians",
@@ -2600,7 +3192,10 @@ class Trainer3DGRUT:
             ("fft_error_ratio_low", "diagnostics/frequency_error/ratio_low"),
             ("fft_error_ratio_mid", "diagnostics/frequency_error/ratio_mid"),
             ("fft_error_ratio_high", "diagnostics/frequency_error/ratio_high"),
-            ("fft_error_ratio_ultra", "diagnostics/frequency_error/ratio_ultra"),
+            (
+                "fft_error_ratio_ultra",
+                "diagnostics/frequency_error/ratio_ultra",
+            ),
         )
         for metric_name, wandb_name in frequency_error_names:
             writer.add_scalar(
@@ -2653,14 +3248,19 @@ class Trainer3DGRUT:
                 ("edge_top15_f1", "edge_f1_top15"),
                 ("radial_center_rgb_l1", "center_rgb_l1"),
                 ("radial_rim_rgb_l1", "rim_rgb_l1"),
-                ("radial_center_edge_energy_ratio", "center_edge_energy_ratio"),
+                (
+                    "radial_center_edge_energy_ratio",
+                    "center_edge_energy_ratio",
+                ),
                 ("radial_rim_edge_energy_ratio", "rim_edge_energy_ratio"),
             )
             for camera_idx in sorted(set(camera_indices.tolist())):
                 camera_mask = camera_indices == camera_idx
                 for source_name, metric_name in camera_metric_names:
                     if source_name in metrics:
-                        values = np.asarray(metrics[source_name], dtype=np.float32)
+                        values = np.asarray(
+                            metrics[source_name], dtype=np.float32
+                        )
                         writer.add_scalar(
                             f"diagnostics/camera/{camera_idx}/{metric_name}",
                             values[camera_mask].mean(),
@@ -2689,7 +3289,9 @@ class Trainer3DGRUT:
         geometry_metrics = _gaussian_geometry_metrics(self.model)
         for metric_name, wandb_name in geometry_metric_names:
             if metric_name in geometry_metrics:
-                writer.add_scalar(wandb_name, geometry_metrics[metric_name], global_step)
+                writer.add_scalar(
+                    wandb_name, geometry_metrics[metric_name], global_step
+                )
         if self.camera_residual is not None:
             for metric_name, value in self.camera_residual.stats().items():
                 writer.add_scalar(
@@ -2724,9 +3326,40 @@ class Trainer3DGRUT:
                 np.mean(metrics["valid_opacity_coverage"]),
                 global_step,
             )
+        render_stat_metric_names = (
+            ("pred_opacity_finite_fraction", "diagnostics/render/opacity/finite_fraction"),
+            ("pred_opacity_nonzero_fraction", "diagnostics/render/opacity/nonzero_fraction"),
+            ("pred_opacity_min", "diagnostics/render/opacity/min"),
+            ("pred_opacity_mean", "diagnostics/render/opacity/mean"),
+            ("pred_opacity_p50", "diagnostics/render/opacity/p50"),
+            ("pred_opacity_p95", "diagnostics/render/opacity/p95"),
+            ("pred_opacity_p99", "diagnostics/render/opacity/p99"),
+            ("pred_opacity_max", "diagnostics/render/opacity/max"),
+            ("pred_dist_finite_fraction", "diagnostics/render/depth/finite_fraction"),
+            ("pred_dist_nonzero_fraction", "diagnostics/render/depth/nonzero_fraction"),
+            ("pred_dist_min", "diagnostics/render/depth/min"),
+            ("pred_dist_mean", "diagnostics/render/depth/mean"),
+            ("pred_dist_p50", "diagnostics/render/depth/p50"),
+            ("pred_dist_p95", "diagnostics/render/depth/p95"),
+            ("pred_dist_p99", "diagnostics/render/depth/p99"),
+            ("pred_dist_max", "diagnostics/render/depth/max"),
+        )
+        for metric_name, writer_name in render_stat_metric_names:
+            if metric_name in metrics:
+                writer.add_scalar(
+                    writer_name,
+                    np.mean(metrics[metric_name]),
+                    global_step,
+                )
         footprint_metric_names = (
-            ("footprint_front_fraction", "diagnostics/footprint/front_fraction"),
-            ("footprint_radius_px_mean", "diagnostics/footprint/radius_px_mean"),
+            (
+                "footprint_front_fraction",
+                "diagnostics/footprint/front_fraction",
+            ),
+            (
+                "footprint_radius_px_mean",
+                "diagnostics/footprint/radius_px_mean",
+            ),
             ("footprint_radius_px_p50", "diagnostics/footprint/radius_px_p50"),
             ("footprint_radius_px_p95", "diagnostics/footprint/radius_px_p95"),
             ("footprint_radius_px_p99", "diagnostics/footprint/radius_px_p99"),
@@ -2742,7 +3375,9 @@ class Trainer3DGRUT:
         )
         for metric_name, wandb_name in footprint_metric_names:
             if metric_name in metrics:
-                writer.add_scalar(wandb_name, np.mean(metrics[metric_name]), global_step)
+                writer.add_scalar(
+                    wandb_name, np.mean(metrics[metric_name]), global_step
+                )
 
         loss = np.mean(metrics["losses"]["total_loss"])
         writer.add_scalar("val/loss/total", loss, global_step)
@@ -2755,6 +3390,46 @@ class Trainer3DGRUT:
         if self.conf.loss.use_ssim:
             ssim_loss = np.mean(metrics["losses"]["ssim_loss"])
             writer.add_scalar("val/loss/ssim", ssim_loss, global_step)
+        if self.conf.loss.use_dense_depth:
+            dense_depth_loss = np.mean(metrics["losses"]["dense_depth_loss"])
+            dense_depth_loss_raw = np.mean(
+                metrics["losses"]["dense_depth_loss_raw"]
+            )
+            writer.add_scalar(
+                "val/loss/dense_depth", dense_depth_loss, global_step
+            )
+            writer.add_scalar(
+                "val/loss/dense_depth_raw",
+                dense_depth_loss_raw,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/lambda/dense_depth",
+                self.conf.loss.lambda_dense_depth,
+                global_step,
+            )
+        if self.conf.loss.use_dense_depth_gradient:
+            dense_depth_gradient_loss = np.mean(
+                metrics["losses"]["dense_depth_gradient_loss"]
+            )
+            dense_depth_gradient_loss_raw = np.mean(
+                metrics["losses"]["dense_depth_gradient_loss_raw"]
+            )
+            writer.add_scalar(
+                "val/loss/dense_depth_gradient",
+                dense_depth_gradient_loss,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/dense_depth_gradient_raw",
+                dense_depth_gradient_loss_raw,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/lambda/dense_depth_gradient",
+                self.conf.loss.lambda_dense_depth_gradient,
+                global_step,
+            )
         if self.conf.loss.use_foundation_feature:
             foundation_feature_loss = np.mean(
                 metrics["losses"]["foundation_feature_loss"]
@@ -2774,9 +3449,15 @@ class Trainer3DGRUT:
             )
         if self.conf.loss.use_sky_opacity:
             sky_opacity_loss = np.mean(metrics["losses"]["sky_opacity_loss"])
-            sky_opacity_loss_raw = np.mean(metrics["losses"]["sky_opacity_loss_raw"])
-            writer.add_scalar("val/loss/sky_opacity", sky_opacity_loss, global_step)
-            writer.add_scalar("val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step)
+            sky_opacity_loss_raw = np.mean(
+                metrics["losses"]["sky_opacity_loss_raw"]
+            )
+            writer.add_scalar(
+                "val/loss/sky_opacity", sky_opacity_loss, global_step
+            )
+            writer.add_scalar(
+                "val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step
+            )
 
         table = {
             k: np.mean(v)
@@ -2823,7 +3504,7 @@ class Trainer3DGRUT:
             )
         }
         for time_key in mean_timings:
-            table[time_key] = f"{'{:.2f}'.format(mean_timings[time_key])}" + " ms/it"
+            table[time_key] = f"{f'{mean_timings[time_key]:.2f}'}" + " ms/it"
         summary_path = os.path.join(
             self.tracking.output_dir,
             f"validation_metrics_step_{global_step:06d}.json",
@@ -2839,27 +3520,35 @@ class Trainer3DGRUT:
                 validation_summary[key] = float(value)
         with open(summary_path, "w", encoding="utf-8") as file:
             json.dump(validation_summary, file, indent=2, sort_keys=True)
-        logger.log_table(f"📊 Validation Metrics - Step {global_step}", record=table)
+        logger.log_table(
+            f"📊 Validation Metrics - Step {global_step}", record=table
+        )
 
-    @torch.cuda.nvtx.range(f"log_training_iter")
+    @torch.cuda.nvtx.range("log_training_iter")
     def log_training_iter(
         self,
         gpu_batch: dict[str, torch.Tensor],
         outputs: dict[str, torch.Tensor],
         batch_metrics: dict[str, Any],
-        iteration: Optional[int] = None,
+        iteration: int | None = None,
     ) -> None:
         """Log information after a single training iteration.
+
         Args:
             gpu_batch: GT data of current batch
             outputs: model prediction for current batch
             batch_metrics: dictionary of metrics computed for current batch
             iteration: optional, local iteration number within the current pass, e.g 0 <= iter < len(dataset).
+
         """
         writer = self.tracking.writer
         global_step = self.global_step
 
-        if self.conf.enable_writer and global_step > 0 and global_step % self.conf.log_frequency == 0:
+        if (
+            self.conf.enable_writer
+            and global_step > 0
+            and global_step % self.conf.log_frequency == 0
+        ):
             loss = np.mean(batch_metrics["losses"]["total_loss"])
             writer.add_scalar("train/loss/total", loss, global_step)
             if self.conf.loss.use_l1:
@@ -2871,6 +3560,59 @@ class Trainer3DGRUT:
             if self.conf.loss.use_ssim:
                 ssim_loss = np.mean(batch_metrics["losses"]["ssim_loss"])
                 writer.add_scalar("train/loss/ssim", ssim_loss, global_step)
+            if self.conf.loss.use_dense_depth:
+                dense_depth_loss = np.mean(
+                    batch_metrics["losses"]["dense_depth_loss"]
+                )
+                dense_depth_loss_raw = np.mean(
+                    batch_metrics["losses"]["dense_depth_loss_raw"]
+                )
+                writer.add_scalar(
+                    "train/loss/dense_depth",
+                    dense_depth_loss,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/dense_depth_raw",
+                    dense_depth_loss_raw,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/lambda/dense_depth",
+                    self.conf.loss.lambda_dense_depth,
+                    global_step,
+                )
+            if self.conf.loss.use_dense_depth_gradient:
+                dense_depth_gradient_loss = np.mean(
+                    batch_metrics["losses"]["dense_depth_gradient_loss"]
+                )
+                dense_depth_gradient_loss_raw = np.mean(
+                    batch_metrics["losses"]["dense_depth_gradient_loss_raw"]
+                )
+                writer.add_scalar(
+                    "train/loss/dense_depth_gradient",
+                    dense_depth_gradient_loss,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/dense_depth_gradient_raw",
+                    dense_depth_gradient_loss_raw,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/lambda/dense_depth_gradient",
+                    self.conf.loss.lambda_dense_depth_gradient,
+                    global_step,
+                )
+            if self.conf.loss.use_camera_loss_weights:
+                camera_loss_weight = np.mean(
+                    batch_metrics["losses"]["camera_loss_weight"]
+                )
+                writer.add_scalar(
+                    "train/loss/camera_weight",
+                    camera_loss_weight,
+                    global_step,
+                )
             if self.conf.loss.use_foundation_feature:
                 foundation_feature_loss = np.mean(
                     batch_metrics["losses"]["foundation_feature_loss"]
@@ -2890,24 +3632,46 @@ class Trainer3DGRUT:
                 )
             if self.conf.loss.use_opacity:
                 opacity_loss = np.mean(batch_metrics["losses"]["opacity_loss"])
-                writer.add_scalar("train/loss/opacity", opacity_loss, global_step)
+                writer.add_scalar(
+                    "train/loss/opacity", opacity_loss, global_step
+                )
             if self.conf.loss.use_scale:
                 scale_loss = np.mean(batch_metrics["losses"]["scale_loss"])
                 writer.add_scalar("train/loss/scale", scale_loss, global_step)
             if self.conf.loss.use_sky_opacity:
-                sky_opacity_loss = np.mean(batch_metrics["losses"]["sky_opacity_loss"])
-                sky_opacity_loss_raw = np.mean(batch_metrics["losses"]["sky_opacity_loss_raw"])
-                writer.add_scalar("train/loss/sky_opacity", sky_opacity_loss, global_step)
-                writer.add_scalar("train/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step)
-            if self.post_processing is not None and "post_processing_reg_loss" in batch_metrics["losses"]:
-                post_processing_reg_loss = np.mean(batch_metrics["losses"]["post_processing_reg_loss"])
+                sky_opacity_loss = np.mean(
+                    batch_metrics["losses"]["sky_opacity_loss"]
+                )
+                sky_opacity_loss_raw = np.mean(
+                    batch_metrics["losses"]["sky_opacity_loss_raw"]
+                )
+                writer.add_scalar(
+                    "train/loss/sky_opacity", sky_opacity_loss, global_step
+                )
+                writer.add_scalar(
+                    "train/loss/sky_opacity_raw",
+                    sky_opacity_loss_raw,
+                    global_step,
+                )
+            if (
+                self.post_processing is not None
+                and "post_processing_reg_loss" in batch_metrics["losses"]
+            ):
+                post_processing_reg_loss = np.mean(
+                    batch_metrics["losses"]["post_processing_reg_loss"]
+                )
                 writer.add_scalar(
                     "train/loss/post_processing_reg",
                     post_processing_reg_loss,
                     global_step,
                 )
-            if self.camera_residual is not None and "camera_residual_reg_loss" in batch_metrics["losses"]:
-                camera_residual_reg_loss = np.mean(batch_metrics["losses"]["camera_residual_reg_loss"])
+            if (
+                self.camera_residual is not None
+                and "camera_residual_reg_loss" in batch_metrics["losses"]
+            ):
+                camera_residual_reg_loss = np.mean(
+                    batch_metrics["losses"]["camera_residual_reg_loss"]
+                )
                 writer.add_scalar(
                     "train/loss/camera_residual_reg",
                     camera_residual_reg_loss,
@@ -2920,19 +3684,41 @@ class Trainer3DGRUT:
                         global_step,
                     )
             if "psnr" in batch_metrics:
-                writer.add_scalar("train/psnr", batch_metrics["psnr"], self.global_step)
+                writer.add_scalar(
+                    "train/psnr", batch_metrics["psnr"], self.global_step
+                )
             if "ssim" in batch_metrics:
-                writer.add_scalar("train/ssim", batch_metrics["ssim"], self.global_step)
+                writer.add_scalar(
+                    "train/ssim", batch_metrics["ssim"], self.global_step
+                )
             if "lpips" in batch_metrics:
-                writer.add_scalar("train/lpips", batch_metrics["lpips"], self.global_step)
+                writer.add_scalar(
+                    "train/lpips", batch_metrics["lpips"], self.global_step
+                )
             if "hits_mean" in batch_metrics:
-                writer.add_scalar("train/hits/mean", batch_metrics["hits_mean"], self.global_step)
+                writer.add_scalar(
+                    "train/hits/mean",
+                    batch_metrics["hits_mean"],
+                    self.global_step,
+                )
             if "hits_std" in batch_metrics:
-                writer.add_scalar("train/hits/std", batch_metrics["hits_std"], self.global_step)
+                writer.add_scalar(
+                    "train/hits/std",
+                    batch_metrics["hits_std"],
+                    self.global_step,
+                )
             if "hits_min" in batch_metrics:
-                writer.add_scalar("train/hits/min", batch_metrics["hits_min"], self.global_step)
+                writer.add_scalar(
+                    "train/hits/min",
+                    batch_metrics["hits_min"],
+                    self.global_step,
+                )
             if "hits_max" in batch_metrics:
-                writer.add_scalar("train/hits/max", batch_metrics["hits_max"], self.global_step)
+                writer.add_scalar(
+                    "train/hits/max",
+                    batch_metrics["hits_max"],
+                    self.global_step,
+                )
             if "valid_hit_coverage" in batch_metrics:
                 writer.add_scalar(
                     "diagnostics/coverage/train_valid_hit_fraction",
@@ -2945,6 +3731,37 @@ class Trainer3DGRUT:
                     batch_metrics["valid_opacity_coverage"],
                     self.global_step,
                 )
+            render_stat_metric_names = (
+                (
+                    "pred_opacity_finite_fraction",
+                    "train/render/opacity/finite_fraction",
+                ),
+                (
+                    "pred_opacity_nonzero_fraction",
+                    "train/render/opacity/nonzero_fraction",
+                ),
+                ("pred_opacity_min", "train/render/opacity/min"),
+                ("pred_opacity_mean", "train/render/opacity/mean"),
+                ("pred_opacity_p50", "train/render/opacity/p50"),
+                ("pred_opacity_p95", "train/render/opacity/p95"),
+                ("pred_opacity_p99", "train/render/opacity/p99"),
+                ("pred_opacity_max", "train/render/opacity/max"),
+                ("pred_dist_finite_fraction", "train/render/depth/finite_fraction"),
+                ("pred_dist_nonzero_fraction", "train/render/depth/nonzero_fraction"),
+                ("pred_dist_min", "train/render/depth/min"),
+                ("pred_dist_mean", "train/render/depth/mean"),
+                ("pred_dist_p50", "train/render/depth/p50"),
+                ("pred_dist_p95", "train/render/depth/p95"),
+                ("pred_dist_p99", "train/render/depth/p99"),
+                ("pred_dist_max", "train/render/depth/max"),
+            )
+            for metric_name, writer_name in render_stat_metric_names:
+                if metric_name in batch_metrics:
+                    writer.add_scalar(
+                        writer_name,
+                        batch_metrics[metric_name],
+                        self.global_step,
+                    )
 
             if "timings" in batch_metrics:
                 for time_key in batch_metrics["timings"]:
@@ -2954,12 +3771,24 @@ class Trainer3DGRUT:
                         self.global_step,
                     )
 
-            writer.add_scalar("train/iteration", self.global_step, self.global_step)
+            writer.add_scalar(
+                "train/iteration", self.global_step, self.global_step
+            )
             if hasattr(self, "_training_start_time"):
-                elapsed_seconds = time.perf_counter() - self._training_start_time
-                writer.add_scalar("time/train/elapsed_seconds", elapsed_seconds, self.global_step)
+                elapsed_seconds = (
+                    time.perf_counter() - self._training_start_time
+                )
+                writer.add_scalar(
+                    "time/train/elapsed_seconds",
+                    elapsed_seconds,
+                    self.global_step,
+                )
 
-            writer.add_scalar("geometry/num_gaussians", self.model.num_gaussians, self.global_step)
+            writer.add_scalar(
+                "geometry/num_gaussians",
+                self.model.num_gaussians,
+                self.global_step,
+            )
 
             # # NOTE: hack to easily compare with 3DGS
             # writer.add_scalar("train_loss_patches/total_loss", loss, global_step)
@@ -2968,19 +3797,20 @@ class Trainer3DGRUT:
         logger.log_progress(
             task_name="Training",
             advance=1,
-            step=f"{str(self.global_step)}",
+            step=f"{self.global_step!s}",
             loss=batch_metrics["losses"]["total_loss"],
         )
 
-    @torch.cuda.nvtx.range(f"log_training_pass")
+    @torch.cuda.nvtx.range("log_training_pass")
     def log_training_pass(self, metrics):
         """Log information after a single training pass.
+
         Args:
             metrics: dictionary of aggregated metrics for all batches in current pass.
-        """
-        pass
 
-    @torch.cuda.nvtx.range(f"on_training_end")
+        """
+
+    @torch.cuda.nvtx.range("on_training_end")
     def on_training_end(self):
         """Callback that prompts at the end of training."""
         conf = self.conf
@@ -2992,9 +3822,18 @@ class Trainer3DGRUT:
         if conf.export_ply.enabled:
             from threedgrut.export import PLYExporter
 
-            ply_path = conf.export_ply.path if conf.export_ply.path else os.path.join(out_dir, "export_last.ply")
+            ply_path = (
+                conf.export_ply.path
+                if conf.export_ply.path
+                else os.path.join(out_dir, "export_last.ply")
+            )
             exporter = PLYExporter()
-            exporter.export(self.model, Path(ply_path), dataset=self.train_dataset, conf=conf)
+            exporter.export(
+                self.model,
+                Path(ply_path),
+                dataset=self.train_dataset,
+                conf=conf,
+            )
 
         if conf.export_usd.enabled:
             from threedgrut.export import NuRecExporter, USDExporter
@@ -3015,7 +3854,9 @@ class Trainer3DGRUT:
                     usdz_path = os.path.join(out_dir, usdz_path)
             else:
                 # Default filename includes format suffix
-                usdz_path = os.path.join(out_dir, f"export_last_{format_suffix}.usdz")
+                usdz_path = os.path.join(
+                    out_dir, f"export_last_{format_suffix}.usdz"
+                )
 
             exporter.export(
                 self.model,
@@ -3026,7 +3867,10 @@ class Trainer3DGRUT:
             )
 
         # Export post-processing report (PPISP-based)
-        if self.post_processing is not None and conf.post_processing.method == "ppisp":
+        if (
+            self.post_processing is not None
+            and conf.post_processing.method == "ppisp"
+        ):
             from ppisp.report import export_ppisp_report
 
             logger.info("📊 Exporting PPISP report...")
@@ -3067,17 +3911,22 @@ class Trainer3DGRUT:
             )
             renderer.render_all()
 
-    @torch.cuda.nvtx.range(f"save_checkpoint")
+    @torch.cuda.nvtx.range("save_checkpoint")
     def save_checkpoint(self, last_checkpoint: bool = False):
         """Saves checkpoint to a path under {conf.out_dir}/{conf.experiment_name}.
+
         Args:
             last_checkpoint: If true, will update checkpoint title to 'last'.
                              Otherwise uses global step
+
         """
         global_step = self.global_step
         out_dir = self.tracking.output_dir
         parameters = self.model.get_model_parameters()
-        parameters |= {"global_step": self.global_step, "epoch": self.n_epochs - 1}
+        parameters |= {
+            "global_step": self.global_step,
+            "epoch": self.n_epochs - 1,
+        }
 
         strategy_parameters = self.strategy.get_strategy_parameters()
         parameters = {**parameters, **strategy_parameters}
@@ -3086,8 +3935,13 @@ class Trainer3DGRUT:
         if self.post_processing is not None:
             parameters["post_processing"] = {
                 "module": self.post_processing.state_dict(),
-                "optimizers": [opt.state_dict() for opt in self.post_processing_optimizers],
-                "schedulers": [sched.state_dict() for sched in self.post_processing_schedulers],
+                "optimizers": [
+                    opt.state_dict() for opt in self.post_processing_optimizers
+                ],
+                "schedulers": [
+                    sched.state_dict()
+                    for sched in self.post_processing_schedulers
+                ],
             }
         if self.camera_residual is not None:
             parameters["camera_residual"] = {
@@ -3095,9 +3949,13 @@ class Trainer3DGRUT:
                 "optimizer": self.camera_residual_optimizer.state_dict(),
             }
 
-        os.makedirs(os.path.join(out_dir, f"ours_{int(global_step)}"), exist_ok=True)
+        os.makedirs(
+            os.path.join(out_dir, f"ours_{int(global_step)}"), exist_ok=True
+        )
         if not last_checkpoint:
-            ckpt_path = os.path.join(out_dir, f"ours_{int(global_step)}", f"ckpt_{global_step}.pt")
+            ckpt_path = os.path.join(
+                out_dir, f"ours_{int(global_step)}", f"ckpt_{global_step}.pt"
+            )
         else:
             ckpt_path = os.path.join(out_dir, "ckpt_last.pt")
         torch.save(parameters, ckpt_path)
@@ -3135,7 +3993,33 @@ class Trainer3DGRUT:
                 while not gui.viz_do_train:
                     time.sleep(0.0001)
 
-    @torch.cuda.nvtx.range(f"run_train_iter")
+    def _log_gradient_diagnostics(self, global_step: int) -> None:
+        """Log whether supervision reaches the Gaussian parameters."""
+        if (
+            not self.conf.enable_writer
+            or global_step <= 0
+            or global_step % self.conf.log_frequency != 0
+        ):
+            return
+
+        writer = self.tracking.writer
+        parameters: tuple[tuple[str, torch.nn.Parameter], ...] = (
+            ("positions", self.model.positions),
+            ("rotation", self.model.rotation),
+            ("scale", self.model.scale),
+            ("density", self.model.density),
+            ("features_albedo", self.model.features_albedo),
+            ("features_specular", self.model.features_specular),
+        )
+        for parameter_name, parameter in parameters:
+            stats = _gradient_tensor_stats(
+                parameter,
+                f"train/grad/{parameter_name}",
+            )
+            for metric_name, value in stats.items():
+                writer.add_scalar(metric_name, value, global_step)
+
+    @torch.cuda.nvtx.range("run_train_iter")
     def run_train_iter(
         self,
         global_step: int,
@@ -3145,7 +4029,10 @@ class Trainer3DGRUT:
         conf: DictConfig,
     ):
         # Freeze Gaussians and suspend strategy when distillation starts
-        if self._distillation_start_step >= 0 and global_step >= self._distillation_start_step:
+        if (
+            self._distillation_start_step >= 0
+            and global_step >= self._distillation_start_step
+        ):
             self.model.freeze_gaussians()
             self.strategy.suspend()
 
@@ -3155,7 +4042,9 @@ class Trainer3DGRUT:
             gpu_batch = self._apply_camera_residual(gpu_batch)
 
         # Perform validation if required
-        is_time_to_validate = (global_step > 0 or conf.validate_first) and (global_step % self.val_frequency == 0)
+        is_time_to_validate = (global_step > 0 or conf.validate_first) and (
+            global_step % self.val_frequency == 0
+        )
         if is_time_to_validate:
             self.run_validation_pass(conf)
 
@@ -3168,20 +4057,34 @@ class Trainer3DGRUT:
         # Apply post-processing to rendered output
         if self.post_processing is not None:
             with torch.cuda.nvtx.range(f"train_{global_step}_post_processing"):
-                outputs = apply_post_processing(self.post_processing, outputs, gpu_batch, training=True)
+                outputs = apply_post_processing(
+                    self.post_processing, outputs, gpu_batch, training=True
+                )
 
         # Compute the losses of a single batch
         with torch.cuda.nvtx.range(f"train_{global_step}_loss"):
             batch_losses = self.get_losses(gpu_batch, outputs)
             # Add post-processing regularization loss
             if self.post_processing is not None:
-                post_processing_reg_loss = self.post_processing.get_regularization_loss()
-                batch_losses["total_loss"] = batch_losses["total_loss"] + post_processing_reg_loss
-                batch_losses["post_processing_reg_loss"] = post_processing_reg_loss
+                post_processing_reg_loss = (
+                    self.post_processing.get_regularization_loss()
+                )
+                batch_losses["total_loss"] = (
+                    batch_losses["total_loss"] + post_processing_reg_loss
+                )
+                batch_losses["post_processing_reg_loss"] = (
+                    post_processing_reg_loss
+                )
             if self.camera_residual is not None:
-                camera_residual_reg_loss = self.camera_residual.get_regularization_loss()
-                batch_losses["total_loss"] = batch_losses["total_loss"] + camera_residual_reg_loss
-                batch_losses["camera_residual_reg_loss"] = camera_residual_reg_loss
+                camera_residual_reg_loss = (
+                    self.camera_residual.get_regularization_loss()
+                )
+                batch_losses["total_loss"] = (
+                    batch_losses["total_loss"] + camera_residual_reg_loss
+                )
+                batch_losses["camera_residual_reg_loss"] = (
+                    camera_residual_reg_loss
+                )
 
         # Backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_pre_bwd"):
@@ -3198,6 +4101,7 @@ class Trainer3DGRUT:
             profilers["backward"].start()
             batch_losses["total_loss"].backward()
             profilers["backward"].end()
+        self._log_gradient_diagnostics(global_step)
         self._validate_camera_residual_gradient(global_step)
 
         # Post backward strategy step
@@ -3216,7 +4120,9 @@ class Trainer3DGRUT:
             if isinstance(self.model.optimizer, SelectiveAdam):
                 assert (
                     outputs["mog_visibility"].shape == self.model.density.shape
-                ), f"Visibility shape {outputs['mog_visibility'].shape} does not match density shape {self.model.density.shape}"
+                ), (
+                    f"Visibility shape {outputs['mog_visibility'].shape} does not match density shape {self.model.density.shape}"
+                )
                 self.model.optimizer.step(outputs["mog_visibility"])
             else:
                 self.model.optimizer.step()
@@ -3228,14 +4134,18 @@ class Trainer3DGRUT:
 
         # Post-processing optimizer/scheduler step
         if self.post_processing_optimizers is not None:
-            with torch.cuda.nvtx.range(f"train_{global_step}_post_processing_opt"):
+            with torch.cuda.nvtx.range(
+                f"train_{global_step}_post_processing_opt"
+            ):
                 for opt in self.post_processing_optimizers:
                     opt.step()
                     opt.zero_grad()
                 for sched in self.post_processing_schedulers:
                     sched.step()
         if self.camera_residual_optimizer is not None:
-            with torch.cuda.nvtx.range(f"train_{global_step}_camera_residual_opt"):
+            with torch.cuda.nvtx.range(
+                f"train_{global_step}_camera_residual_opt"
+            ):
                 self.camera_residual_optimizer.step()
                 self.camera_residual_optimizer.zero_grad()
 
@@ -3257,7 +4167,8 @@ class Trainer3DGRUT:
 
         # Update the BVH if required
         if scene_updated or (
-            conf.model.bvh_update_frequency > 0 and global_step % conf.model.bvh_update_frequency == 0
+            conf.model.bvh_update_frequency > 0
+            and global_step % conf.model.bvh_update_frequency == 0
         ):
             with torch.cuda.nvtx.range(f"train_{global_step}_bvh"):
                 profilers["build_as"].start()
@@ -3278,9 +4189,13 @@ class Trainer3DGRUT:
             iteration=iter,
         )
         if "forward_render" in self.model.renderer.timings:
-            batch_metrics["timings"]["forward_render_cuda"] = self.model.renderer.timings["forward_render"]
+            batch_metrics["timings"]["forward_render_cuda"] = (
+                self.model.renderer.timings["forward_render"]
+            )
         if "backward_render" in self.model.renderer.timings:
-            batch_metrics["timings"]["backward_render_cuda"] = self.model.renderer.timings["backward_render"]
+            batch_metrics["timings"]["backward_render_cuda"] = (
+                self.model.renderer.timings["backward_render"]
+            )
         metrics.append(batch_metrics)
 
         # !!! Below global step has been incremented !!!
@@ -3297,7 +4212,7 @@ class Trainer3DGRUT:
             elif self.conf.with_gui:
                 self.render_gui(scene_updated)
 
-    @torch.cuda.nvtx.range(f"run_train_pass")
+    @torch.cuda.nvtx.range("run_train_pass")
     def run_train_pass(self, conf: DictConfig):
         """Runs a single train epoch over the dataset."""
         metrics = []
@@ -3313,18 +4228,21 @@ class Trainer3DGRUT:
                 return
 
             # Step for training iteration
-            self.run_train_iter(self.global_step, batch, profilers, metrics, conf)
+            self.run_train_iter(
+                self.global_step, batch, profilers, metrics, conf
+            )
 
         self.log_training_pass(metrics)
 
-    @torch.cuda.nvtx.range(f"run_validation_pass")
+    @torch.cuda.nvtx.range("run_validation_pass")
     @torch.no_grad()
     def run_validation_pass(self, conf: DictConfig) -> dict[str, Any]:
         """Runs a single validation epoch over the dataset.
+
         Returns:
              dictionary of metrics computed and aggregated over validation set.
-        """
 
+        """
         profilers = {
             "inference": CudaTimer(),
         }
@@ -3338,16 +4256,25 @@ class Trainer3DGRUT:
 
         for val_iteration, batch_idx in enumerate(self.val_dataloader):
             # Access the GPU-cache batch data
-            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
+            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
+                batch_idx
+            )
             gpu_batch = self._apply_camera_residual(gpu_batch)
 
             # Compute the outputs of a single batch
-            with torch.cuda.nvtx.range(f"train.validation_step_{self.global_step}"):
+            with torch.cuda.nvtx.range(
+                f"train.validation_step_{self.global_step}"
+            ):
                 profilers["inference"].start()
                 outputs = self.model(gpu_batch, train=False)
                 # Apply post-processing for validation (novel view mode)
                 if self.post_processing is not None:
-                    outputs = apply_post_processing(self.post_processing, outputs, gpu_batch, training=False)
+                    outputs = apply_post_processing(
+                        self.post_processing,
+                        outputs,
+                        gpu_batch,
+                        training=False,
+                    )
                 profilers["inference"].end()
 
                 batch_losses = self.get_losses(gpu_batch, outputs)
@@ -3360,7 +4287,9 @@ class Trainer3DGRUT:
                     iteration=val_iteration,
                 )
 
-                self.log_validation_iter(gpu_batch, outputs, batch_metrics, iteration=val_iteration)
+                self.log_validation_iter(
+                    gpu_batch, outputs, batch_metrics, iteration=val_iteration
+                )
                 metrics.append(batch_metrics)
 
         logger.end_progress(task_name="Validation")
@@ -3371,15 +4300,18 @@ class Trainer3DGRUT:
 
     @staticmethod
     def _flatten_list_of_dicts(list_of_dicts):
-        """
-        Converts list of dicts -> dict of lists.
+        """Converts list of dicts -> dict of lists.
         Supports flattening of up to 2 levels of dict hierarchies
         """
         flat_dict = defaultdict(list)
         for d in list_of_dicts:
             for k, v in d.items():
                 if isinstance(v, dict):
-                    flat_dict[k] = defaultdict(list) if k not in flat_dict else flat_dict[k]
+                    flat_dict[k] = (
+                        defaultdict(list)
+                        if k not in flat_dict
+                        else flat_dict[k]
+                    )
                     for inner_k, inner_v in v.items():
                         flat_dict[k][inner_k].append(inner_v)
                 else:
@@ -3390,23 +4322,28 @@ class Trainer3DGRUT:
         """Initiate training logic for n_epochs.
         Training and validation are controlled by the config.
         """
-        assert self.model.optimizer is not None, "Optimizer needs to be initialized before the training can start!"
+        assert self.model.optimizer is not None, (
+            "Optimizer needs to be initialized before the training can start!"
+        )
         conf = self.conf
 
         logger.log_rule(f"Training {conf.render.method.upper()}")
-        if (
-            self.camera_residual is not None
-            and bool(conf.camera_residual.finite_difference_audit.enabled)
+        if self.camera_residual is not None and bool(
+            conf.camera_residual.finite_difference_audit.enabled
         ):
             self.run_camera_residual_finite_difference_audit()
             if bool(conf.camera_residual.finite_difference_audit.exit_after):
-                logger.info("Camera residual finite-difference audit complete.")
+                logger.info(
+                    "Camera residual finite-difference audit complete."
+                )
                 return
 
         if bool(conf.camera_intrinsics_audit.enabled):
             self.run_camera_intrinsics_finite_difference_audit()
             if bool(conf.camera_intrinsics_audit.exit_after):
-                logger.info("Camera intrinsics finite-difference audit complete.")
+                logger.info(
+                    "Camera intrinsics finite-difference audit complete."
+                )
                 return
 
         if bool(conf.get("validate_only", False)):
@@ -3416,7 +4353,11 @@ class Trainer3DGRUT:
 
         # Training loop
         self._training_start_time = time.perf_counter()
-        logger.start_progress(task_name="Training", total_steps=conf.n_iterations, color="spring_green1")
+        logger.start_progress(
+            task_name="Training",
+            total_steps=conf.n_iterations,
+            color="spring_green1",
+        )
 
         for epoch_idx in range(self.n_epochs):
             self.run_train_pass(conf)
@@ -3431,7 +4372,7 @@ class Trainer3DGRUT:
             training_time=f"{stats['elapsed']:.2f} s",
             iteration_speed=f"{self.global_step / stats['elapsed']:.2f} it/s",
         )
-        logger.log_table(f"🎊 Training Statistics", record=table)
+        logger.log_table("🎊 Training Statistics", record=table)
 
         if bool(conf.get("validate_final", True)):
             logger.log_rule("Final Validation")
@@ -3439,10 +4380,10 @@ class Trainer3DGRUT:
 
         # Perform testing
         self.on_training_end()
-        logger.info(f"🥳 Training Complete.")
+        logger.info("🥳 Training Complete.")
 
         # Updating the GUI
         if self.gui is not None:
             self.gui.training_done = True
-            logger.info(f"🎨 GUI Blocking... Terminate GUI to Stop.")
+            logger.info("🎨 GUI Blocking... Terminate GUI to Stop.")
             self.gui.block_in_rendering_loop(fps=60)

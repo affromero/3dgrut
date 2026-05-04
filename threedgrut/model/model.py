@@ -46,6 +46,41 @@ from threedgrut.utils.misc import (
 from threedgrut.utils.render import RGB2SH
 
 
+SCENE_EXTENT_MIN = 1e-6
+SCENE_EXTENT_MAX_SAMPLES = 1_000_000
+
+
+def _sample_point_rows(points: torch.Tensor) -> torch.Tensor:
+    """Return a bounded deterministic row sample for extent estimates."""
+    if points.shape[0] <= SCENE_EXTENT_MAX_SAMPLES:
+        return points
+    step = (
+        points.shape[0] + SCENE_EXTENT_MAX_SAMPLES - 1
+    ) // SCENE_EXTENT_MAX_SAMPLES
+    return points[::step]
+
+
+def _estimate_scene_extent_from_points(points: torch.Tensor) -> float:
+    """Estimate a nonzero scene scale from point geometry."""
+    sampled = _sample_point_rows(points.detach().float())
+    finite_mask = torch.isfinite(sampled).all(dim=1)
+    if not finite_mask.any():
+        return 1.0
+
+    sampled = sampled[finite_mask]
+    center = sampled.median(dim=0).values
+    radius = torch.linalg.norm(sampled - center[None, :], dim=1).median()
+    if torch.isfinite(radius) and radius.item() > SCENE_EXTENT_MIN:
+        return float(radius.item() * 1.1)
+
+    bbox_diagonal = torch.linalg.norm(
+        sampled.max(dim=0).values - sampled.min(dim=0).values
+    )
+    if torch.isfinite(bbox_diagonal) and bbox_diagonal.item() > SCENE_EXTENT_MIN:
+        return float(bbox_diagonal.item() * 0.1)
+    return 1.0
+
+
 def _rotation_matrix_to_quaternion_wxyz(rotation: torch.Tensor) -> torch.Tensor:
     """Convert rotation matrices to normalized WXYZ quaternions."""
     trace = rotation[:, 0, 0] + rotation[:, 1, 1] + rotation[:, 2, 2]
@@ -715,6 +750,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         N = pts.shape[0]
         positions = pts
+        self.ensure_scene_extent_from_points(positions)
 
         # Random rotations
         rots = torch.rand((N, 4), dtype=dtype, device=self.device, generator=rng)
@@ -873,7 +909,25 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             if param_group["name"] in self.schedulers:
                 lr = self.schedulers[param_group["name"]](step)
                 if lr is not None:
+                    if not np.isfinite(float(lr)):
+                        raise ValueError(
+                            "Non-finite scheduler LR for "
+                            f"{param_group['name']} at step {step}: {lr}"
+                        )
                     param_group["lr"] = lr
+
+    def ensure_scene_extent_from_points(self, points: torch.Tensor) -> None:
+        """Use point geometry when camera-center extent is degenerate."""
+        if self.scene_extent is not None:
+            scene_extent = float(self.scene_extent)
+            if np.isfinite(scene_extent) and scene_extent > SCENE_EXTENT_MIN:
+                return
+
+        self.scene_extent = _estimate_scene_extent_from_points(points)
+        logger.warning(
+            "Camera-derived scene extent is degenerate; using point-cloud "
+            f"fallback scene_extent={self.scene_extent:.6f}"
+        )
 
     def set_optimizable_parameters(self):
         if not self.conf.model.optimize_density:

@@ -95,6 +95,9 @@ def make(name: str, config, ray_jitter):
                 ray_jitter=ray_jitter,
                 exif_exposures=exif_exposures,
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -103,6 +106,9 @@ def make(name: str, config, ray_jitter):
                 test_split_interval=config.dataset.test_split_interval,
                 exif_exposures=exif_exposures,
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
             )
         case "scannetpp":
             train_dataset = ScannetppDataset(

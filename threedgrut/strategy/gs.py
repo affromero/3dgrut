@@ -47,9 +47,18 @@ class GSStrategy(BaseStrategy):
         self.footprint_scale_stats = {}
         self.residual_density_stats = {}
         self.edge_error_density_stats = {}
+        self.frequency_error_density_stats = {}
+        self.abs_gradient_density_stats = {}
         self.camera_balance_density_stats = {}
+        self.structure_density_stats = {}
         self.roma_precision_density_stats: dict = {}
         self.camera_balance_residual_ema = torch.empty((0,), device=self.model.device)
+        self.densify_abs_grad_norm_accum = torch.empty([0, 1])
+        self.densify_signed_grad_accum = torch.empty([0, 3])
+        self.structure_axis_x_accum = torch.empty([0, 1])
+        self.structure_axis_y_accum = torch.empty([0, 1])
+        self.structure_local_axis_accum = torch.empty([0, 3])
+        self.structure_axis_denom = torch.empty([0, 1])
         # Per-image RoMa precision tensors keyed by image stem (e.g. "left_0009").
         # Lazily filled on first read; small (~3 * frame_count entries).
         self._roma_precision_cache: dict = {}
@@ -59,17 +68,91 @@ class GSStrategy(BaseStrategy):
 
         params["densify_grad_norm_accum"] = (self.densify_grad_norm_accum,)
         params["densify_grad_norm_denom"] = (self.densify_grad_norm_denom,)
+        params["densify_abs_grad_norm_accum"] = (
+            self.densify_abs_grad_norm_accum,
+        )
+        params["densify_signed_grad_accum"] = (
+            self.densify_signed_grad_accum,
+        )
+        params["structure_axis_x_accum"] = (self.structure_axis_x_accum,)
+        params["structure_axis_y_accum"] = (self.structure_axis_y_accum,)
+        params["structure_local_axis_accum"] = (self.structure_local_axis_accum,)
+        params["structure_axis_denom"] = (self.structure_axis_denom,)
 
         return params
 
     def init_densification_buffer(self, checkpoint: Optional[dict] = None):
+        num_gaussians = self.model.num_gaussians
         if checkpoint is not None:
             self.densify_grad_norm_accum = checkpoint["densify_grad_norm_accum"][0].detach()
             self.densify_grad_norm_denom = checkpoint["densify_grad_norm_denom"][0].detach()
+            self.densify_abs_grad_norm_accum = self._checkpoint_or_zero_buffer(
+                checkpoint,
+                "densify_abs_grad_norm_accum",
+                num_gaussians,
+            )
+            self.densify_signed_grad_accum = self._checkpoint_or_zero_buffer(
+                checkpoint,
+                "densify_signed_grad_accum",
+                num_gaussians,
+                width=3,
+            )
+            self.structure_axis_x_accum = self._checkpoint_or_zero_buffer(
+                checkpoint,
+                "structure_axis_x_accum",
+                num_gaussians,
+            )
+            self.structure_axis_y_accum = self._checkpoint_or_zero_buffer(
+                checkpoint,
+                "structure_axis_y_accum",
+                num_gaussians,
+            )
+            self.structure_local_axis_accum = self._checkpoint_or_zero_buffer(
+                checkpoint,
+                "structure_local_axis_accum",
+                num_gaussians,
+                width=3,
+            )
+            self.structure_axis_denom = self._checkpoint_or_zero_buffer(
+                checkpoint,
+                "structure_axis_denom",
+                num_gaussians,
+                dtype=torch.int,
+            )
         else:
-            num_gaussians = self.model.num_gaussians
             self.densify_grad_norm_accum = torch.zeros((num_gaussians, 1), dtype=torch.float, device=self.model.device)
             self.densify_grad_norm_denom = torch.zeros((num_gaussians, 1), dtype=torch.int, device=self.model.device)
+            self.densify_abs_grad_norm_accum = torch.zeros(
+                (num_gaussians, 1),
+                dtype=torch.float,
+                device=self.model.device,
+            )
+            self.densify_signed_grad_accum = torch.zeros(
+                (num_gaussians, 3),
+                dtype=torch.float,
+                device=self.model.device,
+            )
+            self.structure_axis_x_accum = torch.zeros((num_gaussians, 1), dtype=torch.float, device=self.model.device)
+            self.structure_axis_y_accum = torch.zeros((num_gaussians, 1), dtype=torch.float, device=self.model.device)
+            self.structure_local_axis_accum = torch.zeros(
+                (num_gaussians, 3),
+                dtype=torch.float,
+                device=self.model.device,
+            )
+            self.structure_axis_denom = torch.zeros((num_gaussians, 1), dtype=torch.int, device=self.model.device)
+
+    def _checkpoint_or_zero_buffer(
+        self,
+        checkpoint: dict,
+        key: str,
+        num_gaussians: int,
+        dtype: torch.dtype = torch.float,
+        width: int = 1,
+    ) -> torch.Tensor:
+        checkpoint_value = checkpoint.get(key)
+        if checkpoint_value is not None:
+            return checkpoint_value[0].detach()
+        return torch.zeros((num_gaussians, width), dtype=dtype, device=self.model.device)
 
     def _post_backward(
         self,
@@ -156,6 +239,7 @@ class GSStrategy(BaseStrategy):
         self.log_footprint_control(step, writer)
         self.log_footprint_scale_control(step, writer)
         self.log_residual_density_control(step, writer)
+        self.log_structure_density_control(step, writer)
 
         return scene_updated
 
@@ -174,15 +258,32 @@ class GSStrategy(BaseStrategy):
             return
 
         distance_to_camera = (self.model.positions[mask] - sensor_position).norm(dim=1, keepdim=True)
-        grad_norm = torch.norm(params_grad[mask] * distance_to_camera, dim=-1, keepdim=True) / 2
+        scaled_grad = params_grad[mask] * distance_to_camera / 2
+        grad_norm = torch.norm(scaled_grad, dim=-1, keepdim=True)
+        density_weight = torch.ones_like(grad_norm)
 
         if self.footprint_control.get("enabled", False) and batch is not None:
-            grad_norm = grad_norm * self.compute_footprint_weights(mask, batch, outputs)
+            density_weight = density_weight * self.compute_footprint_weights(
+                mask,
+                batch,
+                outputs,
+            )
 
         if self.residual_density_control.get("enabled", False) and batch is not None and outputs is not None:
-            grad_norm = grad_norm * self.compute_residual_density_weights(mask, batch, outputs)
+            density_weight = density_weight * self.compute_residual_density_weights(
+                mask,
+                batch,
+                outputs,
+            )
 
-        self.densify_grad_norm_accum[mask] += grad_norm
+        weighted_grad = scaled_grad * density_weight
+
+        self.densify_grad_norm_accum[mask] += grad_norm * density_weight
+        self.densify_abs_grad_norm_accum[mask] += weighted_grad.abs().sum(
+            dim=-1,
+            keepdim=True,
+        )
+        self.densify_signed_grad_accum[mask] += weighted_grad
         self.densify_grad_norm_denom[mask] += 1
 
     def camera_focal_mean(self, batch) -> float:
@@ -371,13 +472,21 @@ class GSStrategy(BaseStrategy):
 
         gradient_weight = self.compute_responsibility_gradient_weight(mask)
         edge_error_weight = self.compute_edge_error_weight(mask, batch, outputs)
+        frequency_error_weight = self.compute_frequency_error_weight(
+            mask,
+            batch,
+            outputs,
+        )
         roma_precision_weight = self.compute_roma_precision_weight(mask, batch, outputs)
+        structure_weight = self.compute_structure_density_weight(mask, batch, outputs)
         total_weight = (
             area_weight
             * residual_weight
             * gradient_weight
             * edge_error_weight
+            * frequency_error_weight
             * roma_precision_weight
+            * structure_weight
             * camera_balance_weight
         )
         total_weight = torch.clamp(
@@ -398,15 +507,21 @@ class GSStrategy(BaseStrategy):
             "gradient_weight_max": gradient_weight.max().item(),
             "edge_error_weight_mean": edge_error_weight.mean().item(),
             "edge_error_weight_max": edge_error_weight.max().item(),
+            "frequency_error_weight_mean": frequency_error_weight.mean().item(),
+            "frequency_error_weight_max": frequency_error_weight.max().item(),
             "roma_precision_weight_mean": roma_precision_weight.mean().item(),
             "roma_precision_weight_max": roma_precision_weight.max().item(),
+            "structure_weight_mean": structure_weight.mean().item(),
+            "structure_weight_max": structure_weight.max().item(),
             "camera_balance_weight": float(camera_balance_weight),
             "total_weight_mean": total_weight.mean().item(),
             "total_weight_max": total_weight.max().item(),
         }
         self.residual_density_stats.update(self.edge_error_density_stats)
+        self.residual_density_stats.update(self.frequency_error_density_stats)
         self.residual_density_stats.update(self.roma_precision_density_stats)
         self.residual_density_stats.update(self.camera_balance_density_stats)
+        self.residual_density_stats.update(self.structure_density_stats)
         if "mog_tiles_count" in outputs:
             tiles_count = outputs["mog_tiles_count"][mask].float()
             self.residual_density_stats.update(
@@ -416,6 +531,386 @@ class GSStrategy(BaseStrategy):
                 }
             )
         return total_weight.unsqueeze(1)
+
+    @torch.no_grad()
+    def compute_structure_density_weight(self, mask: torch.Tensor, batch, outputs) -> torch.Tensor:
+        selected_count = int(mask.sum().item())
+        self.structure_density_stats = {}
+        weights = torch.ones((selected_count,), device=self.model.device)
+        if selected_count == 0:
+            return weights
+        if not self.residual_density_control.get("use_structure_density_weight", False):
+            return weights
+        if "mog_projected_position" not in outputs or "mog_projected_extent" not in outputs:
+            return weights
+
+        maps = self.compute_structure_maps(batch.rgb_gt, outputs["pred_rgb"])
+        positions = outputs["mog_projected_position"][mask].float()
+        x = torch.round(positions[:, 0]).long()
+        y = torch.round(positions[:, 1]).long()
+        height, width = maps["edge"].shape
+        valid = torch.logical_and(
+            torch.logical_and(x >= 0, x < width),
+            torch.logical_and(y >= 0, y < height),
+        )
+        if "mog_visibility" in outputs:
+            visible = outputs["mog_visibility"][mask].reshape(-1) > 0
+            valid = torch.logical_and(valid, visible)
+        if batch.mask is not None:
+            frame_mask = batch.mask
+            if frame_mask.dim() == 4:
+                frame_mask = frame_mask[0]
+            frame_mask = frame_mask.squeeze(-1) > 0.5
+            valid_mask_sample = torch.zeros_like(valid)
+            valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            if valid_indices.numel() > 0:
+                valid_mask_sample[valid_indices] = frame_mask[
+                    y[valid_indices],
+                    x[valid_indices],
+                ]
+            valid = torch.logical_and(valid, valid_mask_sample)
+
+        edge = torch.zeros_like(weights)
+        anisotropy = torch.zeros_like(weights)
+        scale_px = torch.ones_like(weights)
+        residual = torch.zeros_like(weights)
+        grad_x = torch.zeros_like(weights)
+        grad_y = torch.zeros_like(weights)
+        signed_grad_x = torch.zeros_like(weights)
+        signed_grad_y = torch.zeros_like(weights)
+        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        if valid_indices.numel() > 0:
+            sample_y = y[valid_indices]
+            sample_x = x[valid_indices]
+            edge[valid_indices] = maps["edge"][sample_y, sample_x]
+            anisotropy[valid_indices] = maps["anisotropy"][sample_y, sample_x]
+            scale_px[valid_indices] = maps["scale_px"][sample_y, sample_x]
+            residual[valid_indices] = maps["residual"][sample_y, sample_x]
+            grad_x[valid_indices] = maps["grad_x"][sample_y, sample_x]
+            grad_y[valid_indices] = maps["grad_y"][sample_y, sample_x]
+            signed_grad_x[valid_indices] = maps["grad_x_signed"][sample_y, sample_x]
+            signed_grad_y[valid_indices] = maps["grad_y_signed"][sample_y, sample_x]
+
+        extent = outputs["mog_projected_extent"][mask].float().abs()
+        extent_x = extent[:, 0].clamp_min(1.0e-6)
+        extent_y = extent[:, 1].clamp_min(1.0e-6)
+        normalized_edge = self.normalize_signal(edge)
+        normalized_residual = self.normalize_signal(residual)
+        reliable_structure = normalized_edge * (1.0 + anisotropy)
+        violation_x = extent_x * self.normalize_signal(grad_x) / scale_px.clamp_min(1.0)
+        violation_y = extent_y * self.normalize_signal(grad_y) / scale_px.clamp_min(1.0)
+        violation = torch.maximum(violation_x, violation_y)
+        score = violation * reliable_structure * (1.0 + normalized_residual)
+        score = torch.where(valid, score, torch.zeros_like(score))
+
+        score_reference = float(
+            self.residual_density_control.get("structure_score_reference", 1.0)
+        )
+        score_power = float(self.residual_density_control.get("structure_score_power", 0.5))
+        weights = torch.pow(score / max(score_reference, 1e-6), score_power)
+        weights = torch.clamp(
+            weights,
+            min=float(self.residual_density_control.get("structure_min_weight", 0.5)),
+            max=float(self.residual_density_control.get("structure_max_weight", 4.0)),
+        )
+
+        axis_x = torch.logical_and(valid, violation_x >= violation_y)
+        axis_y = torch.logical_and(valid, violation_y > violation_x)
+        axis_score = torch.clamp(score, max=float(self.residual_density_control.get("structure_axis_max_score", 10.0)))
+        self.structure_axis_x_accum[mask] += (axis_x.float() * axis_score).unsqueeze(1)
+        self.structure_axis_y_accum[mask] += (axis_y.float() * axis_score).unsqueeze(1)
+        self.accumulate_projected_local_axis_scores(
+            mask,
+            batch,
+            valid,
+            signed_grad_x,
+            signed_grad_y,
+            axis_score,
+        )
+        self.structure_axis_denom[mask] += valid.float().unsqueeze(1).to(self.structure_axis_denom.dtype)
+
+        center_x = (width - 1) * 0.5
+        center_y = (height - 1) * 0.5
+        radius = torch.sqrt((x.float() - center_x).square() + (y.float() - center_y).square())
+        max_radius = max(min(width, height) * 0.5, 1.0)
+        rim_threshold = float(self.residual_density_control.get("structure_rim_radius_fraction", 0.80))
+        rim = torch.logical_and(valid, radius / max_radius >= rim_threshold)
+
+        valid_scores = score[valid]
+        self.structure_density_stats = {
+            "structure_valid_fraction": valid.float().mean().item(),
+            "structure_score_mean": valid_scores.mean().item() if valid.any() else 0.0,
+            "structure_score_p95": torch.quantile(valid_scores, 0.95).item()
+            if valid.any()
+            else 0.0,
+            "structure_weight_mean": weights.mean().item(),
+            "structure_weight_max": weights.max().item(),
+            "structure_axis_x_fraction": axis_x.float().mean().item(),
+            "structure_axis_y_fraction": axis_y.float().mean().item(),
+            "structure_rim_fraction": rim.float().mean().item(),
+            "structure_edge_mean": edge[valid].mean().item() if valid.any() else 0.0,
+            "structure_anisotropy_mean": anisotropy[valid].mean().item()
+            if valid.any()
+            else 0.0,
+            "structure_scale_px_mean": scale_px[valid].mean().item() if valid.any() else 0.0,
+        }
+        return weights
+
+    @torch.no_grad()
+    def accumulate_projected_local_axis_scores(
+        self,
+        mask: torch.Tensor,
+        batch,
+        valid: torch.Tensor,
+        grad_x: torch.Tensor,
+        grad_y: torch.Tensor,
+        axis_score: torch.Tensor,
+    ) -> None:
+        if not self.residual_density_control.get("structure_project_local_axes", False):
+            return
+        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        if valid_indices.numel() == 0:
+            return
+        projected_axes = self.project_local_axis_vectors(mask, batch)
+        if projected_axes is None:
+            return
+        gradient = torch.stack([grad_x, grad_y], dim=1)
+        gradient = torch.nn.functional.normalize(gradient, dim=1, eps=1e-6)
+        projected_axes = torch.nn.functional.normalize(
+            projected_axes,
+            dim=2,
+            eps=1e-6,
+        )
+        axis_alignment = torch.abs(
+            (projected_axes * gradient[:, None, :]).sum(dim=2)
+        )
+        axis_scores = axis_alignment * axis_score[:, None]
+        axis_scores = torch.where(valid[:, None], axis_scores, torch.zeros_like(axis_scores))
+        self.structure_local_axis_accum[mask] += axis_scores
+        valid_axis = axis_scores[valid_indices].argmax(dim=1)
+        self.structure_density_stats.update(
+            {
+                "structure_local_axis_0_fraction": (
+                    (valid_axis == 0).float().mean().item()
+                ),
+                "structure_local_axis_1_fraction": (
+                    (valid_axis == 1).float().mean().item()
+                ),
+                "structure_local_axis_2_fraction": (
+                    (valid_axis == 2).float().mean().item()
+                ),
+            }
+        )
+
+    @torch.no_grad()
+    def project_local_axis_vectors(self, mask: torch.Tensor, batch) -> torch.Tensor | None:
+        intrinsics = batch.intrinsics_RationalCameraModelParameters
+        if intrinsics is None:
+            return None
+        positions = self.model.positions[mask].float()
+        if positions.numel() == 0:
+            return torch.zeros((0, 3, 2), device=self.model.device)
+        scales = self.model.get_scale()[mask].float().clamp_min(1e-4)
+        rotations = quaternion_to_so3(self.model.rotation[mask]).float()
+        local_axes = rotations.transpose(1, 2)
+        endpoints = positions[:, None, :] + local_axes * scales[:, :, None]
+        center_pixels, center_valid = self.project_rational_world_points(
+            positions,
+            batch,
+            intrinsics,
+        )
+        endpoint_pixels, endpoint_valid = self.project_rational_world_points(
+            endpoints.reshape(-1, 3),
+            batch,
+            intrinsics,
+        )
+        endpoint_pixels = endpoint_pixels.reshape(-1, 3, 2)
+        endpoint_valid = endpoint_valid.reshape(-1, 3)
+        axis_vectors = endpoint_pixels - center_pixels[:, None, :]
+        valid_axes = torch.logical_and(center_valid[:, None], endpoint_valid)
+        axis_vectors = torch.where(
+            valid_axes[:, :, None],
+            axis_vectors,
+            torch.zeros_like(axis_vectors),
+        )
+        return axis_vectors
+
+    @torch.no_grad()
+    def project_rational_world_points(
+        self,
+        points_world: torch.Tensor,
+        batch,
+        intrinsics: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        transform_world_to_camera = torch.linalg.inv(batch.T_to_world[0].float())
+        ones = torch.ones(
+            (points_world.shape[0], 1),
+            device=points_world.device,
+            dtype=points_world.dtype,
+        )
+        points_h = torch.cat([points_world, ones], dim=1)
+        points_camera = (points_h @ transform_world_to_camera.T)[:, :3]
+        z = points_camera[:, 2].clamp_min(1e-6)
+        x = points_camera[:, 0] / z
+        y = points_camera[:, 1] / z
+        pixels_native = self.rational_project_xy(x, y, intrinsics)
+        pixels_stored = self.native_to_stored_rational_pixels(
+            pixels_native,
+            intrinsics,
+        )
+        valid = points_camera[:, 2] > 1e-6
+        return pixels_stored, valid
+
+    @torch.no_grad()
+    def rational_project_xy(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        intrinsics: dict,
+    ) -> torch.Tensor:
+        focal = torch.as_tensor(
+            intrinsics["focal_length"],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        principal = torch.as_tensor(
+            intrinsics["principal_point"],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        numerator = torch.as_tensor(
+            intrinsics["numerator_coeffs"],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        denominator = torch.as_tensor(
+            intrinsics["denominator_coeffs"],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        affine = torch.as_tensor(
+            intrinsics["affine_coeffs"],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        tangential = torch.as_tensor(
+            intrinsics["tangential_coeffs"],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        skew = torch.as_tensor(intrinsics["skew"], device=x.device, dtype=x.dtype)
+        r2 = x.square() + y.square()
+        r4 = r2.square()
+        r6 = r4 * r2
+        radial_num = 1.0 + numerator[0] * r2 + numerator[1] * r4 + numerator[2] * r6
+        radial_den = 1.0 + denominator[0] * r2 + denominator[1] * r4 + denominator[2] * r6
+        radial = radial_num / radial_den.clamp_min(1e-8)
+        p1 = tangential[0]
+        p2 = tangential[1]
+        x_distorted = x * radial + affine[0] * (
+            2.0 * p1 * x * y + p2 * (r2 + 2.0 * x.square())
+        )
+        y_distorted = y * radial + affine[1] * (
+            p1 * (r2 + 2.0 * y.square()) + 2.0 * p2 * x * y
+        )
+        u = focal[0] * x_distorted + skew * y_distorted + principal[0]
+        v = focal[1] * y_distorted + principal[1]
+        return torch.stack([u, v], dim=1)
+
+    @torch.no_grad()
+    def native_to_stored_rational_pixels(
+        self,
+        pixels_native: torch.Tensor,
+        intrinsics: dict,
+    ) -> torch.Tensor:
+        resolution = torch.as_tensor(
+            intrinsics["resolution"],
+            device=pixels_native.device,
+            dtype=pixels_native.dtype,
+        )
+        width = resolution[0]
+        height = resolution[1]
+        rotation = int(intrinsics.get("image_rotation_quadrants_cw", 0)) % 4
+        u = pixels_native[:, 0]
+        v = pixels_native[:, 1]
+        if rotation == 1:
+            return torch.stack([(width - 1.0) - v, u], dim=1)
+        if rotation == 2:
+            return torch.stack([(width - 1.0) - u, (height - 1.0) - v], dim=1)
+        if rotation == 3:
+            return torch.stack([v, (height - 1.0) - u], dim=1)
+        return pixels_native
+
+    @torch.no_grad()
+    def compute_structure_maps(
+        self,
+        rgb_gt: torch.Tensor,
+        rgb_pred: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if rgb_gt.dim() == 4:
+            rgb_gt = rgb_gt[0]
+        if rgb_pred.dim() == 4:
+            rgb_pred = rgb_pred[0]
+        luma_gt = self.rgb_to_luma(rgb_gt)
+        luma_pred = self.rgb_to_luma(rgb_pred)
+        grad_x = torch.zeros_like(luma_gt)
+        grad_y = torch.zeros_like(luma_gt)
+        grad_x[:, :-1] = luma_gt[:, 1:] - luma_gt[:, :-1]
+        grad_y[:-1, :] = luma_gt[1:, :] - luma_gt[:-1, :]
+        abs_grad_x = torch.abs(grad_x)
+        abs_grad_y = torch.abs(grad_y)
+        edge = torch.sqrt(torch.clamp_min(grad_x.square() + grad_y.square(), 1e-12))
+
+        tensor_xx = self.smooth_structure_map(grad_x.square())
+        tensor_yy = self.smooth_structure_map(grad_y.square())
+        tensor_xy = self.smooth_structure_map(grad_x * grad_y)
+        trace = tensor_xx + tensor_yy
+        delta = torch.sqrt(
+            torch.clamp_min((tensor_xx - tensor_yy).square() + 4.0 * tensor_xy.square(), 0.0)
+        )
+        anisotropy = delta / trace.clamp_min(1e-6)
+
+        laplacian = torch.zeros_like(luma_gt)
+        laplacian[1:-1, 1:-1] = torch.abs(
+            -4.0 * luma_gt[1:-1, 1:-1]
+            + luma_gt[1:-1, :-2]
+            + luma_gt[1:-1, 2:]
+            + luma_gt[:-2, 1:-1]
+            + luma_gt[2:, 1:-1]
+        )
+        scale_px = torch.clamp(edge / laplacian.clamp_min(1e-4), min=1.0, max=16.0)
+        residual = torch.abs(luma_pred - luma_gt)
+        return {
+            "edge": edge,
+            "anisotropy": anisotropy,
+            "scale_px": scale_px,
+            "residual": residual,
+            "grad_x_signed": grad_x,
+            "grad_y_signed": grad_y,
+            "grad_x": abs_grad_x,
+            "grad_y": abs_grad_y,
+        }
+
+    @torch.no_grad()
+    def smooth_structure_map(self, image: torch.Tensor) -> torch.Tensor:
+        smoothed = torch.nn.functional.avg_pool2d(
+            image[None, None],
+            kernel_size=5,
+            stride=1,
+            padding=2,
+        )
+        return smoothed[0, 0]
+
+    def log_structure_density_control(self, step: int, writer) -> None:
+        if not self.residual_density_control.get("use_structure_density_weight", False):
+            return
+        if writer is None or not hasattr(writer, "add_scalar"):
+            return
+        log_frequency = int(self.residual_density_control.get("structure_log_frequency", 100))
+        if not check_step_condition(step, 0, -1, log_frequency):
+            return
+        for name, value in self.structure_density_stats.items():
+            writer.add_scalar(f"diagnostics/structure_density/{name}", value, step)
 
     @torch.no_grad()
     def compute_edge_error_weight(self, mask: torch.Tensor, batch, outputs) -> torch.Tensor:
@@ -477,6 +972,127 @@ class GSStrategy(BaseStrategy):
             "edge_error_valid_fraction": valid.float().mean().item(),
             "edge_error_mean": sampled_error[valid].mean().item() if valid.any() else 0.0,
             "edge_error_p95": torch.quantile(sampled_error[valid], 0.95).item()
+            if valid.any()
+            else 0.0,
+        }
+        return weights
+
+    @torch.no_grad()
+    def compute_frequency_error_weight(
+        self,
+        mask: torch.Tensor,
+        batch,
+        outputs,
+    ) -> torch.Tensor:
+        selected_count = int(mask.sum().item())
+        self.frequency_error_density_stats = {}
+        weights = torch.ones((selected_count,), device=self.model.device)
+        if selected_count == 0:
+            return weights
+        if not self.residual_density_control.get(
+            "use_frequency_error_weight",
+            False,
+        ):
+            return weights
+        if "mog_projected_position" not in outputs:
+            return weights
+
+        frequency_error, gt_edge = self.compute_frequency_error_map(
+            batch.rgb_gt,
+            outputs["pred_rgb"],
+        )
+        positions = outputs["mog_projected_position"][mask].float()
+        x = torch.round(positions[:, 0]).long()
+        y = torch.round(positions[:, 1]).long()
+        height, width = frequency_error.shape
+        valid = torch.logical_and(
+            torch.logical_and(x >= 0, x < width),
+            torch.logical_and(y >= 0, y < height),
+        )
+        if "mog_visibility" in outputs:
+            visible = outputs["mog_visibility"][mask].reshape(-1) > 0
+            valid = torch.logical_and(valid, visible)
+        if batch.mask is not None:
+            frame_mask = batch.mask
+            if frame_mask.dim() == 4:
+                frame_mask = frame_mask[0]
+            frame_mask = frame_mask.squeeze(-1) > 0.5
+            valid_mask_sample = torch.zeros_like(valid)
+            valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            if valid_indices.numel() > 0:
+                valid_mask_sample[valid_indices] = frame_mask[
+                    y[valid_indices],
+                    x[valid_indices],
+                ]
+            valid = torch.logical_and(valid, valid_mask_sample)
+
+        sampled_error = torch.zeros_like(weights)
+        sampled_edge = torch.zeros_like(weights)
+        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        if valid_indices.numel() > 0:
+            sample_y = y[valid_indices]
+            sample_x = x[valid_indices]
+            sampled_error[valid_indices] = frequency_error[sample_y, sample_x]
+            sampled_edge[valid_indices] = gt_edge[sample_y, sample_x]
+
+        reference = float(
+            self.residual_density_control.get("frequency_error_reference", 0.03)
+        )
+        power = float(
+            self.residual_density_control.get("frequency_error_power", 0.5)
+        )
+        weights = torch.pow(sampled_error / max(reference, 1e-6), power)
+        if self.residual_density_control.get("frequency_use_edge_gate", True):
+            edge_reference = float(
+                self.residual_density_control.get("frequency_edge_reference", 0.05)
+            )
+            edge_power = float(
+                self.residual_density_control.get("frequency_edge_power", 0.5)
+            )
+            edge_weight = torch.pow(
+                sampled_edge / max(edge_reference, 1e-6),
+                edge_power,
+            )
+            edge_weight = torch.clamp(
+                edge_weight,
+                min=float(
+                    self.residual_density_control.get(
+                        "frequency_edge_min_weight",
+                        0.75,
+                    )
+                ),
+                max=float(
+                    self.residual_density_control.get(
+                        "frequency_edge_max_weight",
+                        2.0,
+                    )
+                ),
+            )
+            weights = weights * edge_weight
+        weights = torch.clamp(
+            weights,
+            min=float(
+                self.residual_density_control.get(
+                    "frequency_error_min_weight",
+                    0.5,
+                )
+            ),
+            max=float(
+                self.residual_density_control.get(
+                    "frequency_error_max_weight",
+                    4.0,
+                )
+            ),
+        )
+        self.frequency_error_density_stats = {
+            "frequency_error_valid_fraction": valid.float().mean().item(),
+            "frequency_error_mean": sampled_error[valid].mean().item()
+            if valid.any()
+            else 0.0,
+            "frequency_error_p95": torch.quantile(sampled_error[valid], 0.95).item()
+            if valid.any()
+            else 0.0,
+            "frequency_edge_mean": sampled_edge[valid].mean().item()
             if valid.any()
             else 0.0,
         }
@@ -583,6 +1199,25 @@ class GSStrategy(BaseStrategy):
         )
 
     @torch.no_grad()
+    def compute_frequency_error_map(
+        self,
+        rgb_gt: torch.Tensor,
+        rgb_pred: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if rgb_gt.dim() == 4:
+            rgb_gt = rgb_gt[0]
+        if rgb_pred.dim() == 4:
+            rgb_pred = rgb_pred[0]
+        luma_gt = self.rgb_to_luma(rgb_gt)
+        luma_pred = self.rgb_to_luma(rgb_pred)
+        frequency_error = torch.abs(
+            self.image_laplacian_abs(luma_pred)
+            - self.image_laplacian_abs(luma_gt)
+        )
+        gt_edge = self.image_gradient_magnitude(luma_gt)
+        return frequency_error, gt_edge
+
+    @torch.no_grad()
     def rgb_to_luma(self, rgb: torch.Tensor) -> torch.Tensor:
         weights = torch.tensor(
             [0.299, 0.587, 0.114],
@@ -598,6 +1233,18 @@ class GSStrategy(BaseStrategy):
         grad_x[:, :-1] = torch.abs(image[:, 1:] - image[:, :-1])
         grad_y[:-1, :] = torch.abs(image[1:, :] - image[:-1, :])
         return torch.sqrt(torch.clamp_min(grad_x.square() + grad_y.square(), 1e-12))
+
+    @torch.no_grad()
+    def image_laplacian_abs(self, image: torch.Tensor) -> torch.Tensor:
+        laplacian = torch.zeros_like(image)
+        laplacian[1:-1, 1:-1] = (
+            -4.0 * image[1:-1, 1:-1]
+            + image[1:-1, :-2]
+            + image[1:-1, 2:]
+            + image[:-2, 1:-1]
+            + image[2:, 1:-1]
+        )
+        return torch.abs(laplacian)
 
     @torch.no_grad()
     def compute_projected_area(self, mask: torch.Tensor, batch, outputs=None) -> torch.Tensor:
@@ -778,11 +1425,155 @@ class GSStrategy(BaseStrategy):
         ), "Optimizer need to be initialized before splitting and cloning the Gaussians"
         densify_grad_norm = self.densify_grad_norm_accum / self.densify_grad_norm_denom
         densify_grad_norm[densify_grad_norm.isnan()] = 0.0
+        if self.residual_density_control.get("use_abs_gradient_score", False):
+            densify_grad_norm = self.compute_abs_gradient_densify_score(
+                densify_grad_norm,
+            )
+
+        if self.residual_density_control.get("structure_score_only", False):
+            self.log_structure_score_only_candidates(
+                densify_grad_norm.squeeze(),
+                scene_extent,
+            )
+            self.reset_densification_buffers()
+            return
 
         self.clone_gaussians(densify_grad_norm.squeeze(), scene_extent)
         self.split_gaussians(densify_grad_norm.squeeze(), scene_extent)
 
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def compute_abs_gradient_densify_score(
+        self,
+        densify_grad_norm: torch.Tensor,
+    ) -> torch.Tensor:
+        denom = self.densify_grad_norm_denom.float().clamp_min(1.0)
+        active = self.densify_grad_norm_denom > 0
+        abs_score = self.densify_abs_grad_norm_accum / denom
+        signed_vector = self.densify_signed_grad_accum / denom
+        signed_vector_score = torch.norm(signed_vector, dim=-1, keepdim=True)
+        collision_ratio = abs_score / signed_vector_score.clamp_min(1e-12)
+        collision_ratio = torch.where(
+            active,
+            collision_ratio,
+            torch.ones_like(collision_ratio),
+        )
+        reference = float(
+            self.residual_density_control.get(
+                "abs_gradient_collision_reference",
+                1.0,
+            )
+        )
+        power = float(
+            self.residual_density_control.get(
+                "abs_gradient_collision_power",
+                0.5,
+            )
+        )
+        collision_weight = torch.pow(
+            collision_ratio / max(reference, 1e-6),
+            power,
+        )
+        collision_weight = torch.clamp(
+            collision_weight,
+            min=float(
+                self.residual_density_control.get(
+                    "abs_gradient_collision_min_weight",
+                    1.0,
+                )
+            ),
+            max=float(
+                self.residual_density_control.get(
+                    "abs_gradient_collision_max_weight",
+                    3.0,
+                )
+            ),
+        )
+        score = densify_grad_norm * collision_weight
+        self.abs_gradient_density_stats = {
+            "abs_gradient_active_fraction": active.float().mean().item(),
+            "abs_gradient_score_mean": abs_score[active].mean().item()
+            if active.any()
+            else 0.0,
+            "abs_gradient_signed_vector_score_mean": signed_vector_score[
+                active
+            ].mean().item()
+            if active.any()
+            else 0.0,
+            "abs_gradient_collision_ratio_mean": collision_ratio[
+                active
+            ].mean().item()
+            if active.any()
+            else 0.0,
+            "abs_gradient_collision_ratio_p95": torch.quantile(
+                collision_ratio[active],
+                0.95,
+            ).item()
+            if active.any()
+            else 0.0,
+            "abs_gradient_collision_weight_mean": collision_weight[
+                active
+            ].mean().item()
+            if active.any()
+            else 0.0,
+            "abs_gradient_collision_weight_max": collision_weight[
+                active
+            ].max().item()
+            if active.any()
+            else 0.0,
+        }
+        self.residual_density_stats.update(self.abs_gradient_density_stats)
+        return score
+
+    @torch.no_grad()
+    def log_structure_score_only_candidates(
+        self,
+        densify_grad_norm: torch.Tensor,
+        scene_extent: float,
+    ) -> None:
+        n_init_points = self.model.num_gaussians
+        padded_grad = torch.zeros((n_init_points), device=self.model.device)
+        padded_grad[: densify_grad_norm.shape[0]] = densify_grad_norm.squeeze()
+        clone_mask = padded_grad >= self.clone_grad_threshold
+        clone_mask = torch.logical_and(
+            clone_mask,
+            torch.max(self.model.get_scale(), dim=1).values
+            <= self.relative_size_threshold * scene_extent,
+        )
+        split_mask = padded_grad >= self.split_grad_threshold
+        split_mask = torch.logical_and(
+            split_mask,
+            torch.max(self.model.get_scale(), dim=1).values
+            > self.relative_size_threshold * scene_extent,
+        )
+        candidate_mask = torch.logical_or(clone_mask, split_mask)
+        candidate_scores = padded_grad[candidate_mask]
+        axis_denom = self.structure_axis_denom.clamp_min(1)
+        axis_x_score = self.structure_axis_x_accum / axis_denom
+        axis_y_score = self.structure_axis_y_accum / axis_denom
+        axis_x = torch.logical_and(candidate_mask[:, None], axis_x_score >= axis_y_score)
+        axis_y = torch.logical_and(candidate_mask[:, None], axis_y_score > axis_x_score)
+        candidate_count = candidate_mask.float().sum().clamp_min(1.0)
+        self.structure_density_stats.update(
+            {
+                "score_only_candidate_count": float(candidate_mask.sum().item()),
+                "score_only_clone_candidate_count": float(clone_mask.sum().item()),
+                "score_only_split_candidate_count": float(split_mask.sum().item()),
+                "score_only_score_mean": candidate_scores.mean().item()
+                if candidate_scores.numel() > 0
+                else 0.0,
+                "score_only_score_p95": torch.quantile(candidate_scores, 0.95).item()
+                if candidate_scores.numel() > 0
+                else 0.0,
+                "score_only_axis_x_fraction": (
+                    axis_x.float().sum() / candidate_count
+                ).item(),
+                "score_only_axis_y_fraction": (
+                    axis_y.float().sum() / candidate_count
+                ).item(),
+            }
+        )
 
     @torch.cuda.nvtx.range("split_gaussians")
     def split_gaussians(self, densify_grad_norm: torch.Tensor, scene_extent: float):
@@ -799,11 +1590,55 @@ class GSStrategy(BaseStrategy):
         )
         mask = self.cap_residual_density_candidates(mask, padded_grad, "split")
 
-        stds = self.model.get_scale()[mask].repeat(self.split_n_gaussians, 1)
+        selected_scale = self.model.get_scale()[mask]
+        structure_axis_index = self.structure_split_axis_index(mask)
+        if structure_axis_index is not None:
+            row_index = torch.arange(
+                selected_scale.shape[0],
+                device=selected_scale.device,
+            )
+            axis_stds = selected_scale.clone()
+            anisotropic_mask = structure_axis_index >= 0
+            if anisotropic_mask.any():
+                anisotropic_rows = row_index[anisotropic_mask]
+                anisotropic_axes = structure_axis_index[anisotropic_mask]
+                axis_stds[anisotropic_mask] = 0.0
+                axis_stds[anisotropic_rows, anisotropic_axes] = selected_scale[
+                    anisotropic_rows,
+                    anisotropic_axes,
+                ]
+            stds = axis_stds.repeat(self.split_n_gaussians, 1)
+            selected_axis_index = structure_axis_index[anisotropic_mask]
+            evidence_fraction = anisotropic_mask.float().mean().item()
+            self.structure_density_stats["anisotropic_split_axis_x_fraction"] = (
+                (selected_axis_index == 0).float().mean().item()
+                if selected_axis_index.numel() > 0
+                else 0.0
+            )
+            self.structure_density_stats["anisotropic_split_axis_y_fraction"] = (
+                (selected_axis_index == 1).float().mean().item()
+                if selected_axis_index.numel() > 0
+                else 0.0
+            )
+            self.structure_density_stats["anisotropic_split_axis_z_fraction"] = (
+                (selected_axis_index == 2).float().mean().item()
+                if selected_axis_index.numel() > 0
+                else 0.0
+            )
+            self.structure_density_stats["anisotropic_split_evidence_fraction"] = (
+                evidence_fraction
+            )
+        else:
+            stds = selected_scale.repeat(self.split_n_gaussians, 1)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = quaternion_to_so3(self.model.rotation[mask]).repeat(self.split_n_gaussians, 1, 1)
         offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
+        structure_axis_index_repeated = (
+            structure_axis_index.repeat(self.split_n_gaussians)
+            if structure_axis_index is not None
+            else None
+        )
         # stats
         if self.conf.strategy.print_stats:
             n_before = mask.shape[0]
@@ -815,9 +1650,27 @@ class GSStrategy(BaseStrategy):
             if name == "positions":
                 p_split = param[mask].repeat(repeats) + offsets  # [2N, 3]
             elif name == "scale":
-                p_split = self.model.scale_activation_inv(
-                    self.model.scale_activation(param[mask].repeat(repeats)) / (0.8 * self.split_n_gaussians)
-                )
+                split_scale = self.model.scale_activation(
+                    param[mask].repeat(repeats)
+                ) / (0.8 * self.split_n_gaussians)
+                if structure_axis_index_repeated is not None:
+                    axis_divisor = float(
+                        self.residual_density_control.get(
+                            "structure_split_axis_scale_divisor",
+                            1.5,
+                        )
+                    )
+                    valid_axis = structure_axis_index_repeated >= 0
+                    if valid_axis.any():
+                        split_rows = torch.arange(
+                            split_scale.shape[0],
+                            device=split_scale.device,
+                        )[valid_axis]
+                        split_axes = structure_axis_index_repeated[valid_axis]
+                        split_scale[split_rows, split_axes] = (
+                            split_scale[split_rows, split_axes] / axis_divisor
+                        )
+                p_split = self.model.scale_activation_inv(split_scale)
             else:
                 p_split = param[mask].repeat(repeats)
 
@@ -831,6 +1684,42 @@ class GSStrategy(BaseStrategy):
 
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
         self.reset_densification_buffers()
+
+    @torch.no_grad()
+    def structure_split_axis_index(self, mask: torch.Tensor) -> torch.Tensor | None:
+        if not self.residual_density_control.get("use_structure_density_weight", False):
+            return None
+        if self.residual_density_control.get("structure_score_only", False):
+            return None
+        if not self.residual_density_control.get("structure_anisotropic_split", False):
+            return None
+        if not mask.any():
+            return None
+        if self.residual_density_control.get("structure_project_local_axes", False):
+            axis_denom = self.structure_axis_denom.clamp_min(1)
+            local_axis_score = self.structure_local_axis_accum / axis_denom
+            selected_score = local_axis_score[mask]
+            axis_index = selected_score.argmax(dim=1)
+            has_evidence = selected_score.sum(dim=1) > 0
+            return torch.where(
+                has_evidence,
+                axis_index,
+                torch.full_like(axis_index, -1),
+            )
+        axis_denom = self.structure_axis_denom.clamp_min(1)
+        axis_x_score = (self.structure_axis_x_accum / axis_denom)[mask].reshape(-1)
+        axis_y_score = (self.structure_axis_y_accum / axis_denom)[mask].reshape(-1)
+        axis_index = torch.where(
+            axis_x_score >= axis_y_score,
+            torch.zeros_like(axis_x_score, dtype=torch.long),
+            torch.ones_like(axis_y_score, dtype=torch.long),
+        )
+        has_evidence = (axis_x_score + axis_y_score) > 0
+        return torch.where(
+            has_evidence,
+            axis_index,
+            torch.full_like(axis_index, -1),
+        )
 
     @torch.cuda.nvtx.range("clone_gaussians")
     def clone_gaussians(self, densify_grad_norm: torch.Tensor, scene_extent: float):
@@ -885,7 +1774,40 @@ class GSStrategy(BaseStrategy):
             return torch.cat([v, torch.zeros((int(mask.sum()), *v.shape[1:]), device=v.device)])
 
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
-        self.reset_densification_buffers()
+        if self.should_preserve_structure_buffers_for_split():
+            self.extend_densification_buffers_for_clones(int(mask.sum().item()))
+        else:
+            self.reset_densification_buffers()
+
+    def should_preserve_structure_buffers_for_split(self) -> bool:
+        return bool(
+            self.residual_density_control.get("enabled", False)
+            and self.residual_density_control.get("use_structure_density_weight", False)
+            and self.residual_density_control.get("structure_anisotropic_split", False)
+        )
+
+    def extend_densification_buffers_for_clones(self, clone_count: int) -> None:
+        buffer_shapes = (
+            ("densify_grad_norm_accum", self.densify_grad_norm_accum, 1),
+            ("densify_grad_norm_denom", self.densify_grad_norm_denom, 1),
+            (
+                "densify_abs_grad_norm_accum",
+                self.densify_abs_grad_norm_accum,
+                1,
+            ),
+            ("densify_signed_grad_accum", self.densify_signed_grad_accum, 3),
+            ("structure_axis_x_accum", self.structure_axis_x_accum, 1),
+            ("structure_axis_y_accum", self.structure_axis_y_accum, 1),
+            ("structure_local_axis_accum", self.structure_local_axis_accum, 3),
+            ("structure_axis_denom", self.structure_axis_denom, 1),
+        )
+        for name, buffer, width in buffer_shapes:
+            clone_buffer = torch.zeros(
+                (clone_count, width),
+                device=self.model.device,
+                dtype=buffer.dtype,
+            )
+            setattr(self, name, torch.cat([buffer, clone_buffer], dim=0))
 
     @torch.no_grad()
     def cap_residual_density_candidates(
@@ -990,11 +1912,51 @@ class GSStrategy(BaseStrategy):
             device=self.model.device,
             dtype=self.densify_grad_norm_denom.dtype,
         )
+        self.densify_abs_grad_norm_accum = torch.zeros(
+            (self.model.get_positions().shape[0], 1),
+            device=self.model.device,
+            dtype=self.densify_abs_grad_norm_accum.dtype,
+        )
+        self.densify_signed_grad_accum = torch.zeros(
+            (self.model.get_positions().shape[0], 3),
+            device=self.model.device,
+            dtype=self.densify_signed_grad_accum.dtype,
+        )
+        self.structure_axis_x_accum = torch.zeros(
+            (self.model.get_positions().shape[0], 1),
+            device=self.model.device,
+            dtype=self.structure_axis_x_accum.dtype,
+        )
+        self.structure_axis_y_accum = torch.zeros(
+            (self.model.get_positions().shape[0], 1),
+            device=self.model.device,
+            dtype=self.structure_axis_y_accum.dtype,
+        )
+        self.structure_local_axis_accum = torch.zeros(
+            (self.model.get_positions().shape[0], 3),
+            device=self.model.device,
+            dtype=self.structure_local_axis_accum.dtype,
+        )
+        self.structure_axis_denom = torch.zeros(
+            (self.model.get_positions().shape[0], 1),
+            device=self.model.device,
+            dtype=self.structure_axis_denom.dtype,
+        )
 
     def prune_densification_buffers(self, valid_mask: torch.Tensor) -> None:
         # Update non-optimizable buffers
         self.densify_grad_norm_accum = self.densify_grad_norm_accum[valid_mask]
         self.densify_grad_norm_denom = self.densify_grad_norm_denom[valid_mask]
+        self.densify_abs_grad_norm_accum = self.densify_abs_grad_norm_accum[
+            valid_mask
+        ]
+        self.densify_signed_grad_accum = self.densify_signed_grad_accum[
+            valid_mask
+        ]
+        self.structure_axis_x_accum = self.structure_axis_x_accum[valid_mask]
+        self.structure_axis_y_accum = self.structure_axis_y_accum[valid_mask]
+        self.structure_local_axis_accum = self.structure_local_axis_accum[valid_mask]
+        self.structure_axis_denom = self.structure_axis_denom[valid_mask]
 
     def decay_density(self):
         def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:

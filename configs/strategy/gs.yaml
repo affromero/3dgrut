@@ -50,11 +50,26 @@ residual_density_control:
   color_grad_weight: 0.5
   density_grad_weight: 0.25
   gradient_max_weight: 3.0
+  use_abs_gradient_score: false
+  abs_gradient_collision_reference: 1.0
+  abs_gradient_collision_power: 0.5
+  abs_gradient_collision_min_weight: 1.0
+  abs_gradient_collision_max_weight: 3.0
   use_edge_error_weight: false
   edge_error_reference: 0.05
   edge_error_power: 0.5
   edge_error_min_weight: 0.5
   edge_error_max_weight: 3.0
+  use_frequency_error_weight: false
+  frequency_error_reference: 0.03
+  frequency_error_power: 0.5
+  frequency_error_min_weight: 0.5
+  frequency_error_max_weight: 4.0
+  frequency_use_edge_gate: true
+  frequency_edge_reference: 0.05
+  frequency_edge_power: 0.5
+  frequency_edge_min_weight: 0.75
+  frequency_edge_max_weight: 2.0
   # RoMa-guided density control (Phase 3a): per-image precision lookup
   # Hydra struct mode rejects unknown keys, so all defaults must be
   # declared here even when the feature is off (use_roma_precision_weight=false).
@@ -64,6 +79,18 @@ residual_density_control:
   roma_precision_power: 1.0
   roma_precision_min_weight: 0.5
   roma_precision_max_weight: 3.0
+  use_structure_density_weight: false
+  structure_score_only: false
+  structure_anisotropic_split: false
+  structure_project_local_axes: false
+  structure_score_reference: 50.0
+  structure_score_power: 0.5
+  structure_min_weight: 0.5
+  structure_max_weight: 4.0
+  structure_axis_max_score: 10.0
+  structure_split_axis_scale_divisor: 1.5
+  structure_rim_radius_fraction: 0.80
+  structure_log_frequency: 100
   min_total_weight: 0.25
   max_total_weight: 6.0
   max_candidate_fraction: 0.001
