@@ -64,6 +64,17 @@ from threedgrut.utils.timer import CudaTimer
 
 
 DIAGNOSTIC_QUANTILE_MAX_SAMPLES = 1_000_000
+EVAL_IMAGE_GRID_DIR = "eval_image_grids"
+SEMANTIC_MASK_DIR = "semantic_masks"
+SEMANTIC_OPACITY_TILE = "semantic_opacity_mask"
+SEMANTIC_LABEL_COLORS_RGB = (
+    (0.95, 0.20, 0.15),
+    (0.10, 0.70, 1.00),
+    (0.20, 0.85, 0.25),
+    (1.00, 0.72, 0.10),
+    (0.72, 0.35, 1.00),
+    (0.05, 0.95, 0.80),
+)
 
 
 def _quantile_values(value: torch.Tensor) -> torch.Tensor:
@@ -95,6 +106,81 @@ def _robust_jet_map(
     else:
         max_value = torch.quantile(valid_values, quantile).clamp_min(1e-6)
     return jet_map(value_map, max_value)
+
+
+def _colorize_semantic_mask(
+    mask: torch.Tensor,
+    color_index: int,
+) -> torch.Tensor:
+    """Colorize one binary semantic mask with a deterministic palette entry."""
+    color = torch.tensor(
+        SEMANTIC_LABEL_COLORS_RGB[
+            color_index % len(SEMANTIC_LABEL_COLORS_RGB)
+        ],
+        device=mask.device,
+        dtype=mask.dtype,
+    )
+    return mask.clip(0, 1.0).expand(*mask.shape[:2], 3) * color.view(1, 1, 3)
+
+
+def _colorize_semantic_label_masks(
+    semantic_label_masks: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Combine per-label masks into one color-coded semantic tile."""
+    first_mask = next(iter(semantic_label_masks.values()))
+    semantic_rgb = torch.zeros(
+        (*first_mask.shape[:2], 3),
+        device=first_mask.device,
+        dtype=first_mask.dtype,
+    )
+    for label_index, (_, label_mask) in enumerate(
+        sorted(semantic_label_masks.items())
+    ):
+        semantic_rgb = semantic_rgb + _colorize_semantic_mask(
+            label_mask,
+            label_index,
+        )
+    return semantic_rgb.clip(0, 1.0)
+
+
+def _load_semantic_label_masks(
+    *,
+    image_path: str,
+    target_shape: tuple[int, int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Load optional per-label semantic mask sidecars for one COLMAP image."""
+    colmap_dir = os.path.dirname(os.path.dirname(image_path))
+    semantic_root = os.path.join(colmap_dir, SEMANTIC_MASK_DIR)
+    if not os.path.isdir(semantic_root):
+        return {}
+
+    image_name = os.path.basename(image_path)
+    target_h, target_w = target_shape
+    masks: dict[str, torch.Tensor] = {}
+    for label in sorted(os.listdir(semantic_root)):
+        label_dir = os.path.join(semantic_root, label)
+        if not os.path.isdir(label_dir):
+            continue
+        mask_path = os.path.join(label_dir, image_name)
+        if not os.path.exists(mask_path):
+            continue
+        mask_np = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask_np is None:
+            continue
+        if mask_np.shape[:2] != (target_h, target_w):
+            mask_np = cv2.resize(
+                mask_np,
+                (target_w, target_h),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        mask_bool = (mask_np > 127).astype(np.float32)
+        masks[label] = torch.from_numpy(mask_bool).to(
+            device=device,
+            dtype=dtype,
+        ).unsqueeze(-1)
+    return masks
 
 
 def _scalar_tensor_stats(
@@ -856,16 +942,20 @@ def _screen_space_footprint_metrics(
     with torch.no_grad():
         positions = model.get_positions().detach()
         scales = model.get_scale().detach().float().amax(dim=1)
-        sample_count = min(max_samples, positions.shape[0])
+        position_count = int(positions.shape[0])
+        sample_count = min(max_samples, position_count)
         if sample_count <= 0:
             return {}
-        if sample_count < positions.shape[0]:
-            sample_idx = torch.linspace(
-                0,
-                positions.shape[0] - 1,
-                steps=sample_count,
-                device=positions.device,
-            ).long()
+        if sample_count < position_count:
+            sample_idx = (
+                torch.arange(
+                    sample_count,
+                    device=positions.device,
+                    dtype=torch.long,
+                )
+                * (position_count - 1)
+                // max(sample_count - 1, 1)
+            ).clamp_(max=position_count - 1)
             positions = positions[sample_idx]
             scales = scales[sample_idx]
         pose = gpu_batch.T_to_world.squeeze(0)
@@ -1093,6 +1183,7 @@ def _make_validation_image_tiles(
     hit_counts: torch.Tensor,
     mask: torch.Tensor | None,
     sky_mask: torch.Tensor | None,
+    semantic_label_masks: dict[str, torch.Tensor] | None,
     max_hit_count: int,
     gt_depth: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -1158,7 +1249,14 @@ def _make_validation_image_tiles(
         "opacity_low": opacity_low.expand_as(rgb_gt),
     }
     if sky_mask is not None:
-        tiles["sky_opacity_mask"] = sky_mask.clip(0, 1.0).expand_as(rgb_gt)
+        if semantic_label_masks:
+            tiles[SEMANTIC_OPACITY_TILE] = _colorize_semantic_label_masks(
+                semantic_label_masks
+            )
+        else:
+            tiles[SEMANTIC_OPACITY_TILE] = sky_mask.clip(0, 1.0).expand_as(
+                rgb_gt
+            )
     if gt_depth is not None:
         # `_robust_jet_map` / `jet_map` expect the same shape `pred_dist`
         # has at this point — sliced last batch element, ``[H, W, 1]``.
@@ -2508,6 +2606,15 @@ class Trainer3DGRUT:
                     else None
                 )
                 metrics["eval_image_path"] = gpu_batch.image_path
+                semantic_label_masks = _load_semantic_label_masks(
+                    image_path=str(gpu_batch.image_path),
+                    target_shape=(
+                        int(gpu_batch.rgb_gt[-1].shape[0]),
+                        int(gpu_batch.rgb_gt[-1].shape[1]),
+                    ),
+                    device=self.device,
+                    dtype=gpu_batch.rgb_gt.dtype,
+                )
                 gt_depth_for_tile = None
                 dense_depth_dir = (
                     self.conf.loss.get("dense_depth_dir", "")
@@ -2543,6 +2650,7 @@ class Trainer3DGRUT:
                     hit_counts=outputs["hits_count"][-1],
                     mask=mask,
                     sky_mask=sky_mask,
+                    semantic_label_masks=semantic_label_masks,
                     max_hit_count=self.conf.writer.max_num_hits,
                     gt_depth=gt_depth_for_tile,
                 )
@@ -3040,17 +3148,18 @@ class Trainer3DGRUT:
         writer = self.tracking.writer
         global_step = self.global_step
 
-        if self.conf.use_wandb and "img_eval_tiles" in metrics:
+        if "img_eval_tiles" in metrics and "eval_image_path" in metrics:
             jpg_dir = os.path.join(
                 self.tracking.output_dir,
-                "wandb_eval_jpg",
+                EVAL_IMAGE_GRID_DIR,
                 f"step_{global_step:06d}",
             )
             os.makedirs(jpg_dir, exist_ok=True)
+            tile_groups = metrics["img_eval_tiles"]
             grid_columns = [
                 "input_rgb",
                 "training_mask",
-                "sky_opacity_mask",
+                SEMANTIC_OPACITY_TILE,
                 "prediction_rgb",
                 "rgb_error",
                 "low_freq_error",
@@ -3064,7 +3173,6 @@ class Trainer3DGRUT:
                 "hits_sparse",
                 "opacity_low",
             ]
-            tile_groups = metrics["img_eval_tiles"]
             grid_columns = [
                 column for column in grid_columns if column in tile_groups
             ]
@@ -3087,16 +3195,18 @@ class Trainer3DGRUT:
                     row_end=group_end,
                     output_path=grid_path,
                 )
-                caption = f"rows=image path, columns={', '.join(grid_columns)}"
-                wandb.log(
-                    {
-                        "train/iteration": global_step,
-                        f"eval/image_grid/group_{group_idx:03d}": wandb.Image(
-                            grid_path,
-                            caption=caption,
-                        )
-                    },
-                )
+                if self.conf.use_wandb:
+                    caption = (
+                        f"rows=image path, columns={', '.join(grid_columns)}"
+                    )
+                    wandb.log(
+                        {
+                            "train/iteration": global_step,
+                            f"eval/image_grid/group_{group_idx:03d}": (
+                                wandb.Image(grid_path, caption=caption)
+                            ),
+                        },
+                    )
 
         mean_timings = {}
         if "timings" in metrics:
