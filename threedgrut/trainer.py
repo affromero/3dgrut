@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import torch.utils.data
 import wandb
 from addict import Dict
+from difflogtest.utils.path import path_abs, path_join, path_mkdir
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torchmetrics import PeakSignalNoiseRatio
@@ -67,6 +68,9 @@ DIAGNOSTIC_QUANTILE_MAX_SAMPLES = 1_000_000
 EVAL_IMAGE_GRID_DIR = "eval_image_grids"
 SEMANTIC_MASK_DIR = "semantic_masks"
 SEMANTIC_OPACITY_TILE = "semantic_opacity_mask"
+LAST_CHECKPOINT_FILENAME = "ckpt_last.pt"
+BEST_CHECKPOINT_FILENAME = "ckpt_best.pt"
+EARLY_STOPPING_AUTO_PSNR_METRIC = "masked_psnr_if_available"
 SEMANTIC_LABEL_COLORS_RGB = (
     (0.95, 0.20, 0.15),
     (0.10, 0.70, 1.00),
@@ -176,10 +180,14 @@ def _load_semantic_label_masks(
                 interpolation=cv2.INTER_NEAREST,
             )
         mask_bool = (mask_np > 127).astype(np.float32)
-        masks[label] = torch.from_numpy(mask_bool).to(
-            device=device,
-            dtype=dtype,
-        ).unsqueeze(-1)
+        masks[label] = (
+            torch.from_numpy(mask_bool)
+            .to(
+                device=device,
+                dtype=dtype,
+            )
+            .unsqueeze(-1)
+        )
     return masks
 
 
@@ -1360,6 +1368,11 @@ class Trainer3DGRUT:
         """ Total number of train epochs / passes, e.g. single pass over the dataset."""
         self.val_frequency = conf.val_frequency
         """ Validation frequency, in terms on global steps """
+        self._should_stop_training = False
+        self._best_validation_score: float | None = None
+        self._best_validation_step: int | None = None
+        self._stale_validation_count = 0
+        self._best_checkpoint_path: str | None = None
 
         # Setup the trainer and components
         logger.log_rule("Load Datasets")
@@ -3439,16 +3452,28 @@ class Trainer3DGRUT:
                 global_step,
             )
         render_stat_metric_names = (
-            ("pred_opacity_finite_fraction", "diagnostics/render/opacity/finite_fraction"),
-            ("pred_opacity_nonzero_fraction", "diagnostics/render/opacity/nonzero_fraction"),
+            (
+                "pred_opacity_finite_fraction",
+                "diagnostics/render/opacity/finite_fraction",
+            ),
+            (
+                "pred_opacity_nonzero_fraction",
+                "diagnostics/render/opacity/nonzero_fraction",
+            ),
             ("pred_opacity_min", "diagnostics/render/opacity/min"),
             ("pred_opacity_mean", "diagnostics/render/opacity/mean"),
             ("pred_opacity_p50", "diagnostics/render/opacity/p50"),
             ("pred_opacity_p95", "diagnostics/render/opacity/p95"),
             ("pred_opacity_p99", "diagnostics/render/opacity/p99"),
             ("pred_opacity_max", "diagnostics/render/opacity/max"),
-            ("pred_dist_finite_fraction", "diagnostics/render/depth/finite_fraction"),
-            ("pred_dist_nonzero_fraction", "diagnostics/render/depth/nonzero_fraction"),
+            (
+                "pred_dist_finite_fraction",
+                "diagnostics/render/depth/finite_fraction",
+            ),
+            (
+                "pred_dist_nonzero_fraction",
+                "diagnostics/render/depth/nonzero_fraction",
+            ),
             ("pred_dist_min", "diagnostics/render/depth/min"),
             ("pred_dist_mean", "diagnostics/render/depth/mean"),
             ("pred_dist_p50", "diagnostics/render/depth/p50"),
@@ -3635,6 +3660,131 @@ class Trainer3DGRUT:
         logger.log_table(
             f"📊 Validation Metrics - Step {global_step}", record=table
         )
+
+    def _validation_checkpoint_score(
+        self, metrics: dict[str, list[float]]
+    ) -> float:
+        """Return the configured scalar validation score for checkpointing."""
+        metric_name = str(
+            self.conf.early_stopping.get("metric", "masked_psnr")
+        )
+        if metric_name == EARLY_STOPPING_AUTO_PSNR_METRIC:
+            metric_name = "masked_psnr" if "masked_psnr" in metrics else "psnr"
+        if metric_name not in metrics:
+            msg = (
+                f"Early-stopping metric '{metric_name}' was not produced by "
+                "validation."
+            )
+            raise KeyError(msg)
+        values = metrics[metric_name]
+        if len(values) == 0:
+            msg = f"Validation metric '{metric_name}' has no values."
+            raise ValueError(msg)
+        return float(np.mean(values))
+
+    def _is_validation_improvement(self, score: float) -> bool:
+        """Return whether ``score`` beats the current best by ``min_delta``."""
+        if self._best_validation_score is None:
+            return True
+        min_delta = float(self.conf.early_stopping.get("min_delta", 0.0))
+        if min_delta < 0.0:
+            msg = f"early_stopping.min_delta must be >= 0, got {min_delta}."
+            raise ValueError(msg)
+        return score > self._best_validation_score + min_delta
+
+    def _handle_validation_checkpointing(
+        self, metrics: dict[str, list[float]]
+    ) -> None:
+        """Update latest/best checkpoints and early-stopping state."""
+        checkpoint_conf = self.conf.checkpoint
+        early_stopping_conf = self.conf.early_stopping
+        save_last = bool(checkpoint_conf.get("save_last_on_validation", False))
+        save_best = bool(
+            checkpoint_conf.get("save_best_on_validation", False)
+            or early_stopping_conf.get("enabled", False)
+        )
+
+        if save_last:
+            self.save_checkpoint(last_checkpoint=True)
+        if not save_best and not bool(
+            early_stopping_conf.get("enabled", False)
+        ):
+            return
+
+        score = self._validation_checkpoint_score(metrics)
+        metric_name = str(early_stopping_conf.get("metric", "masked_psnr"))
+        if metric_name == EARLY_STOPPING_AUTO_PSNR_METRIC:
+            metric_name = "masked_psnr" if "masked_psnr" in metrics else "psnr"
+        if self._is_validation_improvement(score):
+            self._best_validation_score = score
+            self._best_validation_step = self.global_step
+            self._stale_validation_count = 0
+            if save_best:
+                self._best_checkpoint_path = self.save_checkpoint(
+                    best_checkpoint=True
+                )
+            logger.info(
+                f"Best validation {metric_name}={score:.6f} "
+                f"at step {self.global_step}"
+            )
+            return
+
+        self._stale_validation_count += 1
+        best_score = self._best_validation_score
+        if best_score is None:
+            msg = "No best validation score was recorded before stale update."
+            raise RuntimeError(msg)
+        patience = int(early_stopping_conf.get("patience", 3))
+        if patience < 1:
+            msg = f"early_stopping.patience must be >= 1, got {patience}."
+            raise ValueError(msg)
+        logger.info(
+            f"Validation {metric_name}={score:.6f} did not improve from "
+            f"{best_score:.6f}; "
+            f"stale validations: {self._stale_validation_count}/{patience}"
+        )
+        if (
+            bool(early_stopping_conf.get("enabled", False))
+            and self._stale_validation_count >= patience
+        ):
+            self._should_stop_training = True
+            logger.info(
+                "Early stopping triggered at step "
+                f"{self.global_step}; best step={self._best_validation_step}, "
+                f"best {metric_name}={best_score:.6f}"
+            )
+
+    def _restore_best_checkpoint_for_export(self) -> None:
+        """Load the best validation checkpoint before final export/testing."""
+        early_stopping_conf = self.conf.early_stopping
+        if not bool(early_stopping_conf.get("restore_best_on_end", True)):
+            return
+        if self._best_checkpoint_path is None:
+            return
+        if self._best_validation_step == self.global_step:
+            return
+
+        logger.info(
+            "Restoring best validation checkpoint for export: "
+            f"{self._best_checkpoint_path}"
+        )
+        checkpoint = torch.load(self._best_checkpoint_path, weights_only=False)
+        self.model.init_from_checkpoint(checkpoint, setup_optimizer=False)
+        if (
+            self.post_processing is not None
+            and "post_processing" in checkpoint
+        ):
+            self.post_processing.load_state_dict(
+                checkpoint["post_processing"]["module"]
+            )
+        if (
+            self.camera_residual is not None
+            and "camera_residual" in checkpoint
+        ):
+            self.camera_residual.load_state_dict(
+                checkpoint["camera_residual"]["module"]
+            )
+        self.global_step = int(checkpoint["global_step"])
 
     @torch.cuda.nvtx.range("log_training_iter")
     def log_training_iter(
@@ -3858,8 +4008,14 @@ class Trainer3DGRUT:
                 ("pred_opacity_p95", "train/render/opacity/p95"),
                 ("pred_opacity_p99", "train/render/opacity/p99"),
                 ("pred_opacity_max", "train/render/opacity/max"),
-                ("pred_dist_finite_fraction", "train/render/depth/finite_fraction"),
-                ("pred_dist_nonzero_fraction", "train/render/depth/nonzero_fraction"),
+                (
+                    "pred_dist_finite_fraction",
+                    "train/render/depth/finite_fraction",
+                ),
+                (
+                    "pred_dist_nonzero_fraction",
+                    "train/render/depth/nonzero_fraction",
+                ),
                 ("pred_dist_min", "train/render/depth/min"),
                 ("pred_dist_mean", "train/render/depth/mean"),
                 ("pred_dist_p50", "train/render/depth/p50"),
@@ -3930,6 +4086,8 @@ class Trainer3DGRUT:
 
         # Export the mixture-of-3d-gaussians
         logger.log_rule("Exporting Models")
+        self.save_checkpoint(last_checkpoint=True)
+        self._restore_best_checkpoint_for_export()
 
         if conf.export_ply.enabled:
             from threedgrut.export import PLYExporter
@@ -4004,7 +4162,6 @@ class Trainer3DGRUT:
             logger.info(f"📊 PPISP report saved to: {ppisp_report_dir}")
 
         self.teardown_dataloaders()
-        self.save_checkpoint(last_checkpoint=True)
 
         # Evaluate on test set
         if conf.test_last:
@@ -4024,14 +4181,23 @@ class Trainer3DGRUT:
             renderer.render_all()
 
     @torch.cuda.nvtx.range("save_checkpoint")
-    def save_checkpoint(self, last_checkpoint: bool = False):
+    def save_checkpoint(
+        self,
+        *,
+        last_checkpoint: bool = False,
+        best_checkpoint: bool = False,
+    ) -> str:
         """Saves checkpoint to a path under {conf.out_dir}/{conf.experiment_name}.
 
         Args:
             last_checkpoint: If true, will update checkpoint title to 'last'.
                              Otherwise uses global step
+            best_checkpoint: If true, will update checkpoint title to 'best'.
 
         """
+        if last_checkpoint and best_checkpoint:
+            msg = "Checkpoint cannot be both latest and best."
+            raise ValueError(msg)
         global_step = self.global_step
         out_dir = self.tracking.output_dir
         parameters = self.model.get_model_parameters()
@@ -4061,17 +4227,31 @@ class Trainer3DGRUT:
                 "optimizer": self.camera_residual_optimizer.state_dict(),
             }
 
-        os.makedirs(
-            os.path.join(out_dir, f"ours_{int(global_step)}"), exist_ok=True
-        )
-        if not last_checkpoint:
-            ckpt_path = os.path.join(
-                out_dir, f"ours_{int(global_step)}", f"ckpt_{global_step}.pt"
-            )
+        if best_checkpoint:
+            ckpt_path = path_join(out_dir, BEST_CHECKPOINT_FILENAME)
+        elif last_checkpoint:
+            ckpt_path = path_join(out_dir, LAST_CHECKPOINT_FILENAME)
         else:
-            ckpt_path = os.path.join(out_dir, "ckpt_last.pt")
+            if not bool(
+                self.conf.checkpoint.get("keep_step_checkpoints", True)
+            ):
+                ckpt_path = path_join(out_dir, LAST_CHECKPOINT_FILENAME)
+            else:
+                checkpoint_dir = path_join(out_dir, f"ours_{int(global_step)}")
+                path_mkdir(checkpoint_dir, parents=True, exist_ok=True)
+                ckpt_path = path_join(checkpoint_dir, f"ckpt_{global_step}.pt")
+        if best_checkpoint:
+            checkpoint_label = "best"
+        elif last_checkpoint:
+            checkpoint_label = "latest"
+        else:
+            checkpoint_label = "step"
         torch.save(parameters, ckpt_path)
-        logger.info(f'💾 Saved checkpoint to: "{os.path.abspath(ckpt_path)}"')
+        logger.info(
+            f"💾 Saved {checkpoint_label} checkpoint to: "
+            f'"{path_abs(ckpt_path)}"'
+        )
+        return ckpt_path
 
     def render_gui(self, scene_updated):
         """Render & refresh a single frame for the gui"""
@@ -4158,7 +4338,10 @@ class Trainer3DGRUT:
             global_step % self.val_frequency == 0
         )
         if is_time_to_validate:
-            self.run_validation_pass(conf)
+            validation_metrics = self.run_validation_pass(conf)
+            self._handle_validation_checkpointing(validation_metrics)
+            if self._should_stop_training:
+                return
 
         # Compute the outputs of a single batch
         with torch.cuda.nvtx.range(f"train_{global_step}_fwd"):
@@ -4343,6 +4526,8 @@ class Trainer3DGRUT:
             self.run_train_iter(
                 self.global_step, batch, profilers, metrics, conf
             )
+            if self._should_stop_training:
+                return
 
         self.log_training_pass(metrics)
 
@@ -4473,6 +4658,8 @@ class Trainer3DGRUT:
 
         for epoch_idx in range(self.n_epochs):
             self.run_train_pass(conf)
+            if self._should_stop_training:
+                break
 
         logger.end_progress(task_name="Training")
 
@@ -4486,9 +4673,13 @@ class Trainer3DGRUT:
         )
         logger.log_table("🎊 Training Statistics", record=table)
 
-        if bool(conf.get("validate_final", True)):
+        if (
+            bool(conf.get("validate_final", True))
+            and not self._should_stop_training
+        ):
             logger.log_rule("Final Validation")
-            self.run_validation_pass(conf)
+            validation_metrics = self.run_validation_pass(conf)
+            self._handle_validation_checkpointing(validation_metrics)
 
         # Perform testing
         self.on_training_end()

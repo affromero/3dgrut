@@ -26,6 +26,13 @@ validate_only: false
 log_frequency: 1
 compute_extra_metrics: true
 
+early_stopping:
+  enabled: false
+  metric: masked_psnr_if_available
+  patience: 3
+  min_delta: 0.0
+  restore_best_on_end: true
+
 enable_frame_timings: false
 
 enable_writer: true
@@ -133,6 +140,9 @@ model:
 
 checkpoint:
   iterations: ${int_list:[ 7000, 30000 ]}
+  keep_step_checkpoints: true
+  save_last_on_validation: false
+  save_best_on_validation: false
 
 optimizer:
   type: adam # We only support adam and selective_adam for now
