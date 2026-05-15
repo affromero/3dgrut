@@ -28,7 +28,7 @@ import torch.nn.functional as F
 import torch.utils.data
 import wandb
 from addict import Dict
-from difflogtest.utils.path import path_abs, path_join, path_mkdir
+from klog.path import path_abs, path_join, path_mkdir
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 from torchmetrics import PeakSignalNoiseRatio
