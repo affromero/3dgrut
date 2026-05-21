@@ -33,6 +33,8 @@ diagnostics:
   snapshot_frequency: 500   # Save render/residual/grad_positions PNGs every N steps (0 disables)
   snapshot_camera_index: 0  # Which train camera to render snapshots from
   snapshot_resolution: 256  # Thumbnail edge length
+  snapshot_include_gt: true  # Include GT RGB when the train batch exposes it
+  snapshot_contact_sheet_enabled: true  # Log GT/render/residual/grad in one PNG
   loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
   loss_volume_voxel_size_m: 0.1
   loss_volume_view_stride: 4

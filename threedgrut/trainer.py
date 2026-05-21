@@ -4321,12 +4321,14 @@ class Trainer3DGRUT:
 
     @torch.no_grad()
     def _log_visual_snapshots(self, global_step: int) -> None:
-        """Save 256x256 render/residual/grad PNGs every `snapshot_frequency` steps.
+        """Save render/residual/grad PNGs every `snapshot_frequency` steps.
 
         Writes to `{tracking.output_dir}/snapshots/step_NNNNNN_<kind>.png` and
         also logs to wandb if `use_wandb` is set. Uses the same nearest-train-
         view machinery as the GUI residual mode. Skipped pre-first-backward
-        (model._last_grad_norms is empty).
+        (model._last_grad_norms is empty). When GT is available, also writes a
+        same-resolution contact sheet so visual diagnostics can be compared in
+        one W&B panel.
         """
         diag = self.conf.get("diagnostics") if hasattr(self.conf, "get") else None
         if diag is None:
@@ -4360,8 +4362,9 @@ class Trainer3DGRUT:
 
         # 2) Residual: |render - gt|
         gt = gpu_batch.rgb_gt
+        gt_rgb = None
         residual = None
-        if gt is not None:
+        if gt is not None and bool(diag.get("snapshot_include_gt", True)):
             gt0 = gt[0] if gt.ndim == 4 else gt
             if gt0.shape[:2] != render.shape[:2]:
                 gt0 = torch.nn.functional.interpolate(
@@ -4370,7 +4373,8 @@ class Trainer3DGRUT:
                     mode="bilinear",
                     align_corners=False,
                 )[0].permute(1, 2, 0)
-            residual = (render - gt0.to(render.device)).abs().mean(dim=-1)
+            gt_rgb = gt0.to(render.device).clamp(0.0, 1.0)
+            residual = (render - gt_rgb).abs().mean(dim=-1)
 
         # 3) Grad_positions render
         grad_render = None
@@ -4402,16 +4406,21 @@ class Trainer3DGRUT:
         snapshots_dir = path_join(self.tracking.output_dir, "snapshots")
         path_mkdir(snapshots_dir, parents=True, exist_ok=True)
 
-        # Save + (optionally) log
+        # Save + (optionally) log.
         from PIL import Image as _PILImage
+        from PIL import ImageDraw as _PILImageDraw
 
-        def _save_rgb(t: torch.Tensor, kind: str) -> str:
+        def _rgb_array(t: torch.Tensor) -> np.ndarray:
             arr = (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
+            return arr
+
+        def _save_rgb(t: torch.Tensor, kind: str) -> tuple[str, np.ndarray]:
+            arr = _rgb_array(t)
             sp = path_join(snapshots_dir, f"step_{global_step:06d}_{kind}.png")
             _PILImage.fromarray(arr).save(sp)
-            return sp
+            return sp, arr
 
-        def _save_scalar_hot(t: torch.Tensor, kind: str, vmax: float = 0.3) -> str:
+        def _scalar_hot_array(t: torch.Tensor, vmax: float = 0.3) -> np.ndarray:
             v = (t.detach().cpu().numpy() / max(vmax, 1e-9)).clip(0.0, 1.0)
             try:
                 from matplotlib import cm
@@ -4419,26 +4428,73 @@ class Trainer3DGRUT:
                 arr = (rgba[..., :3] * 255.0).astype("uint8")
             except ImportError:
                 arr = np.stack([v * 255, v * 128, np.zeros_like(v)], axis=-1).astype("uint8")
+            return arr
+
+        def _save_scalar_hot(t: torch.Tensor, kind: str, vmax: float = 0.3) -> tuple[str, np.ndarray]:
+            arr = _scalar_hot_array(t, vmax=vmax)
             sp = path_join(snapshots_dir, f"step_{global_step:06d}_{kind}.png")
             _PILImage.fromarray(arr).save(sp)
+            return sp, arr
+
+        def _labeled_panel(label: str, arr: np.ndarray) -> np.ndarray:
+            label_h = 22
+            canvas = np.zeros((arr.shape[0] + label_h, arr.shape[1], 3), dtype=np.uint8)
+            canvas[:label_h, :, :] = 24
+            canvas[label_h:, :, :] = arr
+            image = _PILImage.fromarray(canvas)
+            draw = _PILImageDraw.Draw(image)
+            draw.text((6, 4), label, fill=(235, 235, 235))
+            return np.asarray(image)
+
+        def _save_contact_sheet(panels: list[tuple[str, np.ndarray]]) -> str | None:
+            if len(panels) < 2:
+                return None
+            base_shape = panels[0][1].shape
+            matched = [(label, arr) for label, arr in panels if arr.shape == base_shape]
+            if len(matched) < 2:
+                return None
+            sheet = np.concatenate(
+                [_labeled_panel(label, arr) for label, arr in matched],
+                axis=1,
+            )
+            sp = path_join(
+                snapshots_dir,
+                f"step_{global_step:06d}_contact_sheet.png",
+            )
+            _PILImage.fromarray(sheet).save(sp)
             return sp
 
-        render_path = _save_rgb(_resize_rgb(render), "render")
+        panels: list[tuple[str, np.ndarray]] = []
+        gt_path = None
+        if gt_rgb is not None:
+            gt_path, gt_arr = _save_rgb(_resize_rgb(gt_rgb), "gt")
+            panels.append(("GT", gt_arr))
+        render_path, render_arr = _save_rgb(_resize_rgb(render), "render")
+        panels.append(("render", render_arr))
         residual_path = None
         if residual is not None:
-            residual_path = _save_scalar_hot(_resize_scalar(residual), "residual")
+            residual_path, residual_arr = _save_scalar_hot(_resize_scalar(residual), "residual")
+            panels.append(("residual", residual_arr))
         grad_path = None
         if grad_render is not None:
-            grad_path = _save_rgb(_resize_rgb(grad_render), "grad_positions")
+            grad_path, grad_arr = _save_rgb(_resize_rgb(grad_render), "grad_positions")
+            panels.append(("grad_positions", grad_arr))
+        contact_sheet_path = None
+        if bool(diag.get("snapshot_contact_sheet_enabled", True)):
+            contact_sheet_path = _save_contact_sheet(panels)
 
         if self.conf.use_wandb:
             try:
                 import wandb
                 payload = {"train/iteration": global_step, "viz/render": wandb.Image(render_path)}
+                if gt_path is not None:
+                    payload["viz/gt"] = wandb.Image(gt_path)
                 if residual_path is not None:
                     payload["viz/residual"] = wandb.Image(residual_path)
                 if grad_path is not None:
                     payload["viz/grad_positions"] = wandb.Image(grad_path)
+                if contact_sheet_path is not None:
+                    payload["viz/contact_sheet"] = wandb.Image(contact_sheet_path)
                 wandb.log(payload)
             except Exception as exc:
                 logger.warning(f"snapshot: wandb log failed: {exc}")
