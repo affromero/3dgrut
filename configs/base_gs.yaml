@@ -30,6 +30,9 @@ log_frequency: 1
 diagnostics:
   parquet_enabled: true     # Write per-step metrics to {output_dir}/diagnostics.parquet
   parquet_flush_steps: 100  # Flush row groups every N steps
+  snapshot_frequency: 500   # Save render/residual/grad_positions PNGs every N steps (0 disables)
+  snapshot_camera_index: 0  # Which train camera to render snapshots from
+  snapshot_resolution: 256  # Thumbnail edge length
 compute_extra_metrics: true
 
 early_stopping:

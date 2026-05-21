@@ -4318,6 +4318,129 @@ class Trainer3DGRUT:
             g = param.grad.detach()
             self.model._last_grad_norms[name] = g.reshape(g.shape[0], -1).norm(dim=1)
 
+    @torch.no_grad()
+    def _log_visual_snapshots(self, global_step: int) -> None:
+        """Save 256x256 render/residual/grad PNGs every `snapshot_frequency` steps.
+
+        Writes to `{tracking.output_dir}/snapshots/step_NNNNNN_<kind>.png` and
+        also logs to wandb if `use_wandb` is set. Uses the same nearest-train-
+        view machinery as the GUI residual mode. Skipped pre-first-backward
+        (model._last_grad_norms is empty).
+        """
+        diag = self.conf.get("diagnostics") if hasattr(self.conf, "get") else None
+        if diag is None:
+            return
+        freq = int(diag.get("snapshot_frequency", 0))
+        if freq <= 0 or global_step <= 0 or global_step % freq != 0:
+            return
+        if self.train_dataset is None:
+            return
+
+        cam_idx = int(diag.get("snapshot_camera_index", 0)) % max(len(self.train_dataset), 1)
+        try:
+            sample = self.train_dataset[cam_idx]
+        except Exception as exc:
+            logger.warning(f"snapshot: dataset[{cam_idx}] failed: {exc}")
+            return
+        try:
+            gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(sample)
+        except Exception as exc:
+            logger.warning(f"snapshot: get_gpu_batch failed: {exc}")
+            return
+
+        # 1) Regular render
+        try:
+            outputs = self.model(gpu_batch, train=False)
+        except Exception as exc:
+            logger.warning(f"snapshot: render failed: {exc}")
+            return
+        render = outputs["pred_rgb"][0]  # [H, W, 3] in [0, 1]
+
+        # 2) Residual: |render - gt|
+        gt = gpu_batch.rgb_gt
+        residual = None
+        if gt is not None:
+            gt0 = gt[0] if gt.ndim == 4 else gt
+            if gt0.shape[:2] != render.shape[:2]:
+                gt0 = torch.nn.functional.interpolate(
+                    gt0.permute(2, 0, 1).unsqueeze(0),
+                    size=(render.shape[0], render.shape[1]),
+                    mode="bilinear",
+                    align_corners=False,
+                )[0].permute(1, 2, 0)
+            residual = (render - gt0.to(render.device)).abs().mean(dim=-1)
+
+        # 3) Grad_positions render
+        grad_render = None
+        try:
+            from threedgrut.utils.grad_viz import build_features_override_for_grad
+            features_override = build_features_override_for_grad(
+                self.model, "positions", "p99"
+            )
+            if features_override is not None:
+                grad_outputs = self.model.render_diagnostic(
+                    gpu_batch, features_override=features_override, sph_degree_override=0
+                )
+                grad_render = grad_outputs["pred_rgb"][0]
+        except Exception as exc:
+            logger.warning(f"snapshot: grad render failed: {exc}")
+
+        # Resize all to snapshot_resolution
+        res = int(diag.get("snapshot_resolution", 256))
+        def _resize_rgb(t: torch.Tensor) -> torch.Tensor:
+            chw = t.permute(2, 0, 1).unsqueeze(0)
+            chw = torch.nn.functional.interpolate(chw, size=(res, res), mode="area")
+            return chw[0].permute(1, 2, 0).clamp(0.0, 1.0)
+
+        def _resize_scalar(t: torch.Tensor) -> torch.Tensor:
+            chw = t.unsqueeze(0).unsqueeze(0)
+            chw = torch.nn.functional.interpolate(chw, size=(res, res), mode="area")
+            return chw[0, 0].clamp(0.0, 1.0)
+
+        snapshots_dir = path_join(self.tracking.output_dir, "snapshots")
+        path_mkdir(snapshots_dir, parents=True, exist_ok=True)
+
+        # Save + (optionally) log
+        from PIL import Image as _PILImage
+
+        def _save_rgb(t: torch.Tensor, kind: str) -> str:
+            arr = (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
+            sp = path_join(snapshots_dir, f"step_{global_step:06d}_{kind}.png")
+            _PILImage.fromarray(arr).save(sp)
+            return sp
+
+        def _save_scalar_hot(t: torch.Tensor, kind: str, vmax: float = 0.3) -> str:
+            v = (t.detach().cpu().numpy() / max(vmax, 1e-9)).clip(0.0, 1.0)
+            try:
+                from matplotlib import cm
+                rgba = cm.hot(v)
+                arr = (rgba[..., :3] * 255.0).astype("uint8")
+            except ImportError:
+                arr = np.stack([v * 255, v * 128, np.zeros_like(v)], axis=-1).astype("uint8")
+            sp = path_join(snapshots_dir, f"step_{global_step:06d}_{kind}.png")
+            _PILImage.fromarray(arr).save(sp)
+            return sp
+
+        render_path = _save_rgb(_resize_rgb(render), "render")
+        residual_path = None
+        if residual is not None:
+            residual_path = _save_scalar_hot(_resize_scalar(residual), "residual")
+        grad_path = None
+        if grad_render is not None:
+            grad_path = _save_rgb(_resize_rgb(grad_render), "grad_positions")
+
+        if self.conf.use_wandb:
+            try:
+                import wandb
+                payload = {"train/iteration": global_step, "viz/render": wandb.Image(render_path)}
+                if residual_path is not None:
+                    payload["viz/residual"] = wandb.Image(residual_path)
+                if grad_path is not None:
+                    payload["viz/grad_positions"] = wandb.Image(grad_path)
+                wandb.log(payload)
+            except Exception as exc:
+                logger.warning(f"snapshot: wandb log failed: {exc}")
+
     def _log_gradient_diagnostics(self, global_step: int) -> None:
         """Log whether supervision reaches the Gaussian parameters."""
         if (
@@ -4442,6 +4565,7 @@ class Trainer3DGRUT:
                 step_total_ms=step_total_ms,
             )
             self.diagnostics.log(global_step, **metrics)
+        self._log_visual_snapshots(global_step)
         self._validate_camera_residual_gradient(global_step)
 
         # Post backward strategy step
