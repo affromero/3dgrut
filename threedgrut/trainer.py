@@ -4854,11 +4854,39 @@ class Trainer3DGRUT:
         self.on_training_end()
         logger.info("🥳 Training Complete.")
 
+        # Compute and save the per-tile 3D loss volume if configured.
+        diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
+        if diag_conf is not None and bool(diag_conf.get("loss_volume_after_training", False)):
+            try:
+                from threedgrut.post_processing.loss_volume import (
+                    compute_loss_volume,
+                    save_loss_volume,
+                )
+                volume = compute_loss_volume(
+                    self.model,
+                    self.train_dataset,
+                    voxel_size_m=float(diag_conf.get("loss_volume_voxel_size_m", 0.1)),
+                    view_stride=int(diag_conf.get("loss_volume_view_stride", 4)),
+                )
+                if volume is not None:
+                    npz_path, png_path = save_loss_volume(volume, self.tracking.output_dir)
+                    logger.info(f"loss_volume: saved {npz_path} ({len(volume['coords'])} voxels)")
+                    if png_path and conf.use_wandb:
+                        try:
+                            import wandb
+                            wandb.log({"viz/loss_volume_topdown": wandb.Image(png_path)})
+                        except Exception as exc:
+                            logger.warning(f"loss_volume: wandb upload failed: {exc}")
+            except Exception as exc:
+                logger.warning(f"loss_volume: compute failed: {exc}")
+
+        # Always close the diagnostics writer at end of training (was guarded by gui).
+        if self.diagnostics is not None:
+            self.diagnostics.close()
+            self.diagnostics = None
+
         # Updating the GUI
         if self.gui is not None:
-            if self.diagnostics is not None:
-                self.diagnostics.close()
-                self.diagnostics = None
             self.gui.training_done = True
             logger.info("🎨 GUI Blocking... Terminate GUI to Stop.")
             self.gui.block_in_rendering_loop(fps=60)
