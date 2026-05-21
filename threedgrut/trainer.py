@@ -226,7 +226,9 @@ def _group_metric_summary(
         if not group:
             continue
         group_mask = groups == raw_group
-        group_summary: dict[str, float] = {}
+        group_summary: dict[str, float] = {
+            "view_count": float(np.count_nonzero(group_mask))
+        }
         for source_name, metric_name in metric_names:
             if source_name not in metrics:
                 continue
@@ -239,6 +241,61 @@ def _group_metric_summary(
             group_summary[metric_name] = float(np.mean(group_values))
         if group_summary:
             summary[group] = group_summary
+    return summary
+
+
+def _group_metric_summary_by_keys(
+    *,
+    metrics: dict[str, Any],
+    group_keys: tuple[str, ...],
+    metric_names: tuple[tuple[str, str], ...],
+) -> dict[str, dict[str, float]]:
+    """Return per-composite-group metric means from flattened metrics."""
+    if any(group_key not in metrics for group_key in group_keys):
+        return {}
+    group_arrays = [
+        np.asarray(metrics[group_key], dtype=object) for group_key in group_keys
+    ]
+    if not group_arrays or group_arrays[0].size == 0:
+        return {}
+    group_size = group_arrays[0].shape[0]
+    if any(group_array.shape[0] != group_size for group_array in group_arrays):
+        return {}
+    raw_groups = sorted(
+        {
+            tuple(group_array[index] for group_array in group_arrays)
+            for index in range(group_size)
+        },
+        key=lambda group: tuple(str(value) for value in group),
+    )
+    summary: dict[str, dict[str, float]] = {}
+    for raw_group in raw_groups:
+        group_parts = [
+            _safe_metric_group_name(str(value)) for value in raw_group
+        ]
+        if any(not group_part for group_part in group_parts):
+            continue
+        group_mask = np.ones(group_size, dtype=bool)
+        for group_array, group_value in zip(
+            group_arrays, raw_group, strict=True
+        ):
+            group_mask &= group_array == group_value
+        group_summary: dict[str, float] = {
+            "view_count": float(np.count_nonzero(group_mask))
+        }
+        group_name = "/".join(group_parts)
+        for source_name, metric_name in metric_names:
+            if source_name not in metrics:
+                continue
+            values = np.asarray(metrics[source_name], dtype=np.float32)
+            if values.shape[0] != group_size:
+                continue
+            group_values = values[group_mask]
+            if group_values.size == 0:
+                continue
+            group_summary[metric_name] = float(np.mean(group_values))
+        if group_summary:
+            summary[group_name] = group_summary
     return summary
 
 
@@ -3473,6 +3530,22 @@ class Trainer3DGRUT:
                     metric_value,
                     global_step,
                 )
+        source_scan_camera_summary = _group_metric_summary_by_keys(
+            metrics=metrics,
+            group_keys=("source_scan_id", "camera_idx"),
+            metric_names=SOURCE_SCAN_METRIC_NAMES,
+        )
+        for group_name, group_metrics in source_scan_camera_summary.items():
+            scan_id, camera_idx = group_name.split("/", 1)
+            for metric_name, metric_value in group_metrics.items():
+                writer.add_scalar(
+                    (
+                        "diagnostics/source_scan_camera/"
+                        f"{scan_id}/camera_{camera_idx}/{metric_name}"
+                    ),
+                    metric_value,
+                    global_step,
+                )
         geometry_metric_names = (
             ("num_gaussians", "geometry/num_gaussians"),
             ("scale_axis_min", "geometry/scale/axis_min"),
@@ -3739,6 +3812,10 @@ class Trainer3DGRUT:
                 validation_summary[key] = float(value)
         if source_scan_summary:
             validation_summary["source_scan_metrics"] = source_scan_summary
+        if source_scan_camera_summary:
+            validation_summary["source_scan_camera_metrics"] = (
+                source_scan_camera_summary
+            )
         with open(summary_path, "w", encoding="utf-8") as file:
             json.dump(validation_summary, file, indent=2, sort_keys=True)
         logger.log_table(
