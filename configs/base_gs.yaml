@@ -25,6 +25,11 @@ validate_first: false
 validate_final: true
 validate_only: false
 log_frequency: 1
+
+# Diagnostic substrate (AI-readable Parquet sidecar + future PNG snapshots).
+diagnostics:
+  parquet_enabled: true     # Write per-step metrics to {output_dir}/diagnostics.parquet
+  parquet_flush_steps: 100  # Flush row groups every N steps
 compute_extra_metrics: true
 
 early_stopping:

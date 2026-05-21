@@ -1719,6 +1719,17 @@ class Trainer3DGRUT:
             output_dir=out_dir,
         )
 
+        # Per-step Parquet sidecar (AI-readable diagnostics substrate).
+        self.diagnostics = None
+        diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
+        if diag_conf is not None and bool(diag_conf.get("parquet_enabled", True)):
+            from threedgrut.utils.diagnostics_writer import DiagnosticsWriter
+            diag_path = os.path.join(out_dir, "diagnostics.parquet")
+            self.diagnostics = DiagnosticsWriter(
+                diag_path,
+                flush_steps=int(diag_conf.get("parquet_flush_steps", 100)),
+            )
+
     def init_post_processing(self, conf: DictConfig):
         """Initialize post-processing module based on config."""
         method = conf.post_processing.method
@@ -4420,6 +4431,17 @@ class Trainer3DGRUT:
             profilers["backward"].end()
         self._compute_per_gaussian_grad_norms()
         self._log_gradient_diagnostics(global_step)
+        if self.diagnostics is not None:
+            step_total_ms = float(profilers["backward"].timing() if hasattr(profilers.get("backward"), "timing") else 0.0)
+            grad_norms = getattr(self.model, "_last_grad_norms", {}) or {}
+            metrics = self.diagnostics.compute_per_step_metrics(
+                batch_losses={k: (v.detach().item() if hasattr(v, "detach") else float(v))
+                              for k, v in batch_losses.items() if v is not None},
+                grad_norms=grad_norms,
+                n_gaussians=int(self.model.num_gaussians),
+                step_total_ms=step_total_ms,
+            )
+            self.diagnostics.log(global_step, **metrics)
         self._validate_camera_residual_gradient(global_step)
 
         # Post backward strategy step
@@ -4710,6 +4732,9 @@ class Trainer3DGRUT:
 
         # Updating the GUI
         if self.gui is not None:
+            if self.diagnostics is not None:
+                self.diagnostics.close()
+                self.diagnostics = None
             self.gui.training_done = True
             logger.info("🎨 GUI Blocking... Terminate GUI to Stop.")
             self.gui.block_in_rendering_loop(fps=60)
