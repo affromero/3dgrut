@@ -462,6 +462,10 @@ class Tracer:
             "hits_count": hits_count,
         }
 
+    def get_bvh_stats(self) -> dict:
+        """3DGUT uses SplatRaster (no OptiX BVH) — return empty stats."""
+        return {}
+
     @staticmethod
     def __fov2focal(fov_radians: float, pixels: int):
         return pixels / (2 * math.tan(fov_radians / 2))

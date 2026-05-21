@@ -31,6 +31,17 @@
 #include <playground/hybridTracer.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // BVHStats is defined in 3dgrt/optixTracer.h. Bind here too since each
+  // pybind11 module has its own type registry — methods returning BVHStats
+  // need the type registered locally to convert at call time.
+  pybind11::class_<BVHStats>(m, "BVHStats")
+      .def_readonly("last_build_time_ms", &BVHStats::lastBuildTimeMs)
+      .def_readonly("primitive_count", &BVHStats::primitiveCount)
+      .def_readonly("gas_buffer_bytes", &BVHStats::gasBufferBytes)
+      .def_readonly("gas_buffer_tmp_bytes", &BVHStats::gasBufferTmpBytes)
+      .def_readonly("g_prim_aabb_bytes", &BVHStats::gPrimAABBBytes)
+      .def_readonly("last_build_was_full_rebuild", &BVHStats::lastBuildWasFullRebuild);
+
   pybind11::class_<HybridOptixTracer>(m, "HybridOptixTracer")
       .def(pybind11::init<const std::string &, const std::string &,
                           const std::string &, const std::string &,
@@ -38,6 +49,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                           float, bool, int, bool, bool>())
       .def("trace", &OptixTracer::trace)
       .def("build_bvh", &OptixTracer::buildBVH)
+      .def("get_bvh_stats", &OptixTracer::getBVHStats)
       .def("trace_hybrid", &HybridOptixTracer::traceHybrid)
       .def("build_mesh_bvh", &HybridOptixTracer::buildMeshBVH)
       .def("denoise", &HybridOptixTracer::denoise);

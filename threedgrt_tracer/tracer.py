@@ -324,3 +324,18 @@ class Tracer:
             "pred_normals": torch.nn.functional.normalize(pred_normals, dim=3),
             "hits_count": hits_count,
         }
+
+    def get_bvh_stats(self) -> dict:
+        """Return per-build BVH stats from the OptiX tracer wrapper as a plain dict."""
+        try:
+            s = self.tracer_wrapper.get_bvh_stats()
+        except AttributeError:
+            return {}
+        return {
+            "last_build_time_ms": float(s.last_build_time_ms),
+            "primitive_count": int(s.primitive_count),
+            "gas_buffer_bytes": int(s.gas_buffer_bytes),
+            "gas_buffer_tmp_bytes": int(s.gas_buffer_tmp_bytes),
+            "g_prim_aabb_bytes": int(s.g_prim_aabb_bytes),
+            "last_build_was_full_rebuild": bool(s.last_build_was_full_rebuild),
+        }

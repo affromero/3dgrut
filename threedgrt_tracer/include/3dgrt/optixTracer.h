@@ -54,6 +54,18 @@ enum CreatePipelineFlags {
     PipelineFlag_SpherePrim = 1 << 5
 };
 
+// Public POD exposed via pybind11 — diagnostic stats captured at the most
+// recent `buildBVH(...)` call. Used by the live GUIs and the per-step
+// Parquet sidecar to attribute densification cost.
+struct BVHStats {
+    float lastBuildTimeMs;          // host-side wall-clock of last buildBVH()
+    uint32_t primitiveCount;        // gNum at last build
+    size_t gasBufferBytes;          // OptiX GAS output buffer bytes
+    size_t gasBufferTmpBytes;       // OptiX GAS temp scratch bytes
+    size_t gPrimAABBBytes;          // primitive AABB / instance buffer bytes
+    bool lastBuildWasFullRebuild;   // true = full rebuild, false = refit/update
+};
+
 class OptixTracer {
 
 protected:
@@ -173,4 +185,11 @@ public:
                           torch::Tensor mogDns,
                           unsigned int rebuild,
                           bool allow_update);
+
+    // Diagnostic accessor for the most recent buildBVH() call. Populated
+    // inside buildBVH(); zero-initialized until first build.
+    BVHStats getBVHStats() const { return _lastBVHStats; }
+
+protected:
+    BVHStats _lastBVHStats{0.f, 0, 0, 0, 0, false};
 };

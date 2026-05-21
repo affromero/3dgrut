@@ -582,6 +582,13 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
                            unsigned int rebuild,
                            bool allow_update) {
 
+    // Diagnostic: time the entire buildBVH() call via CUDA events.
+    cudaEvent_t _bvhStartEvt = nullptr, _bvhEndEvt = nullptr;
+    cudaEventCreate(&_bvhStartEvt);
+    cudaEventCreate(&_bvhEndEvt);
+    cudaEventRecord(_bvhStartEvt, at::cuda::getCurrentCUDAStream());
+    const bool _bvhWasFullRebuild = (rebuild != 0);
+
     const uint32_t gNum = mogPos.size(0);
 
     const uint32_t primitiveOpts = _state->particleKernelDensityClamping ? MOGRenderOpts::MOGRenderAdaptiveKernelClamping : MOGRenderOpts::MOGRenderNone;
@@ -849,6 +856,21 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
     }
 
     CUDA_CHECK_LAST();
+
+    // Diagnostic: capture buildBVH timing + buffer sizes.
+    cudaEventRecord(_bvhEndEvt, at::cuda::getCurrentCUDAStream());
+    cudaEventSynchronize(_bvhEndEvt);
+    float _bvhElapsedMs = 0.f;
+    cudaEventElapsedTime(&_bvhElapsedMs, _bvhStartEvt, _bvhEndEvt);
+    cudaEventDestroy(_bvhStartEvt);
+    cudaEventDestroy(_bvhEndEvt);
+
+    _lastBVHStats.lastBuildTimeMs = _bvhElapsedMs;
+    _lastBVHStats.primitiveCount = _state->gNum;
+    _lastBVHStats.gasBufferBytes = _state->gasBufferSz;
+    _lastBVHStats.gasBufferTmpBytes = _state->gasBufferTmpSz;
+    _lastBVHStats.gPrimAABBBytes = _state->gPrimAABBSz;
+    _lastBVHStats.lastBuildWasFullRebuild = _bvhWasFullRebuild;
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

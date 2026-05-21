@@ -997,6 +997,13 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         inputs = Batch(T_to_world=T_to_world, rays_ori=rays_o, rays_dir=rays_d)
         return self.renderer.render(self, inputs)
 
+    def get_bvh_stats(self) -> dict:
+        """Forward to the configured backend renderer; empty dict if unavailable."""
+        try:
+            return self.renderer.get_bvh_stats()
+        except AttributeError:
+            return {}
+
     @torch.no_grad()
     def render_diagnostic(
         self,
