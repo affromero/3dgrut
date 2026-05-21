@@ -12,6 +12,7 @@ out_dir: "./runs"
 n_iterations: 30000
 with_gui: false
 with_viser_gui: false
+viser_port: 8080
 gui_update_from_device: true
 val_frequency: 5000
 num_workers: 24
