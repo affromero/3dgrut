@@ -45,7 +45,7 @@ class ViserGUI:
         self.viz_bbox = False
         self.live_update = True
         self.viz_render_styles = [
-            "color", "density", "distance", "hits", "normals",
+            "color", "density", "distance", "hits", "normals", "residual",
             "grad_positions", "grad_rotation", "grad_scale",
             "grad_density", "grad_features_albedo", "grad_features_specular",
         ]
@@ -310,6 +310,9 @@ class ViserGUI:
             rays_dir=rays_dir.reshape(1, window_h, window_w, 3),
         )
 
+        # Stash latest C2W so residual mode can locate nearest train GT camera.
+        self._viser_last_render_c2w = render_c2w.copy() if hasattr(render_c2w, "copy") else render_c2w
+
         # Render using model(inputs); switch to render_diagnostic when grad overrides are present
         with torch.no_grad():
             self.render_timer.start()
@@ -387,7 +390,38 @@ class ViserGUI:
             return
 
         # Update viser background image based on style
-        if style == "color" or style.startswith("grad_"):
+        if style == "residual":
+            # Render is sple_orad; find nearest train GT, compute residual heatmap,
+            # colormap with `hot`, send as background image.
+            from threedgrut.utils.residual_viz import (
+                find_closest_train_camera,
+                load_gt_for_train_view,
+                compute_residual_heatmap,
+            )
+            rendered = sple_orad[0]
+            heat = None
+            try:
+                C2W = self._viser_last_render_c2w  # set inside render_from_current_view
+                closest = find_closest_train_camera(C2W, self.train_dataset)
+                if closest is not None:
+                    gt = load_gt_for_train_view(self.train_dataset, closest[0])
+                    if gt is not None:
+                        heat = compute_residual_heatmap(rendered, gt)
+            except Exception:
+                heat = None
+            if heat is None:
+                heat = torch.zeros((rendered.shape[0], rendered.shape[1]), device=rendered.device)
+            # Apply matplotlib `hot` colormap (with fallback) to scalar -> RGB
+            try:
+                from matplotlib import cm
+                rgba = cm.hot(heat.detach().cpu().numpy().clip(0.0, 0.3) / 0.3)
+                rgb_np = rgba[..., :3].astype(np.float32)
+            except ImportError:
+                v = (heat.detach().cpu().numpy() / 0.3).clip(0.0, 1.0)
+                rgb_np = np.stack([v, v * 0.5, np.zeros_like(v)], axis=-1).astype(np.float32)
+            client.scene.set_background_image(rgb_np)
+
+        elif style == "color" or style.startswith("grad_"):
             # Convert RGB to numpy and set as background
             rgb_np = to_np(sple_orad[0])  # Remove batch dimension
             # rgb_np[points_plane[:, 0], points_plane[:, 1]] = [0, 0, 255]

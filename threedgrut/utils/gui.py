@@ -76,7 +76,7 @@ class GUI:
         self.viz_bbox = False
         self.live_update = True  # if disabled , will skip rendering updates to accelerate background training loop
         self.viz_render_styles = [
-            "color", "density", "distance", "hits", "normals",
+            "color", "density", "distance", "hits", "normals", "residual",
             "grad_positions", "grad_rotation", "grad_scale",
             "grad_density", "grad_features_albedo", "grad_features_specular",
         ]
@@ -318,6 +318,22 @@ class GUI:
                 self.viz_render_color_buffer = None
                 self.viz_render_scalar_buffer = ps.get_quantity_buffer(self.viz_render_name, "values")
 
+            elif style == "residual":
+                dummy_vals = np.zeros((window_h, window_w), dtype=np.float32)
+                dummy_vals[0] = 0.3  # fix the scale to a useful range for residual L1
+                ps.add_scalar_image_quantity(
+                    self.viz_render_name,
+                    dummy_vals,
+                    enabled=self.viz_render_enabled,
+                    image_origin="upper_left",
+                    show_fullscreen=True,
+                    show_in_imgui_window=False,
+                    cmap="hot",
+                    vminmax=(0, 0.3),
+                )
+                self.viz_render_color_buffer = None
+                self.viz_render_scalar_buffer = ps.get_quantity_buffer(self.viz_render_name, "values")
+
             elif style.startswith("grad_"):
                 # Grad modes use the SH/RGB color path (band-0 only).
                 dummy_image = np.ones((window_h, window_w, 4), dtype=np.float32)
@@ -386,6 +402,34 @@ class GUI:
                 self.viz_render_scalar_buffer.update_data_from_device(sple_ohit.detach())
             else:
                 self.viz_render_scalar_buffer.update_data(to_np(sple_ohit))
+
+        elif style == "residual":
+            # Render is already in sple_orad; find nearest train GT, compute |render - gt|.
+            from threedgrut.utils.residual_viz import (
+                find_closest_train_camera,
+                load_gt_for_train_view,
+                compute_residual_heatmap,
+            )
+            rendered = sple_orad[0]  # [H, W, 3]
+            try:
+                view_params = ps.get_view_camera_parameters()
+                W2C = view_params.get_view_mat()
+                C2W = np.linalg.inv(W2C)
+                C2W[:, 1:3] *= -1  # match polyscope -> 3DGRUT axis flip used in render_from_current_ps_view
+                closest = find_closest_train_camera(C2W, self.train_dataset)
+            except Exception:
+                closest = None
+            heat = None
+            if closest is not None:
+                gt = load_gt_for_train_view(self.train_dataset, closest[0])
+                if gt is not None:
+                    heat = compute_residual_heatmap(rendered, gt)
+            if heat is None:
+                heat = torch.zeros((rendered.shape[0], rendered.shape[1]), device=rendered.device)
+            if self.update_from_device:
+                self.viz_render_scalar_buffer.update_data_from_device(heat.detach())
+            else:
+                self.viz_render_scalar_buffer.update_data(to_np(heat))
 
         elif style.startswith("grad_"):
             # Treat grad render output as a color image (RGB via band-0 SH).
