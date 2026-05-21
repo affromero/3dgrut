@@ -29,6 +29,7 @@ import pyarrow.parquet as pq
 import torch
 
 from threedgrut.utils.logger import logger
+from threedgrut.utils.quantile import bounded_quantile
 
 
 SCHEMA_VERSION = 1
@@ -73,7 +74,7 @@ def _scalar_summaries(t: torch.Tensor) -> tuple[float, float, float]:
     t = t.detach().float()
     return (
         float(t.mean().item()),
-        float(torch.quantile(t, 0.95).item()),
+        float(bounded_quantile(t, 0.95).item()),
         float(t.max().item()),
     )
 

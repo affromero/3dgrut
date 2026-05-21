@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+from torch.utils.data import default_collate
 
 from threedgrut.utils.logger import logger
 
@@ -28,6 +29,7 @@ def compute_loss_volume(
     *,
     voxel_size_m: float = 0.1,
     view_stride: int = 4,
+    pixel_stride: int = 8,
     max_views: int = 256,
 ) -> dict[str, np.ndarray] | None:
     """Return a sparse loss volume aggregated across stride-sampled train views.
@@ -53,16 +55,19 @@ def compute_loss_volume(
     view_indices = list(range(0, n, max(1, view_stride)))[:max_views]
     if not view_indices:
         return None
+    resolved_pixel_stride = max(1, int(pixel_stride))
 
     # Aggregate in float64 / int64 over all views, then convert at the end.
     voxel_to_idx: dict[tuple[int, int, int], int] = {}
     loss_sum: list[float] = []
     loss_count: list[int] = []
+    views_rendered = 0
 
     for idx in logger.track(view_indices, description="Computing loss volume"):
         try:
             sample = dataset[idx]
-            gpu_batch = dataset.get_gpu_batch_with_intrinsics(sample)
+            batch = default_collate([sample])
+            gpu_batch = dataset.get_gpu_batch_with_intrinsics(batch)
             outputs = model(gpu_batch, train=False)
         except Exception as exc:
             logger.warning(f"loss_volume: view {idx} render failed: {exc}")
@@ -86,6 +91,15 @@ def compute_loss_volume(
         # Project pixels into world space: cam_pts = origin + dir * dist
         rays_ori = gpu_batch.rays_ori[0]  # [H, W, 3]
         rays_dir = gpu_batch.rays_dir[0]  # [H, W, 3] normalized
+        if resolved_pixel_stride > 1:
+            loss = loss[::resolved_pixel_stride, ::resolved_pixel_stride]
+            dist = dist[::resolved_pixel_stride, ::resolved_pixel_stride]
+            rays_ori = rays_ori[
+                ::resolved_pixel_stride, ::resolved_pixel_stride
+            ]
+            rays_dir = rays_dir[
+                ::resolved_pixel_stride, ::resolved_pixel_stride
+            ]
         cam_pts = rays_ori + rays_dir * dist.unsqueeze(-1)
         T = gpu_batch.T_to_world[0]
         if T.shape == (4, 4):
@@ -115,6 +129,7 @@ def compute_loss_volume(
             else:
                 loss_sum[existing] += float(l)
                 loss_count[existing] += 1
+        views_rendered += 1
 
     if not voxel_to_idx:
         return None
@@ -129,7 +144,8 @@ def compute_loss_volume(
         "loss_count": loss_count_arr,
         "loss_mean": loss_mean_arr,
         "voxel_size_m": np.float32(voxel_size_m),
-        "views_used": np.int32(len(view_indices)),
+        "views_used": np.int32(views_rendered),
+        "pixel_stride": np.int32(resolved_pixel_stride),
     }
 
 

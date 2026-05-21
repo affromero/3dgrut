@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import torch
 
+from threedgrut.utils.quantile import bounded_quantile
+
 
 GRAD_RENDER_STYLES: tuple[str, ...] = (
     "grad_positions",
@@ -41,7 +43,7 @@ def scale_grad_norms(norms: torch.Tensor, mode: str) -> torch.Tensor:
         scaled = torch.log1p(norms)
         return (scaled / scaled.max().clamp_min(1e-9)).clamp(0.0, 1.0)
     if mode == "p99":
-        p99 = torch.quantile(norms, 0.99)
+        p99 = bounded_quantile(norms, 0.99)
         return (norms / p99.clamp_min(1e-9)).clamp(0.0, 1.0)
     # linear
     return (norms / norms.max().clamp_min(1e-9)).clamp(0.0, 1.0)

@@ -4172,6 +4172,7 @@ class Trainer3DGRUT:
             )
             logger.info(f"📊 PPISP report saved to: {ppisp_report_dir}")
 
+        self._compute_loss_volume_if_enabled()
         self.teardown_dataloaders()
 
         # Evaluate on test set
@@ -4343,7 +4344,8 @@ class Trainer3DGRUT:
             logger.warning(f"snapshot: dataset[{cam_idx}] failed: {exc}")
             return
         try:
-            gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(sample)
+            batch = torch.utils.data.default_collate([sample])
+            gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(batch)
         except Exception as exc:
             logger.warning(f"snapshot: get_gpu_batch failed: {exc}")
             return
@@ -4440,6 +4442,51 @@ class Trainer3DGRUT:
                 wandb.log(payload)
             except Exception as exc:
                 logger.warning(f"snapshot: wandb log failed: {exc}")
+
+    def _compute_loss_volume_if_enabled(self) -> None:
+        """Compute and save the configured post-training loss volume."""
+        conf = self.conf
+        diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
+        if diag_conf is None or not bool(
+            diag_conf.get("loss_volume_after_training", False)
+        ):
+            return
+        try:
+            from threedgrut.post_processing.loss_volume import (
+                compute_loss_volume,
+                save_loss_volume,
+            )
+            volume = compute_loss_volume(
+                self.model,
+                self.train_dataset,
+                voxel_size_m=float(
+                    diag_conf.get("loss_volume_voxel_size_m", 0.1)
+                ),
+                view_stride=int(diag_conf.get("loss_volume_view_stride", 4)),
+                pixel_stride=int(
+                    diag_conf.get("loss_volume_pixel_stride", 8)
+                ),
+            )
+            if volume is not None:
+                npz_path, png_path = save_loss_volume(
+                    volume, self.tracking.output_dir
+                )
+                logger.info(
+                    f"loss_volume: saved {npz_path} "
+                    f"({len(volume['coords'])} voxels)"
+                )
+                if png_path and conf.use_wandb:
+                    try:
+                        import wandb
+                        wandb.log(
+                            {"viz/loss_volume_topdown": wandb.Image(png_path)}
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"loss_volume: wandb upload failed: {exc}"
+                        )
+        except Exception as exc:
+            logger.warning(f"loss_volume: compute failed: {exc}")
 
     def _log_gradient_diagnostics(self, global_step: int) -> None:
         """Log whether supervision reaches the Gaussian parameters."""
@@ -4557,14 +4604,14 @@ class Trainer3DGRUT:
         if self.diagnostics is not None:
             step_total_ms = float(profilers["backward"].timing() if hasattr(profilers.get("backward"), "timing") else 0.0)
             grad_norms = getattr(self.model, "_last_grad_norms", {}) or {}
-            metrics = self.diagnostics.compute_per_step_metrics(
+            diagnostic_metrics = self.diagnostics.compute_per_step_metrics(
                 batch_losses={k: (v.detach().item() if hasattr(v, "detach") else float(v))
                               for k, v in batch_losses.items() if v is not None},
                 grad_norms=grad_norms,
                 n_gaussians=int(self.model.num_gaussians),
                 step_total_ms=step_total_ms,
             )
-            self.diagnostics.log(global_step, **metrics)
+            self.diagnostics.log(global_step, **diagnostic_metrics)
         self._log_visual_snapshots(global_step)
         self._validate_camera_residual_gradient(global_step)
 
@@ -4853,32 +4900,6 @@ class Trainer3DGRUT:
         # Perform testing
         self.on_training_end()
         logger.info("🥳 Training Complete.")
-
-        # Compute and save the per-tile 3D loss volume if configured.
-        diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
-        if diag_conf is not None and bool(diag_conf.get("loss_volume_after_training", False)):
-            try:
-                from threedgrut.post_processing.loss_volume import (
-                    compute_loss_volume,
-                    save_loss_volume,
-                )
-                volume = compute_loss_volume(
-                    self.model,
-                    self.train_dataset,
-                    voxel_size_m=float(diag_conf.get("loss_volume_voxel_size_m", 0.1)),
-                    view_stride=int(diag_conf.get("loss_volume_view_stride", 4)),
-                )
-                if volume is not None:
-                    npz_path, png_path = save_loss_volume(volume, self.tracking.output_dir)
-                    logger.info(f"loss_volume: saved {npz_path} ({len(volume['coords'])} voxels)")
-                    if png_path and conf.use_wandb:
-                        try:
-                            import wandb
-                            wandb.log({"viz/loss_volume_topdown": wandb.Image(png_path)})
-                        except Exception as exc:
-                            logger.warning(f"loss_volume: wandb upload failed: {exc}")
-            except Exception as exc:
-                logger.warning(f"loss_volume: compute failed: {exc}")
 
         # Always close the diagnostics writer at end of training (was guarded by gui).
         if self.diagnostics is not None:

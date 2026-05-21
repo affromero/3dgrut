@@ -36,6 +36,7 @@ diagnostics:
   loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
   loss_volume_voxel_size_m: 0.1
   loss_volume_view_stride: 4
+  loss_volume_pixel_stride: 8
 compute_extra_metrics: true
 
 early_stopping:
