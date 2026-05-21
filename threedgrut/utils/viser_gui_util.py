@@ -44,7 +44,18 @@ class ViserGUI:
         self.training_done = False
         self.viz_bbox = False
         self.live_update = True
-        self.viz_render_styles = ["color", "density", "distance", "hits", "normals"]
+        self.viz_render_styles = [
+            "color", "density", "distance", "hits", "normals",
+            "grad_positions", "grad_rotation", "grad_scale",
+            "grad_density", "grad_features_albedo", "grad_features_specular",
+        ]
+        # Grad-mode scaling: "p99" | "log" | "linear" (see threedgrut.utils.grad_viz)
+        from threedgrut.utils.grad_viz import GRAD_SCALE_MODES
+        self.viz_grad_scale_modes = list(GRAD_SCALE_MODES)
+        self.viz_grad_scale_mode = self.viz_grad_scale_modes[0]
+        # Transient per-frame override for the diagnostic render path.
+        # Populated by update_render_view when style is a grad_* mode; None otherwise.
+        self._viser_grad_features_override: "torch.Tensor | None" = None
         self.viz_render_style = "color"
         self.viz_render_style_scale = 1.0
         self.viz_render_enabled = True
@@ -80,6 +91,10 @@ class ViserGUI:
         def _(_):
             self.viz_render_enabled = self.show_render_checkbox.value
 
+        @self.grad_scale_dropdown.on_update
+        def _grad_scale_changed(_):
+            self.viz_grad_scale_mode = self.grad_scale_dropdown.value
+
         @self.render_style_dropdown.on_update
         def _(_):
             self.viz_render_style = self.render_style_dropdown.value
@@ -112,6 +127,9 @@ class ViserGUI:
             # Render controls
             self.render_style_dropdown = self.server.gui.add_dropdown(
                 "Render Style", options=self.viz_render_styles, initial_value=self.viz_render_styles[0]
+            )
+            self.grad_scale_dropdown = self.server.gui.add_dropdown(
+                "Grad Scale", options=self.viz_grad_scale_modes, initial_value=self.viz_grad_scale_modes[0]
             )
 
             self.show_render_checkbox = self.server.gui.add_checkbox("Show Render", initial_value=True)
@@ -292,10 +310,17 @@ class ViserGUI:
             rays_dir=rays_dir.reshape(1, window_h, window_w, 3),
         )
 
-        # Render using model(inputs) instead of model.render()
+        # Render using model(inputs); switch to render_diagnostic when grad overrides are present
         with torch.no_grad():
             self.render_timer.start()
-            outputs = self.model(inputs, train=self.viz_render_train_view)
+            if self._viser_grad_features_override is not None:
+                outputs = self.model.render_diagnostic(
+                    inputs,
+                    features_override=self._viser_grad_features_override,
+                    sph_degree_override=0,
+                )
+            else:
+                outputs = self.model(inputs, train=self.viz_render_train_view)
             self.render_timer.end()
             self.render_width = window_w
             self.render_height = window_h
@@ -332,8 +357,25 @@ class ViserGUI:
         # Get current render style
         style = self.viz_render_style
 
+        # For grad_* modes, stash a feature override that render_from_current_view picks up.
+        from threedgrut.utils.grad_viz import (
+            is_grad_style,
+            grad_attr_from_style,
+            build_features_override_for_grad,
+        )
+        if is_grad_style(style):
+            self._viser_grad_features_override = build_features_override_for_grad(
+                self.model,
+                grad_attr_from_style(style),
+                self.viz_grad_scale_mode,
+            )
+        else:
+            self._viser_grad_features_override = None
+
         # Render current view
         sple_orad, sple_odns, sple_odist, sple_onrm, sple_ohit, points_plane = self.render_from_current_view(client)
+        # Reset override so subsequent regular calls aren't affected.
+        self._viser_grad_features_override = None
 
         """Update rendered view - rewritten to match polyscope version"""
         if not self.viz_render_enabled and force:
@@ -345,7 +387,7 @@ class ViserGUI:
             return
 
         # Update viser background image based on style
-        if style == "color":
+        if style == "color" or style.startswith("grad_"):
             # Convert RGB to numpy and set as background
             rgb_np = to_np(sple_orad[0])  # Remove batch dimension
             # rgb_np[points_plane[:, 0], points_plane[:, 1]] = [0, 0, 255]

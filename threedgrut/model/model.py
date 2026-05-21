@@ -998,7 +998,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return self.renderer.render(self, inputs)
 
     @torch.no_grad()
-    @torch.no_grad()
     def render_diagnostic(
         self,
         gpu_batch: Batch,

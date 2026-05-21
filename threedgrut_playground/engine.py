@@ -1102,6 +1102,49 @@ class Engine3DGRUT:
         self._cache_last_state(camera=camera, renderbuffers=rb, canvas_size=[camera.height, camera.width])
         return rb
 
+    @torch.cuda.nvtx.range("render_grad_diagnostic")
+    @torch.no_grad()
+    def render_grad_diagnostic(
+        self,
+        camera: Camera,
+        features_override=None,
+        sph_degree_override=None,
+    ) -> Dict[str, torch.Tensor]:
+        """No-grad diagnostic render with per-particle feature overrides.
+
+        Used by the playground GUI for gradient render modes. Skips
+        antialiasing, depth-of-field, denoising, and the hybrid mesh path
+        (primitives are not relevant to a per-particle gradient view).
+        Returns the same keys as `render_pass` for GUI compatibility.
+        """
+        from threedgrut.datasets.protocols import Batch
+
+        if camera.device.type == "cpu":
+            camera = camera.cuda()
+        rays = self.raygen(camera, use_spp=False)
+        inputs = Batch(
+            T_to_world=camera.extrinsics.view_matrix().contiguous(),
+            rays_ori=rays.rays_ori,
+            rays_dir=rays.rays_dir,
+        )
+        outputs = self.scene_mog.render_diagnostic(
+            inputs,
+            features_override=features_override,
+            sph_degree_override=sph_degree_override,
+        )
+        rb = {
+            "rgb": outputs["pred_rgb"].mean(dim=0).unsqueeze(0),
+            "opacity": outputs["pred_opacity"].mean(dim=0).unsqueeze(0),
+        }
+        rb["rgb_buffer"] = rb["rgb"]
+        if rays.mask is not None:
+            mask = rays.mask[None, :, :, 0]
+            rb["rgb"][mask] = 0.0
+            rb["rgb_buffer"][mask] = 0.0
+            rb["opacity"][mask] = 0.0
+        self._cache_last_state(camera=camera, renderbuffers=rb, canvas_size=[camera.height, camera.width])
+        return rb
+
     @torch.cuda.nvtx.range("render")
     def render(self, camera: Camera) -> Dict[str, torch.Tensor]:
         """Renders a complete frame with all enabled visual effects.

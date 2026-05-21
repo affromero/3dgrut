@@ -62,7 +62,15 @@ class Playground:
         self.viz_do_train = False
         self.viz_bbox = False
         self.live_update = True  # if disabled , will skip rendering updates to accelerate background training loop
-        self.viz_render_styles = ["color", "density"]
+        self.viz_render_styles = [
+            "color", "density",
+            "grad_positions", "grad_rotation", "grad_scale",
+            "grad_density", "grad_features_albedo", "grad_features_specular",
+        ]
+        # Grad-mode scaling: "p99" | "log" | "linear" (see threedgrut.utils.grad_viz)
+        from threedgrut.utils.grad_viz import GRAD_SCALE_MODES
+        self.viz_grad_scale_modes = list(GRAD_SCALE_MODES)
+        self.viz_grad_scale_mode_ind = 0
         self.viz_render_style_ind = 0
         self.viz_curr_render_size = None
         self.viz_curr_render_style_ind = None
@@ -137,7 +145,13 @@ class Playground:
 
     @torch.cuda.nvtx.range("render_from_current_ps_view")
     @torch.no_grad()
-    def render_from_current_ps_view(self, window_w=None, window_h=None):
+    def render_from_current_ps_view(
+        self,
+        window_w=None,
+        window_h=None,
+        features_override=None,
+        sph_degree_override=None,
+    ):
         """Render a frame using the polyscope gui camera and window size"""
         if window_w is None or window_h is None:
             window_w, window_h = ps.get_window_size()
@@ -162,7 +176,14 @@ class Playground:
             return self.engine.last_state["rgb"], self.engine.last_state["opacity"]
 
         # Render a frame pass
-        outputs = self.engine.render_pass(camera, is_first_pass)
+        if features_override is not None:
+            outputs = self.engine.render_grad_diagnostic(
+                camera,
+                features_override=features_override,
+                sph_degree_override=sph_degree_override,
+            )
+        else:
+            outputs = self.engine.render_pass(camera, is_first_pass)
 
         self.is_force_canvas_dirty = False
         return outputs["rgb"], outputs["opacity"]
@@ -224,18 +245,51 @@ class Playground:
                 self.viz_render_color_buffer = None
                 self.viz_render_scalar_buffer = ps.get_quantity_buffer(self.viz_render_name, "values")
 
+            elif style.startswith("grad_"):
+                dummy_image = np.ones((window_h, window_w, 4), dtype=np.float32)
+                ps.add_color_alpha_image_quantity(
+                    self.viz_render_name,
+                    dummy_image,
+                    enabled=self.viz_render_enabled,
+                    image_origin="upper_left",
+                    show_fullscreen=True,
+                    show_in_imgui_window=False,
+                )
+                self.viz_render_color_buffer = ps.get_quantity_buffer(self.viz_render_name, "colors")
+                self.viz_render_scalar_buffer = None
+
         # do the actual rendering
+        from threedgrut.utils.grad_viz import (
+            is_grad_style,
+            grad_attr_from_style,
+            build_features_override_for_grad,
+        )
         try:
-            sple_orad, sple_odns = self.render_from_current_ps_view()
-            sple_orad = sple_orad[0]
-            sple_odns = sple_odns[0]
+            if is_grad_style(style):
+                features_override = build_features_override_for_grad(
+                    self.scene_mog,
+                    grad_attr_from_style(style),
+                    self.viz_grad_scale_modes[self.viz_grad_scale_mode_ind],
+                )
+                sple_orad, sple_odns = self.render_from_current_ps_view(
+                    features_override=features_override,
+                    sph_degree_override=0 if features_override is not None else None,
+                )
+                sple_orad = sple_orad[0]
+                sple_odns = sple_odns[0]
+                if features_override is None:
+                    sple_orad = torch.full_like(sple_orad, 0.5)
+            else:
+                sple_orad, sple_odns = self.render_from_current_ps_view()
+                sple_orad = sple_orad[0]
+                sple_odns = sple_odns[0]
         except Exception:
             print("Rendering error occurred.")
             traceback.print_exc()
             return
 
         # update the data
-        if style in ("color",):
+        if style == "color" or style.startswith("grad_"):
             # append 1s for alpha
             sple_orad = torch.cat((sple_orad, torch.ones_like(sple_orad[:, :, 0:1])), dim=-1)
             self.update_data_on_device(self.viz_render_color_buffer, sple_orad)
@@ -293,6 +347,14 @@ class Playground:
             if render_channel_changed:
                 self.engine.rebuild_bvh(self.scene_mog)
                 self.is_force_canvas_dirty = True
+            _curr_style = self.viz_render_styles[self.viz_render_style_ind]
+            if _curr_style.startswith("grad_"):
+                psim.SameLine()
+                grad_changed, self.viz_grad_scale_mode_ind = psim.Combo(
+                    "Grad Scale", self.viz_grad_scale_mode_ind, self.viz_grad_scale_modes
+                )
+                if grad_changed:
+                    self.is_force_canvas_dirty = True
 
             psim.PushItemWidth(110)
             cam_idx = Engine3DGRUT.AVAILABLE_CAMERAS.index(self.engine.camera_type)
