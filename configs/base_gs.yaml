@@ -35,6 +35,9 @@ diagnostics:
   snapshot_resolution: 256  # Thumbnail edge length
   snapshot_include_gt: true  # Include GT RGB when the train batch exposes it
   snapshot_contact_sheet_enabled: true  # Log GT/render/residual/grad in one PNG
+  snapshot_grad_enabled: false  # Grad panels are sparse on dense-prior smoke runs; opt in when needed
+  snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
+  snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
   loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
   loss_volume_voxel_size_m: 0.1
   loss_volume_view_stride: 4

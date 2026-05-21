@@ -24,7 +24,7 @@ GRAD_RENDER_STYLES: tuple[str, ...] = (
     "grad_features_specular",
 )
 
-GRAD_SCALE_MODES: tuple[str, ...] = ("p99", "log", "linear")
+GRAD_SCALE_MODES: tuple[str, ...] = ("p95", "p99", "log", "linear")
 
 
 def is_grad_style(style: str) -> bool:
@@ -42,6 +42,9 @@ def scale_grad_norms(norms: torch.Tensor, mode: str) -> torch.Tensor:
     if mode == "log":
         scaled = torch.log1p(norms)
         return (scaled / scaled.max().clamp_min(1e-9)).clamp(0.0, 1.0)
+    if mode == "p95":
+        p95 = bounded_quantile(norms, 0.95)
+        return (norms / p95.clamp_min(1e-9)).clamp(0.0, 1.0)
     if mode == "p99":
         p99 = bounded_quantile(norms, 0.99)
         return (norms / p99.clamp_min(1e-9)).clamp(0.0, 1.0)

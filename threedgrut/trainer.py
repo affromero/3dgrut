@@ -4376,20 +4376,25 @@ class Trainer3DGRUT:
             gt_rgb = gt0.to(render.device).clamp(0.0, 1.0)
             residual = (render - gt_rgb).abs().mean(dim=-1)
 
-        # 3) Grad_positions render
+        # 3) Gradient render
         grad_render = None
-        try:
-            from threedgrut.utils.grad_viz import build_features_override_for_grad
-            features_override = build_features_override_for_grad(
-                self.model, "positions", "p99"
-            )
-            if features_override is not None:
-                grad_outputs = self.model.render_diagnostic(
-                    gpu_batch, features_override=features_override, sph_degree_override=0
+        grad_attr = str(diag.get("snapshot_grad_attr", "density"))
+        grad_scale_mode = str(diag.get("snapshot_grad_scale_mode", "p95"))
+        if bool(diag.get("snapshot_grad_enabled", False)):
+            try:
+                from threedgrut.utils.grad_viz import build_features_override_for_grad
+                features_override = build_features_override_for_grad(
+                    self.model, grad_attr, grad_scale_mode
                 )
-                grad_render = grad_outputs["pred_rgb"][0]
-        except Exception as exc:
-            logger.warning(f"snapshot: grad render failed: {exc}")
+                if features_override is not None:
+                    grad_outputs = self.model.render_diagnostic(
+                        gpu_batch,
+                        features_override=features_override,
+                        sph_degree_override=0,
+                    )
+                    grad_render = grad_outputs["pred_rgb"][0]
+            except Exception as exc:
+                logger.warning(f"snapshot: grad render failed: {exc}")
 
         # Resize all to snapshot_resolution
         res = int(diag.get("snapshot_resolution", 256))
@@ -4414,12 +4419,6 @@ class Trainer3DGRUT:
             arr = (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
             return arr
 
-        def _save_rgb(t: torch.Tensor, kind: str) -> tuple[str, np.ndarray]:
-            arr = _rgb_array(t)
-            sp = path_join(snapshots_dir, f"step_{global_step:06d}_{kind}.png")
-            _PILImage.fromarray(arr).save(sp)
-            return sp, arr
-
         def _scalar_hot_array(t: torch.Tensor, vmax: float = 0.3) -> np.ndarray:
             v = (t.detach().cpu().numpy() / max(vmax, 1e-9)).clip(0.0, 1.0)
             try:
@@ -4429,12 +4428,6 @@ class Trainer3DGRUT:
             except ImportError:
                 arr = np.stack([v * 255, v * 128, np.zeros_like(v)], axis=-1).astype("uint8")
             return arr
-
-        def _save_scalar_hot(t: torch.Tensor, kind: str, vmax: float = 0.3) -> tuple[str, np.ndarray]:
-            arr = _scalar_hot_array(t, vmax=vmax)
-            sp = path_join(snapshots_dir, f"step_{global_step:06d}_{kind}.png")
-            _PILImage.fromarray(arr).save(sp)
-            return sp, arr
 
         def _labeled_panel(label: str, arr: np.ndarray) -> np.ndarray:
             label_h = 22
@@ -4465,36 +4458,41 @@ class Trainer3DGRUT:
             return sp
 
         panels: list[tuple[str, np.ndarray]] = []
-        gt_path = None
+        individual_paths: dict[str, str] = {}
         if gt_rgb is not None:
-            gt_path, gt_arr = _save_rgb(_resize_rgb(gt_rgb), "gt")
+            gt_arr = _rgb_array(_resize_rgb(gt_rgb))
             panels.append(("GT", gt_arr))
-        render_path, render_arr = _save_rgb(_resize_rgb(render), "render")
+        render_arr = _rgb_array(_resize_rgb(render))
         panels.append(("render", render_arr))
-        residual_path = None
         if residual is not None:
-            residual_path, residual_arr = _save_scalar_hot(_resize_scalar(residual), "residual")
+            residual_arr = _scalar_hot_array(_resize_scalar(residual))
             panels.append(("residual", residual_arr))
-        grad_path = None
         if grad_render is not None:
-            grad_path, grad_arr = _save_rgb(_resize_rgb(grad_render), "grad_positions")
-            panels.append(("grad_positions", grad_arr))
+            grad_arr = _rgb_array(_resize_rgb(grad_render))
+            panels.append((f"grad_{grad_attr}", grad_arr))
+
         contact_sheet_path = None
         if bool(diag.get("snapshot_contact_sheet_enabled", True)):
             contact_sheet_path = _save_contact_sheet(panels)
+        if contact_sheet_path is None:
+            for label, arr in panels:
+                kind = label.lower()
+                sp = path_join(
+                    snapshots_dir,
+                    f"step_{global_step:06d}_{kind}.png",
+                )
+                _PILImage.fromarray(arr).save(sp)
+                individual_paths[kind] = sp
 
         if self.conf.use_wandb:
             try:
                 import wandb
-                payload = {"train/iteration": global_step, "viz/render": wandb.Image(render_path)}
-                if gt_path is not None:
-                    payload["viz/gt"] = wandb.Image(gt_path)
-                if residual_path is not None:
-                    payload["viz/residual"] = wandb.Image(residual_path)
-                if grad_path is not None:
-                    payload["viz/grad_positions"] = wandb.Image(grad_path)
+                payload = {"train/iteration": global_step}
                 if contact_sheet_path is not None:
                     payload["viz/contact_sheet"] = wandb.Image(contact_sheet_path)
+                else:
+                    for kind, image_path in individual_paths.items():
+                        payload[f"viz/{kind}"] = wandb.Image(image_path)
                 wandb.log(payload)
             except Exception as exc:
                 logger.warning(f"snapshot: wandb log failed: {exc}")
@@ -4660,14 +4658,27 @@ class Trainer3DGRUT:
         if self.diagnostics is not None:
             step_total_ms = float(profilers["backward"].timing() if hasattr(profilers.get("backward"), "timing") else 0.0)
             grad_norms = getattr(self.model, "_last_grad_norms", {}) or {}
+            try:
+                bvh_stats = self.model.get_bvh_stats()
+            except Exception:
+                bvh_stats = {}
             diagnostic_metrics = self.diagnostics.compute_per_step_metrics(
                 batch_losses={k: (v.detach().item() if hasattr(v, "detach") else float(v))
                               for k, v in batch_losses.items() if v is not None},
                 grad_norms=grad_norms,
                 n_gaussians=int(self.model.num_gaussians),
                 step_total_ms=step_total_ms,
+                bvh_stats=bvh_stats,
             )
             self.diagnostics.log(global_step, **diagnostic_metrics)
+            # Mirror grad distribution + BVH stats to wandb (close the wandb/Parquet parity gap).
+            if self.conf.enable_writer:
+                writer = self.tracking.writer
+                for k, v in diagnostic_metrics.items():
+                    if k.startswith("grad_") and k.endswith(("_mean", "_p95", "_max")):
+                        writer.add_scalar(f"train/grad_stats/{k}", float(v), global_step)
+                    elif k.startswith("bvh_") and not isinstance(v, bool):
+                        writer.add_scalar(f"train/{k}", float(v), global_step)
         self._log_visual_snapshots(global_step)
         self._validate_camera_residual_gradient(global_step)
 

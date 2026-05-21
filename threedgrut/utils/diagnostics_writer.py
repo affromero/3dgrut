@@ -32,7 +32,7 @@ from threedgrut.utils.logger import logger
 from threedgrut.utils.quantile import bounded_quantile
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Per-attribute grad-norm summaries (one mean/p95/max each for 6 params).
 _GRAD_PARAMS = (
@@ -63,6 +63,13 @@ def _build_schema() -> pa.Schema:
         pa.field("n_gaussians", pa.int64()),
         # Timing
         pa.field("step_total_ms", pa.float32()),
+        # BVH stats from OptiX tracer (zeros when backend has no BVH, e.g. 3DGUT)
+        pa.field("bvh_last_build_time_ms", pa.float32()),
+        pa.field("bvh_primitive_count", pa.int64()),
+        pa.field("bvh_gas_buffer_bytes", pa.int64()),
+        pa.field("bvh_gas_buffer_tmp_bytes", pa.int64()),
+        pa.field("bvh_g_prim_aabb_bytes", pa.int64()),
+        pa.field("bvh_last_build_was_full_rebuild", pa.bool_()),
     ]
     return pa.schema(fields)
 
@@ -145,6 +152,7 @@ class DiagnosticsWriter:
         grad_norms: dict,
         n_gaussians: int,
         step_total_ms: float,
+        bvh_stats: dict | None = None,
     ) -> dict:
         """Convenience: collect the schema columns from training state."""
         out: dict[str, float | int] = {
@@ -161,4 +169,13 @@ class DiagnosticsWriter:
             out[f"grad_{attr}_mean"] = mean
             out[f"grad_{attr}_p95"] = p95
             out[f"grad_{attr}_max"] = max_v
+        bvh_stats = bvh_stats or {}
+        out["bvh_last_build_time_ms"] = float(bvh_stats.get("last_build_time_ms", 0.0))
+        out["bvh_primitive_count"] = int(bvh_stats.get("primitive_count", 0))
+        out["bvh_gas_buffer_bytes"] = int(bvh_stats.get("gas_buffer_bytes", 0))
+        out["bvh_gas_buffer_tmp_bytes"] = int(bvh_stats.get("gas_buffer_tmp_bytes", 0))
+        out["bvh_g_prim_aabb_bytes"] = int(bvh_stats.get("g_prim_aabb_bytes", 0))
+        out["bvh_last_build_was_full_rebuild"] = bool(
+            bvh_stats.get("last_build_was_full_rebuild", False)
+        )
         return out
