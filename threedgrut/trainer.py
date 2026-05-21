@@ -4509,6 +4509,7 @@ class Trainer3DGRUT:
             from threedgrut.post_processing.loss_volume import (
                 compute_loss_volume,
                 save_loss_volume,
+                summarize_loss_volume,
             )
             volume = compute_loss_volume(
                 self.model,
@@ -4525,16 +4526,24 @@ class Trainer3DGRUT:
                 npz_path, png_path = save_loss_volume(
                     volume, self.tracking.output_dir
                 )
+                summary = summarize_loss_volume(volume)
                 logger.info(
                     f"loss_volume: saved {npz_path} "
-                    f"({len(volume['coords'])} voxels)"
+                    f"({summary['active_voxels']} voxels, "
+                    f"p95={summary['p95']:.4f})"
                 )
-                if png_path and conf.use_wandb:
+                if conf.use_wandb:
                     try:
                         import wandb
-                        wandb.log(
-                            {"viz/loss_volume_topdown": wandb.Image(png_path)}
-                        )
+                        payload = {
+                            f"loss_volume/{key}": value
+                            for key, value in summary.items()
+                        }
+                        if png_path:
+                            payload["viz/loss_volume_topdown"] = wandb.Image(
+                                png_path
+                            )
+                        wandb.log(payload)
                     except Exception as exc:
                         logger.warning(
                             f"loss_volume: wandb upload failed: {exc}"
