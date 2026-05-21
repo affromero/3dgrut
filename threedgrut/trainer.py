@@ -4285,6 +4285,28 @@ class Trainer3DGRUT:
                 while not gui.viz_do_train:
                     time.sleep(0.0001)
 
+    def _compute_per_gaussian_grad_norms(self) -> None:
+        """Stash per-attribute per-gaussian L2 grad norms on `self.model`.
+
+        Populates `model._last_grad_norms[name]` (shape `[N_gaussians]`)
+        for each grad-bearing parameter. Consumed by the live GUI for
+        gradient render modes. Uncongated — runs every training step.
+        Frozen or gradient-less parameters are skipped silently.
+        """
+        params: tuple[tuple[str, torch.nn.Parameter], ...] = (
+            ("positions", self.model.positions),
+            ("rotation", self.model.rotation),
+            ("scale", self.model.scale),
+            ("density", self.model.density),
+            ("features_albedo", self.model.features_albedo),
+            ("features_specular", self.model.features_specular),
+        )
+        for name, param in params:
+            if param.grad is None:
+                continue
+            g = param.grad.detach()
+            self.model._last_grad_norms[name] = g.reshape(g.shape[0], -1).norm(dim=1)
+
     def _log_gradient_diagnostics(self, global_step: int) -> None:
         """Log whether supervision reaches the Gaussian parameters."""
         if (
@@ -4396,6 +4418,7 @@ class Trainer3DGRUT:
             profilers["backward"].start()
             batch_losses["total_loss"].backward()
             profilers["backward"].end()
+        self._compute_per_gaussian_grad_norms()
         self._log_gradient_diagnostics(global_step)
         self._validate_camera_residual_gradient(global_step)
 

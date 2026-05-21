@@ -268,6 +268,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.conf = conf
         self.scene_extent = scene_extent
         self.positions_gradient_norm = None
+        # Per-attribute per-gaussian gradient L2 norms, populated each
+        # training step by Trainer3DGRUT._compute_per_gaussian_grad_norms.
+        # Consumed by the live GUI for grad-mode visualization. Empty in
+        # inference-only loading.
+        self._last_grad_norms: dict[str, torch.Tensor] = {}
 
         self.device = "cuda"
         self.optimizer = None
