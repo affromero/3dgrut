@@ -61,6 +61,7 @@ from threedgrut.utils.misc import (
     jet_map,
 )
 from threedgrut.utils.render import apply_post_processing
+from threedgrut.utils.source_scan import source_scan_id_from_image_path
 from threedgrut.utils.timer import CudaTimer
 
 
@@ -71,6 +72,17 @@ SEMANTIC_OPACITY_TILE = "semantic_opacity_mask"
 LAST_CHECKPOINT_FILENAME = "ckpt_last.pt"
 BEST_CHECKPOINT_FILENAME = "ckpt_best.pt"
 EARLY_STOPPING_AUTO_PSNR_METRIC = "masked_psnr_if_available"
+SOURCE_SCAN_METRIC_NAMES = (
+    ("masked_psnr", "masked_psnr"),
+    ("psnr", "psnr"),
+    ("ssim", "ssim"),
+    ("lpips", "lpips"),
+    ("gradient_l1", "gradient_l1"),
+    ("fft_error_ratio_high", "frequency_error_ratio_high"),
+    ("edge_top15_f1", "edge_f1_top15"),
+    ("radial_center_rgb_l1", "center_rgb_l1"),
+    ("radial_rim_rgb_l1", "rim_rgb_l1"),
+)
 SEMANTIC_LABEL_COLORS_RGB = (
     (0.95, 0.20, 0.15),
     (0.10, 0.70, 1.00),
@@ -189,6 +201,45 @@ def _load_semantic_label_masks(
             .unsqueeze(-1)
         )
     return masks
+
+
+def _safe_metric_group_name(name: str) -> str:
+    """Return a TensorBoard/W&B-safe group name."""
+    return name.replace("/", "_").strip()
+
+
+def _group_metric_summary(
+    *,
+    metrics: dict[str, Any],
+    group_key: str,
+    metric_names: tuple[tuple[str, str], ...],
+) -> dict[str, dict[str, float]]:
+    """Return per-group metric means from flattened validation metrics."""
+    if group_key not in metrics:
+        return {}
+    groups = np.asarray(metrics[group_key], dtype=object)
+    if groups.size == 0:
+        return {}
+    summary: dict[str, dict[str, float]] = {}
+    for raw_group in sorted({str(value) for value in groups.tolist()}):
+        group = _safe_metric_group_name(raw_group)
+        if not group:
+            continue
+        group_mask = groups == raw_group
+        group_summary: dict[str, float] = {}
+        for source_name, metric_name in metric_names:
+            if source_name not in metrics:
+                continue
+            values = np.asarray(metrics[source_name], dtype=np.float32)
+            if values.shape[0] != groups.shape[0]:
+                continue
+            group_values = values[group_mask]
+            if group_values.size == 0:
+                continue
+            group_summary[metric_name] = float(np.mean(group_values))
+        if group_summary:
+            summary[group] = group_summary
+    return summary
 
 
 def _scalar_tensor_stats(
@@ -1722,8 +1773,11 @@ class Trainer3DGRUT:
         # Per-step Parquet sidecar (AI-readable diagnostics substrate).
         self.diagnostics = None
         diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
-        if diag_conf is not None and bool(diag_conf.get("parquet_enabled", True)):
+        if diag_conf is not None and bool(
+            diag_conf.get("parquet_enabled", True)
+        ):
             from threedgrut.utils.diagnostics_writer import DiagnosticsWriter
+
             diag_path = os.path.join(out_dir, "diagnostics.parquet")
             self.diagnostics = DiagnosticsWriter(
                 diag_path,
@@ -2555,6 +2609,11 @@ class Trainer3DGRUT:
 
         if is_compute_validation_metrics:
             metrics["camera_idx"] = int(gpu_batch.camera_idx)
+            source_scan_id = source_scan_id_from_image_path(
+                image_path=str(gpu_batch.image_path),
+                camera_idx=int(gpu_batch.camera_idx),
+            )
+            metrics["source_scan_id"] = source_scan_id or ""
             with torch.cuda.nvtx.range("criterions_psnr"):
                 metrics["psnr"] = psnr(rgb_pred, rgb_gt).item()
                 if gpu_batch.mask is not None:
@@ -3402,6 +3461,18 @@ class Trainer3DGRUT:
                             values[camera_mask].mean(),
                             global_step,
                         )
+        source_scan_summary = _group_metric_summary(
+            metrics=metrics,
+            group_key="source_scan_id",
+            metric_names=SOURCE_SCAN_METRIC_NAMES,
+        )
+        for scan_id, scan_metrics in source_scan_summary.items():
+            for metric_name, metric_value in scan_metrics.items():
+                writer.add_scalar(
+                    f"diagnostics/source_scan/{scan_id}/{metric_name}",
+                    metric_value,
+                    global_step,
+                )
         geometry_metric_names = (
             ("num_gaussians", "geometry/num_gaussians"),
             ("scale_axis_min", "geometry/scale/axis_min"),
@@ -3657,7 +3728,7 @@ class Trainer3DGRUT:
             self.tracking.output_dir,
             f"validation_metrics_step_{global_step:06d}.json",
         )
-        validation_summary: dict[str, float | str] = {
+        validation_summary: dict[str, Any] = {
             "global_step": float(global_step),
             "num_gaussians": float(self.model.num_gaussians),
         }
@@ -3666,6 +3737,8 @@ class Trainer3DGRUT:
                 validation_summary[key] = value
             else:
                 validation_summary[key] = float(value)
+        if source_scan_summary:
+            validation_summary["source_scan_metrics"] = source_scan_summary
         with open(summary_path, "w", encoding="utf-8") as file:
             json.dump(validation_summary, file, indent=2, sort_keys=True)
         logger.log_table(
@@ -4317,7 +4390,9 @@ class Trainer3DGRUT:
             if param.grad is None:
                 continue
             g = param.grad.detach()
-            self.model._last_grad_norms[name] = g.reshape(g.shape[0], -1).norm(dim=1)
+            self.model._last_grad_norms[name] = g.reshape(g.shape[0], -1).norm(
+                dim=1
+            )
 
     @torch.no_grad()
     def _log_visual_snapshots(self, global_step: int) -> None:
@@ -4330,7 +4405,9 @@ class Trainer3DGRUT:
         same-resolution contact sheet so visual diagnostics can be compared in
         one W&B panel.
         """
-        diag = self.conf.get("diagnostics") if hasattr(self.conf, "get") else None
+        diag = (
+            self.conf.get("diagnostics") if hasattr(self.conf, "get") else None
+        )
         if diag is None:
             return
         freq = int(diag.get("snapshot_frequency", 0))
@@ -4339,7 +4416,9 @@ class Trainer3DGRUT:
         if self.train_dataset is None:
             return
 
-        cam_idx = int(diag.get("snapshot_camera_index", 0)) % max(len(self.train_dataset), 1)
+        cam_idx = int(diag.get("snapshot_camera_index", 0)) % max(
+            len(self.train_dataset), 1
+        )
         try:
             sample = self.train_dataset[cam_idx]
         except Exception as exc:
@@ -4382,7 +4461,10 @@ class Trainer3DGRUT:
         grad_scale_mode = str(diag.get("snapshot_grad_scale_mode", "p95"))
         if bool(diag.get("snapshot_grad_enabled", False)):
             try:
-                from threedgrut.utils.grad_viz import build_features_override_for_grad
+                from threedgrut.utils.grad_viz import (
+                    build_features_override_for_grad,
+                )
+
                 features_override = build_features_override_for_grad(
                     self.model, grad_attr, grad_scale_mode
                 )
@@ -4398,14 +4480,19 @@ class Trainer3DGRUT:
 
         # Resize all to snapshot_resolution
         res = int(diag.get("snapshot_resolution", 256))
+
         def _resize_rgb(t: torch.Tensor) -> torch.Tensor:
             chw = t.permute(2, 0, 1).unsqueeze(0)
-            chw = torch.nn.functional.interpolate(chw, size=(res, res), mode="area")
+            chw = torch.nn.functional.interpolate(
+                chw, size=(res, res), mode="area"
+            )
             return chw[0].permute(1, 2, 0).clamp(0.0, 1.0)
 
         def _resize_scalar(t: torch.Tensor) -> torch.Tensor:
             chw = t.unsqueeze(0).unsqueeze(0)
-            chw = torch.nn.functional.interpolate(chw, size=(res, res), mode="area")
+            chw = torch.nn.functional.interpolate(
+                chw, size=(res, res), mode="area"
+            )
             return chw[0, 0].clamp(0.0, 1.0)
 
         snapshots_dir = path_join(self.tracking.output_dir, "snapshots")
@@ -4416,22 +4503,31 @@ class Trainer3DGRUT:
         from PIL import ImageDraw as _PILImageDraw
 
         def _rgb_array(t: torch.Tensor) -> np.ndarray:
-            arr = (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
+            arr = (
+                (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
+            )
             return arr
 
-        def _scalar_hot_array(t: torch.Tensor, vmax: float = 0.3) -> np.ndarray:
+        def _scalar_hot_array(
+            t: torch.Tensor, vmax: float = 0.3
+        ) -> np.ndarray:
             v = (t.detach().cpu().numpy() / max(vmax, 1e-9)).clip(0.0, 1.0)
             try:
                 from matplotlib import cm
+
                 rgba = cm.hot(v)
                 arr = (rgba[..., :3] * 255.0).astype("uint8")
             except ImportError:
-                arr = np.stack([v * 255, v * 128, np.zeros_like(v)], axis=-1).astype("uint8")
+                arr = np.stack(
+                    [v * 255, v * 128, np.zeros_like(v)], axis=-1
+                ).astype("uint8")
             return arr
 
         def _labeled_panel(label: str, arr: np.ndarray) -> np.ndarray:
             label_h = 22
-            canvas = np.zeros((arr.shape[0] + label_h, arr.shape[1], 3), dtype=np.uint8)
+            canvas = np.zeros(
+                (arr.shape[0] + label_h, arr.shape[1], 3), dtype=np.uint8
+            )
             canvas[:label_h, :, :] = 24
             canvas[label_h:, :, :] = arr
             image = _PILImage.fromarray(canvas)
@@ -4439,11 +4535,17 @@ class Trainer3DGRUT:
             draw.text((6, 4), label, fill=(235, 235, 235))
             return np.asarray(image)
 
-        def _save_contact_sheet(panels: list[tuple[str, np.ndarray]]) -> str | None:
+        def _save_contact_sheet(
+            panels: list[tuple[str, np.ndarray]],
+        ) -> str | None:
             if len(panels) < 2:
                 return None
             base_shape = panels[0][1].shape
-            matched = [(label, arr) for label, arr in panels if arr.shape == base_shape]
+            matched = [
+                (label, arr)
+                for label, arr in panels
+                if arr.shape == base_shape
+            ]
             if len(matched) < 2:
                 return None
             sheet = np.concatenate(
@@ -4487,9 +4589,12 @@ class Trainer3DGRUT:
         if self.conf.use_wandb:
             try:
                 import wandb
+
                 payload = {"train/iteration": global_step}
                 if contact_sheet_path is not None:
-                    payload["viz/contact_sheet"] = wandb.Image(contact_sheet_path)
+                    payload["viz/contact_sheet"] = wandb.Image(
+                        contact_sheet_path
+                    )
                 else:
                     for kind, image_path in individual_paths.items():
                         payload[f"viz/{kind}"] = wandb.Image(image_path)
@@ -4511,6 +4616,7 @@ class Trainer3DGRUT:
                 save_loss_volume,
                 summarize_loss_volume,
             )
+
             volume = compute_loss_volume(
                 self.model,
                 self.train_dataset,
@@ -4518,9 +4624,7 @@ class Trainer3DGRUT:
                     diag_conf.get("loss_volume_voxel_size_m", 0.1)
                 ),
                 view_stride=int(diag_conf.get("loss_volume_view_stride", 4)),
-                pixel_stride=int(
-                    diag_conf.get("loss_volume_pixel_stride", 8)
-                ),
+                pixel_stride=int(diag_conf.get("loss_volume_pixel_stride", 8)),
             )
             if volume is not None:
                 npz_path, png_path = save_loss_volume(
@@ -4535,6 +4639,7 @@ class Trainer3DGRUT:
                 if conf.use_wandb:
                     try:
                         import wandb
+
                         payload = {
                             f"loss_volume/{key}": value
                             for key, value in summary.items()
@@ -4665,15 +4770,24 @@ class Trainer3DGRUT:
         self._compute_per_gaussian_grad_norms()
         self._log_gradient_diagnostics(global_step)
         if self.diagnostics is not None:
-            step_total_ms = float(profilers["backward"].timing() if hasattr(profilers.get("backward"), "timing") else 0.0)
+            step_total_ms = float(
+                profilers["backward"].timing()
+                if hasattr(profilers.get("backward"), "timing")
+                else 0.0
+            )
             grad_norms = getattr(self.model, "_last_grad_norms", {}) or {}
             try:
                 bvh_stats = self.model.get_bvh_stats()
             except Exception:
                 bvh_stats = {}
             diagnostic_metrics = self.diagnostics.compute_per_step_metrics(
-                batch_losses={k: (v.detach().item() if hasattr(v, "detach") else float(v))
-                              for k, v in batch_losses.items() if v is not None},
+                batch_losses={
+                    k: (
+                        v.detach().item() if hasattr(v, "detach") else float(v)
+                    )
+                    for k, v in batch_losses.items()
+                    if v is not None
+                },
                 grad_norms=grad_norms,
                 n_gaussians=int(self.model.num_gaussians),
                 step_total_ms=step_total_ms,
@@ -4684,8 +4798,12 @@ class Trainer3DGRUT:
             if self.conf.enable_writer:
                 writer = self.tracking.writer
                 for k, v in diagnostic_metrics.items():
-                    if k.startswith("grad_") and k.endswith(("_mean", "_p95", "_max")):
-                        writer.add_scalar(f"train/grad_stats/{k}", float(v), global_step)
+                    if k.startswith("grad_") and k.endswith(
+                        ("_mean", "_p95", "_max")
+                    ):
+                        writer.add_scalar(
+                            f"train/grad_stats/{k}", float(v), global_step
+                        )
                     elif k.startswith("bvh_") and not isinstance(v, bool):
                         writer.add_scalar(f"train/{k}", float(v), global_step)
         self._log_visual_snapshots(global_step)
