@@ -998,6 +998,27 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return self.renderer.render(self, inputs)
 
     @torch.no_grad()
+    @torch.no_grad()
+    def render_diagnostic(
+        self,
+        gpu_batch: Batch,
+        features_override=None,
+        sph_degree_override=None,
+    ) -> dict[str, torch.Tensor]:
+        """No-grad diagnostic render dispatching to the configured backend.
+
+        Used by GUIs for visualization modes (gradient heatmaps etc.) where
+        per-particle SH features are overridden by a scalar-derived color and
+        the SH degree is forced to 0 so only band-0 evaluates. Bypasses the
+        training autograd graph entirely; no training math is affected.
+        """
+        return self.renderer.render_diagnostic(
+            self,
+            gpu_batch,
+            features_override=features_override,
+            sph_degree_override=sph_degree_override,
+        )
+
     def export_ply(self, mogt_path: str):
         exporter = PLYExporter()
         exporter.export(self, Path(mogt_path))

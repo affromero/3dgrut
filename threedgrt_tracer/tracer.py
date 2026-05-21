@@ -255,3 +255,72 @@ class Tracer:
             "frame_time_ms": self.frame_timer.timing() if self.frame_timer is not None else 0.0,
             "mog_visibility": mog_visibility,
         }
+
+    @torch.no_grad()
+    def render_diagnostic(
+        self,
+        gaussians,
+        gpu_batch: Batch,
+        frame_id: int = 0,
+        features_override=None,
+        sph_degree_override=None,
+    ):
+        """No-grad diagnostic render bypassing _Autograd, accepting overrides.
+
+        Used by the live GUI for gradient render modes: substitutes a
+        per-particle scalar-derived feature tensor and (optionally) forces
+        `sph_degree=0` so only band-0 SH evaluates. Does not affect training.
+        """
+        mog_pos = gaussians.positions.contiguous()
+        mog_rot = gaussians.get_rotation().contiguous()
+        mog_scl = gaussians.get_scale().contiguous()
+        mog_dns = gaussians.get_density().contiguous()
+        mog_sph = (
+            features_override.contiguous()
+            if features_override is not None
+            else gaussians.get_features().contiguous()
+        )
+        sph_degree = (
+            sph_degree_override
+            if sph_degree_override is not None
+            else gaussians.n_active_features
+        )
+
+        particle_density = torch.concat(
+            [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
+        )
+
+        (
+            pred_rgb,
+            pred_opacity,
+            pred_dist,
+            pred_normals,
+            hits_count,
+            _mog_visibility,
+        ) = self.tracer_wrapper.trace(
+            frame_id,
+            gpu_batch.T_to_world.contiguous(),
+            gpu_batch.rays_ori.contiguous(),
+            gpu_batch.rays_dir.contiguous(),
+            particle_density,
+            mog_sph,
+            Tracer.RenderOpts.DEFAULT,
+            sph_degree,
+            self.conf.render.min_transmittance,
+        )
+
+        pred_rgb, pred_opacity = gaussians.background(
+            gpu_batch.T_to_world.contiguous(),
+            gpu_batch.rays_dir.contiguous(),
+            pred_rgb,
+            pred_opacity,
+            False,
+        )
+
+        return {
+            "pred_rgb": pred_rgb,
+            "pred_opacity": pred_opacity,
+            "pred_dist": pred_dist[:, :, :, 0:1],
+            "pred_normals": torch.nn.functional.normalize(pred_normals, dim=3),
+            "hits_count": hits_count,
+        }

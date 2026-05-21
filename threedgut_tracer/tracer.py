@@ -370,6 +370,98 @@ class Tracer:
             "mog_tiles_count": mog_tiles_count,
         }
 
+    @torch.no_grad()
+    def render_diagnostic(
+        self,
+        gaussians,
+        gpu_batch: Batch,
+        frame_id: int = 0,
+        features_override=None,
+        sph_degree_override=None,
+    ):
+        """No-grad diagnostic render bypassing _Autograd, accepting overrides.
+
+        Used by the live GUI for gradient render modes: substitutes a
+        per-particle scalar-derived feature tensor and (optionally) forces
+        `n_active_features=0` (3DGUT band-0 only). Does not affect training.
+        """
+        rays_o = gpu_batch.rays_ori
+        rays_d = gpu_batch.rays_dir
+
+        sensor, poses = Tracer.__create_camera_parameters(gpu_batch)
+
+        n_active_features = (
+            sph_degree_override
+            if sph_degree_override is not None
+            else gaussians.n_active_features
+        )
+
+        mog_pos = gaussians.positions.contiguous()
+        mog_rot = gaussians.get_rotation().contiguous()
+        mog_scl = gaussians.get_scale().contiguous()
+        mog_dns = gaussians.get_density().contiguous()
+        particle_density = torch.concat(
+            [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
+        ).contiguous()
+        particle_radiance = (
+            features_override.contiguous()
+            if features_override is not None
+            else gaussians.get_features().contiguous()
+        )
+
+        ray_time = (
+            torch.ones(
+                (rays_o.shape[0], rays_o.shape[1], rays_o.shape[2], 1),
+                device=rays_o.device,
+                dtype=torch.long,
+            )
+            * poses.timestamps_us[0]
+        )
+
+        (
+            ray_radiance_density,
+            ray_hit_distance,
+            ray_hit_count,
+            _mog_visibility,
+            _mog_projected_position,
+            _mog_projected_extent,
+            _mog_tiles_count,
+        ) = self.tracer_wrapper.trace(
+            frame_id,
+            n_active_features,
+            particle_density,
+            particle_radiance,
+            rays_o.contiguous(),
+            rays_d.contiguous(),
+            ray_time.contiguous(),
+            sensor,
+            poses.timestamps_us[0],
+            poses.timestamps_us[1],
+            poses.T_world_sensors[0],
+            poses.T_world_sensors[1],
+        )
+
+        pred_rgb = ray_radiance_density[..., :3].unsqueeze(0).contiguous()
+        pred_opacity = ray_radiance_density[..., 3:].unsqueeze(0).contiguous()
+        pred_dist = ray_hit_distance.unsqueeze(0).contiguous()
+        hits_count = ray_hit_count.unsqueeze(0).contiguous()
+
+        pred_rgb, pred_opacity = gaussians.background(
+            gpu_batch.T_to_world.contiguous(),
+            rays_d,
+            pred_rgb,
+            pred_opacity,
+            False,
+        )
+
+        return {
+            "pred_rgb": pred_rgb,
+            "pred_opacity": pred_opacity,
+            "pred_dist": pred_dist,
+            "pred_normals": torch.nn.functional.normalize(torch.ones_like(pred_rgb), dim=3),
+            "hits_count": hits_count,
+        }
+
     @staticmethod
     def __fov2focal(fov_radians: float, pixels: int):
         return pixels / (2 * math.tan(fov_radians / 2))
