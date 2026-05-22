@@ -20,14 +20,17 @@ from typing import Callable, Optional
 import numpy as np
 import numpy.typing as npt
 import torch
-from hax_cv.tools.generative.utils.wandb_tools import (
-    ensure_wandb_api_key_env,
-)
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard.writer import SummaryWriter
 
 OmegaConf.register_new_resolver("div", lambda a, b: a / b)
 OmegaConf.register_new_resolver("eq", lambda a, b: a == b)
+
+
+def ensure_wandb_api_key_env() -> None:
+    """Let W&B resolve credentials from the native environment."""
+
+    return None
 
 
 def to_torch(data: npt.NDArray, device: str, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
