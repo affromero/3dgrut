@@ -1286,6 +1286,36 @@ def _make_validation_image_tiles(
     return tiles
 
 
+def _load_post_processing_state_compat(
+    module: nn.Module,
+    saved_state: dict,
+) -> list[str]:
+    """Load ``saved_state`` into ``module``, dropping shape-mismatched entries.
+
+    Returns the list of dropped keys. This happens when a continuation run
+    changes the training-split size (e.g. ``dataset.train_exclude_image_list_path``
+    shrinks per-frame buffers like ``frame_log_gain``/``frame_bias``).
+    Keys missing from the saved state are tolerated via ``strict=False``.
+    """
+    current_state = module.state_dict()
+    filtered: dict = {}
+    dropped: list[str] = []
+    for key, value in saved_state.items():
+        target = current_state.get(key)
+        if target is None:
+            continue
+        if (
+            hasattr(value, "shape")
+            and hasattr(target, "shape")
+            and tuple(value.shape) != tuple(target.shape)
+        ):
+            dropped.append(key)
+            continue
+        filtered[key] = value
+    module.load_state_dict(filtered, strict=False)
+    return dropped
+
+
 class Trainer3DGRUT:
     """Trainer for paper: "3D Gaussian Ray Tracing: Fast Tracing of Particle Scenes" """
 
@@ -1509,10 +1539,17 @@ class Trainer3DGRUT:
                 "post_processing" in checkpoint
                 and self.post_processing is not None
             ):
-                self.post_processing.load_state_dict(
+                dropped = _load_post_processing_state_compat(
+                    self.post_processing,
                     checkpoint["post_processing"]["module"],
-                    strict=False,
                 )
+                if dropped:
+                    logger.warning(
+                        "📷 Dropping shape-mismatched post-processing "
+                        f"buffers from resume checkpoint: {sorted(dropped)}. "
+                        "Fresh values will be used (typically per-frame "
+                        "buffers after a train-split change)."
+                    )
                 for opt, opt_state in zip(
                     self.post_processing_optimizers,
                     checkpoint["post_processing"]["optimizers"],
@@ -1599,10 +1636,15 @@ class Trainer3DGRUT:
                         "post_processing" in checkpoint
                         and self.post_processing is not None
                     ):
-                        self.post_processing.load_state_dict(
+                        dropped = _load_post_processing_state_compat(
+                            self.post_processing,
                             checkpoint["post_processing"]["module"],
-                            strict=False,
                         )
+                        if dropped:
+                            logger.warning(
+                                "📷 Dropping shape-mismatched "
+                                f"post-processing buffers: {sorted(dropped)}."
+                            )
                         logger.info(
                             "📷 Post-processing module restored from initialization checkpoint"
                         )
@@ -3949,10 +3991,15 @@ class Trainer3DGRUT:
             self.post_processing is not None
             and "post_processing" in checkpoint
         ):
-            self.post_processing.load_state_dict(
+            dropped = _load_post_processing_state_compat(
+                self.post_processing,
                 checkpoint["post_processing"]["module"],
-                strict=False,
             )
+            if dropped:
+                logger.warning(
+                    "📷 Dropping shape-mismatched post-processing "
+                    f"buffers when restoring best checkpoint: {sorted(dropped)}."
+                )
         if (
             self.camera_residual is not None
             and "camera_residual" in checkpoint
