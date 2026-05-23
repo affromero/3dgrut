@@ -518,11 +518,12 @@ class Renderer:
                     ).item()
                 )
 
-                # Color-corrected metrics
-                pred_rgb_cc = color_correct_affine(pred_rgb_full, rgb_gt_full)
-                cc_psnr.append(
-                    criterions["psnr"](pred_rgb_cc, rgb_gt_full).item()
-                )
+            # Color-corrected metrics
+            pred_rgb_cc = color_correct_affine(pred_rgb_full, rgb_gt_full)
+            cc_psnr.append(
+                criterions["psnr"](pred_rgb_cc, rgb_gt_full).item()
+            )
+            if self.compute_extra_metrics:
                 cc_ssim.append(
                     criterions["ssim"](
                         pred_rgb_cc.permute(0, 3, 1, 2),
