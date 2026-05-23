@@ -163,6 +163,38 @@ class Renderer:
                 ),
                 max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
                 max_bias=conf.post_processing.get("max_bias", 0.10),
+                use_color_matrix=conf.post_processing.get(
+                    "use_color_matrix",
+                    False,
+                ),
+                max_matrix_delta=conf.post_processing.get(
+                    "max_matrix_delta",
+                    0.10,
+                ),
+                color_matrix_reg_lambda=conf.post_processing.get(
+                    "color_matrix_reg_lambda",
+                    0.25,
+                ),
+                use_radial_affine=conf.post_processing.get(
+                    "use_radial_affine",
+                    False,
+                ),
+                radial_band_count=conf.post_processing.get(
+                    "radial_band_count",
+                    4,
+                ),
+                radial_max_log_gain=conf.post_processing.get(
+                    "radial_max_log_gain",
+                    0.08,
+                ),
+                radial_max_bias=conf.post_processing.get(
+                    "radial_max_bias",
+                    0.03,
+                ),
+                radial_reg_lambda=conf.post_processing.get(
+                    "radial_reg_lambda",
+                    0.50,
+                ),
                 use_residual_grid=conf.post_processing.get(
                     "use_residual_grid",
                     False,
@@ -180,7 +212,7 @@ class Renderer:
                     0.01,
                 ),
             ).to("cuda")
-            post_processing.load_state_dict(state)
+            post_processing.load_state_dict(state, strict=False)
             logger.info(
                 f"📷 {method.upper()} loaded from checkpoint: "
                 f"{num_cameras} cameras, {num_frames} frames"
@@ -332,35 +364,36 @@ class Renderer:
                 worst_psnr_img = pred_img_to_write
                 worst_psnr_img_gt = gt_img_to_write
 
-            # evaluate on full image
-            ssim.append(
-                criterions["ssim"](
-                    pred_rgb_full.permute(0, 3, 1, 2),
-                    rgb_gt_full.permute(0, 3, 1, 2),
-                ).item()
-            )
-            lpips.append(
-                criterions["lpips"](
-                    pred_rgb_full.clip(0, 1).permute(0, 3, 1, 2),
-                    rgb_gt_full.permute(0, 3, 1, 2),
-                ).item()
-            )
+            if self.compute_extra_metrics:
+                # evaluate on full image
+                ssim.append(
+                    criterions["ssim"](
+                        pred_rgb_full.permute(0, 3, 1, 2),
+                        rgb_gt_full.permute(0, 3, 1, 2),
+                    ).item()
+                )
+                lpips.append(
+                    criterions["lpips"](
+                        pred_rgb_full.clip(0, 1).permute(0, 3, 1, 2),
+                        rgb_gt_full.permute(0, 3, 1, 2),
+                    ).item()
+                )
 
-            # Color-corrected metrics
-            pred_rgb_cc = color_correct_affine(pred_rgb_full, rgb_gt_full)
-            cc_psnr.append(criterions["psnr"](pred_rgb_cc, rgb_gt_full).item())
-            cc_ssim.append(
-                criterions["ssim"](
-                    pred_rgb_cc.permute(0, 3, 1, 2),
-                    rgb_gt_full.permute(0, 3, 1, 2),
-                ).item()
-            )
-            cc_lpips.append(
-                criterions["lpips"](
-                    pred_rgb_cc.clip(0, 1).permute(0, 3, 1, 2),
-                    rgb_gt_full.permute(0, 3, 1, 2),
-                ).item()
-            )
+                # Color-corrected metrics
+                pred_rgb_cc = color_correct_affine(pred_rgb_full, rgb_gt_full)
+                cc_psnr.append(criterions["psnr"](pred_rgb_cc, rgb_gt_full).item())
+                cc_ssim.append(
+                    criterions["ssim"](
+                        pred_rgb_cc.permute(0, 3, 1, 2),
+                        rgb_gt_full.permute(0, 3, 1, 2),
+                    ).item()
+                )
+                cc_lpips.append(
+                    criterions["lpips"](
+                        pred_rgb_cc.clip(0, 1).permute(0, 3, 1, 2),
+                        rgb_gt_full.permute(0, 3, 1, 2),
+                    ).item()
+                )
 
             # Record the time
             inference_time.append(outputs["frame_time_ms"])
@@ -372,44 +405,49 @@ class Renderer:
         mean_psnr = np.mean(psnr)
         mean_masked_psnr = np.mean(masked_psnr) if masked_psnr else None
         mean_mask_coverage = np.mean(mask_coverage) if mask_coverage else None
-        mean_ssim = np.mean(ssim)
-        mean_lpips = np.mean(lpips)
-        mean_cc_psnr = np.mean(cc_psnr)
-        mean_cc_ssim = np.mean(cc_ssim)
-        mean_cc_lpips = np.mean(cc_lpips)
+        mean_ssim = np.mean(ssim) if ssim else None
+        mean_lpips = np.mean(lpips) if lpips else None
+        mean_cc_psnr = np.mean(cc_psnr) if cc_psnr else None
+        mean_cc_ssim = np.mean(cc_ssim) if cc_ssim else None
+        mean_cc_lpips = np.mean(cc_lpips) if cc_lpips else None
         std_psnr = np.std(psnr)
         mean_inference_time = np.mean(inference_time)
 
-        table = dict(
-            mean_psnr=mean_psnr,
-            mean_ssim=mean_ssim,
-            mean_lpips=mean_lpips,
-            mean_cc_psnr=mean_cc_psnr,
-            mean_cc_ssim=mean_cc_ssim,
-            mean_cc_lpips=mean_cc_lpips,
-            std_psnr=std_psnr,
-        )
+        table = dict(mean_psnr=mean_psnr, std_psnr=std_psnr)
         if mean_masked_psnr is not None:
             table["mean_masked_psnr"] = mean_masked_psnr
         if mean_mask_coverage is not None:
             table["mean_mask_coverage"] = mean_mask_coverage
+        if mean_ssim is not None:
+            table["mean_ssim"] = mean_ssim
+        if mean_lpips is not None:
+            table["mean_lpips"] = mean_lpips
+        if mean_cc_psnr is not None:
+            table["mean_cc_psnr"] = mean_cc_psnr
+        if mean_cc_ssim is not None:
+            table["mean_cc_ssim"] = mean_cc_ssim
+        if mean_cc_lpips is not None:
+            table["mean_cc_lpips"] = mean_cc_lpips
 
         if self.conf.render.enable_kernel_timings:
             table["mean_inference_time"] = f"{'{:.2f}'.format(mean_inference_time)}" + " ms/frame"
 
         # Save metrics to JSON file
-        metrics_json = dict(
-            mean_psnr=float(mean_psnr),
-            mean_ssim=float(mean_ssim),
-            mean_lpips=float(mean_lpips),
-            mean_cc_psnr=float(mean_cc_psnr),
-            mean_cc_ssim=float(mean_cc_ssim),
-            mean_cc_lpips=float(mean_cc_lpips),
-        )
+        metrics_json = dict(mean_psnr=float(mean_psnr))
         if mean_masked_psnr is not None:
             metrics_json["mean_masked_psnr"] = float(mean_masked_psnr)
         if mean_mask_coverage is not None:
             metrics_json["mean_mask_coverage"] = float(mean_mask_coverage)
+        if mean_ssim is not None:
+            metrics_json["mean_ssim"] = float(mean_ssim)
+        if mean_lpips is not None:
+            metrics_json["mean_lpips"] = float(mean_lpips)
+        if mean_cc_psnr is not None:
+            metrics_json["mean_cc_psnr"] = float(mean_cc_psnr)
+        if mean_cc_ssim is not None:
+            metrics_json["mean_cc_ssim"] = float(mean_cc_ssim)
+        if mean_cc_lpips is not None:
+            metrics_json["mean_cc_lpips"] = float(mean_cc_lpips)
         metrics_path = os.path.join(self.out_dir, "metrics.json")
         with open(metrics_path, "w") as f:
             json.dump(metrics_json, f, indent=2)
@@ -423,11 +461,16 @@ class Renderer:
                 self.writer.add_scalar("test/masked_psnr", mean_masked_psnr, self.global_step)
             if mean_mask_coverage is not None:
                 self.writer.add_scalar("test/mask_coverage", mean_mask_coverage, self.global_step)
-            self.writer.add_scalar("test/ssim", mean_ssim, self.global_step)
-            self.writer.add_scalar("test/lpips", mean_lpips, self.global_step)
-            self.writer.add_scalar("test/color_corrected_psnr", mean_cc_psnr, self.global_step)
-            self.writer.add_scalar("test/color_corrected_ssim", mean_cc_ssim, self.global_step)
-            self.writer.add_scalar("test/color_corrected_lpips", mean_cc_lpips, self.global_step)
+            if mean_ssim is not None:
+                self.writer.add_scalar("test/ssim", mean_ssim, self.global_step)
+            if mean_lpips is not None:
+                self.writer.add_scalar("test/lpips", mean_lpips, self.global_step)
+            if mean_cc_psnr is not None:
+                self.writer.add_scalar("test/color_corrected_psnr", mean_cc_psnr, self.global_step)
+            if mean_cc_ssim is not None:
+                self.writer.add_scalar("test/color_corrected_ssim", mean_cc_ssim, self.global_step)
+            if mean_cc_lpips is not None:
+                self.writer.add_scalar("test/color_corrected_lpips", mean_cc_lpips, self.global_step)
             self.writer.add_scalar("time/test/inference", mean_inference_time, self.global_step)
 
             if best_psnr_img is not None:

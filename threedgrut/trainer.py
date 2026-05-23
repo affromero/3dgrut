@@ -1371,6 +1371,8 @@ class Trainer3DGRUT:
         self._should_stop_training = False
         self._best_validation_score: float | None = None
         self._best_validation_step: int | None = None
+        self._early_stopping_reference_score: float | None = None
+        self._early_stopping_reference_step: int | None = None
         self._stale_validation_count = 0
         self._best_checkpoint_path: str | None = None
 
@@ -1508,7 +1510,8 @@ class Trainer3DGRUT:
                 and self.post_processing is not None
             ):
                 self.post_processing.load_state_dict(
-                    checkpoint["post_processing"]["module"]
+                    checkpoint["post_processing"]["module"],
+                    strict=False,
                 )
                 for opt, opt_state in zip(
                     self.post_processing_optimizers,
@@ -1597,7 +1600,8 @@ class Trainer3DGRUT:
                         and self.post_processing is not None
                     ):
                         self.post_processing.load_state_dict(
-                            checkpoint["post_processing"]["module"]
+                            checkpoint["post_processing"]["module"],
+                            strict=False,
                         )
                         logger.info(
                             "📷 Post-processing module restored from initialization checkpoint"
@@ -1668,15 +1672,19 @@ class Trainer3DGRUT:
         self.gui = gui
 
     def init_metrics(self):
-        self.criterions = Dict(
+        criterions = Dict(
             psnr=PeakSignalNoiseRatio(data_range=1).to(self.device),
-            ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(
-                self.device
-            ),
-            lpips=LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=True
-            ).to(self.device),
         )
+        if bool(self.conf.get("compute_extra_metrics", True)):
+            criterions.update(
+                ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(
+                    self.device
+                ),
+                lpips=LearnedPerceptualImagePatchSimilarity(
+                    net_type="vgg", normalize=True
+                ).to(self.device),
+            )
+        self.criterions = criterions
 
     def init_foundation_feature_probe(self, conf: DictConfig) -> None:
         """Initialize optional frozen image feature probe."""
@@ -1800,6 +1808,38 @@ class Trainer3DGRUT:
                 ),
                 max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
                 max_bias=conf.post_processing.get("max_bias", 0.10),
+                use_color_matrix=conf.post_processing.get(
+                    "use_color_matrix",
+                    False,
+                ),
+                max_matrix_delta=conf.post_processing.get(
+                    "max_matrix_delta",
+                    0.10,
+                ),
+                color_matrix_reg_lambda=conf.post_processing.get(
+                    "color_matrix_reg_lambda",
+                    0.25,
+                ),
+                use_radial_affine=conf.post_processing.get(
+                    "use_radial_affine",
+                    False,
+                ),
+                radial_band_count=conf.post_processing.get(
+                    "radial_band_count",
+                    4,
+                ),
+                radial_max_log_gain=conf.post_processing.get(
+                    "radial_max_log_gain",
+                    0.08,
+                ),
+                radial_max_bias=conf.post_processing.get(
+                    "radial_max_bias",
+                    0.03,
+                ),
+                radial_reg_lambda=conf.post_processing.get(
+                    "radial_reg_lambda",
+                    0.50,
+                ),
                 use_residual_grid=conf.post_processing.get(
                     "use_residual_grid",
                     False,
@@ -2563,12 +2603,14 @@ class Trainer3DGRUT:
             pred_rgb_full = rgb_pred.permute(0, 3, 1, 2)
             pred_rgb_full_clipped = rgb_pred.clip(0, 1).permute(0, 3, 1, 2)
 
-            with torch.cuda.nvtx.range("criterions_ssim"):
-                metrics["ssim"] = ssim(pred_rgb_full, rgb_gt_full).item()
-            with torch.cuda.nvtx.range("criterions_lpips"):
-                metrics["lpips"] = lpips(
-                    pred_rgb_full_clipped, rgb_gt_full
-                ).item()
+            if "ssim" in self.criterions:
+                with torch.cuda.nvtx.range("criterions_ssim"):
+                    metrics["ssim"] = ssim(pred_rgb_full, rgb_gt_full).item()
+            if "lpips" in self.criterions:
+                with torch.cuda.nvtx.range("criterions_lpips"):
+                    metrics["lpips"] = lpips(
+                        pred_rgb_full_clipped, rgb_gt_full
+                    ).item()
 
             foundation_feature_error_map = None
             feature_conf = self.conf.get("foundation_features", {})
@@ -2801,6 +2843,26 @@ class Trainer3DGRUT:
                 ).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
+        loss_position_anchor = torch.zeros(1, device=self.device)
+        lambda_position_anchor = 0.0
+        if self.conf.loss.use_position_anchor:
+            if self.model.position_anchor.shape != self.model.positions.shape:
+                msg = (
+                    "loss.use_position_anchor requires position_anchor and "
+                    "positions to have the same shape. Disable densify/prune "
+                    "or refresh the anchor after topology changes."
+                )
+                raise RuntimeError(msg)
+            with torch.cuda.nvtx.range("loss-position-anchor"):
+                epsilon = float(self.conf.loss.position_anchor_epsilon)
+                squared_distance = (
+                    self.model.positions - self.model.position_anchor
+                ).square().sum(dim=1)
+                loss_position_anchor = (
+                    torch.sqrt(squared_distance + epsilon * epsilon) - epsilon
+                ).mean()
+                lambda_position_anchor = self.conf.loss.lambda_position_anchor
+
         # Dense depth supervision (Phase 3c: DA3 z-extended)
         loss_dense_depth = torch.zeros(1, device=self.device)
         lambda_dense_depth = 0.0
@@ -2964,6 +3026,11 @@ class Trainer3DGRUT:
 
         # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps)
         loss_equirect_consistency = torch.zeros(1, device=self.device)
+        loss_equirect_consistency_raw = torch.zeros(1, device=self.device)
+        equirect_consistency_camera_weight = torch.ones(
+            1,
+            device=self.device,
+        )
         lambda_equirect_consistency = 0.0
         if self.conf.loss.use_equirect_consistency:
             warp_dir = self.conf.loss.equirect_warp_dir
@@ -3067,6 +3134,28 @@ class Trainer3DGRUT:
                         overlap_t.unsqueeze(0),
                         threshold,
                     )
+                    loss_equirect_consistency_raw = loss_equirect_consistency
+                    configured_weights = list(
+                        self.conf.loss.equirect_consistency_camera_weights
+                    )
+                    if configured_weights:
+                        camera_idx = int(gpu_batch.camera_idx)
+                        if camera_idx >= len(configured_weights):
+                            msg = (
+                                "loss.equirect_consistency_camera_weights "
+                                "must include one weight per camera. Missing "
+                                f"index {camera_idx}."
+                            )
+                            raise RuntimeError(msg)
+                        equirect_consistency_camera_weight = torch.tensor(
+                            float(configured_weights[camera_idx]),
+                            device=self.device,
+                            dtype=rgb_pred.dtype,
+                        )
+                        loss_equirect_consistency = (
+                            loss_equirect_consistency
+                            * equirect_consistency_camera_weight
+                        )
                 lambda_equirect_consistency = (
                     self.conf.loss.lambda_equirect_consistency
                 )
@@ -3094,6 +3183,7 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
+            + lambda_position_anchor * loss_position_anchor
             + lambda_dense_depth * loss_dense_depth
             + lambda_dense_depth_gradient * loss_dense_depth_gradient
             + lambda_equirect_consistency * loss_equirect_consistency
@@ -3114,7 +3204,10 @@ class Trainer3DGRUT:
             equirect_consistency_loss=(
                 lambda_equirect_consistency * loss_equirect_consistency
             ),
-            equirect_consistency_loss_raw=loss_equirect_consistency,
+            equirect_consistency_loss_raw=loss_equirect_consistency_raw,
+            equirect_consistency_camera_weight=(
+                equirect_consistency_camera_weight
+            ),
             foundation_feature_loss=(
                 lambda_foundation_feature * loss_foundation_feature
             ),
@@ -3123,6 +3216,10 @@ class Trainer3DGRUT:
             scale_loss=lambda_scale * loss_scale,
             sky_opacity_loss=lambda_sky_opacity * loss_sky_opacity,
             sky_opacity_loss_raw=loss_sky_opacity,
+            position_anchor_loss=(
+                lambda_position_anchor * loss_position_anchor
+            ),
+            position_anchor_loss_raw=loss_position_anchor,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -3249,8 +3346,14 @@ class Trainer3DGRUT:
                 np.mean(metrics["mask_coverage"]),
                 global_step,
             )
-        writer.add_scalar("val/ssim", np.mean(metrics["ssim"]), global_step)
-        writer.add_scalar("val/lpips", np.mean(metrics["lpips"]), global_step)
+        if "ssim" in metrics:
+            writer.add_scalar(
+                "val/ssim", np.mean(metrics["ssim"]), global_step
+            )
+        if "lpips" in metrics:
+            writer.add_scalar(
+                "val/lpips", np.mean(metrics["lpips"]), global_step
+            )
         feature_metric_names = (
             (
                 "foundation_feature_cosine",
@@ -3567,6 +3670,36 @@ class Trainer3DGRUT:
                 self.conf.loss.lambda_dense_depth_gradient,
                 global_step,
             )
+        if self.conf.loss.use_equirect_consistency:
+            equirect_consistency_loss = np.mean(
+                metrics["losses"]["equirect_consistency_loss"]
+            )
+            equirect_consistency_loss_raw = np.mean(
+                metrics["losses"]["equirect_consistency_loss_raw"]
+            )
+            equirect_camera_weight = np.mean(
+                metrics["losses"]["equirect_consistency_camera_weight"]
+            )
+            writer.add_scalar(
+                "val/loss/equirect_consistency",
+                equirect_consistency_loss,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/equirect_consistency_raw",
+                equirect_consistency_loss_raw,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/equirect_camera_weight",
+                equirect_camera_weight,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/lambda/equirect_consistency",
+                self.conf.loss.lambda_equirect_consistency,
+                global_step,
+            )
         if self.conf.loss.use_foundation_feature:
             foundation_feature_loss = np.mean(
                 metrics["losses"]["foundation_feature_loss"]
@@ -3594,6 +3727,28 @@ class Trainer3DGRUT:
             )
             writer.add_scalar(
                 "val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step
+            )
+        if self.conf.loss.use_position_anchor:
+            position_anchor_loss = np.mean(
+                metrics["losses"]["position_anchor_loss"]
+            )
+            position_anchor_loss_raw = np.mean(
+                metrics["losses"]["position_anchor_loss_raw"]
+            )
+            writer.add_scalar(
+                "val/loss/position_anchor",
+                position_anchor_loss,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/position_anchor_raw",
+                position_anchor_loss_raw,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/lambda/position_anchor",
+                self.conf.loss.lambda_position_anchor,
+                global_step,
             )
 
         table = {
@@ -3682,15 +3837,21 @@ class Trainer3DGRUT:
             raise ValueError(msg)
         return float(np.mean(values))
 
-    def _is_validation_improvement(self, score: float) -> bool:
-        """Return whether ``score`` beats the current best by ``min_delta``."""
+    def _is_best_validation_score(self, score: float) -> bool:
+        """Return whether ``score`` is the numerically best validation score."""
         if self._best_validation_score is None:
+            return True
+        return score > self._best_validation_score
+
+    def _is_early_stopping_improvement(self, score: float) -> bool:
+        """Return whether ``score`` beats the early-stop reference."""
+        if self._early_stopping_reference_score is None:
             return True
         min_delta = float(self.conf.early_stopping.get("min_delta", 0.0))
         if min_delta < 0.0:
             msg = f"early_stopping.min_delta must be >= 0, got {min_delta}."
             raise ValueError(msg)
-        return score > self._best_validation_score + min_delta
+        return score > self._early_stopping_reference_score + min_delta
 
     def _handle_validation_checkpointing(
         self, metrics: dict[str, list[float]]
@@ -3715,10 +3876,9 @@ class Trainer3DGRUT:
         metric_name = str(early_stopping_conf.get("metric", "masked_psnr"))
         if metric_name == EARLY_STOPPING_AUTO_PSNR_METRIC:
             metric_name = "masked_psnr" if "masked_psnr" in metrics else "psnr"
-        if self._is_validation_improvement(score):
+        if self._is_best_validation_score(score):
             self._best_validation_score = score
             self._best_validation_step = self.global_step
-            self._stale_validation_count = 0
             if save_best:
                 self._best_checkpoint_path = self.save_checkpoint(
                     best_checkpoint=True
@@ -3727,30 +3887,45 @@ class Trainer3DGRUT:
                 f"Best validation {metric_name}={score:.6f} "
                 f"at step {self.global_step}"
             )
+        if not bool(early_stopping_conf.get("enabled", False)):
+            return
+
+        if self._is_early_stopping_improvement(score):
+            self._early_stopping_reference_score = score
+            self._early_stopping_reference_step = self.global_step
+            self._stale_validation_count = 0
             return
 
         self._stale_validation_count += 1
-        best_score = self._best_validation_score
-        if best_score is None:
-            msg = "No best validation score was recorded before stale update."
+        reference_score = self._early_stopping_reference_score
+        if reference_score is None:
+            msg = "No early-stopping reference was recorded before stale update."
             raise RuntimeError(msg)
         patience = int(early_stopping_conf.get("patience", 3))
         if patience < 1:
             msg = f"early_stopping.patience must be >= 1, got {patience}."
             raise ValueError(msg)
         logger.info(
-            f"Validation {metric_name}={score:.6f} did not improve from "
-            f"{best_score:.6f}; "
+            f"Validation {metric_name}={score:.6f} did not clear "
+            f"early-stopping min_delta from {reference_score:.6f}; "
             f"stale validations: {self._stale_validation_count}/{patience}"
         )
         if (
             bool(early_stopping_conf.get("enabled", False))
             and self._stale_validation_count >= patience
         ):
+            best_score = self._best_validation_score
+            best_step = self._best_validation_step
+            if best_score is None or best_step is None:
+                msg = "No best validation score was recorded before stopping."
+                raise RuntimeError(msg)
             self._should_stop_training = True
             logger.info(
                 "Early stopping triggered at step "
-                f"{self.global_step}; best step={self._best_validation_step}, "
+                f"{self.global_step}; reference step="
+                f"{self._early_stopping_reference_step}, "
+                f"reference {metric_name}={reference_score:.6f}; best step="
+                f"{best_step}, "
                 f"best {metric_name}={best_score:.6f}"
             )
 
@@ -3775,7 +3950,8 @@ class Trainer3DGRUT:
             and "post_processing" in checkpoint
         ):
             self.post_processing.load_state_dict(
-                checkpoint["post_processing"]["module"]
+                checkpoint["post_processing"]["module"],
+                strict=False,
             )
         if (
             self.camera_residual is not None
@@ -3866,6 +4042,38 @@ class Trainer3DGRUT:
                     self.conf.loss.lambda_dense_depth_gradient,
                     global_step,
                 )
+            if self.conf.loss.use_equirect_consistency:
+                equirect_consistency_loss = np.mean(
+                    batch_metrics["losses"]["equirect_consistency_loss"]
+                )
+                equirect_consistency_loss_raw = np.mean(
+                    batch_metrics["losses"]["equirect_consistency_loss_raw"]
+                )
+                equirect_camera_weight = np.mean(
+                    batch_metrics["losses"][
+                        "equirect_consistency_camera_weight"
+                    ]
+                )
+                writer.add_scalar(
+                    "train/loss/equirect_consistency",
+                    equirect_consistency_loss,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/equirect_consistency_raw",
+                    equirect_consistency_loss_raw,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/equirect_camera_weight",
+                    equirect_camera_weight,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/lambda/equirect_consistency",
+                    self.conf.loss.lambda_equirect_consistency,
+                    global_step,
+                )
             if self.conf.loss.use_camera_loss_weights:
                 camera_loss_weight = np.mean(
                     batch_metrics["losses"]["camera_loss_weight"]
@@ -3913,6 +4121,28 @@ class Trainer3DGRUT:
                 writer.add_scalar(
                     "train/loss/sky_opacity_raw",
                     sky_opacity_loss_raw,
+                    global_step,
+                )
+            if self.conf.loss.use_position_anchor:
+                position_anchor_loss = np.mean(
+                    batch_metrics["losses"]["position_anchor_loss"]
+                )
+                position_anchor_loss_raw = np.mean(
+                    batch_metrics["losses"]["position_anchor_loss_raw"]
+                )
+                writer.add_scalar(
+                    "train/loss/position_anchor",
+                    position_anchor_loss,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/position_anchor_raw",
+                    position_anchor_loss_raw,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/lambda/position_anchor",
+                    self.conf.loss.lambda_position_anchor,
                     global_step,
                 )
             if (

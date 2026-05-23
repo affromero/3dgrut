@@ -196,6 +196,12 @@ loss:
   use_sky_opacity: false
   lambda_sky_opacity: 0.0
 
+  # Scanner-surface prior: penalize Gaussian center drift away from the
+  # initialization points with a robust Charbonnier distance in meters.
+  use_position_anchor: false
+  lambda_position_anchor: 0.0
+  position_anchor_epsilon: 0.02
+
   use_foundation_feature: false
   lambda_foundation_feature: 0.0
 
@@ -226,6 +232,7 @@ loss:
   equirect_warp_dir: ""
   equirect_image_dir: ""
   equirect_consistency_overlap_threshold: 0.5
+  equirect_consistency_camera_weights: []
 
 foundation_features:
   enabled: false
@@ -253,6 +260,14 @@ post_processing:
   use_frame_residual: false
   max_log_gain: 0.25
   max_bias: 0.10
+  use_color_matrix: false
+  max_matrix_delta: 0.10
+  color_matrix_reg_lambda: 0.25
+  use_radial_affine: false
+  radial_band_count: 4
+  radial_max_log_gain: 0.08
+  radial_max_bias: 0.03
+  radial_reg_lambda: 0.50
   use_residual_grid: false
   residual_grid_size: 32
   residual_grid_max: 0.05

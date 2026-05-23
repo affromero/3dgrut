@@ -212,6 +212,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         model_params = {
             "positions": self.positions,
+            "position_anchor": self.position_anchor,
             "rotation": self.rotation,
             "scale": self.scale,
             "density": self.density,
@@ -252,6 +253,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Positions of the 3D Gaussians (x, y, z) [n_gaussians, 3]
+        self.position_anchor = torch.empty([0, 3])
         self.rotation = torch.nn.Parameter(
             torch.empty([0, 4])
         )  # Rotation of each Gaussian represented as a unit quaternion [n_gaussians, 4]
@@ -302,6 +304,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # State of gradients of Gaussian parameters
         self._gaussians_frozen = False
 
+    def reset_position_anchor(self) -> None:
+        self.position_anchor = self.positions.detach().clone()
+
     @torch.no_grad()
     def build_acc(self, rebuild=True):
         self.renderer.build_acc(self, rebuild)
@@ -328,6 +333,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     def validate_fields(self):
         num_gaussians = self.num_gaussians
         assert self.positions.shape == (num_gaussians, 3)
+        assert self.position_anchor.shape == (num_gaussians, 3)
         assert self.density.shape == (num_gaussians, 1)
         assert self.rotation.shape == (num_gaussians, 4)
         assert self.scale.shape == (num_gaussians, 3)
@@ -553,6 +559,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         feats_sph = feats_sph.reshape(num_gaussians, 3, -1).transpose(-1, -2).reshape(num_gaussians, -1)
 
         self.features_specular = torch.nn.Parameter(feats_sph)
+        self.reset_position_anchor()
 
         if set_optimizable_parameters:
             self.set_optimizable_parameters()
@@ -602,6 +609,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = torch.nn.Parameter(opacities.to(dtype=dtype, device=self.device))
         self.features_albedo = torch.nn.Parameter(features_albedo.to(dtype=dtype, device=self.device))
         self.features_specular = torch.nn.Parameter(features_specular.to(dtype=dtype, device=self.device))
+        self.reset_position_anchor()
 
         if set_optimizable_parameters:
             self.set_optimizable_parameters()
@@ -614,6 +622,17 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = checkpoint["density"]
         self.features_albedo = checkpoint["features_albedo"]
         self.features_specular = checkpoint["features_specular"]
+        checkpoint_anchor = checkpoint.get("position_anchor")
+        if (
+            checkpoint_anchor is None
+            or checkpoint_anchor.shape != self.positions.shape
+        ):
+            self.reset_position_anchor()
+        else:
+            self.position_anchor = checkpoint_anchor.to(
+                dtype=self.positions.dtype,
+                device=self.device,
+            )
         self.n_active_features = checkpoint["n_active_features"]
         self.max_n_features = checkpoint["max_n_features"]
         self.scene_extent = checkpoint["scene_extent"]
@@ -849,6 +868,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = torch.nn.Parameter(opacities.to(dtype=dtype, device=self.device))
         self.features_albedo = torch.nn.Parameter(features_albedo.to(dtype=dtype, device=self.device))
         self.features_specular = torch.nn.Parameter(features_specular.to(dtype=dtype, device=self.device))
+        self.reset_position_anchor()
 
         self.set_optimizable_parameters()
         self.setup_optimizer()
@@ -1060,6 +1080,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = torch.nn.Parameter(torch.tensor(mogt_densities, dtype=self.density.dtype, device=self.device))
         self.scale = torch.nn.Parameter(torch.tensor(mogt_scales, dtype=self.scale.dtype, device=self.device))
         self.rotation = torch.nn.Parameter(torch.tensor(mogt_rotation, dtype=self.rotation.dtype, device=self.device))
+        self.reset_position_anchor()
 
         self.n_active_features = self.max_n_features
 
@@ -1082,6 +1103,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.density = torch.nn.Parameter(other.density.clone())
             self.features_albedo = torch.nn.Parameter(other.features_albedo.clone())
             self.features_specular = torch.nn.Parameter(other.features_specular.clone())
+            self.position_anchor = other.position_anchor.clone()
         else:  # shared tensors
             self.positions = torch.nn.Parameter(other.positions)
             self.rotation = torch.nn.Parameter(other.rotation)
@@ -1089,6 +1111,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.density = torch.nn.Parameter(other.density)
             self.features_albedo = torch.nn.Parameter(other.features_albedo)
             self.features_specular = torch.nn.Parameter(other.features_specular)
+            self.position_anchor = other.position_anchor
         self.max_sh_degree = other.max_sh_degree
         self.n_active_features = other.n_active_features
         self.scene_extent = other.scene_extent
@@ -1112,6 +1135,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         sliced.density = torch.nn.Parameter(sliced.density[idx])
         sliced.features_albedo = torch.nn.Parameter(sliced.features_albedo[idx])
         sliced.features_specular = torch.nn.Parameter(sliced.features_specular[idx])
+        sliced.position_anchor = sliced.position_anchor[idx]
         return sliced
 
     def __len__(self):
