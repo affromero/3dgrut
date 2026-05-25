@@ -315,6 +315,35 @@ class Tracer:
     def build_acc(self, gaussians, rebuild=True):
         pass  # no-op for 3DGUT
 
+    def _apply_gaussian_dropout(self, densities, train, frame_id):
+        if not train:
+            return densities
+        dropout_conf = self.conf.render.get("gaussian_dropout", None)
+        if dropout_conf is None or not dropout_conf.get("enabled", False):
+            return densities
+        probability = float(dropout_conf.get("probability", 0.0))
+        if probability <= 0.0:
+            return densities
+        if probability >= 1.0:
+            raise ValueError(
+                "render.gaussian_dropout.probability must be in [0, 1), "
+                f"got {probability}."
+            )
+        step = int(frame_id)
+        start_iteration = int(dropout_conf.get("start_iteration", 0))
+        end_iteration = int(dropout_conf.get("end_iteration", -1))
+        if step < start_iteration:
+            return densities
+        if end_iteration >= 0 and step > end_iteration:
+            return densities
+
+        keep_probability = 1.0 - probability
+        keep_mask = torch.rand_like(densities) < keep_probability
+        dropped = densities * keep_mask.to(dtype=densities.dtype)
+        if dropout_conf.get("compensate_density", True):
+            dropped = dropped / keep_probability
+        return dropped
+
     def render(self, gaussians, gpu_batch: Batch, train=False, frame_id=0):
         rays_o = gpu_batch.rays_ori
         rays_d = gpu_batch.rays_dir
@@ -323,6 +352,11 @@ class Tracer:
 
         num_gaussians = gaussians.num_gaussians
         with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
+            densities = self._apply_gaussian_dropout(
+                gaussians.get_density(),
+                train,
+                frame_id,
+            )
             (
                 pred_rgba,
                 pred_dist,
@@ -340,7 +374,7 @@ class Tracer:
                 gaussians.positions.contiguous(),
                 gaussians.get_rotation().contiguous(),
                 gaussians.get_scale().contiguous(),
-                gaussians.get_density().contiguous(),
+                densities.contiguous(),
                 gaussians.get_features().contiguous(),
                 sensor,
                 poses,

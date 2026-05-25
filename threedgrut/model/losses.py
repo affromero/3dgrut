@@ -32,8 +32,9 @@ def ssim(img1, img2, window_size=11, size_average=True):
     # predicted_image, gt_image: [BS, CH, H, W], predicted_image is differentiable
     return fused_ssim(img1, img2, padding="valid")
 
+
 @torch.cuda.nvtx.range("dense_depth_l1_loss")
-def dense_depth_l1_loss(pred_dist, gt_depth, valid_mask):
+def dense_depth_l1_loss(pred_dist, gt_depth, valid_mask, pixel_weight=None):
     """L1 loss on per-pixel dense depth, masked to pixels with valid GT.
 
     Args:
@@ -43,6 +44,8 @@ def dense_depth_l1_loss(pred_dist, gt_depth, valid_mask):
             DA3 z-extended sidecar.
         valid_mask: [B, H, W] boolean mask where `gt_depth > 0` (and any other
             constraints from the dataset, e.g. training mask).
+        pixel_weight: Optional [B, H, W] non-negative per-pixel weights applied
+            inside the valid depth mask.
     Returns:
         Scalar masked-mean L1 loss; returns a zero-tensor on the predicted
         device if no valid pixels exist (dataset has no DA3 cache for this
@@ -53,10 +56,20 @@ def dense_depth_l1_loss(pred_dist, gt_depth, valid_mask):
     if not valid_mask.any():
         return torch.zeros(1, device=pred_dist.device, dtype=pred_dist.dtype)
     diff = (pred_dist - gt_depth).abs()
-    return (diff * valid_mask.to(diff.dtype)).sum() / valid_mask.sum().clamp_min(1.0)
+    weight = valid_mask.to(diff.dtype)
+    if pixel_weight is not None:
+        weight = weight * pixel_weight.to(diff.dtype).clamp_min(0.0)
+    return (diff * weight).sum() / weight.sum().clamp_min(1.0)
+
 
 @torch.cuda.nvtx.range("equirect_consistency_l1_loss")
-def equirect_consistency_l1_loss(pred_rgb, equirect_at_fisheye, overlap, threshold):
+def equirect_consistency_l1_loss(
+    pred_rgb,
+    equirect_at_fisheye,
+    overlap,
+    threshold,
+    pixel_weight=None,
+):
     """L1 loss between fisheye render and equirect-sampled colors at overlap.
 
     Args:
@@ -67,6 +80,8 @@ def equirect_consistency_l1_loss(pred_rgb, equirect_at_fisheye, overlap, thresho
         overlap: [B, H, W] RoMa fisheye-equirect overlap confidence in [0, 1].
         threshold: Pixels with `overlap >= threshold` contribute to the loss;
             others are masked out so non-overlapping rim pixels don't dominate.
+        pixel_weight: Optional [B, H, W] non-negative per-pixel weights applied
+            inside the valid overlap mask.
     Returns:
         Scalar masked-mean L1; zero tensor on the predicted device when no
         pixels exceed threshold.
@@ -75,7 +90,14 @@ def equirect_consistency_l1_loss(pred_rgb, equirect_at_fisheye, overlap, thresho
     if not valid.any():
         return torch.zeros(1, device=pred_rgb.device, dtype=pred_rgb.dtype)
     diff = (pred_rgb - equirect_at_fisheye).abs()
-    return (diff * valid.unsqueeze(-1).to(diff.dtype)).sum() / valid.sum().clamp_min(1.0).mul(diff.shape[-1])
+    weight = valid.unsqueeze(-1).to(diff.dtype)
+    if pixel_weight is not None:
+        if pixel_weight.dim() == 3:
+            pixel_weight = pixel_weight.unsqueeze(-1)
+        weight = weight * pixel_weight.to(diff.dtype).clamp_min(0.0)
+    denominator = weight.sum().clamp_min(1.0).mul(diff.shape[-1])
+    return (diff * weight).sum() / denominator
+
 
 @torch.cuda.nvtx.range("dense_depth_gradient_l1_loss")
 def dense_depth_gradient_l1_loss(pred_dist, gt_depth, valid_mask):

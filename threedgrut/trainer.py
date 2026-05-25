@@ -93,6 +93,20 @@ SEMANTIC_LABEL_COLORS_RGB = (
 )
 
 
+def _scale_optimizer_learning_rates(
+    optimizer: torch.optim.Optimizer, *, scale: float, label: str
+) -> None:
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(
+            f"{label} LR scale must be finite and positive: {scale}"
+        )
+    if scale == 1.0:
+        return
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = float(param_group["lr"]) * scale
+    logger.info(f"🔆 Scaled {label} learning rates by {scale:g}")
+
+
 def _quantile_values(value: torch.Tensor) -> torch.Tensor:
     """Bound tensor size before quantile diagnostics on dense point clouds."""
     if value.numel() <= DIAGNOSTIC_QUANTILE_MAX_SAMPLES:
@@ -719,6 +733,41 @@ def _region_mask(
     return ((radius >= lower) & (radius < upper)).to(radius.dtype)[
         None, :, :, None
     ]
+
+
+def _radial_weight_map(
+    *,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    band_weights: list[float],
+) -> torch.Tensor:
+    """Return a [1, H, W] radial loss-weight map."""
+    if len(band_weights) != 4:
+        raise RuntimeError(
+            "Radial loss-weight entries must have four values: center, "
+            "mid, outer, rim."
+        )
+    radius = _image_radius(
+        height=height,
+        width=width,
+        device=device,
+        dtype=dtype,
+    )
+    radius = radius / torch.clamp_min(radius.max(), 1e-6)
+    bands = (
+        (0.00, 0.33),
+        (0.33, 0.66),
+        (0.66, 0.90),
+        (0.90, 1.01),
+    )
+    weight = torch.ones_like(radius)
+    for band_weight, (lower, upper) in zip(band_weights, bands):
+        band_mask = (radius >= lower) & (radius < upper)
+        band_value = torch.full_like(weight, float(band_weight))
+        weight = torch.where(band_mask, band_value, weight)
+    return weight.unsqueeze(0)
 
 
 def _radial_residual_metrics(
@@ -1394,6 +1443,93 @@ def _make_validation_image_tiles(
     return tiles
 
 
+def _load_post_processing_state(
+    module: nn.Module,
+    saved_state: dict,
+) -> list[str]:
+    """Load ``saved_state`` into ``module``, dropping shape-mismatched entries.
+
+    Returns the list of dropped keys. This happens when a continuation run
+    changes the training-split size (e.g. ``dataset.train_exclude_image_list_path``
+    shrinks per-frame buffers like ``frame_log_gain``/``frame_bias``).
+    Keys missing from the saved state are tolerated via ``strict=False``.
+    """
+    current_state = module.state_dict()
+    filtered: dict = {}
+    dropped: list[str] = []
+    for key, value in saved_state.items():
+        target = current_state.get(key)
+        if target is None:
+            continue
+        if torch.is_tensor(value) and tuple(value.shape) != tuple(
+            target.shape
+        ):
+            if (
+                key == "residual_grid"
+                and value.ndim == 4
+                and target.ndim == 4
+                and value.shape[:2] == target.shape[:2]
+            ):
+                filtered[key] = F.interpolate(
+                    value.to(device=target.device, dtype=target.dtype),
+                    size=target.shape[-2:],
+                    mode="bilinear",
+                    align_corners=True,
+                )
+                continue
+            dropped.append(key)
+            continue
+        filtered[key] = value
+    module.load_state_dict(filtered, strict=False)
+    return dropped
+
+
+def _drop_shape_mismatched_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    *,
+    label: str,
+) -> list[str]:
+    """Reset optimizer buffers whose tensor shape no longer matches a param."""
+    dropped: list[str] = []
+    for group_index, group in enumerate(optimizer.param_groups):
+        for param_index, parameter in enumerate(group["params"]):
+            state = optimizer.state.get(parameter)
+            if not state:
+                continue
+            parameter_shape = tuple(parameter.shape)
+            has_mismatched_buffer = False
+            for key, value in state.items():
+                if not torch.is_tensor(value) or value.ndim == 0:
+                    continue
+                if tuple(value.shape) != parameter_shape:
+                    dropped.append(
+                        f"{label}.group{group_index}.param{param_index}."
+                        f"{key}:{tuple(value.shape)}!={parameter_shape}"
+                    )
+                    has_mismatched_buffer = True
+            if has_mismatched_buffer:
+                state.clear()
+    return dropped
+
+
+def _load_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    saved_state: dict,
+    *,
+    label: str,
+) -> list[str]:
+    """Restore optimizer state when parameter groups still match."""
+    try:
+        optimizer.load_state_dict(saved_state)
+    except ValueError as exc:
+        logger.warning(
+            f"📷 Could not restore {label} optimizer state: {exc}. "
+            "Using fresh optimizer state for this optimizer."
+        )
+        return []
+    return _drop_shape_mismatched_optimizer_state(optimizer, label=label)
+
+
 class Trainer3DGRUT:
     """Trainer for paper: "3D Gaussian Ray Tracing: Fast Tracing of Particle Scenes" """
 
@@ -1407,10 +1543,10 @@ class Trainer3DGRUT:
     val_dataloader: torch.utils.data.DataLoader
 
     scene_extent: float = 1.0
-    """TODO: Add docstring"""
+    """Spatial scale used to normalize scene-dependent optimizer settings."""
 
     scene_bbox: tuple[torch.Tensor, torch.Tensor]  # Tuple of vec3 (min,max)
-    """TODO: Add docstring"""
+    """Scene bounding box as minimum and maximum 3D coordinates."""
 
     strategy: BaseStrategy
     """ Strategy for optimizing the Gaussian model in terms of densification, pruning, etc. """
@@ -1479,6 +1615,8 @@ class Trainer3DGRUT:
         self._should_stop_training = False
         self._best_validation_score: float | None = None
         self._best_validation_step: int | None = None
+        self._early_stopping_reference_score: float | None = None
+        self._early_stopping_reference_step: int | None = None
         self._stale_validation_count = 0
         self._best_checkpoint_path: str | None = None
 
@@ -1615,15 +1753,42 @@ class Trainer3DGRUT:
                 "post_processing" in checkpoint
                 and self.post_processing is not None
             ):
-                self.post_processing.load_state_dict(
-                    checkpoint["post_processing"]["module"]
+                dropped = _load_post_processing_state(
+                    self.post_processing,
+                    checkpoint["post_processing"]["module"],
                 )
+                if dropped:
+                    logger.warning(
+                        "📷 Dropping shape-mismatched post-processing "
+                        f"buffers from resume checkpoint: {sorted(dropped)}. "
+                        "Fresh values will be used (typically per-frame "
+                        "buffers after a train-split change)."
+                    )
                 for opt, opt_state in zip(
                     self.post_processing_optimizers,
                     checkpoint["post_processing"]["optimizers"],
                     strict=False,
                 ):
-                    opt.load_state_dict(opt_state)
+                    dropped_optimizer_state = _load_optimizer_state(
+                        opt,
+                        opt_state,
+                        label="post_processing",
+                    )
+                    if dropped_optimizer_state:
+                        logger.warning(
+                            "📷 Resetting shape-mismatched "
+                            "post-processing optimizer buffers: "
+                            f"{dropped_optimizer_state}"
+                        )
+                    _scale_optimizer_learning_rates(
+                        opt,
+                        scale=float(
+                            self.conf.post_processing.get(
+                                "resume_lr_scale", 1.0
+                            )
+                        ),
+                        label="post-processing resume",
+                    )
                 for sched, sched_state in zip(
                     self.post_processing_schedulers,
                     checkpoint["post_processing"]["schedulers"],
@@ -1704,9 +1869,15 @@ class Trainer3DGRUT:
                         "post_processing" in checkpoint
                         and self.post_processing is not None
                     ):
-                        self.post_processing.load_state_dict(
-                            checkpoint["post_processing"]["module"]
+                        dropped = _load_post_processing_state(
+                            self.post_processing,
+                            checkpoint["post_processing"]["module"],
                         )
+                        if dropped:
+                            logger.warning(
+                                "📷 Dropping shape-mismatched "
+                                f"post-processing buffers: {sorted(dropped)}."
+                            )
                         logger.info(
                             "📷 Post-processing module restored from initialization checkpoint"
                         )
@@ -1776,15 +1947,19 @@ class Trainer3DGRUT:
         self.gui = gui
 
     def init_metrics(self):
-        self.criterions = Dict(
+        criterions = Dict(
             psnr=PeakSignalNoiseRatio(data_range=1).to(self.device),
-            ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(
-                self.device
-            ),
-            lpips=LearnedPerceptualImagePatchSimilarity(
-                net_type="vgg", normalize=True
-            ).to(self.device),
         )
+        if bool(self.conf.get("compute_extra_metrics", True)):
+            criterions.update(
+                ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(
+                    self.device
+                ),
+                lpips=LearnedPerceptualImagePatchSimilarity(
+                    net_type="vgg", normalize=True
+                ).to(self.device),
+            )
+        self.criterions = criterions
 
     def init_foundation_feature_probe(self, conf: DictConfig) -> None:
         """Initialize optional frozen image feature probe."""
@@ -1922,6 +2097,38 @@ class Trainer3DGRUT:
                 ),
                 max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
                 max_bias=conf.post_processing.get("max_bias", 0.10),
+                use_color_matrix=conf.post_processing.get(
+                    "use_color_matrix",
+                    False,
+                ),
+                max_matrix_delta=conf.post_processing.get(
+                    "max_matrix_delta",
+                    0.10,
+                ),
+                color_matrix_reg_lambda=conf.post_processing.get(
+                    "color_matrix_reg_lambda",
+                    0.25,
+                ),
+                use_radial_affine=conf.post_processing.get(
+                    "use_radial_affine",
+                    False,
+                ),
+                radial_band_count=conf.post_processing.get(
+                    "radial_band_count",
+                    4,
+                ),
+                radial_max_log_gain=conf.post_processing.get(
+                    "radial_max_log_gain",
+                    0.08,
+                ),
+                radial_max_bias=conf.post_processing.get(
+                    "radial_max_bias",
+                    0.03,
+                ),
+                radial_reg_lambda=conf.post_processing.get(
+                    "radial_reg_lambda",
+                    0.50,
+                ),
                 use_residual_grid=conf.post_processing.get(
                     "use_residual_grid",
                     False,
@@ -1937,6 +2144,38 @@ class Trainer3DGRUT:
                 residual_grid_reg_lambda=conf.post_processing.get(
                     "residual_grid_reg_lambda",
                     0.01,
+                ),
+                use_residual_grid_edge_gate=conf.post_processing.get(
+                    "use_residual_grid_edge_gate",
+                    False,
+                ),
+                residual_grid_gate_floor=conf.post_processing.get(
+                    "residual_grid_gate_floor",
+                    0.20,
+                ),
+                use_temporal_affine=conf.post_processing.get(
+                    "use_temporal_affine",
+                    False,
+                ),
+                temporal_num_knots=conf.post_processing.get(
+                    "temporal_num_knots",
+                    32,
+                ),
+                temporal_max_sequence_idx=conf.post_processing.get(
+                    "temporal_max_sequence_idx",
+                    400,
+                ),
+                temporal_max_log_gain=conf.post_processing.get(
+                    "temporal_max_log_gain",
+                    0.08,
+                ),
+                temporal_max_bias=conf.post_processing.get(
+                    "temporal_max_bias",
+                    0.03,
+                ),
+                temporal_reg_lambda=conf.post_processing.get(
+                    "temporal_reg_lambda",
+                    0.50,
                 ),
             ).to(self.device)
 
@@ -1968,8 +2207,17 @@ class Trainer3DGRUT:
             reg_lambda=conf.camera_residual.reg_lambda,
             max_rotation_rad=conf.camera_residual.max_rotation_rad,
             max_translation_m=conf.camera_residual.max_translation_m,
+            max_rolling_rotation_rad=(
+                conf.camera_residual.max_rolling_rotation_rad
+            ),
+            max_rolling_translation_m=(
+                conf.camera_residual.max_rolling_translation_m
+            ),
             optimize_global=conf.camera_residual.optimize_global,
             optimize_per_camera=conf.camera_residual.optimize_per_camera,
+            optimize_rolling_per_camera=(
+                conf.camera_residual.optimize_rolling_per_camera
+            ),
         ).to(self.device)
         self.camera_residual_optimizer = (
             self.camera_residual.create_optimizer()
@@ -2054,6 +2302,24 @@ class Trainer3DGRUT:
                 )
         return candidates
 
+    def _camera_residual_audit_rolling_candidates(
+        self,
+        *,
+        camera_idx: int,
+    ) -> list[tuple[str, int | None, torch.Tensor, torch.Tensor]]:
+        """Return fixed row-linear residual perturbations for one camera."""
+        return self._camera_residual_audit_axis_candidates(
+            prefix=f"rolling_camera_{camera_idx}",
+            camera_idx=camera_idx,
+        )
+
+    def _camera_residual_audit_is_rolling_candidate(
+        self,
+        candidate_name: str,
+    ) -> bool:
+        """Return whether an audit candidate targets row-linear residuals."""
+        return candidate_name.startswith("rolling_camera_")
+
     def _camera_residual_audit_candidates(
         self,
     ) -> list[tuple[str, int | None, torch.Tensor, torch.Tensor]]:
@@ -2063,6 +2329,17 @@ class Trainer3DGRUT:
             camera_idx=None,
         )
         if not self.camera_residual.optimize_per_camera:
+            if not self.camera_residual.optimize_rolling_per_camera:
+                return candidates
+            camera_count = int(
+                self.camera_residual.rolling_rotation_raw.shape[0]
+            )
+            for camera_idx in range(camera_count):
+                candidates.extend(
+                    self._camera_residual_audit_rolling_candidates(
+                        camera_idx=camera_idx,
+                    )
+                )
             return candidates
         camera_count = int(self.camera_residual.camera_rotation_raw.shape[0])
         for camera_idx in range(camera_count):
@@ -2072,7 +2349,262 @@ class Trainer3DGRUT:
                     camera_idx=camera_idx,
                 )
             )
+        if self.camera_residual.optimize_rolling_per_camera:
+            for camera_idx in range(camera_count):
+                candidates.extend(
+                    self._camera_residual_audit_rolling_candidates(
+                        camera_idx=camera_idx,
+                    )
+                )
         return candidates
+
+    def _camera_residual_audit_target_image_names(self) -> set[str]:
+        """Return the optional image-name filter for pose residual audits."""
+        audit_conf = self.conf.camera_residual.finite_difference_audit
+        raw_names = str(audit_conf.get("target_image_names", "")).strip()
+        if not raw_names:
+            return set()
+        normalized = raw_names.replace("|", ",")
+        return {name.strip() for name in normalized.split(",") if name.strip()}
+
+    def _set_camera_residual_audit_delta(
+        self,
+        *,
+        candidate_name: str = "",
+        camera_idx: int | None,
+        rotation: torch.Tensor,
+        translation: torch.Tensor,
+    ) -> None:
+        """Apply one fixed residual candidate to the audit module."""
+        if self.camera_residual is None:
+            raise RuntimeError("Camera residual module is not initialized.")
+        if self._camera_residual_audit_is_rolling_candidate(candidate_name):
+            if camera_idx is None:
+                raise RuntimeError(
+                    "Rolling camera residual audit requires a camera index."
+                )
+            self.camera_residual.set_rolling_camera_delta(
+                camera_idx=camera_idx,
+                rotation=rotation,
+                translation=translation,
+            )
+            return
+        if camera_idx is None:
+            self.camera_residual.set_global_delta(
+                rotation=rotation,
+                translation=translation,
+            )
+            return
+        self.camera_residual.set_camera_delta(
+            camera_idx=camera_idx,
+            rotation=rotation,
+            translation=translation,
+        )
+
+    def _camera_residual_audit_batch_metrics(
+        self, gpu_batch
+    ) -> dict[str, float]:
+        """Evaluate one validation batch under the active residual candidate."""
+        if self.camera_residual is None:
+            raise RuntimeError("Camera residual module is not initialized.")
+        residual_batch = self._apply_camera_residual(gpu_batch)
+        outputs = self.model(residual_batch, train=False)
+        if self.post_processing is not None:
+            outputs = apply_post_processing(
+                self.post_processing,
+                outputs,
+                residual_batch,
+                training=False,
+            )
+        rgb_error = torch.square(outputs["pred_rgb"] - residual_batch.rgb_gt)
+        psnr_value = (
+            -10.0 * torch.log10(torch.clamp_min(rgb_error.mean(), 1e-12))
+        ).item()
+        metrics = {"psnr": float(psnr_value)}
+        if residual_batch.mask is not None:
+            mask = residual_batch.mask
+            masked_error = rgb_error * mask
+            denominator = torch.clamp_min(
+                mask.sum() * residual_batch.rgb_gt.shape[-1],
+                1.0,
+            )
+            masked_mse = masked_error.sum() / denominator
+            metrics["masked_psnr"] = float(
+                (
+                    -10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))
+                ).item()
+            )
+        return metrics
+
+    @torch.no_grad()
+    def run_camera_residual_per_view_finite_difference_audit(self) -> None:
+        """Evaluate per-image SO3/SE3 nudges on selected validation views."""
+        if self.camera_residual is None:
+            raise RuntimeError(
+                "camera_residual.finite_difference_audit requires "
+                "camera_residual.enabled=true."
+            )
+        audit_conf = self.conf.camera_residual.finite_difference_audit
+        max_views = int(audit_conf.max_views)
+        if max_views <= 0:
+            raise ValueError(
+                "camera_residual.finite_difference_audit.max_views must be positive."
+            )
+        original_global_rotation = (
+            self.camera_residual.global_rotation_raw.detach().clone()
+        )
+        original_global_translation = (
+            self.camera_residual.global_translation_raw.detach().clone()
+        )
+        original_camera_rotation = (
+            self.camera_residual.camera_rotation_raw.detach().clone()
+        )
+        original_camera_translation = (
+            self.camera_residual.camera_translation_raw.detach().clone()
+        )
+        original_rolling_rotation = (
+            self.camera_residual.rolling_rotation_raw.detach().clone()
+        )
+        original_rolling_translation = (
+            self.camera_residual.rolling_translation_raw.detach().clone()
+        )
+        target_image_names = self._camera_residual_audit_target_image_names()
+        rows = []
+        selected_views = 0
+        try:
+            for _, batch_idx in enumerate(self.val_dataloader):
+                gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
+                    batch_idx
+                )
+                image_name = os.path.basename(gpu_batch.image_path)
+                if target_image_names and image_name not in target_image_names:
+                    continue
+                if selected_views >= max_views:
+                    break
+                selected_views += 1
+                prefix = os.path.splitext(image_name)[0]
+                candidates = self._camera_residual_audit_axis_candidates(
+                    prefix=prefix,
+                    camera_idx=None,
+                )
+                baseline_metrics: dict[str, float] | None = None
+                for name, camera_idx, rotation, translation in candidates:
+                    self._set_camera_residual_audit_delta(
+                        candidate_name=name,
+                        camera_idx=camera_idx,
+                        rotation=rotation,
+                        translation=translation,
+                    )
+                    logger.info(
+                        "Camera residual per-view finite-difference candidate: "
+                        f"{image_name} {name}"
+                    )
+                    metrics = self._camera_residual_audit_batch_metrics(
+                        gpu_batch
+                    )
+                    if baseline_metrics is None:
+                        baseline_metrics = metrics
+                    row = {
+                        "candidate": name,
+                        "image_name": image_name,
+                        "split_frame_idx": int(gpu_batch.frame_idx),
+                        "camera_idx": int(gpu_batch.camera_idx),
+                        "rotation_x": float(rotation[0].item()),
+                        "rotation_y": float(rotation[1].item()),
+                        "rotation_z": float(rotation[2].item()),
+                        "translation_x": float(translation[0].item()),
+                        "translation_y": float(translation[1].item()),
+                        "translation_z": float(translation[2].item()),
+                        "mean_psnr": metrics["psnr"],
+                        "delta_psnr": (
+                            metrics["psnr"] - baseline_metrics["psnr"]
+                        ),
+                    }
+                    if "masked_psnr" in metrics:
+                        baseline_masked = baseline_metrics["masked_psnr"]
+                        row["mean_masked_psnr"] = metrics["masked_psnr"]
+                        row["delta_masked_psnr"] = (
+                            metrics["masked_psnr"] - baseline_masked
+                        )
+                    rows.append(row)
+        finally:
+            with torch.no_grad():
+                self.camera_residual.global_rotation_raw.copy_(
+                    original_global_rotation
+                )
+                self.camera_residual.global_translation_raw.copy_(
+                    original_global_translation
+                )
+                self.camera_residual.camera_rotation_raw.copy_(
+                    original_camera_rotation
+                )
+                self.camera_residual.camera_translation_raw.copy_(
+                    original_camera_translation
+                )
+                self.camera_residual.rolling_rotation_raw.copy_(
+                    original_rolling_rotation
+                )
+                self.camera_residual.rolling_translation_raw.copy_(
+                    original_rolling_translation
+                )
+        if target_image_names and selected_views != len(target_image_names):
+            found = {str(row["image_name"]) for row in rows}
+            missing = sorted(target_image_names - found)
+            logger.warning(
+                "Camera residual per-view audit did not find all targets: "
+                f"{missing}"
+            )
+        if not rows:
+            raise RuntimeError(
+                "Camera residual per-view finite-difference audit selected no "
+                "validation views."
+            )
+        score_key = (
+            "delta_masked_psnr"
+            if any("delta_masked_psnr" in row for row in rows)
+            else "delta_psnr"
+        )
+        finite_rows = [row for row in rows if np.isfinite(row[score_key])]
+        best = max(finite_rows, key=lambda row: row[score_key])
+        baselines = [
+            row for row in rows if row["candidate"].endswith("_baseline")
+        ]
+        for row in rows:
+            display_row = {
+                key: str(value) if isinstance(value, int) else value
+                for key, value in row.items()
+            }
+            logger.log_table(
+                "Camera Residual Per-View Finite-Difference Audit - "
+                f"{row['image_name']} {row['candidate']}",
+                record=display_row,
+            )
+        output_path = os.path.join(
+            self.tracking.output_dir,
+            "camera_residual_per_view_finite_difference_audit.json",
+        )
+        with open(output_path, "w", encoding="utf-8") as fp:
+            json.dump(
+                {
+                    "score_key": score_key,
+                    "per_view": True,
+                    "target_image_names": sorted(target_image_names),
+                    "baseline": baselines,
+                    "best": best,
+                    "rows": rows,
+                },
+                fp,
+                indent=2,
+            )
+        logger.info(
+            "Camera residual per-view finite-difference best: "
+            f"{best['image_name']} {best['candidate']} "
+            f"{score_key}={best[score_key]:.6f}"
+        )
+        logger.info(
+            "Camera residual per-view finite-difference audit JSON: "
+            f"{output_path}"
+        )
 
     @torch.no_grad()
     def run_camera_residual_finite_difference_audit(self) -> None:
@@ -2088,12 +2620,27 @@ class Trainer3DGRUT:
             raise ValueError(
                 "camera_residual.finite_difference_audit.max_views must be positive."
             )
+        if bool(audit_conf.get("per_view", False)):
+            self.run_camera_residual_per_view_finite_difference_audit()
+            return
 
         original_rotation = (
             self.camera_residual.global_rotation_raw.detach().clone()
         )
         original_translation = (
             self.camera_residual.global_translation_raw.detach().clone()
+        )
+        original_camera_rotation = (
+            self.camera_residual.camera_rotation_raw.detach().clone()
+        )
+        original_camera_translation = (
+            self.camera_residual.camera_translation_raw.detach().clone()
+        )
+        original_rolling_rotation = (
+            self.camera_residual.rolling_rotation_raw.detach().clone()
+        )
+        original_rolling_translation = (
+            self.camera_residual.rolling_translation_raw.detach().clone()
         )
         rows = []
         try:
@@ -2103,17 +2650,12 @@ class Trainer3DGRUT:
                 rotation,
                 translation,
             ) in self._camera_residual_audit_candidates():
-                if camera_idx is None:
-                    self.camera_residual.set_global_delta(
-                        rotation=rotation,
-                        translation=translation,
-                    )
-                else:
-                    self.camera_residual.set_camera_delta(
-                        camera_idx=camera_idx,
-                        rotation=rotation,
-                        translation=translation,
-                    )
+                self._set_camera_residual_audit_delta(
+                    candidate_name=name,
+                    camera_idx=camera_idx,
+                    rotation=rotation,
+                    translation=translation,
+                )
                 psnr_values = []
                 masked_psnr_values = []
                 logger.info(
@@ -2130,41 +2672,12 @@ class Trainer3DGRUT:
                         continue
                     if len(psnr_values) >= max_views:
                         break
-                    gpu_batch = self._apply_camera_residual(gpu_batch)
-                    outputs = self.model(gpu_batch, train=False)
-                    if self.post_processing is not None:
-                        outputs = apply_post_processing(
-                            self.post_processing,
-                            outputs,
-                            gpu_batch,
-                            training=False,
-                        )
-                    rgb_error = torch.square(
-                        outputs["pred_rgb"] - gpu_batch.rgb_gt
+                    metrics = self._camera_residual_audit_batch_metrics(
+                        gpu_batch
                     )
-                    psnr_values.append(
-                        (
-                            -10.0
-                            * torch.log10(
-                                torch.clamp_min(rgb_error.mean(), 1e-12)
-                            )
-                        ).item()
-                    )
-                    if gpu_batch.mask is not None:
-                        mask = gpu_batch.mask
-                        masked_error = rgb_error * mask
-                        denominator = torch.clamp_min(
-                            mask.sum() * gpu_batch.rgb_gt.shape[-1], 1.0
-                        )
-                        masked_mse = masked_error.sum() / denominator
-                        masked_psnr_values.append(
-                            (
-                                -10.0
-                                * torch.log10(
-                                    torch.clamp_min(masked_mse, 1e-12)
-                                )
-                            ).item()
-                        )
+                    psnr_values.append(metrics["psnr"])
+                    if "masked_psnr" in metrics:
+                        masked_psnr_values.append(metrics["masked_psnr"])
                 mean_psnr = (
                     float(np.mean(psnr_values))
                     if psnr_values
@@ -2197,15 +2710,29 @@ class Trainer3DGRUT:
                 self.camera_residual.global_translation_raw.copy_(
                     original_translation
                 )
-                self.camera_residual.camera_rotation_raw.zero_()
-                self.camera_residual.camera_translation_raw.zero_()
+                self.camera_residual.camera_rotation_raw.copy_(
+                    original_camera_rotation
+                )
+                self.camera_residual.camera_translation_raw.copy_(
+                    original_camera_translation
+                )
+                self.camera_residual.rolling_rotation_raw.copy_(
+                    original_rolling_rotation
+                )
+                self.camera_residual.rolling_translation_raw.copy_(
+                    original_rolling_translation
+                )
 
         score_key = "mean_masked_psnr"
         if not rows or all(np.isnan(row[score_key]) for row in rows):
             score_key = "mean_psnr"
         finite_rows = [row for row in rows if not np.isnan(row[score_key])]
         best = max(finite_rows, key=lambda row: row[score_key])
-        if best["camera_idx"] >= 0:
+        if self._camera_residual_audit_is_rolling_candidate(
+            str(best["candidate"])
+        ):
+            baseline_name = f"rolling_camera_{best['camera_idx']}_baseline"
+        elif best["camera_idx"] >= 0:
             baseline_name = f"camera_{best['camera_idx']}_baseline"
         else:
             baseline_name = "global_baseline"
@@ -2690,12 +3217,14 @@ class Trainer3DGRUT:
             pred_rgb_full = rgb_pred.permute(0, 3, 1, 2)
             pred_rgb_full_clipped = rgb_pred.clip(0, 1).permute(0, 3, 1, 2)
 
-            with torch.cuda.nvtx.range("criterions_ssim"):
-                metrics["ssim"] = ssim(pred_rgb_full, rgb_gt_full).item()
-            with torch.cuda.nvtx.range("criterions_lpips"):
-                metrics["lpips"] = lpips(
-                    pred_rgb_full_clipped, rgb_gt_full
-                ).item()
+            if "ssim" in self.criterions:
+                with torch.cuda.nvtx.range("criterions_ssim"):
+                    metrics["ssim"] = ssim(pred_rgb_full, rgb_gt_full).item()
+            if "lpips" in self.criterions:
+                with torch.cuda.nvtx.range("criterions_lpips"):
+                    metrics["lpips"] = lpips(
+                        pred_rgb_full_clipped, rgb_gt_full
+                    ).item()
 
             foundation_feature_error_map = None
             feature_conf = self.conf.get("foundation_features", {})
@@ -2848,7 +3377,27 @@ class Trainer3DGRUT:
         lambda_l1 = 0.0
         if self.conf.loss.use_l1:
             with torch.cuda.nvtx.range("loss-l1"):
-                loss_l1 = torch.abs(rgb_pred - rgb_gt).sum() / loss_denominator
+                rgb_error = rgb_pred - rgb_gt
+                l1_loss_type = str(
+                    self.conf.loss.get("l1_loss_type", "absolute")
+                )
+                if l1_loss_type == "absolute":
+                    loss_l1 = torch.abs(rgb_error).sum() / loss_denominator
+                elif l1_loss_type == "charbonnier":
+                    epsilon = float(
+                        self.conf.loss.get("charbonnier_epsilon", 0.01)
+                    )
+                    loss_l1 = (
+                        torch.sqrt(rgb_error.square() + epsilon * epsilon)
+                        - epsilon
+                    ).sum() / loss_denominator
+                else:
+                    msg = (
+                        "Unsupported loss.l1_loss_type "
+                        f"{l1_loss_type!r}. Supported values: "
+                        "absolute, charbonnier."
+                    )
+                    raise RuntimeError(msg)
                 lambda_l1 = self.conf.loss.lambda_l1
 
         # L2 loss
@@ -2928,8 +3477,92 @@ class Trainer3DGRUT:
                 ).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
+        loss_position_anchor = torch.zeros(1, device=self.device)
+        lambda_position_anchor = 0.0
+        if self.conf.loss.use_position_anchor:
+            if self.model.position_anchor.shape != self.model.positions.shape:
+                msg = (
+                    "loss.use_position_anchor requires position_anchor and "
+                    "positions to have the same shape. Disable densify/prune "
+                    "or refresh the anchor after topology changes."
+                )
+                raise RuntimeError(msg)
+            with torch.cuda.nvtx.range("loss-position-anchor"):
+                epsilon = float(self.conf.loss.position_anchor_epsilon)
+                squared_distance = (
+                    (self.model.positions - self.model.position_anchor)
+                    .square()
+                    .sum(dim=1)
+                )
+                loss_position_anchor = (
+                    torch.sqrt(squared_distance + epsilon * epsilon) - epsilon
+                ).mean()
+                lambda_position_anchor = self.conf.loss.lambda_position_anchor
+
+        loss_tangent_plane_anchor = torch.zeros(1, device=self.device)
+        lambda_tangent_plane_anchor = 0.0
+        if self.conf.loss.get("use_tangent_plane_anchor", False):
+            if self.model.position_anchor.shape != self.model.positions.shape:
+                msg = (
+                    "loss.use_tangent_plane_anchor requires position_anchor "
+                    "and positions to have the same shape."
+                )
+                raise RuntimeError(msg)
+            if (
+                self.model.tangent_plane_normal_anchor.shape
+                != self.model.positions.shape
+            ):
+                msg = (
+                    "loss.use_tangent_plane_anchor requires "
+                    "tangent_plane_normal_anchor and positions to have the "
+                    "same shape."
+                )
+                raise RuntimeError(msg)
+            with torch.cuda.nvtx.range("loss-tangent-plane-anchor"):
+                epsilon = float(self.conf.loss.tangent_plane_anchor_epsilon)
+                normals = torch.nn.functional.normalize(
+                    self.model.tangent_plane_normal_anchor.to(
+                        dtype=self.model.positions.dtype,
+                        device=self.model.positions.device,
+                    ),
+                    dim=1,
+                )
+                offset = self.model.positions - self.model.position_anchor
+                signed_distance = (offset * normals).sum(dim=1)
+                loss_tangent_plane_anchor = (
+                    torch.sqrt(signed_distance.square() + epsilon * epsilon)
+                    - epsilon
+                ).mean()
+                lambda_tangent_plane_anchor = (
+                    self.conf.loss.lambda_tangent_plane_anchor
+                )
+
+        loss_view_albedo_delta = torch.zeros(1, device=self.device)
+        lambda_view_albedo_delta = 0.0
+        if self.conf.loss.get("use_view_albedo_delta", False):
+            with torch.cuda.nvtx.range("loss-view-albedo-delta"):
+                loss_view_albedo_delta = (
+                    self.model.get_view_albedo_delta_regularization_loss()
+                )
+                lambda_view_albedo_delta = (
+                    self.conf.loss.lambda_view_albedo_delta
+                )
+
+        loss_view_density_delta = torch.zeros(1, device=self.device)
+        lambda_view_density_delta = 0.0
+        if self.conf.loss.get("use_view_density_delta", False):
+            with torch.cuda.nvtx.range("loss-view-density-delta"):
+                loss_view_density_delta = (
+                    self.model.get_view_density_delta_regularization_loss()
+                )
+                lambda_view_density_delta = (
+                    self.conf.loss.lambda_view_density_delta
+                )
+
         # Dense depth supervision (Phase 3c: DA3 z-extended)
         loss_dense_depth = torch.zeros(1, device=self.device)
+        dense_depth_camera_weight = torch.ones(1, device=self.device)
+        dense_depth_radial_weight = torch.ones(1, device=self.device)
         lambda_dense_depth = 0.0
         if self.conf.loss.use_dense_depth:
             dense_depth_dir = self.conf.loss.dense_depth_dir
@@ -3001,11 +3634,60 @@ class Trainer3DGRUT:
                             pred_dist_2d = pred_dist_2d[:mh, :mw]
                             gt_depth = gt_depth[:mh, :mw]
                         valid_mask = valid_mask & m
+                    pixel_weight = None
+                    radial_weights = list(
+                        self.conf.loss.get(
+                            "dense_depth_radial_camera_weights",
+                            [],
+                        )
+                    )
+                    if radial_weights:
+                        camera_idx = int(gpu_batch.camera_idx)
+                        if camera_idx >= len(radial_weights):
+                            msg = (
+                                "loss.dense_depth_radial_camera_weights must "
+                                "include one four-band entry per camera. "
+                                f"Missing index {camera_idx}."
+                            )
+                            raise RuntimeError(msg)
+                        band_weights = [
+                            float(weight)
+                            for weight in list(radial_weights[camera_idx])
+                        ]
+                        pixel_weight = _radial_weight_map(
+                            height=valid_mask.shape[0],
+                            width=valid_mask.shape[1],
+                            device=self.device,
+                            dtype=pred_dist_2d.dtype,
+                            band_weights=band_weights,
+                        )
+                        dense_depth_radial_weight = pixel_weight.mean()
                     loss_dense_depth = dense_depth_l1_loss(
                         pred_dist_2d.unsqueeze(0),
                         gt_depth.unsqueeze(0),
                         valid_mask.unsqueeze(0),
+                        pixel_weight=pixel_weight,
                     )
+                    configured_weights = list(
+                        self.conf.loss.get("dense_depth_camera_weights", [])
+                    )
+                    if configured_weights:
+                        camera_idx = int(gpu_batch.camera_idx)
+                        if camera_idx >= len(configured_weights):
+                            msg = (
+                                "loss.dense_depth_camera_weights must include "
+                                "one weight per camera. Missing index "
+                                f"{camera_idx}."
+                            )
+                            raise RuntimeError(msg)
+                        dense_depth_camera_weight = torch.tensor(
+                            float(configured_weights[camera_idx]),
+                            device=self.device,
+                            dtype=pred_dist_2d.dtype,
+                        )
+                        loss_dense_depth = (
+                            loss_dense_depth * dense_depth_camera_weight
+                        )
                 lambda_dense_depth = self.conf.loss.lambda_dense_depth
 
         # Dense depth gradient supervision (Phase 3c-redesign)
@@ -3091,6 +3773,15 @@ class Trainer3DGRUT:
 
         # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps)
         loss_equirect_consistency = torch.zeros(1, device=self.device)
+        loss_equirect_consistency_raw = torch.zeros(1, device=self.device)
+        equirect_consistency_camera_weight = torch.ones(
+            1,
+            device=self.device,
+        )
+        equirect_consistency_radial_weight = torch.ones(
+            1,
+            device=self.device,
+        )
         lambda_equirect_consistency = 0.0
         if self.conf.loss.use_equirect_consistency:
             warp_dir = self.conf.loss.equirect_warp_dir
@@ -3188,12 +3879,74 @@ class Trainer3DGRUT:
                     threshold = float(
                         self.conf.loss.equirect_consistency_overlap_threshold
                     )
-                    loss_equirect_consistency = equirect_consistency_l1_loss(
-                        rgb_pred,
-                        sampled,
-                        overlap_t.unsqueeze(0),
-                        threshold,
+                    loss_equirect_consistency_raw = (
+                        equirect_consistency_l1_loss(
+                            rgb_pred,
+                            sampled,
+                            overlap_t.unsqueeze(0),
+                            threshold,
+                        )
                     )
+                    loss_equirect_consistency = loss_equirect_consistency_raw
+                    radial_weights = list(
+                        self.conf.loss.get(
+                            "equirect_consistency_radial_camera_weights",
+                            [],
+                        )
+                    )
+                    if radial_weights:
+                        camera_idx = int(gpu_batch.camera_idx)
+                        if camera_idx >= len(radial_weights):
+                            msg = (
+                                "loss.equirect_consistency_radial_camera_weights "
+                                "must include one four-band entry per camera. "
+                                f"Missing index {camera_idx}."
+                            )
+                            raise RuntimeError(msg)
+                        band_weights = [
+                            float(weight)
+                            for weight in list(radial_weights[camera_idx])
+                        ]
+                        pixel_weight = _radial_weight_map(
+                            height=h_p,
+                            width=w_p,
+                            device=self.device,
+                            dtype=rgb_pred.dtype,
+                            band_weights=band_weights,
+                        )
+                        equirect_consistency_radial_weight = (
+                            pixel_weight.mean()
+                        )
+                        loss_equirect_consistency = (
+                            equirect_consistency_l1_loss(
+                                rgb_pred,
+                                sampled,
+                                overlap_t.unsqueeze(0),
+                                threshold,
+                                pixel_weight=pixel_weight,
+                            )
+                        )
+                    configured_weights = list(
+                        self.conf.loss.equirect_consistency_camera_weights
+                    )
+                    if configured_weights:
+                        camera_idx = int(gpu_batch.camera_idx)
+                        if camera_idx >= len(configured_weights):
+                            msg = (
+                                "loss.equirect_consistency_camera_weights "
+                                "must include one weight per camera. Missing "
+                                f"index {camera_idx}."
+                            )
+                            raise RuntimeError(msg)
+                        equirect_consistency_camera_weight = torch.tensor(
+                            float(configured_weights[camera_idx]),
+                            device=self.device,
+                            dtype=rgb_pred.dtype,
+                        )
+                        loss_equirect_consistency = (
+                            loss_equirect_consistency
+                            * equirect_consistency_camera_weight
+                        )
                 lambda_equirect_consistency = (
                     self.conf.loss.lambda_equirect_consistency
                 )
@@ -3214,6 +3967,13 @@ class Trainer3DGRUT:
                 device=self.device,
                 dtype=rgb_pred.dtype,
             )
+        frame_loss_weight = torch.ones(1, device=self.device)
+        batch_loss_weight = gpu_batch.__dict__.get("loss_weight")
+        if batch_loss_weight is not None:
+            frame_loss_weight = batch_loss_weight.to(
+                device=self.device,
+                dtype=rgb_pred.dtype,
+            ).reshape(1)
         loss = (
             lambda_l1 * loss_l1
             + lambda_ssim * loss_ssim
@@ -3221,19 +3981,26 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
+            + lambda_position_anchor * loss_position_anchor
+            + lambda_tangent_plane_anchor * loss_tangent_plane_anchor
+            + lambda_view_albedo_delta * loss_view_albedo_delta
+            + lambda_view_density_delta * loss_view_density_delta
             + lambda_dense_depth * loss_dense_depth
             + lambda_dense_depth_gradient * loss_dense_depth_gradient
             + lambda_equirect_consistency * loss_equirect_consistency
         )
-        loss = loss * camera_loss_weight
+        loss = loss * camera_loss_weight * frame_loss_weight
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
             l2_loss=lambda_l2 * loss_l2,
             ssim_loss=lambda_ssim * loss_ssim,
             camera_loss_weight=camera_loss_weight,
+            frame_loss_weight=frame_loss_weight,
             dense_depth_loss=lambda_dense_depth * loss_dense_depth,
             dense_depth_loss_raw=loss_dense_depth,
+            dense_depth_camera_weight=dense_depth_camera_weight,
+            dense_depth_radial_weight=dense_depth_radial_weight,
             dense_depth_gradient_loss=(
                 lambda_dense_depth_gradient * loss_dense_depth_gradient
             ),
@@ -3241,7 +4008,13 @@ class Trainer3DGRUT:
             equirect_consistency_loss=(
                 lambda_equirect_consistency * loss_equirect_consistency
             ),
-            equirect_consistency_loss_raw=loss_equirect_consistency,
+            equirect_consistency_loss_raw=loss_equirect_consistency_raw,
+            equirect_consistency_camera_weight=(
+                equirect_consistency_camera_weight
+            ),
+            equirect_consistency_radial_weight=(
+                equirect_consistency_radial_weight
+            ),
             foundation_feature_loss=(
                 lambda_foundation_feature * loss_foundation_feature
             ),
@@ -3250,6 +4023,22 @@ class Trainer3DGRUT:
             scale_loss=lambda_scale * loss_scale,
             sky_opacity_loss=lambda_sky_opacity * loss_sky_opacity,
             sky_opacity_loss_raw=loss_sky_opacity,
+            position_anchor_loss=(
+                lambda_position_anchor * loss_position_anchor
+            ),
+            position_anchor_loss_raw=loss_position_anchor,
+            tangent_plane_anchor_loss=(
+                lambda_tangent_plane_anchor * loss_tangent_plane_anchor
+            ),
+            tangent_plane_anchor_loss_raw=loss_tangent_plane_anchor,
+            view_albedo_delta_loss=(
+                lambda_view_albedo_delta * loss_view_albedo_delta
+            ),
+            view_albedo_delta_loss_raw=loss_view_albedo_delta,
+            view_density_delta_loss=(
+                lambda_view_density_delta * loss_view_density_delta
+            ),
+            view_density_delta_loss_raw=loss_view_density_delta,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -3376,8 +4165,14 @@ class Trainer3DGRUT:
                 np.mean(metrics["mask_coverage"]),
                 global_step,
             )
-        writer.add_scalar("val/ssim", np.mean(metrics["ssim"]), global_step)
-        writer.add_scalar("val/lpips", np.mean(metrics["lpips"]), global_step)
+        if "ssim" in metrics:
+            writer.add_scalar(
+                "val/ssim", np.mean(metrics["ssim"]), global_step
+            )
+        if "lpips" in metrics:
+            writer.add_scalar(
+                "val/lpips", np.mean(metrics["lpips"]), global_step
+            )
         feature_metric_names = (
             (
                 "foundation_feature_cosine",
@@ -3722,6 +4517,44 @@ class Trainer3DGRUT:
                 self.conf.loss.lambda_dense_depth_gradient,
                 global_step,
             )
+        if self.conf.loss.use_equirect_consistency:
+            equirect_consistency_loss = np.mean(
+                metrics["losses"]["equirect_consistency_loss"]
+            )
+            equirect_consistency_loss_raw = np.mean(
+                metrics["losses"]["equirect_consistency_loss_raw"]
+            )
+            equirect_camera_weight = np.mean(
+                metrics["losses"]["equirect_consistency_camera_weight"]
+            )
+            equirect_radial_weight = np.mean(
+                metrics["losses"]["equirect_consistency_radial_weight"]
+            )
+            writer.add_scalar(
+                "val/loss/equirect_consistency",
+                equirect_consistency_loss,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/equirect_consistency_raw",
+                equirect_consistency_loss_raw,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/equirect_camera_weight",
+                equirect_camera_weight,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/equirect_radial_weight",
+                equirect_radial_weight,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/lambda/equirect_consistency",
+                self.conf.loss.lambda_equirect_consistency,
+                global_step,
+            )
         if self.conf.loss.use_foundation_feature:
             foundation_feature_loss = np.mean(
                 metrics["losses"]["foundation_feature_loss"]
@@ -3749,6 +4582,50 @@ class Trainer3DGRUT:
             )
             writer.add_scalar(
                 "val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step
+            )
+        if self.conf.loss.use_position_anchor:
+            position_anchor_loss = np.mean(
+                metrics["losses"]["position_anchor_loss"]
+            )
+            position_anchor_loss_raw = np.mean(
+                metrics["losses"]["position_anchor_loss_raw"]
+            )
+            writer.add_scalar(
+                "val/loss/position_anchor",
+                position_anchor_loss,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/position_anchor_raw",
+                position_anchor_loss_raw,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/lambda/position_anchor",
+                self.conf.loss.lambda_position_anchor,
+                global_step,
+            )
+        if self.conf.loss.get("use_tangent_plane_anchor", False):
+            tangent_plane_anchor_loss = np.mean(
+                metrics["losses"]["tangent_plane_anchor_loss"]
+            )
+            tangent_plane_anchor_loss_raw = np.mean(
+                metrics["losses"]["tangent_plane_anchor_loss_raw"]
+            )
+            writer.add_scalar(
+                "val/loss/tangent_plane_anchor",
+                tangent_plane_anchor_loss,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/loss/tangent_plane_anchor_raw",
+                tangent_plane_anchor_loss_raw,
+                global_step,
+            )
+            writer.add_scalar(
+                "val/lambda/tangent_plane_anchor",
+                self.conf.loss.lambda_tangent_plane_anchor,
+                global_step,
             )
 
         table = {
@@ -3843,15 +4720,21 @@ class Trainer3DGRUT:
             raise ValueError(msg)
         return float(np.mean(values))
 
-    def _is_validation_improvement(self, score: float) -> bool:
-        """Return whether ``score`` beats the current best by ``min_delta``."""
+    def _is_best_validation_score(self, score: float) -> bool:
+        """Return whether ``score`` is the numerically best validation score."""
         if self._best_validation_score is None:
+            return True
+        return score > self._best_validation_score
+
+    def _is_early_stopping_improvement(self, score: float) -> bool:
+        """Return whether ``score`` beats the early-stop reference."""
+        if self._early_stopping_reference_score is None:
             return True
         min_delta = float(self.conf.early_stopping.get("min_delta", 0.0))
         if min_delta < 0.0:
             msg = f"early_stopping.min_delta must be >= 0, got {min_delta}."
             raise ValueError(msg)
-        return score > self._best_validation_score + min_delta
+        return score > self._early_stopping_reference_score + min_delta
 
     def _handle_validation_checkpointing(
         self, metrics: dict[str, list[float]]
@@ -3876,10 +4759,9 @@ class Trainer3DGRUT:
         metric_name = str(early_stopping_conf.get("metric", "masked_psnr"))
         if metric_name == EARLY_STOPPING_AUTO_PSNR_METRIC:
             metric_name = "masked_psnr" if "masked_psnr" in metrics else "psnr"
-        if self._is_validation_improvement(score):
+        if self._is_best_validation_score(score):
             self._best_validation_score = score
             self._best_validation_step = self.global_step
-            self._stale_validation_count = 0
             if save_best:
                 self._best_checkpoint_path = self.save_checkpoint(
                     best_checkpoint=True
@@ -3888,30 +4770,47 @@ class Trainer3DGRUT:
                 f"Best validation {metric_name}={score:.6f} "
                 f"at step {self.global_step}"
             )
+        if not bool(early_stopping_conf.get("enabled", False)):
+            return
+
+        if self._is_early_stopping_improvement(score):
+            self._early_stopping_reference_score = score
+            self._early_stopping_reference_step = self.global_step
+            self._stale_validation_count = 0
             return
 
         self._stale_validation_count += 1
-        best_score = self._best_validation_score
-        if best_score is None:
-            msg = "No best validation score was recorded before stale update."
+        reference_score = self._early_stopping_reference_score
+        if reference_score is None:
+            msg = (
+                "No early-stopping reference was recorded before stale update."
+            )
             raise RuntimeError(msg)
         patience = int(early_stopping_conf.get("patience", 3))
         if patience < 1:
             msg = f"early_stopping.patience must be >= 1, got {patience}."
             raise ValueError(msg)
         logger.info(
-            f"Validation {metric_name}={score:.6f} did not improve from "
-            f"{best_score:.6f}; "
+            f"Validation {metric_name}={score:.6f} did not clear "
+            f"early-stopping min_delta from {reference_score:.6f}; "
             f"stale validations: {self._stale_validation_count}/{patience}"
         )
         if (
             bool(early_stopping_conf.get("enabled", False))
             and self._stale_validation_count >= patience
         ):
+            best_score = self._best_validation_score
+            best_step = self._best_validation_step
+            if best_score is None or best_step is None:
+                msg = "No best validation score was recorded before stopping."
+                raise RuntimeError(msg)
             self._should_stop_training = True
             logger.info(
                 "Early stopping triggered at step "
-                f"{self.global_step}; best step={self._best_validation_step}, "
+                f"{self.global_step}; reference step="
+                f"{self._early_stopping_reference_step}, "
+                f"reference {metric_name}={reference_score:.6f}; best step="
+                f"{best_step}, "
                 f"best {metric_name}={best_score:.6f}"
             )
 
@@ -3935,9 +4834,15 @@ class Trainer3DGRUT:
             self.post_processing is not None
             and "post_processing" in checkpoint
         ):
-            self.post_processing.load_state_dict(
-                checkpoint["post_processing"]["module"]
+            dropped = _load_post_processing_state(
+                self.post_processing,
+                checkpoint["post_processing"]["module"],
             )
+            if dropped:
+                logger.warning(
+                    "📷 Dropping shape-mismatched post-processing "
+                    f"buffers when restoring best checkpoint: {sorted(dropped)}."
+                )
         if (
             self.camera_residual is not None
             and "camera_residual" in checkpoint
@@ -4027,6 +4932,48 @@ class Trainer3DGRUT:
                     self.conf.loss.lambda_dense_depth_gradient,
                     global_step,
                 )
+            if self.conf.loss.use_equirect_consistency:
+                equirect_consistency_loss = np.mean(
+                    batch_metrics["losses"]["equirect_consistency_loss"]
+                )
+                equirect_consistency_loss_raw = np.mean(
+                    batch_metrics["losses"]["equirect_consistency_loss_raw"]
+                )
+                equirect_camera_weight = np.mean(
+                    batch_metrics["losses"][
+                        "equirect_consistency_camera_weight"
+                    ]
+                )
+                equirect_radial_weight = np.mean(
+                    batch_metrics["losses"][
+                        "equirect_consistency_radial_weight"
+                    ]
+                )
+                writer.add_scalar(
+                    "train/loss/equirect_consistency",
+                    equirect_consistency_loss,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/equirect_consistency_raw",
+                    equirect_consistency_loss_raw,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/equirect_camera_weight",
+                    equirect_camera_weight,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/equirect_radial_weight",
+                    equirect_radial_weight,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/lambda/equirect_consistency",
+                    self.conf.loss.lambda_equirect_consistency,
+                    global_step,
+                )
             if self.conf.loss.use_camera_loss_weights:
                 camera_loss_weight = np.mean(
                     batch_metrics["losses"]["camera_loss_weight"]
@@ -4074,6 +5021,50 @@ class Trainer3DGRUT:
                 writer.add_scalar(
                     "train/loss/sky_opacity_raw",
                     sky_opacity_loss_raw,
+                    global_step,
+                )
+            if self.conf.loss.use_position_anchor:
+                position_anchor_loss = np.mean(
+                    batch_metrics["losses"]["position_anchor_loss"]
+                )
+                position_anchor_loss_raw = np.mean(
+                    batch_metrics["losses"]["position_anchor_loss_raw"]
+                )
+                writer.add_scalar(
+                    "train/loss/position_anchor",
+                    position_anchor_loss,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/position_anchor_raw",
+                    position_anchor_loss_raw,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/lambda/position_anchor",
+                    self.conf.loss.lambda_position_anchor,
+                    global_step,
+                )
+            if self.conf.loss.get("use_tangent_plane_anchor", False):
+                tangent_plane_anchor_loss = np.mean(
+                    batch_metrics["losses"]["tangent_plane_anchor_loss"]
+                )
+                tangent_plane_anchor_loss_raw = np.mean(
+                    batch_metrics["losses"]["tangent_plane_anchor_loss_raw"]
+                )
+                writer.add_scalar(
+                    "train/loss/tangent_plane_anchor",
+                    tangent_plane_anchor_loss,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/tangent_plane_anchor_raw",
+                    tangent_plane_anchor_loss_raw,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/lambda/tangent_plane_anchor",
+                    self.conf.loss.lambda_tangent_plane_anchor,
                     global_step,
                 )
             if (

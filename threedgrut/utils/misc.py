@@ -28,9 +28,15 @@ OmegaConf.register_new_resolver("eq", lambda a, b: a == b)
 
 
 def ensure_wandb_api_key_env() -> None:
-    """Let W&B resolve credentials from the native environment."""
+    """Require W&B credentials before starting a tracked training run."""
 
-    return None
+    if os.environ.get("WANDB_API_KEY"):
+        return
+
+    raise RuntimeError(
+        "W&B logging is enabled, but WANDB_API_KEY is not set. "
+        "Export WANDB_API_KEY before starting a tracked training run."
+    )
 
 
 def to_torch(data: npt.NDArray, device: str, dtype: Optional[torch.dtype] = None) -> torch.Tensor:

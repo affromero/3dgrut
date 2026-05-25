@@ -14,10 +14,18 @@
 # limitations under the License.
 
 
+import torch
+
 ## NOTE: SPH code from gaussian-splatting, from plenoctree, from ???
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
-C2 = [1.0925484305920792, -1.0925484305920792, 0.31539156525252005, -1.0925484305920792, 0.5462742152960396]
+C2 = [
+    1.0925484305920792,
+    -1.0925484305920792,
+    0.31539156525252005,
+    -1.0925484305920792,
+    0.5462742152960396,
+]
 C3 = [
     -0.5900435899266435,
     2.890611442640554,
@@ -48,6 +56,41 @@ def SH2RGB(sh):
     return sh * C0 + 0.5
 
 
+def _edge_gate(image_bhwc: torch.Tensor) -> torch.Tensor:
+    """Return a robust 0-1 edge gate for a `[1, H, W, C]` image tensor."""
+    image = torch.nan_to_num(image_bhwc.detach())
+    if image.shape[-1] > 1:
+        image = image.mean(dim=-1, keepdim=True)
+    magnitude = torch.zeros_like(image)
+    magnitude[:, :, 1:, :] = magnitude[:, :, 1:, :] + torch.abs(
+        image[:, :, 1:, :] - image[:, :, :-1, :]
+    )
+    magnitude[:, 1:, :, :] = magnitude[:, 1:, :, :] + torch.abs(
+        image[:, 1:, :, :] - image[:, :-1, :, :]
+    )
+    finite = magnitude[torch.isfinite(magnitude)]
+    if finite.numel() == 0:
+        return torch.zeros_like(magnitude)
+    scale = torch.quantile(finite, 0.95).clamp_min(1e-6)
+    return (magnitude / scale).clamp(0.0, 1.0)
+
+
+def _residual_grid_edge_gate(outputs: dict) -> torch.Tensor | None:
+    """Build a render/depth edge gate for image-conditioned residuals."""
+    pred_rgb = outputs.get("pred_rgb")
+    if pred_rgb is None:
+        return None
+    gate = _edge_gate(pred_rgb)
+    pred_dist = outputs.get("pred_dist")
+    if pred_dist is not None:
+        gate = torch.maximum(gate, _edge_gate(pred_dist))
+    pred_opacity = outputs.get("pred_opacity")
+    if pred_opacity is not None:
+        opacity = torch.nan_to_num(pred_opacity.detach()).clamp(0.0, 1.0)
+        gate = gate * opacity
+    return gate
+
+
 def apply_post_processing(
     post_processing,
     outputs: dict,
@@ -59,17 +102,21 @@ def apply_post_processing(
     Args:
         post_processing: Post-processing module
         outputs: Model outputs including pred_rgb
-        gpu_batch: Batch containing camera_idx, frame_idx, pixel_coords, exposure
+        gpu_batch: Batch containing camera_idx, frame_idx, sequence_idx,
+            pixel_coords, exposure
         training: If True, use actual frame_idx; if False, use -1 for novel view mode
 
     Returns:
         Updated outputs dict with post-processed pred_rgb
     """
-    assert outputs["pred_rgb"].shape[0] == 1, "Post-processing requires batch_size=1"
+    assert outputs["pred_rgb"].shape[0] == 1, (
+        "Post-processing requires batch_size=1"
+    )
 
     pred_rgb = outputs["pred_rgb"]
     camera_idx = gpu_batch.camera_idx
     frame_idx = gpu_batch.frame_idx if training else -1
+    sequence_idx = getattr(gpu_batch, "sequence_idx", -1)
     H, W = pred_rgb.shape[1], pred_rgb.shape[2]
 
     # Flatten: [1, H, W, 3] -> [H*W, 3]
@@ -78,13 +125,20 @@ def apply_post_processing(
     pixel_coords_flat = gpu_batch.pixel_coords.contiguous().view(-1, 2)
 
     # Apply post-processing
+    residual_grid_gate = None
+    if getattr(post_processing, "use_residual_grid_edge_gate", False):
+        residual_grid_gate = _residual_grid_edge_gate(outputs)
+        if residual_grid_gate is not None:
+            residual_grid_gate = residual_grid_gate.contiguous().view(-1)
     pred_rgb_pp = post_processing(
         pred_rgb_flat,
         pixel_coords_flat,
         resolution=(W, H),
         camera_idx=camera_idx,
         frame_idx=frame_idx,
+        sequence_idx=sequence_idx,
         exposure_prior=gpu_batch.exposure,
+        residual_grid_gate=residual_grid_gate,
     )
 
     # Reshape back: [H*W, 3] -> [1, H, W, 3]

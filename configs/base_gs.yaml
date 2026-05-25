@@ -96,8 +96,11 @@ camera_residual:
   reg_lambda: 1.0
   max_rotation_rad: 0.0174533
   max_translation_m: 0.02
+  max_rolling_rotation_rad: 0.004
+  max_rolling_translation_m: 0.005
   optimize_global: true
   optimize_per_camera: false
+  optimize_rolling_per_camera: false
   fail_on_zero_grad: true
   fail_after_steps: 5
   min_abs_grad: 1.e-12
@@ -106,6 +109,8 @@ camera_residual:
     max_views: 12
     rotation_step_rad: 0.001
     translation_step_m: 0.002
+    per_view: false
+    target_image_names: ""
     exit_after: true
 
 camera_intrinsics_audit:
@@ -143,6 +148,16 @@ model:
   optimize_rotation: true
   optimize_scale: true
   bvh_update_frequency: 1
+  view_conditioned_albedo:
+    enabled: false
+    num_cameras: 3
+    max_delta: 0.25
+    init_std: 0.0
+  view_conditioned_density:
+    enabled: false
+    num_cameras: 3
+    max_delta: 0.75
+    init_std: 0.0
   progressive_training:
     feature_type: "sh" # one of [sh, mlp], currently only sh supported
     init_n_features: 0 # sh: initial sh deg | mlp: num of dims initially unmasked
@@ -166,6 +181,7 @@ optimizer:
   type: adam # We only support adam and selective_adam for now
   lr: 0.0
   eps: 1.e-15
+  resume_lr_scale: 1.0
   params:
     positions:
       lr: 0.00016 # 3DGS value: 0.00016 initial and decayed to 0.0000016
@@ -175,6 +191,10 @@ optimizer:
       lr: 0.0025 # 3DGS value: 0.0025
     features_specular:
       lr: ${div:${optimizer.params.features_albedo.lr},20} # 3DGS value 20x smaller than lr of features_albedo
+    view_albedo_delta_logits:
+      lr: 0.0005
+    view_density_delta_logits:
+      lr: 0.0005
     rotation:
       lr: 0.001 # 3DGS value: 0.001
     scale:
@@ -195,7 +215,9 @@ scheduler:
 loss:
   use_l1: true
   lambda_l1: 0.8
-  
+  l1_loss_type: absolute
+  charbonnier_epsilon: 0.01
+
   use_l2: false
   lambda_l2: 1.0
 
@@ -214,6 +236,19 @@ loss:
   use_sky_opacity: false
   lambda_sky_opacity: 0.0
 
+  # Scanner-surface prior: penalize Gaussian center drift away from the
+  # initialization points with a robust Charbonnier distance in meters.
+  use_position_anchor: false
+  lambda_position_anchor: 0.0
+  position_anchor_epsilon: 0.02
+  use_tangent_plane_anchor: false
+  lambda_tangent_plane_anchor: 0.0
+  tangent_plane_anchor_epsilon: 0.02
+  use_view_albedo_delta: false
+  lambda_view_albedo_delta: 0.0
+  use_view_density_delta: false
+  lambda_view_density_delta: 0.0
+
   use_foundation_feature: false
   lambda_foundation_feature: 0.0
 
@@ -224,6 +259,8 @@ loss:
   use_dense_depth: false
   lambda_dense_depth: 0.0
   dense_depth_dir: ""
+  dense_depth_camera_weights: []
+  dense_depth_radial_camera_weights: []
 
   # Dense depth gradient L1 (Phase 3c-redesign): supervise per-pixel finite
   # differences of depth instead of absolute values. Edge-aware and scale-
@@ -244,6 +281,8 @@ loss:
   equirect_warp_dir: ""
   equirect_image_dir: ""
   equirect_consistency_overlap_threshold: 0.5
+  equirect_consistency_camera_weights: []
+  equirect_consistency_radial_camera_weights: []
 
 foundation_features:
   enabled: false
@@ -257,6 +296,7 @@ foundation_features:
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp", "luminance_affine"
+  resume_lr_scale: 1.0
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.
   use_controller: true
@@ -271,10 +311,26 @@ post_processing:
   use_frame_residual: false
   max_log_gain: 0.25
   max_bias: 0.10
+  use_color_matrix: false
+  max_matrix_delta: 0.10
+  color_matrix_reg_lambda: 0.25
+  use_radial_affine: false
+  radial_band_count: 4
+  radial_max_log_gain: 0.08
+  radial_max_bias: 0.03
+  radial_reg_lambda: 0.50
   use_residual_grid: false
   residual_grid_size: 32
   residual_grid_max: 0.05
   residual_grid_reg_lambda: 0.01
+  use_residual_grid_edge_gate: false
+  residual_grid_gate_floor: 0.20
+  use_temporal_affine: false
+  temporal_num_knots: 32
+  temporal_max_sequence_idx: 400
+  temporal_max_log_gain: 0.08
+  temporal_max_bias: 0.03
+  temporal_reg_lambda: 0.50
 
 hydra:
   output_subdir: null
