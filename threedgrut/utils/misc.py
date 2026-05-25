@@ -20,9 +20,6 @@ from typing import Callable, Optional
 import numpy as np
 import numpy.typing as npt
 import torch
-from hax_cv.tools.generative.utils.wandb_tools import (
-    ensure_wandb_api_key_env,
-)
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -173,8 +170,9 @@ def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb
     out_dir = os.path.join(out_dir, run_name)
 
     if use_wandb:
-        ensure_wandb_api_key_env()
-
+        # Caller is responsible for setting WANDB_API_KEY in the environment
+        # (or having ~/.netrc set up) before reaching this branch — wandb's
+        # own login chain handles whichever auth source is present.
         import wandb
 
         wandb.login()
