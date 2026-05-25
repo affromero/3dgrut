@@ -14,3 +14,10 @@ max_consecutive_bvh_update: 15
 enable_normals: false
 enable_hitcounts: true
 enable_kernel_timings: false
+
+gaussian_dropout:
+  enabled: false
+  probability: 0.0
+  compensate_density: true
+  start_iteration: 0
+  end_iteration: -1

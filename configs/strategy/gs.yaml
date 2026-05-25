@@ -30,6 +30,11 @@ footprint_scale_control:
   max_radius_px: 12.0
   grow_subpixel: true
   max_update_factor: 1.1
+  opacity_balance_enabled: false
+  opacity_balance_power: 2.0
+  opacity_balance_apply_to_shrink: false
+  opacity_balance_min_density: 0.0001
+  opacity_balance_max_density: 0.999
   log_frequency: 100
 
 residual_density_control:
@@ -104,6 +109,17 @@ residual_density_control:
   camera_balance_power: 1.0
   camera_balance_min_weight: 0.75
   camera_balance_max_weight: 2.0
+  use_camera_radial_weight: false
+  camera_radial_target_index: -1
+  camera_radial_other_weight: 0.10
+  camera_radial_center_fraction: 0.45
+  camera_radial_mid_fraction: 0.70
+  camera_radial_outer_fraction: 0.90
+  camera_radial_center_weight: 0.20
+  camera_radial_mid_weight: 0.50
+  camera_radial_outer_weight: 1.25
+  camera_radial_rim_weight: 2.0
+  camera_radial_invalid_weight: 0.05
   log_frequency: 100
 
 # They use the same values for pruning and densification so check the above values

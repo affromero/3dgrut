@@ -195,15 +195,22 @@ def test_clone_gaussians_extends_position_anchor() -> None:
         density=torch.nn.Parameter(torch.ones((3, 1))),
         features_albedo=torch.nn.Parameter(torch.zeros((3, 3))),
         features_specular=torch.nn.Parameter(torch.zeros((3, 45))),
-        position_anchor=torch.tensor(
-            [
-                [10.0, 0.0, 0.0],
-                [20.0, 0.0, 0.0],
-                [30.0, 0.0, 0.0],
-            ]
-        ),
-        device="cpu",
-    )
+            position_anchor=torch.tensor(
+                [
+                    [10.0, 0.0, 0.0],
+                    [20.0, 0.0, 0.0],
+                    [30.0, 0.0, 0.0],
+                ]
+            ),
+            tangent_plane_normal_anchor=torch.tensor(
+                [
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            ),
+            device="cpu",
+        )
     model.optimizer = torch.optim.Adam(
         [
             {"params": [model.positions], "name": "positions"},
@@ -224,11 +231,18 @@ def test_clone_gaussians_extends_position_anchor() -> None:
     model.scale_activation_inv = lambda value: value
     model.density_activation = lambda value: value
     model.density_activation_inv = lambda value: value
-    model.reset_position_anchor = lambda: setattr(
-        model,
-        "position_anchor",
-        model.positions.detach().clone(),
-    )
+    def reset_position_anchor() -> None:
+        model.position_anchor = model.positions.detach().clone()
+        reset_tangent_plane_normal_anchor()
+
+    def reset_tangent_plane_normal_anchor() -> None:
+        model.tangent_plane_normal_anchor = torch.zeros_like(
+            model.positions.detach()
+        )
+        model.tangent_plane_normal_anchor[:, 2] = 1.0
+
+    model.reset_position_anchor = reset_position_anchor
+    model.reset_tangent_plane_normal_anchor = reset_tangent_plane_normal_anchor
 
     strategy = object.__new__(GSStrategy)
     strategy.model = model

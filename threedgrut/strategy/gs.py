@@ -50,6 +50,7 @@ class GSStrategy(BaseStrategy):
         self.frequency_error_density_stats = {}
         self.abs_gradient_density_stats = {}
         self.camera_balance_density_stats = {}
+        self.camera_radial_density_stats = {}
         self.structure_density_stats = {}
         self.roma_precision_density_stats: dict = {}
         self.camera_balance_residual_ema = torch.empty((0,), device=self.model.device)
@@ -359,22 +360,86 @@ class GSStrategy(BaseStrategy):
         scale_factor = self.compute_footprint_scale_factor(batch)
         if scale_factor.numel() == 0:
             return
+        opacity_balance = bool(
+            self.footprint_scale_control.get("opacity_balance_enabled", False)
+        )
+        density_factor = torch.ones_like(scale_factor)
+        if opacity_balance:
+            opacity_power = float(
+                self.footprint_scale_control.get("opacity_balance_power", 2.0)
+            )
+            apply_to_shrink = bool(
+                self.footprint_scale_control.get(
+                    "opacity_balance_apply_to_shrink",
+                    False,
+                )
+            )
+            affected = scale_factor != 1.0 if apply_to_shrink else scale_factor > 1.0
+            density_factor[affected] = torch.pow(
+                scale_factor[affected].clamp_min(1e-6),
+                -opacity_power,
+            )
 
         def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
-            assert name == "scale", "wrong parameter passed to update_param_fn"
-            scale = self.model.scale_activation(param)
-            adjusted_scale = scale * scale_factor[:, None]
-            adjusted_param = self.model.scale_activation_inv(adjusted_scale)
-            return torch.nn.Parameter(adjusted_param, requires_grad=param.requires_grad)
+            if name == "scale":
+                scale = self.model.scale_activation(param)
+                adjusted_scale = scale * scale_factor[:, None]
+                adjusted_param = self.model.scale_activation_inv(adjusted_scale)
+                return torch.nn.Parameter(
+                    adjusted_param,
+                    requires_grad=param.requires_grad,
+                )
+            if name == "density":
+                density = self.model.density_activation(param)
+                min_density = float(
+                    self.footprint_scale_control.get(
+                        "opacity_balance_min_density",
+                        1e-4,
+                    )
+                )
+                max_density = float(
+                    self.footprint_scale_control.get(
+                        "opacity_balance_max_density",
+                        0.999,
+                    )
+                )
+                adjusted_density = torch.clamp(
+                    density * density_factor[:, None],
+                    min=min_density,
+                    max=max_density,
+                )
+                adjusted_param = self.model.density_activation_inv(
+                    adjusted_density
+                )
+                return torch.nn.Parameter(
+                    adjusted_param,
+                    requires_grad=param.requires_grad,
+                )
+            raise ValueError(f"Unsupported footprint-scale parameter: {name}")
 
         def update_optimizer_fn(key: str, value: torch.Tensor) -> torch.Tensor:
             return torch.zeros_like(value)
 
+        names = ["scale", "density"] if opacity_balance else ["scale"]
         self._update_param_with_optimizer(
             update_param_fn,
             update_optimizer_fn,
-            names=["scale"],
+            names=names,
         )
+        if opacity_balance:
+            self.footprint_scale_stats.update(
+                {
+                    "opacity_balance_density_factor_mean": (
+                        density_factor.mean().item()
+                    ),
+                    "opacity_balance_density_factor_min": (
+                        density_factor.min().item()
+                    ),
+                    "opacity_balance_density_factor_max": (
+                        density_factor.max().item()
+                    ),
+                }
+            )
 
     @torch.no_grad()
     def compute_footprint_scale_factor(self, batch) -> torch.Tensor:
@@ -477,6 +542,11 @@ class GSStrategy(BaseStrategy):
             batch,
             outputs,
         )
+        camera_radial_weight = self.compute_camera_radial_density_weight(
+            mask,
+            batch,
+            outputs,
+        )
         roma_precision_weight = self.compute_roma_precision_weight(mask, batch, outputs)
         structure_weight = self.compute_structure_density_weight(mask, batch, outputs)
         total_weight = (
@@ -485,6 +555,7 @@ class GSStrategy(BaseStrategy):
             * gradient_weight
             * edge_error_weight
             * frequency_error_weight
+            * camera_radial_weight
             * roma_precision_weight
             * structure_weight
             * camera_balance_weight
@@ -509,6 +580,8 @@ class GSStrategy(BaseStrategy):
             "edge_error_weight_max": edge_error_weight.max().item(),
             "frequency_error_weight_mean": frequency_error_weight.mean().item(),
             "frequency_error_weight_max": frequency_error_weight.max().item(),
+            "camera_radial_weight_mean": camera_radial_weight.mean().item(),
+            "camera_radial_weight_max": camera_radial_weight.max().item(),
             "roma_precision_weight_mean": roma_precision_weight.mean().item(),
             "roma_precision_weight_max": roma_precision_weight.max().item(),
             "structure_weight_mean": structure_weight.mean().item(),
@@ -519,6 +592,7 @@ class GSStrategy(BaseStrategy):
         }
         self.residual_density_stats.update(self.edge_error_density_stats)
         self.residual_density_stats.update(self.frequency_error_density_stats)
+        self.residual_density_stats.update(self.camera_radial_density_stats)
         self.residual_density_stats.update(self.roma_precision_density_stats)
         self.residual_density_stats.update(self.camera_balance_density_stats)
         self.residual_density_stats.update(self.structure_density_stats)
@@ -1377,6 +1451,124 @@ class GSStrategy(BaseStrategy):
         return float(weight.item())
 
     @torch.no_grad()
+    def compute_camera_radial_density_weight(
+        self,
+        mask: torch.Tensor,
+        batch,
+        outputs,
+    ) -> torch.Tensor:
+        selected_count = int(mask.sum().item())
+        self.camera_radial_density_stats = {}
+        weights = torch.ones((selected_count,), device=self.model.device)
+        if selected_count == 0:
+            return weights
+        if not self.residual_density_control.get("use_camera_radial_weight", False):
+            return weights
+
+        target_index = int(
+            self.residual_density_control.get("camera_radial_target_index", -1)
+        )
+        camera_index = self.batch_camera_index(batch)
+        other_weight = float(
+            self.residual_density_control.get("camera_radial_other_weight", 0.10)
+        )
+        if target_index >= 0 and camera_index != target_index:
+            weights = torch.full_like(weights, other_weight)
+            self.camera_radial_density_stats = {
+                "camera_radial_camera_idx": float(camera_index),
+                "camera_radial_target_match": 0.0,
+                "camera_radial_valid_fraction": 0.0,
+                "camera_radial_radius_mean": 0.0,
+            }
+            return weights
+        if "mog_projected_position" not in outputs:
+            return weights
+
+        positions = outputs["mog_projected_position"][mask].float()
+        x = positions[:, 0]
+        y = positions[:, 1]
+        if batch.rgb_gt.dim() == 4:
+            height = int(batch.rgb_gt.shape[1])
+            width = int(batch.rgb_gt.shape[2])
+        else:
+            height = int(batch.rgb_gt.shape[0])
+            width = int(batch.rgb_gt.shape[1])
+
+        valid = torch.logical_and(
+            torch.logical_and(x >= 0.0, x < float(width)),
+            torch.logical_and(y >= 0.0, y < float(height)),
+        )
+        if "mog_visibility" in outputs:
+            visible = outputs["mog_visibility"][mask].reshape(-1) > 0
+            valid = torch.logical_and(valid, visible)
+        if batch.mask is not None:
+            frame_mask = batch.mask
+            if frame_mask.dim() == 4:
+                frame_mask = frame_mask[0]
+            frame_mask = frame_mask.squeeze(-1) > 0.5
+            valid_mask_sample = torch.zeros_like(valid)
+            valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            if valid_indices.numel() > 0:
+                sample_x = torch.round(x[valid_indices]).long().clamp(
+                    min=0,
+                    max=width - 1,
+                )
+                sample_y = torch.round(y[valid_indices]).long().clamp(
+                    min=0,
+                    max=height - 1,
+                )
+                valid_mask_sample[valid_indices] = frame_mask[sample_y, sample_x]
+            valid = torch.logical_and(valid, valid_mask_sample)
+
+        center_x = (float(width) - 1.0) * 0.5
+        center_y = (float(height) - 1.0) * 0.5
+        max_radius = max((center_x * center_x + center_y * center_y) ** 0.5, 1e-6)
+        radius = torch.sqrt(
+            torch.clamp_min((x - center_x).square() + (y - center_y).square(), 0.0)
+        )
+        radius_fraction = torch.clamp(radius / max_radius, max=1.0)
+
+        center_fraction = float(
+            self.residual_density_control.get("camera_radial_center_fraction", 0.45)
+        )
+        mid_fraction = float(
+            self.residual_density_control.get("camera_radial_mid_fraction", 0.70)
+        )
+        outer_fraction = float(
+            self.residual_density_control.get("camera_radial_outer_fraction", 0.90)
+        )
+        center_weight = float(
+            self.residual_density_control.get("camera_radial_center_weight", 0.20)
+        )
+        mid_weight = float(
+            self.residual_density_control.get("camera_radial_mid_weight", 0.50)
+        )
+        outer_weight = float(
+            self.residual_density_control.get("camera_radial_outer_weight", 1.25)
+        )
+        rim_weight = float(
+            self.residual_density_control.get("camera_radial_rim_weight", 2.0)
+        )
+        invalid_weight = float(
+            self.residual_density_control.get("camera_radial_invalid_weight", 0.05)
+        )
+
+        weights = torch.full_like(weights, rim_weight)
+        weights[radius_fraction < outer_fraction] = outer_weight
+        weights[radius_fraction < mid_fraction] = mid_weight
+        weights[radius_fraction < center_fraction] = center_weight
+        weights[~valid] = invalid_weight
+        self.camera_radial_density_stats = {
+            "camera_radial_camera_idx": float(camera_index),
+            "camera_radial_target_match": 1.0,
+            "camera_radial_valid_fraction": valid.float().mean().item(),
+            "camera_radial_radius_mean": (
+                radius_fraction[valid].mean().item() if valid.any() else 0.0
+            ),
+        }
+        return weights
+
+    @torch.no_grad()
     def compute_responsibility_gradient_weight(self, mask: torch.Tensor) -> torch.Tensor:
         weights = torch.ones((int(mask.sum()),), device=self.model.device)
         color_grad = self.model.features_albedo.grad
@@ -1686,14 +1878,25 @@ class GSStrategy(BaseStrategy):
         if position_anchor.shape != self.model.positions.shape:
             self.model.reset_position_anchor()
             position_anchor = self.model.position_anchor
+        tangent_normal_anchor = self.model.tangent_plane_normal_anchor
+        if tangent_normal_anchor.shape != self.model.positions.shape:
+            self.model.reset_tangent_plane_normal_anchor()
+            tangent_normal_anchor = self.model.tangent_plane_normal_anchor
         repeats = [self.split_n_gaussians] + [1] * (
             position_anchor.dim() - 1
         )
         split_position_anchor = position_anchor[mask].repeat(repeats)
+        split_tangent_normal_anchor = tangent_normal_anchor[mask].repeat(
+            repeats
+        )
 
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
         self.model.position_anchor = torch.cat(
             [position_anchor[~mask], split_position_anchor],
+            dim=0,
+        )
+        self.model.tangent_plane_normal_anchor = torch.cat(
+            [tangent_normal_anchor[~mask], split_tangent_normal_anchor],
             dim=0,
         )
         self.reset_densification_buffers()
@@ -1790,10 +1993,18 @@ class GSStrategy(BaseStrategy):
         if position_anchor.shape != self.model.positions.shape:
             self.model.reset_position_anchor()
             position_anchor = self.model.position_anchor
+        tangent_normal_anchor = self.model.tangent_plane_normal_anchor
+        if tangent_normal_anchor.shape != self.model.positions.shape:
+            self.model.reset_tangent_plane_normal_anchor()
+            tangent_normal_anchor = self.model.tangent_plane_normal_anchor
 
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
         self.model.position_anchor = torch.cat(
             [position_anchor, position_anchor[mask]],
+            dim=0,
+        )
+        self.model.tangent_plane_normal_anchor = torch.cat(
+            [tangent_normal_anchor, tangent_normal_anchor[mask]],
             dim=0,
         )
         if self.should_preserve_structure_buffers_for_split():
