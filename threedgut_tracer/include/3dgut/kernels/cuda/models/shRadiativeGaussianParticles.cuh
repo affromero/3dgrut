@@ -381,7 +381,9 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                                   const TFeaturesVec& featuresGradient,
                                                   float& hitT,
                                                   float hitTBackward,
-                                                  float hitTGradient) const {
+                                                  float hitTGradient,
+                                                  float3& rayOriginGrad,
+                                                  float3& rayDirectionGrad) const {
 
         threedgut::processHitBwd<ExtParams::KernelDegree, false, PerRayRadiance>(
             reinterpret_cast<const float3&>(rayOrigin),
@@ -398,6 +400,8 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
             transmittanceBackward,
             transmittance,
             transmittanceGradient,
+            rayOriginGrad,
+            rayDirectionGrad,
             reinterpret_cast<const float3&>(featuresBackward),
             reinterpret_cast<float3&>(features),
             reinterpret_cast<const float3&>(featuresGradient),
