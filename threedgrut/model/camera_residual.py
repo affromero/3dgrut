@@ -38,6 +38,8 @@ class CameraResidual(nn.Module):
         num_cameras: int,
         num_images: int = 0,
         lr: float,
+        lr_end_fraction: float = 0.01,
+        warmup_steps: int = 0,
         reg_lambda: float,
         max_rotation_rad: float,
         max_translation_m: float,
@@ -47,9 +49,13 @@ class CameraResidual(nn.Module):
         optimize_per_camera: bool,
         optimize_per_image: bool = False,
         optimize_rolling_per_camera: bool,
+        n_iterations: int = 50000,
     ) -> None:
         super().__init__()
         self.lr = lr
+        self.lr_end_fraction = lr_end_fraction
+        self.warmup_steps = warmup_steps
+        self.n_iterations = n_iterations
         self.reg_lambda = reg_lambda
         self.max_rotation_rad = max_rotation_rad
         self.max_translation_m = max_translation_m
@@ -287,7 +293,9 @@ class CameraResidual(nn.Module):
         rays_ori = rays_ori + row_weight * rolling_translation.reshape(1, 1, 1, 3)
         return rays_ori, rays_dir
 
-    def forward(self, batch: Batch) -> Batch:
+    def forward(self, batch: Batch, global_step: int = -1) -> Batch:
+        if 0 <= global_step < self.warmup_steps:
+            return batch
         image_idx = getattr(batch, "frame_idx", -1)
         rotation, translation = self._bounded(batch.camera_idx, image_idx)
         rotation_matrix = _axis_angle_to_matrix(rotation)[0]
@@ -320,14 +328,15 @@ class CameraResidual(nn.Module):
             )
         return loss
 
-    def create_optimizer(self) -> torch.optim.Optimizer:
+    def create_optimizer(self) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
         parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
         if not parameters:
             raise ValueError("CameraResidual has no trainable parameters enabled.")
-        return torch.optim.Adam(
-            parameters,
-            lr=self.lr,
-        )
+        optimizer = torch.optim.Adam(parameters, lr=self.lr)
+        active_steps = max(1, self.n_iterations - self.warmup_steps)
+        gamma = (self.lr_end_fraction) ** (1.0 / active_steps)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+        return optimizer, scheduler
 
     def max_abs_grad(self) -> float:
         """Return the maximum absolute gradient over trainable residual params."""

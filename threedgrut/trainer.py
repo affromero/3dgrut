@@ -1575,6 +1575,9 @@ class Trainer3DGRUT:
     camera_residual_optimizer: torch.optim.Optimizer | None = None
     """ Optimizer for camera residual module """
 
+    camera_residual_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+    """ LR scheduler for camera residual module """
+
     foundation_feature_probe: FoundationFeatureProbe | None = None
     """ Optional frozen foundation-model probe for feature diagnostics """
 
@@ -2203,10 +2206,14 @@ class Trainer3DGRUT:
         frames_per_camera = self.train_dataset.get_frames_per_camera()
         optimize_per_image = getattr(conf.camera_residual, "optimize_per_image", False)
         num_images = len(self.train_dataset) if optimize_per_image else 0
+        warmup_steps = getattr(conf.camera_residual, "warmup_steps", 0)
+        lr_end_fraction = getattr(conf.camera_residual, "lr_end_fraction", 0.01)
         self.camera_residual = CameraResidual(
             num_cameras=len(frames_per_camera),
             num_images=num_images,
             lr=conf.camera_residual.lr,
+            lr_end_fraction=lr_end_fraction,
+            warmup_steps=warmup_steps,
             reg_lambda=conf.camera_residual.reg_lambda,
             max_rotation_rad=conf.camera_residual.max_rotation_rad,
             max_translation_m=conf.camera_residual.max_translation_m,
@@ -2222,8 +2229,9 @@ class Trainer3DGRUT:
             optimize_rolling_per_camera=(
                 conf.camera_residual.optimize_rolling_per_camera
             ),
+            n_iterations=conf.n_iterations,
         ).to(self.device)
-        self.camera_residual_optimizer = (
+        self.camera_residual_optimizer, self.camera_residual_scheduler = (
             self.camera_residual.create_optimizer()
         )
         logger.warning(
@@ -2256,10 +2264,10 @@ class Trainer3DGRUT:
         )
         raise RuntimeError(msg)
 
-    def _apply_camera_residual(self, gpu_batch):
+    def _apply_camera_residual(self, gpu_batch, global_step: int = -1):
         if self.camera_residual is None:
             return gpu_batch
-        return self.camera_residual(gpu_batch)
+        return self.camera_residual(gpu_batch, global_step=global_step)
 
     def _camera_residual_audit_axis_candidates(
         self,
@@ -5774,7 +5782,7 @@ class Trainer3DGRUT:
         # Access the GPU-cache batch data
         with torch.cuda.nvtx.range(f"train_iter{global_step}_get_gpu_batch"):
             gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(batch)
-            gpu_batch = self._apply_camera_residual(gpu_batch)
+            gpu_batch = self._apply_camera_residual(gpu_batch, global_step=global_step)
 
         # Perform validation if required
         is_time_to_validate = (global_step > 0 or conf.validate_first) and (
@@ -5925,6 +5933,8 @@ class Trainer3DGRUT:
             ):
                 self.camera_residual_optimizer.step()
                 self.camera_residual_optimizer.zero_grad()
+                if self.camera_residual_scheduler is not None and global_step >= self.camera_residual.warmup_steps:
+                    self.camera_residual_scheduler.step()
 
         # Post backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_post_opt_step"):
