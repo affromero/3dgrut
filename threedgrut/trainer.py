@@ -2201,8 +2201,11 @@ class Trainer3DGRUT:
         if not conf.camera_residual.enabled:
             return
         frames_per_camera = self.train_dataset.get_frames_per_camera()
+        optimize_per_image = getattr(conf.camera_residual, "optimize_per_image", False)
+        num_images = len(self.train_dataset) if optimize_per_image else 0
         self.camera_residual = CameraResidual(
             num_cameras=len(frames_per_camera),
+            num_images=num_images,
             lr=conf.camera_residual.lr,
             reg_lambda=conf.camera_residual.reg_lambda,
             max_rotation_rad=conf.camera_residual.max_rotation_rad,
@@ -2215,6 +2218,7 @@ class Trainer3DGRUT:
             ),
             optimize_global=conf.camera_residual.optimize_global,
             optimize_per_camera=conf.camera_residual.optimize_per_camera,
+            optimize_per_image=optimize_per_image,
             optimize_rolling_per_camera=(
                 conf.camera_residual.optimize_rolling_per_camera
             ),

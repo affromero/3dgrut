@@ -186,6 +186,82 @@ static inline __device__ void radianceFromSpHBwd(int deg, const float3& rdir, co
     }
 }
 
+static inline __device__ float3
+radianceFromSpHDirBwd(int deg, const float3* sphCoefficients, const float3& rdir, const float3& dL_drad) {
+    float3 dL_ddir = make_float3(0.f, 0.f, 0.f);
+
+    const float3 gradu = radianceFromSpH(deg, sphCoefficients, rdir, false);
+    float3 dL_dRGB = dL_drad;
+    dL_dRGB.x *= (gradu.x > 0.0f ? 1.f : 0.f);
+    dL_dRGB.y *= (gradu.y > 0.0f ? 1.f : 0.f);
+    dL_dRGB.z *= (gradu.z > 0.0f ? 1.f : 0.f);
+
+    if (deg > 0) {
+        const float x = rdir.x, y = rdir.y, z = rdir.z;
+
+        // Band 1: rad += -C1*y*c1 + C1*z*c2 - C1*x*c3
+        // d/dx = -C1*c3, d/dy = -C1*c1, d/dz = C1*c2
+        dL_ddir.x += dot(dL_dRGB, -SpHCoeff1 * sphCoefficients[3]);
+        dL_ddir.y += dot(dL_dRGB, -SpHCoeff1 * sphCoefficients[1]);
+        dL_ddir.z += dot(dL_dRGB,  SpHCoeff1 * sphCoefficients[2]);
+
+        if (deg > 1) {
+            // Band 2:
+            // sh4 = C2[0]*xy  -> dx=C2[0]*y, dy=C2[0]*x
+            // sh5 = C2[1]*yz  -> dy=C2[1]*z, dz=C2[1]*y
+            // sh6 = C2[2]*(2zz-xx-yy) -> dx=-2*C2[2]*x, dy=-2*C2[2]*y, dz=4*C2[2]*z
+            // sh7 = C2[3]*xz  -> dx=C2[3]*z, dz=C2[3]*x
+            // sh8 = C2[4]*(xx-yy) -> dx=2*C2[4]*x, dy=-2*C2[4]*y
+            dL_ddir.x += dot(dL_dRGB, SpHCoeff2[0] * y * sphCoefficients[4]
+                                     - 2.f * SpHCoeff2[2] * x * sphCoefficients[6]
+                                     + SpHCoeff2[3] * z * sphCoefficients[7]
+                                     + 2.f * SpHCoeff2[4] * x * sphCoefficients[8]);
+            dL_ddir.y += dot(dL_dRGB, SpHCoeff2[0] * x * sphCoefficients[4]
+                                     + SpHCoeff2[1] * z * sphCoefficients[5]
+                                     - 2.f * SpHCoeff2[2] * y * sphCoefficients[6]
+                                     - 2.f * SpHCoeff2[4] * y * sphCoefficients[8]);
+            dL_ddir.z += dot(dL_dRGB, SpHCoeff2[1] * y * sphCoefficients[5]
+                                     + 4.f * SpHCoeff2[2] * z * sphCoefficients[6]
+                                     + SpHCoeff2[3] * x * sphCoefficients[7]);
+
+            if (deg > 2) {
+                const float xx = x * x, yy = y * y, zz = z * z;
+                // Band 3: differentiate each term w.r.t. x, y, z
+                // sh9  = C3[0]*y*(3xx-yy)     -> dx=6*C3[0]*xy, dy=C3[0]*(3xx-3yy), dz=0
+                // sh10 = C3[1]*xyz             -> dx=C3[1]*yz, dy=C3[1]*xz, dz=C3[1]*xy
+                // sh11 = C3[2]*y*(4zz-xx-yy)  -> dx=-2*C3[2]*xy, dy=C3[2]*(4zz-xx-3yy), dz=8*C3[2]*yz
+                // sh12 = C3[3]*z*(2zz-3xx-3yy)-> dx=-6*C3[3]*xz, dy=-6*C3[3]*yz, dz=C3[3]*(6zz-3xx-3yy)
+                // sh13 = C3[4]*x*(4zz-xx-yy)  -> dx=C3[4]*(4zz-3xx-yy), dy=-2*C3[4]*xy, dz=8*C3[4]*xz
+                // sh14 = C3[5]*z*(xx-yy)       -> dx=2*C3[5]*xz, dy=-2*C3[5]*yz, dz=C3[5]*(xx-yy)
+                // sh15 = C3[6]*x*(xx-3yy)      -> dx=C3[6]*(3xx-3yy), dy=-6*C3[6]*xy, dz=0
+                dL_ddir.x += dot(dL_dRGB,
+                    6.f * SpHCoeff3[0] * x * y * sphCoefficients[9]
+                    + SpHCoeff3[1] * y * z * sphCoefficients[10]
+                    - 2.f * SpHCoeff3[2] * x * y * sphCoefficients[11]
+                    - 6.f * SpHCoeff3[3] * x * z * sphCoefficients[12]
+                    + SpHCoeff3[4] * (4.f * zz - 3.f * xx - yy) * sphCoefficients[13]
+                    + 2.f * SpHCoeff3[5] * x * z * sphCoefficients[14]
+                    + SpHCoeff3[6] * (3.f * xx - 3.f * yy) * sphCoefficients[15]);
+                dL_ddir.y += dot(dL_dRGB,
+                    SpHCoeff3[0] * (3.f * xx - 3.f * yy) * sphCoefficients[9]
+                    + SpHCoeff3[1] * x * z * sphCoefficients[10]
+                    + SpHCoeff3[2] * (4.f * zz - xx - 3.f * yy) * sphCoefficients[11]
+                    - 6.f * SpHCoeff3[3] * y * z * sphCoefficients[12]
+                    - 2.f * SpHCoeff3[4] * x * y * sphCoefficients[13]
+                    - 2.f * SpHCoeff3[5] * y * z * sphCoefficients[14]
+                    - 6.f * SpHCoeff3[6] * x * y * sphCoefficients[15]);
+                dL_ddir.z += dot(dL_dRGB,
+                    SpHCoeff3[1] * x * y * sphCoefficients[10]
+                    + 8.f * SpHCoeff3[2] * y * z * sphCoefficients[11]
+                    + SpHCoeff3[3] * (6.f * zz - 3.f * xx - 3.f * yy) * sphCoefficients[12]
+                    + 8.f * SpHCoeff3[4] * x * z * sphCoefficients[13]
+                    + SpHCoeff3[5] * (xx - yy) * sphCoefficients[14]);
+            }
+        }
+    }
+    return dL_ddir;
+}
+
 static inline __device__ void fetchParticleDensity(
     const int32_t particleIdx,
     const ParticleDensity* particlesDensity,
@@ -486,6 +562,7 @@ __device__ inline void processHitBwd(
     ParticleDensity* particleDensityGradPtr,
     const float* particleRadiancePtr,
     float* particleRadianceGradPtr,
+    const float3* globalSphCoefficientsPtr,
     float minParticleKernelDensity,
     float minParticleAlpha,
     float minTransmittance,
@@ -596,11 +673,19 @@ __device__ inline void processHitBwd(
                 &sphCoefficients[0]);
             grad = radianceFromSpHBwd<true>(sphEvalDegree, &sphCoefficients[0], rayDirection, weight, radianceGrad,
                                             (float3*)&particleRadianceGradPtr[particleIdx * PARTICLE_RADIANCE_NUM_COEFFS * 3]);
+            // SH direction gradient: d(radiance)/d(rayDirection) through SH basis
+            rayDirectionGrad = rayDirectionGrad + weight * radianceFromSpHDirBwd(
+                sphEvalDegree, &sphCoefficients[0], rayDirection, radianceGrad);
         } else {
             grad                       = reinterpret_cast<const float3*>(particleRadiancePtr)[0];
             particleRadianceGradPtr[0] = radianceGrad.x * weight;
             particleRadianceGradPtr[1] = radianceGrad.y * weight;
             particleRadianceGradPtr[2] = radianceGrad.z * weight;
+            if (globalSphCoefficientsPtr) {
+                const float3* coeffs = &globalSphCoefficientsPtr[particleIdx * PARTICLE_RADIANCE_NUM_COEFFS];
+                rayDirectionGrad = rayDirectionGrad + weight * radianceFromSpHDirBwd(
+                    sphEvalDegree, coeffs, rayDirection, radianceGrad);
+            }
         }
 
         // >>> rayRadiance = accumulatedRayRad + weigth * rayRad + (1-galpha)*transmit * residualRayRad

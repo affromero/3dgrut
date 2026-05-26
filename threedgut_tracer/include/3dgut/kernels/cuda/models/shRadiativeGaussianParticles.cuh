@@ -393,6 +393,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
             reinterpret_cast<threedgut::ParticleDensity*>(densityRawParametersGrad),
             PerRayRadiance ? reinterpret_cast<const float*>(m_featureRawParameters.ptr) : reinterpret_cast<const float*>(particleFeatures.data()),
             PerRayRadiance ? reinterpret_cast<float*>(m_featureRawParameters.gradPtr) : reinterpret_cast<float*>(particleFeaturesGradPtr),
+            reinterpret_cast<const float3*>(m_featureRawParameters.ptr),
             ExtParams::MinParticleKernelDensity,
             ExtParams::AlphaThreshold,
             ExtParams::MinTransmittanceThreshold,

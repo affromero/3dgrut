@@ -36,6 +36,7 @@ class CameraResidual(nn.Module):
         self,
         *,
         num_cameras: int,
+        num_images: int = 0,
         lr: float,
         reg_lambda: float,
         max_rotation_rad: float,
@@ -44,6 +45,7 @@ class CameraResidual(nn.Module):
         max_rolling_translation_m: float,
         optimize_global: bool,
         optimize_per_camera: bool,
+        optimize_per_image: bool = False,
         optimize_rolling_per_camera: bool,
     ) -> None:
         super().__init__()
@@ -55,6 +57,7 @@ class CameraResidual(nn.Module):
         self.max_rolling_translation_m = max_rolling_translation_m
         self.optimize_global = optimize_global
         self.optimize_per_camera = optimize_per_camera
+        self.optimize_per_image = optimize_per_image
         self.optimize_rolling_per_camera = optimize_rolling_per_camera
         self.global_rotation_raw = nn.Parameter(torch.zeros(1, 3))
         self.global_translation_raw = nn.Parameter(torch.zeros(1, 3))
@@ -62,6 +65,12 @@ class CameraResidual(nn.Module):
         self.camera_translation_raw = nn.Parameter(torch.zeros(num_cameras, 3))
         self.rolling_rotation_raw = nn.Parameter(torch.zeros(num_cameras, 3))
         self.rolling_translation_raw = nn.Parameter(torch.zeros(num_cameras, 3))
+        if optimize_per_image and num_images > 0:
+            self.image_rotation_raw = nn.Parameter(torch.zeros(num_images, 3))
+            self.image_translation_raw = nn.Parameter(torch.zeros(num_images, 3))
+        else:
+            self.register_buffer("image_rotation_raw", torch.zeros(0, 3))
+            self.register_buffer("image_translation_raw", torch.zeros(0, 3))
         self.global_rotation_raw.requires_grad_(optimize_global)
         self.global_translation_raw.requires_grad_(optimize_global)
         self.camera_rotation_raw.requires_grad_(optimize_per_camera)
@@ -69,7 +78,7 @@ class CameraResidual(nn.Module):
         self.rolling_rotation_raw.requires_grad_(optimize_rolling_per_camera)
         self.rolling_translation_raw.requires_grad_(optimize_rolling_per_camera)
 
-    def _bounded(self, camera_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _bounded(self, camera_idx: int, image_idx: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
         rotation = torch.zeros(
             (1, 3),
             device=self.global_rotation_raw.device,
@@ -83,6 +92,11 @@ class CameraResidual(nn.Module):
             rotation = rotation + self.camera_rotation_raw[camera_idx : camera_idx + 1]
             translation = translation + self.camera_translation_raw[
                 camera_idx : camera_idx + 1
+            ]
+        if self.optimize_per_image and image_idx >= 0:
+            rotation = rotation + self.image_rotation_raw[image_idx : image_idx + 1]
+            translation = translation + self.image_translation_raw[
+                image_idx : image_idx + 1
             ]
         rotation = torch.tanh(rotation) * self.max_rotation_rad
         translation = torch.tanh(translation) * self.max_translation_m
@@ -274,7 +288,8 @@ class CameraResidual(nn.Module):
         return rays_ori, rays_dir
 
     def forward(self, batch: Batch) -> Batch:
-        rotation, translation = self._bounded(batch.camera_idx)
+        image_idx = getattr(batch, "frame_idx", -1)
+        rotation, translation = self._bounded(batch.camera_idx, image_idx)
         rotation_matrix = _axis_angle_to_matrix(rotation)[0]
         rays_dir = torch.nn.functional.normalize(
             batch.rays_dir @ rotation_matrix.transpose(0, 1),
@@ -290,7 +305,7 @@ class CameraResidual(nn.Module):
         return replace(batch, rays_ori=rays_ori, rays_dir=rays_dir)
 
     def get_regularization_loss(self) -> torch.Tensor:
-        return self.reg_lambda * (
+        loss = self.reg_lambda * (
             self.global_rotation_raw.square().mean()
             + self.global_translation_raw.square().mean()
             + self.camera_rotation_raw.square().mean()
@@ -298,6 +313,12 @@ class CameraResidual(nn.Module):
             + self.rolling_rotation_raw.square().mean()
             + self.rolling_translation_raw.square().mean()
         )
+        if self.optimize_per_image and self.image_rotation_raw.numel() > 0:
+            loss = loss + self.reg_lambda * (
+                self.image_rotation_raw.square().mean()
+                + self.image_translation_raw.square().mean()
+            )
+        return loss
 
     def create_optimizer(self) -> torch.optim.Optimizer:
         parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]

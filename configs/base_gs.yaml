@@ -100,6 +100,7 @@ camera_residual:
   max_rolling_translation_m: 0.005
   optimize_global: true
   optimize_per_camera: false
+  optimize_per_image: false
   optimize_rolling_per_camera: false
   fail_on_zero_grad: true
   fail_after_steps: 5
