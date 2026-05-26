@@ -64,7 +64,7 @@ public:
           torch::Tensor sensorsStartPose,
           torch::Tensor sensorsEndPose);
 
-    std::tuple<torch::Tensor, torch::Tensor>
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     traceBwd(uint32_t frameNumber, int numActiveFeatures,
              // Particles
              torch::Tensor particleDensity,

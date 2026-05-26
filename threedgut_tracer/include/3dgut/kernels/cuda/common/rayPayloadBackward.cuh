@@ -25,6 +25,8 @@ struct RayPayloadBackward : public RayPayload<FeatN> {
     float hitTGradient;
     tcnn::vec<FeatN> featuresBackward;
     tcnn::vec<FeatN> featuresGradient;
+    tcnn::vec3 originGradient;
+    tcnn::vec3 directionGradient;
 };
 
 template <typename RayPayloadT>
@@ -37,11 +39,13 @@ __device__ __inline__ RayPayloadT initializeBackwardRay(const threedgut::RenderP
                                                         const tcnn::vec<RayPayloadT::FeatDim + 1>* __restrict__ featuresDensityGradientPtr,
                                                         const tcnn::mat4x3& sensorToWorldTransform) {
 
-    // NB : no backpropagation through the forward ray initialization / finalization
     RayPayloadT ray = initializeRay<RayPayloadT>(params,
                                                  sensorRayOriginPtr,
                                                  sensorRayDirectionPtr,
                                                  sensorToWorldTransform);
+
+    ray.originGradient    = tcnn::vec3{0.f, 0.f, 0.f};
+    ray.directionGradient = tcnn::vec3{0.f, 0.f, 0.f};
 
     if (ray.isAlive()) {
         const tcnn::vec<RayPayloadT::FeatDim + 1> featuresDensity         = featuresDensityPtr[ray.idx];

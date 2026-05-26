@@ -226,8 +226,8 @@ __global__ void renderBackward(threedgut::RenderParameters params,
                                const float* __restrict__ worldHitDistanceGradientPtr,
                                const tcnn::vec4* __restrict__ radianceDensityPtr,
                                const tcnn::vec4* __restrict__ radianceDensityGradientPtr,
-                               tcnn::vec3* __restrict__ /*worldRayOriginGradientPtr*/,
-                               tcnn::vec3* __restrict__ /*worldRayDirectionGradientPtr*/,
+                               tcnn::vec3* __restrict__ worldRayOriginGradientPtr,
+                               tcnn::vec3* __restrict__ worldRayDirectionGradientPtr,
                                const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,
                                const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
                                const float* __restrict__ particlesGlobalDepthPtr,
@@ -264,6 +264,11 @@ __global__ void renderBackward(threedgut::RenderParameters params,
                                particlesGlobalDepthGradPtr,
                                particlesPrecomputedFeaturesGradPtr,
                                {parameterGradientMemoryHandles});
+
+    if (worldRayOriginGradientPtr && ray.idx != ~0u) {
+        worldRayOriginGradientPtr[ray.idx]    = ray.originGradient;
+        worldRayDirectionGradientPtr[ray.idx] = ray.directionGradient;
+    }
 }
 
 __global__ void projectBackward(tcnn::uvec2 tileGrid,
