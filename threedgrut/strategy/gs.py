@@ -69,6 +69,22 @@ class GSStrategy(BaseStrategy):
         self.structure_axis_y_accum = torch.empty([0, 1])
         self.structure_local_axis_accum = torch.empty([0, 3])
         self.structure_axis_denom = torch.empty([0, 1])
+        # SAD-GS multi-view consistency state (see arxiv 2604.28016 Sec. 3.3).
+        # Accumulates per-Gaussian eta statistics across training views so the
+        # Phase 4 densification can use N_high / N_total > tau_split as the
+        # split criterion and N_low / N_total dominance + low opacity as the
+        # prune criterion. All zero-sized at init; init_densification_buffer
+        # resizes to num_gaussians, densify ops resize to match the new
+        # gaussian count post-split/clone/prune.
+        self.sadgs_accum_eta = torch.empty([0, 1])
+        self.sadgs_max_eta_3ch = torch.empty([0, 3])
+        self.sadgs_eta_high_count = torch.empty([0, 1])
+        self.sadgs_eta_mid_count = torch.empty([0, 1])
+        self.sadgs_eta_low_count = torch.empty([0, 1])
+        self.sadgs_eta_high_sum_3ch = torch.empty([0, 3])
+        self.sadgs_eta_mid_sum_3ch = torch.empty([0, 3])
+        self.sadgs_accum_view_count = torch.empty([0, 1])
+        self.sadgs_accum_weights_valid = torch.empty([0, 1])
         # Per-image RoMa precision tensors keyed by image stem (e.g. "left_0009").
         # Lazily filled on first read; small (~3 * frame_count entries).
         self._roma_precision_cache: dict = {}
@@ -88,6 +104,15 @@ class GSStrategy(BaseStrategy):
         params["structure_axis_y_accum"] = (self.structure_axis_y_accum,)
         params["structure_local_axis_accum"] = (self.structure_local_axis_accum,)
         params["structure_axis_denom"] = (self.structure_axis_denom,)
+        params["sadgs_accum_eta"] = (self.sadgs_accum_eta,)
+        params["sadgs_max_eta_3ch"] = (self.sadgs_max_eta_3ch,)
+        params["sadgs_eta_high_count"] = (self.sadgs_eta_high_count,)
+        params["sadgs_eta_mid_count"] = (self.sadgs_eta_mid_count,)
+        params["sadgs_eta_low_count"] = (self.sadgs_eta_low_count,)
+        params["sadgs_eta_high_sum_3ch"] = (self.sadgs_eta_high_sum_3ch,)
+        params["sadgs_eta_mid_sum_3ch"] = (self.sadgs_eta_mid_sum_3ch,)
+        params["sadgs_accum_view_count"] = (self.sadgs_accum_view_count,)
+        params["sadgs_accum_weights_valid"] = (self.sadgs_accum_weights_valid,)
 
         return params
 
@@ -129,6 +154,33 @@ class GSStrategy(BaseStrategy):
                 num_gaussians,
                 dtype=torch.int,
             )
+            self.sadgs_accum_eta = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_accum_eta", num_gaussians
+            )
+            self.sadgs_max_eta_3ch = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_max_eta_3ch", num_gaussians, width=3
+            )
+            self.sadgs_eta_high_count = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_eta_high_count", num_gaussians
+            )
+            self.sadgs_eta_mid_count = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_eta_mid_count", num_gaussians
+            )
+            self.sadgs_eta_low_count = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_eta_low_count", num_gaussians
+            )
+            self.sadgs_eta_high_sum_3ch = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_eta_high_sum_3ch", num_gaussians, width=3
+            )
+            self.sadgs_eta_mid_sum_3ch = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_eta_mid_sum_3ch", num_gaussians, width=3
+            )
+            self.sadgs_accum_view_count = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_accum_view_count", num_gaussians
+            )
+            self.sadgs_accum_weights_valid = self._checkpoint_or_zero_buffer(
+                checkpoint, "sadgs_accum_weights_valid", num_gaussians
+            )
         else:
             self.densify_grad_norm_accum = torch.zeros((num_gaussians, 1), dtype=torch.float, device=self.model.device)
             self.densify_grad_norm_denom = torch.zeros((num_gaussians, 1), dtype=torch.int, device=self.model.device)
@@ -150,6 +202,33 @@ class GSStrategy(BaseStrategy):
                 device=self.model.device,
             )
             self.structure_axis_denom = torch.zeros((num_gaussians, 1), dtype=torch.int, device=self.model.device)
+            self.sadgs_accum_eta = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_max_eta_3ch = torch.zeros(
+                (num_gaussians, 3), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_eta_high_count = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_eta_mid_count = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_eta_low_count = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_eta_high_sum_3ch = torch.zeros(
+                (num_gaussians, 3), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_eta_mid_sum_3ch = torch.zeros(
+                (num_gaussians, 3), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_accum_view_count = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.sadgs_accum_weights_valid = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
 
     def _checkpoint_or_zero_buffer(
         self,
@@ -699,6 +778,9 @@ class GSStrategy(BaseStrategy):
             # residual term moves to the Phase 6 ablation (--use_residual_
             # weight) where we can A/B against the SAD-GS-faithful default.
             score = sadgs_eta_3ch.max(dim=1).values
+            self._accumulate_sadgs_multiview_state(
+                mask=mask, valid=valid, eta_3ch=sadgs_eta_3ch
+            )
         else:
             score = violation * reliable_structure * (1.0 + normalized_residual)
         score = torch.where(valid, score, torch.zeros_like(score))
@@ -766,6 +848,89 @@ class GSStrategy(BaseStrategy):
             )
 
         return weights
+
+    @torch.no_grad()
+    def _accumulate_sadgs_multiview_state(
+        self,
+        *,
+        mask: torch.Tensor,
+        valid: torch.Tensor,
+        eta_3ch: torch.Tensor,
+    ) -> None:
+        """Accumulate SAD-GS multi-view consistency state for the masked Gaussians.
+
+        Mirrors SAD-GS ``update_freq_stats_online`` lines 382-415: increments
+        per-Gaussian counters and per-axis sums based on whether each
+        Gaussian's max-axis eta in this view crosses ``TAU_HIGH=1.0``
+        (split candidate) or stays below ``TAU_LOW=0.1`` (smooth-region
+        prune candidate). Both thresholds are config-overridable via
+        ``sadgs_tau_high`` and ``sadgs_tau_low``.
+
+        Only valid Gaussians (visible + in-mask + in-frame) contribute;
+        invalid contributions are skipped, matching SAD-GS's visibility
+        and opacity gating.
+
+        Args:
+            mask: ``(M,)`` boolean indexing into the full Gaussian set.
+            valid: ``(N,)`` boolean per-masked Gaussian valid flag.
+            eta_3ch: ``(N, 3)`` per-axis eta values.
+
+        """
+        tau_high = float(
+            self.residual_density_control.get("sadgs_tau_high", 1.0)
+        )
+        tau_low = float(
+            self.residual_density_control.get("sadgs_tau_low", 0.1)
+        )
+
+        eta_max = eta_3ch.max(dim=1).values
+        eta_total = eta_3ch.sum(dim=1)
+
+        is_high = (eta_max > tau_high) & valid
+        is_low = (eta_max <= tau_low) & valid
+        is_mid = valid & ~is_high & ~is_low
+
+        masked_indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
+        valid_indices = masked_indices[valid]
+
+        if valid_indices.numel() == 0:
+            return
+
+        self.sadgs_accum_eta[masked_indices] += torch.where(
+            valid.unsqueeze(1), eta_total.unsqueeze(1), torch.zeros_like(eta_total.unsqueeze(1))
+        )
+        self.sadgs_accum_view_count[masked_indices] += valid.float().unsqueeze(1)
+        # accum_weights_valid increments by 1.0 per valid view (matches
+        # SAD-GS when transmittance is 1; the per-view transmittance
+        # weighting is a Phase 6 ablation).
+        self.sadgs_accum_weights_valid[masked_indices] += valid.float().unsqueeze(
+            1
+        )
+
+        current_max = self.sadgs_max_eta_3ch[masked_indices]
+        valid_expanded = valid.unsqueeze(1).expand_as(eta_3ch)
+        self.sadgs_max_eta_3ch[masked_indices] = torch.where(
+            valid_expanded, torch.maximum(current_max, eta_3ch), current_max
+        )
+
+        self.sadgs_eta_high_count[masked_indices] += is_high.float().unsqueeze(1)
+        self.sadgs_eta_low_count[masked_indices] += is_low.float().unsqueeze(1)
+        self.sadgs_eta_mid_count[masked_indices] += is_mid.float().unsqueeze(1)
+
+        if is_high.any():
+            high_expanded = is_high.unsqueeze(1).expand_as(eta_3ch)
+            self.sadgs_eta_high_sum_3ch[masked_indices] = torch.where(
+                high_expanded,
+                self.sadgs_eta_high_sum_3ch[masked_indices] + eta_3ch,
+                self.sadgs_eta_high_sum_3ch[masked_indices],
+            )
+        if is_mid.any():
+            mid_expanded = is_mid.unsqueeze(1).expand_as(eta_3ch)
+            self.sadgs_eta_mid_sum_3ch[masked_indices] = torch.where(
+                mid_expanded,
+                self.sadgs_eta_mid_sum_3ch[masked_indices] + eta_3ch,
+                self.sadgs_eta_mid_sum_3ch[masked_indices],
+            )
 
     @torch.no_grad()
     def _sadgs_eta_3ch(

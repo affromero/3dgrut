@@ -106,6 +106,13 @@ residual_density_control:
   # 2604.28016. Off by default; turn on once cross-validated against
   # the legacy in-house heuristic via sadgs_debug_enabled.
   sadgs_enabled: false
+  # SAD-GS multi-view consistency thresholds. A Gaussian is classified
+  # high-frequency-violating (split candidate) if its max-axis eta in a
+  # given view exceeds sadgs_tau_high. It is classified background/smooth
+  # (prune candidate when paired with low opacity) if its max-axis eta
+  # stays below sadgs_tau_low. Defaults match SAD-GS arxiv 2604.28016.
+  sadgs_tau_high: 1.0
+  sadgs_tau_low: 0.1
   # SAD-GS-faithful parallel debug path. When enabled, GSStrategy computes
   # SAD-GS multi-channel multi-scale structure tensor + per-Gaussian eta
   # scores alongside the in-house edge/laplacian path. Stats appear in
