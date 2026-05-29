@@ -96,6 +96,15 @@ residual_density_control:
   structure_split_axis_scale_divisor: 1.5
   structure_rim_radius_fraction: 0.80
   structure_log_frequency: 100
+  # SAD-GS-faithful parallel debug path. When enabled, GSStrategy computes
+  # SAD-GS multi-channel multi-scale structure tensor + per-Gaussian eta
+  # scores alongside the in-house edge/laplacian path. Stats appear in
+  # tensorboard under diagnostics/structure_density/sadgs_*. No production
+  # behaviour is altered; this is for cross-validation only.
+  sadgs_debug_enabled: false
+  sadgs_st_levels: 3
+  sadgs_base_sigma: 1.0
+  sadgs_octave_step: 1.5
   min_total_weight: 0.25
   max_total_weight: 6.0
   max_candidate_fraction: 0.001
