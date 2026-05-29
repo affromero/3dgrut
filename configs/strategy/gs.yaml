@@ -113,6 +113,11 @@ residual_density_control:
   # stays below sadgs_tau_low. Defaults match SAD-GS arxiv 2604.28016.
   sadgs_tau_high: 1.0
   sadgs_tau_low: 0.1
+  # SAD-GS split fraction threshold: Gaussians whose high-eta-view ratio
+  # (sadgs_eta_high_count / sadgs_accum_view_count) exceeds this fraction
+  # are flagged as split candidates and their gradient score is lifted to
+  # 2 * split_grad_threshold, routing them into the existing split path.
+  sadgs_tau_split: 0.8
   # SAD-GS-faithful parallel debug path. When enabled, GSStrategy computes
   # SAD-GS multi-channel multi-scale structure tensor + per-Gaussian eta
   # scores alongside the in-house edge/laplacian path. Stats appear in

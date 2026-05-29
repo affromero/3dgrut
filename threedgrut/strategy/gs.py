@@ -2075,6 +2075,12 @@ class GSStrategy(BaseStrategy):
                 densify_grad_norm,
             )
 
+        if (
+            self.residual_density_control.get("sadgs_enabled", False)
+            and self.sadgs_accum_view_count.numel() > 0
+        ):
+            densify_grad_norm = self._sadgs_overlay_split_score(densify_grad_norm)
+
         if self.residual_density_control.get("structure_score_only", False):
             self.log_structure_score_only_candidates(
                 densify_grad_norm.squeeze(),
@@ -2087,6 +2093,59 @@ class GSStrategy(BaseStrategy):
         self.split_gaussians(densify_grad_norm.squeeze(), scene_extent)
 
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _sadgs_overlay_split_score(
+        self, densify_grad_norm: torch.Tensor
+    ) -> torch.Tensor:
+        """Overlay SAD-GS multi-view criterion onto the gradient-based score.
+
+        Per SAD-GS arxiv 2604.28016 Sec. 3.3, a Gaussian is a split
+        candidate when its high-eta-view ratio exceeds tau_split (default
+        0.8) -- meaning across the views that saw this Gaussian, the
+        majority observed high-frequency violation. We compute this ratio
+        from sadgs_eta_high_count and sadgs_accum_view_count, then
+        OR it with the existing gradient-based criterion by lifting the
+        SAD-GS-selected Gaussians' scores above the split threshold.
+
+        This preserves the existing isotropic split machinery
+        (split_n_gaussians, split_grad_threshold, scale-based clone/split
+        discrimination) while routing SAD-GS candidates through it. The
+        truly anisotropic per-axis n_k = ceil(sqrt(max_eta_3ch[k]))
+        children-on-a-grid split is a future refinement; the criterion
+        replacement here is the core SAD-GS contribution per the paper's
+        Sec. 3.3 main claim.
+
+        Args:
+            densify_grad_norm: ``(N, 1)`` original gradient-based score.
+
+        Returns:
+            ``(N, 1)`` augmented score with SAD-GS candidates lifted to
+            ``2 * split_grad_threshold`` (above the split threshold).
+        """
+        view_count = self.sadgs_accum_view_count.clamp_min(1.0)
+        high_ratio = self.sadgs_eta_high_count / view_count
+        tau_split = float(
+            self.residual_density_control.get("sadgs_tau_split", 0.8)
+        )
+        sadgs_mask = (high_ratio.squeeze(-1) > tau_split)
+        if not sadgs_mask.any():
+            return densify_grad_norm
+
+        threshold_target = self.split_grad_threshold * 2.0
+        augmented = densify_grad_norm.clone()
+        augmented[sadgs_mask] = torch.maximum(
+            augmented[sadgs_mask],
+            torch.full_like(augmented[sadgs_mask], threshold_target),
+        )
+
+        self.structure_density_stats["sadgs_split_candidate_count"] = (
+            sadgs_mask.float().sum().item()
+        )
+        self.structure_density_stats["sadgs_split_candidate_fraction"] = (
+            sadgs_mask.float().mean().item()
+        )
+        return augmented
 
     @torch.no_grad()
     def compute_abs_gradient_densify_score(
