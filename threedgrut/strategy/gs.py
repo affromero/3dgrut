@@ -21,6 +21,15 @@ import torch
 
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.strategy.base import BaseStrategy
+from threedgrut.strategy.sadgs_eta import (
+    eta_3ch_projection,
+    eta_3ch_wavelength,
+    sample_structure_tensor_at_pixels,
+)
+from threedgrut.strategy.sadgs_structure_tensor import (
+    multiscale_structure_tensor_v2,
+    wavelength_min_from_structure_tensor,
+)
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import check_step_condition, quaternion_to_so3
 
@@ -728,7 +737,109 @@ class GSStrategy(BaseStrategy):
             else 0.0,
             "structure_scale_px_mean": scale_px[valid].mean().item() if valid.any() else 0.0,
         }
+
+        if self.residual_density_control.get("sadgs_debug_enabled", False):
+            self._accumulate_sadgs_debug_eta_stats(
+                mask=mask,
+                batch=batch,
+                outputs=outputs,
+                maps=maps,
+                positions=positions,
+                valid=valid,
+            )
+
         return weights
+
+    @torch.no_grad()
+    def _accumulate_sadgs_debug_eta_stats(
+        self,
+        *,
+        mask: torch.Tensor,
+        batch,
+        outputs,
+        maps: dict[str, torch.Tensor],
+        positions: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> None:
+        """Compute SAD-GS-faithful eta scores for the masked Gaussians and
+        write distribution statistics into ``structure_density_stats``.
+
+        Reuses the in-house RATIONAL projection (``project_local_axis_vectors``)
+        because SAD-GS's pinhole Jacobian is inaccurate for the Hax-CV
+        camera model. Samples the SAD-GS multi-scale structure tensor
+        (precomputed in ``_compute_sadgs_debug_structure_maps``) bilinearly
+        at each Gaussian's projected centre, then evaluates both eta modes.
+
+        Gated by ``residual_density_control.sadgs_debug_enabled``. Does not
+        modify any densification buffer; only logs statistics. The stats
+        appear in tensorboard under
+        ``diagnostics/structure_density/sadgs_*`` via the existing
+        ``log_structure_density_control`` loop.
+
+        Falsifier expectations against the existing in-house score:
+          * ``sadgs_eta_wl_high_fraction`` should NOT saturate at the rim
+            (cf. the in-house ``structure_rim_fraction`` of 0.294 in the
+            d1bcbivc smoke). If SAD-GS also rim-saturates, the structure
+            tensor isn't fixing the rim issue and we know that before
+            replacing the production path.
+          * ``sadgs_eta_pr_p95`` should be smaller than the wavelength
+            variant because projection mode reads zero on edge-orthogonal
+            axes.
+        """
+
+        if "sadgs_wavelength_min" not in maps:
+            return
+        if "mog_projected_position" not in outputs:
+            return
+
+        projected_axes = self.project_local_axis_vectors(mask, batch)
+        if projected_axes is None or projected_axes.numel() == 0:
+            return
+
+        st_map = torch.stack(
+            [maps["sadgs_st_xx"], maps["sadgs_st_xy"], maps["sadgs_st_yy"]],
+            dim=0,
+        ).unsqueeze(0)
+        sampled_st = sample_structure_tensor_at_pixels(
+            st_map, positions[:, 0], positions[:, 1]
+        )
+
+        eta_wl = eta_3ch_wavelength(projected_axes, sampled_st)
+        eta_pr = eta_3ch_projection(projected_axes, sampled_st)
+
+        eta_wl_max = eta_wl.max(dim=1).values
+        eta_pr_max = eta_pr.max(dim=1).values
+
+        if valid.any():
+            self.structure_density_stats.update(
+                {
+                    "sadgs_eta_wl_mean": eta_wl[valid].mean().item(),
+                    "sadgs_eta_wl_p95": torch.quantile(
+                        eta_wl[valid], 0.95
+                    ).item(),
+                    "sadgs_eta_wl_high_fraction": (
+                        (eta_wl_max[valid] > 1.0).float().mean().item()
+                    ),
+                    "sadgs_eta_wl_low_fraction": (
+                        (eta_wl_max[valid] <= 0.1).float().mean().item()
+                    ),
+                    "sadgs_eta_pr_mean": eta_pr[valid].mean().item(),
+                    "sadgs_eta_pr_p95": torch.quantile(
+                        eta_pr[valid], 0.95
+                    ).item(),
+                }
+            )
+        else:
+            self.structure_density_stats.update(
+                {
+                    "sadgs_eta_wl_mean": 0.0,
+                    "sadgs_eta_wl_p95": 0.0,
+                    "sadgs_eta_wl_high_fraction": 0.0,
+                    "sadgs_eta_wl_low_fraction": 0.0,
+                    "sadgs_eta_pr_mean": 0.0,
+                    "sadgs_eta_pr_p95": 0.0,
+                }
+            )
 
     @torch.no_grad()
     def accumulate_projected_local_axis_scores(
@@ -954,7 +1065,8 @@ class GSStrategy(BaseStrategy):
         )
         scale_px = torch.clamp(edge / laplacian.clamp_min(1e-4), min=1.0, max=16.0)
         residual = torch.abs(luma_pred - luma_gt)
-        return {
+
+        maps = {
             "edge": edge,
             "anisotropy": anisotropy,
             "scale_px": scale_px,
@@ -963,6 +1075,53 @@ class GSStrategy(BaseStrategy):
             "grad_y_signed": grad_y,
             "grad_x": abs_grad_x,
             "grad_y": abs_grad_y,
+        }
+
+        if self.residual_density_control.get("sadgs_debug_enabled", False):
+            maps.update(self._compute_sadgs_debug_structure_maps(rgb_gt))
+
+        return maps
+
+    @torch.no_grad()
+    def _compute_sadgs_debug_structure_maps(
+        self, rgb_gt: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Compute SAD-GS multi-scale structure-tensor maps alongside the in-house
+        edge/laplacian maps for visual validation.
+
+        Caller must have already stripped the batch dimension; ``rgb_gt`` is
+        expected as channels-last ``(H, W, C)``. The output keys are namespaced
+        with the ``sadgs_`` prefix so the downstream scoring code that reads
+        ``maps["scale_px"]`` etc. is untouched.
+
+        This is gated by ``residual_density_control.sadgs_debug_enabled`` and
+        runs only when explicitly turned on. Adds a small amount of work per
+        training frame (the multi-scale structure tensor on the GT image);
+        no Gaussian-side computation here.
+        """
+
+        rgb_bchw = rgb_gt[..., :3].permute(2, 0, 1).unsqueeze(0).contiguous()
+        levels = int(self.residual_density_control.get("sadgs_st_levels", 3))
+        base_sigma = float(
+            self.residual_density_control.get("sadgs_base_sigma", 1.0)
+        )
+        octave_step = float(
+            self.residual_density_control.get("sadgs_octave_step", 1.5)
+        )
+
+        st_map = multiscale_structure_tensor_v2(
+            rgb_bchw,
+            levels=levels,
+            base_sigma=base_sigma,
+            octave_step=octave_step,
+        )
+        wavelength_map = wavelength_min_from_structure_tensor(st_map)
+
+        return {
+            "sadgs_st_xx": st_map[0, 0],
+            "sadgs_st_xy": st_map[0, 1],
+            "sadgs_st_yy": st_map[0, 2],
+            "sadgs_wavelength_min": wavelength_map[0, 0],
         }
 
     @torch.no_grad()
