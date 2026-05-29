@@ -683,7 +683,24 @@ class GSStrategy(BaseStrategy):
         violation_x = extent_x * self.normalize_signal(grad_x) / scale_px.clamp_min(1.0)
         violation_y = extent_y * self.normalize_signal(grad_y) / scale_px.clamp_min(1.0)
         violation = torch.maximum(violation_x, violation_y)
-        score = violation * reliable_structure * (1.0 + normalized_residual)
+
+        sadgs_eta_3ch: torch.Tensor | None = None
+        if self.residual_density_control.get(
+            "sadgs_enabled", False
+        ) and "sadgs_st_xx" in maps:
+            sadgs_eta_3ch = self._sadgs_eta_3ch(mask, batch, maps, positions)
+
+        if sadgs_eta_3ch is not None:
+            # SAD-GS-faithful score: per-Gaussian max across the 3 projected
+            # local axes' wavelength-mode eta. Skips the in-house residual
+            # multiplier (1 + normalized_residual) and the reliable_structure
+            # weighting; SAD-GS argues eta = projected_axis_length /
+            # wavelength_min is the principled score on its own. The legacy
+            # residual term moves to the Phase 6 ablation (--use_residual_
+            # weight) where we can A/B against the SAD-GS-faithful default.
+            score = sadgs_eta_3ch.max(dim=1).values
+        else:
+            score = violation * reliable_structure * (1.0 + normalized_residual)
         score = torch.where(valid, score, torch.zeros_like(score))
 
         score_reference = float(
@@ -749,6 +766,50 @@ class GSStrategy(BaseStrategy):
             )
 
         return weights
+
+    @torch.no_grad()
+    def _sadgs_eta_3ch(
+        self,
+        mask: torch.Tensor,
+        batch,
+        maps: dict[str, torch.Tensor],
+        positions: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Compute the SAD-GS 3-axis frequency-violation eta per masked Gaussian.
+
+        Reuses the in-house RATIONAL-aware ``project_local_axis_vectors``
+        for the per-axis projected lengths (better than SAD-GS's pinhole
+        Jacobian for distorted cameras) and ``eta_3ch_wavelength`` for the
+        magnitude-based ratio. Samples the SAD-GS multi-scale structure
+        tensor (precomputed in ``compute_structure_maps`` under the
+        ``sadgs_st_*`` keys) bilinearly at each Gaussian's projected
+        centre.
+
+        Returns ``None`` when projection isn't available (no RATIONAL
+        intrinsics on the batch); callers fall back to the legacy score.
+
+        Args:
+            mask: ``(M,)`` Gaussian-selection mask (M = total Gaussians).
+            batch: Training batch carrying RATIONAL intrinsics.
+            maps: Structure-maps dict containing ``sadgs_st_{xx,xy,yy}``.
+            positions: ``(N, 2)`` projected pixel positions of masked Gaussians.
+
+        Returns:
+            ``(N, 3)`` eta-per-axis tensor or ``None`` if projection failed.
+
+        """
+        projected_axes = self.project_local_axis_vectors(mask, batch)
+        if projected_axes is None or projected_axes.numel() == 0:
+            return None
+
+        st_map = torch.stack(
+            [maps["sadgs_st_xx"], maps["sadgs_st_xy"], maps["sadgs_st_yy"]],
+            dim=0,
+        ).unsqueeze(0)
+        sampled_st = sample_structure_tensor_at_pixels(
+            st_map, positions[:, 0], positions[:, 1]
+        )
+        return eta_3ch_wavelength(projected_axes, sampled_st)
 
     @torch.no_grad()
     def _accumulate_sadgs_debug_eta_stats(
@@ -1055,6 +1116,7 @@ class GSStrategy(BaseStrategy):
         )
         anisotropy = delta / trace.clamp_min(1e-6)
 
+        sadgs_st_components: dict[str, torch.Tensor] | None = None
         if self.residual_density_control.get("sadgs_enabled", False):
             # SAD-GS-faithful production path: use the principal-eigenvalue
             # wavelength_min from a multi-channel multi-scale structure
@@ -1063,7 +1125,9 @@ class GSStrategy(BaseStrategy):
             # grounded measure (in pixels, capped only by epsilon at the
             # smooth-region end). See SAD-GS arxiv 2604.28016, equations
             # in Sec. 3.2 ("Local frequency analysis").
-            scale_px = self._sadgs_wavelength_min_map(rgb_gt)
+            sadgs_st_components, scale_px = self._sadgs_structure_tensor_and_wavelength(
+                rgb_gt
+            )
         else:
             laplacian = torch.zeros_like(luma_gt)
             laplacian[1:-1, 1:-1] = torch.abs(
@@ -1087,20 +1151,27 @@ class GSStrategy(BaseStrategy):
             "grad_x": abs_grad_x,
             "grad_y": abs_grad_y,
         }
+        if sadgs_st_components is not None:
+            maps.update(sadgs_st_components)
 
-        if self.residual_density_control.get("sadgs_debug_enabled", False):
+        if self.residual_density_control.get("sadgs_debug_enabled", False) and (
+            "sadgs_wavelength_min" not in maps
+        ):
             maps.update(self._compute_sadgs_debug_structure_maps(rgb_gt))
 
         return maps
 
     @torch.no_grad()
-    def _sadgs_wavelength_min_map(self, rgb_gt: torch.Tensor) -> torch.Tensor:
-        """Compute the SAD-GS dominant-wavelength map for the production scale_px.
+    def _sadgs_structure_tensor_and_wavelength(
+        self, rgb_gt: torch.Tensor
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Compute SAD-GS structure-tensor components and wavelength_min map.
 
-        Runs ``multiscale_structure_tensor_v2`` on the GT image and extracts
-        ``wavelength_min = 1/(sqrt(lambda_1) + eps)`` in pixels. Output is
-        a 2D ``(H, W)`` tensor matching the legacy ``scale_px`` shape so the
-        rest of ``compute_structure_density_weight`` is unchanged.
+        Runs ``multiscale_structure_tensor_v2`` on the GT image, returns the
+        per-pixel (S_xx, S_xy, S_yy) components (under namespaced keys for
+        downstream sampling by ``_sadgs_score_weights``) and the
+        ``wavelength_min = 1/(sqrt(lambda_1) + eps)`` map ready to be used
+        in place of the legacy ``scale_px``.
 
         Caller must have already stripped the batch dim; ``rgb_gt`` is
         channels-last ``(H, W, C)``.
@@ -1109,6 +1180,13 @@ class GSStrategy(BaseStrategy):
         debug-mode parallel path (sadgs_st_levels / sadgs_base_sigma /
         sadgs_octave_step), keeping the production and debug paths in
         lock-step on configuration.
+
+        Returns:
+            (sadgs_st_components, wavelength_min_2d) where:
+              sadgs_st_components: dict with keys
+                ``sadgs_st_xx``, ``sadgs_st_xy``, ``sadgs_st_yy``,
+                ``sadgs_wavelength_min``, each a (H, W) tensor.
+              wavelength_min_2d: (H, W) tensor matching legacy scale_px shape.
         """
         rgb_bchw = rgb_gt[..., :3].permute(2, 0, 1).unsqueeze(0).contiguous()
         levels = int(self.residual_density_control.get("sadgs_st_levels", 3))
@@ -1125,7 +1203,13 @@ class GSStrategy(BaseStrategy):
             octave_step=octave_step,
         )
         wavelength_map = wavelength_min_from_structure_tensor(st_map)
-        return wavelength_map[0, 0]
+        components = {
+            "sadgs_st_xx": st_map[0, 0],
+            "sadgs_st_xy": st_map[0, 1],
+            "sadgs_st_yy": st_map[0, 2],
+            "sadgs_wavelength_min": wavelength_map[0, 0],
+        }
+        return components, wavelength_map[0, 0]
 
     @torch.no_grad()
     def _compute_sadgs_debug_structure_maps(
