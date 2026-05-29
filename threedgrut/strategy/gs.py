@@ -1055,15 +1055,26 @@ class GSStrategy(BaseStrategy):
         )
         anisotropy = delta / trace.clamp_min(1e-6)
 
-        laplacian = torch.zeros_like(luma_gt)
-        laplacian[1:-1, 1:-1] = torch.abs(
-            -4.0 * luma_gt[1:-1, 1:-1]
-            + luma_gt[1:-1, :-2]
-            + luma_gt[1:-1, 2:]
-            + luma_gt[:-2, 1:-1]
-            + luma_gt[2:, 1:-1]
-        )
-        scale_px = torch.clamp(edge / laplacian.clamp_min(1e-4), min=1.0, max=16.0)
+        if self.residual_density_control.get("sadgs_enabled", False):
+            # SAD-GS-faithful production path: use the principal-eigenvalue
+            # wavelength_min from a multi-channel multi-scale structure
+            # tensor on the GT image as the per-pixel dominant scale.
+            # Replaces the legacy edge/laplacian heuristic with a physically
+            # grounded measure (in pixels, capped only by epsilon at the
+            # smooth-region end). See SAD-GS arxiv 2604.28016, equations
+            # in Sec. 3.2 ("Local frequency analysis").
+            scale_px = self._sadgs_wavelength_min_map(rgb_gt)
+        else:
+            laplacian = torch.zeros_like(luma_gt)
+            laplacian[1:-1, 1:-1] = torch.abs(
+                -4.0 * luma_gt[1:-1, 1:-1]
+                + luma_gt[1:-1, :-2]
+                + luma_gt[1:-1, 2:]
+                + luma_gt[:-2, 1:-1]
+                + luma_gt[2:, 1:-1]
+            )
+            scale_px = torch.clamp(edge / laplacian.clamp_min(1e-4), min=1.0, max=16.0)
+
         residual = torch.abs(luma_pred - luma_gt)
 
         maps = {
@@ -1081,6 +1092,40 @@ class GSStrategy(BaseStrategy):
             maps.update(self._compute_sadgs_debug_structure_maps(rgb_gt))
 
         return maps
+
+    @torch.no_grad()
+    def _sadgs_wavelength_min_map(self, rgb_gt: torch.Tensor) -> torch.Tensor:
+        """Compute the SAD-GS dominant-wavelength map for the production scale_px.
+
+        Runs ``multiscale_structure_tensor_v2`` on the GT image and extracts
+        ``wavelength_min = 1/(sqrt(lambda_1) + eps)`` in pixels. Output is
+        a 2D ``(H, W)`` tensor matching the legacy ``scale_px`` shape so the
+        rest of ``compute_structure_density_weight`` is unchanged.
+
+        Caller must have already stripped the batch dim; ``rgb_gt`` is
+        channels-last ``(H, W, C)``.
+
+        Multi-scale parameters come from the same Hydra keys used by the
+        debug-mode parallel path (sadgs_st_levels / sadgs_base_sigma /
+        sadgs_octave_step), keeping the production and debug paths in
+        lock-step on configuration.
+        """
+        rgb_bchw = rgb_gt[..., :3].permute(2, 0, 1).unsqueeze(0).contiguous()
+        levels = int(self.residual_density_control.get("sadgs_st_levels", 3))
+        base_sigma = float(
+            self.residual_density_control.get("sadgs_base_sigma", 1.0)
+        )
+        octave_step = float(
+            self.residual_density_control.get("sadgs_octave_step", 1.5)
+        )
+        st_map = multiscale_structure_tensor_v2(
+            rgb_bchw,
+            levels=levels,
+            base_sigma=base_sigma,
+            octave_step=octave_step,
+        )
+        wavelength_map = wavelength_min_from_structure_tensor(st_map)
+        return wavelength_map[0, 0]
 
     @torch.no_grad()
     def _compute_sadgs_debug_structure_maps(
