@@ -2486,8 +2486,19 @@ class GSStrategy(BaseStrategy):
             ("structure_axis_y_accum", self.structure_axis_y_accum, 1),
             ("structure_local_axis_accum", self.structure_local_axis_accum, 3),
             ("structure_axis_denom", self.structure_axis_denom, 1),
+            ("sadgs_accum_eta", self.sadgs_accum_eta, 1),
+            ("sadgs_max_eta_3ch", self.sadgs_max_eta_3ch, 3),
+            ("sadgs_eta_high_count", self.sadgs_eta_high_count, 1),
+            ("sadgs_eta_mid_count", self.sadgs_eta_mid_count, 1),
+            ("sadgs_eta_low_count", self.sadgs_eta_low_count, 1),
+            ("sadgs_eta_high_sum_3ch", self.sadgs_eta_high_sum_3ch, 3),
+            ("sadgs_eta_mid_sum_3ch", self.sadgs_eta_mid_sum_3ch, 3),
+            ("sadgs_accum_view_count", self.sadgs_accum_view_count, 1),
+            ("sadgs_accum_weights_valid", self.sadgs_accum_weights_valid, 1),
         )
         for name, buffer, width in buffer_shapes:
+            if buffer.numel() == 0:
+                continue
             clone_buffer = torch.zeros(
                 (clone_count, width),
                 device=self.model.device,
@@ -2628,6 +2639,36 @@ class GSStrategy(BaseStrategy):
             device=self.model.device,
             dtype=self.structure_axis_denom.dtype,
         )
+        if self.sadgs_accum_eta.numel() > 0:
+            shape_1 = (self.model.get_positions().shape[0], 1)
+            shape_3 = (self.model.get_positions().shape[0], 3)
+            self.sadgs_accum_eta = torch.zeros(
+                shape_1, device=self.model.device, dtype=self.sadgs_accum_eta.dtype
+            )
+            self.sadgs_max_eta_3ch = torch.zeros(
+                shape_3, device=self.model.device, dtype=self.sadgs_max_eta_3ch.dtype
+            )
+            self.sadgs_eta_high_count = torch.zeros(
+                shape_1, device=self.model.device, dtype=self.sadgs_eta_high_count.dtype
+            )
+            self.sadgs_eta_mid_count = torch.zeros(
+                shape_1, device=self.model.device, dtype=self.sadgs_eta_mid_count.dtype
+            )
+            self.sadgs_eta_low_count = torch.zeros(
+                shape_1, device=self.model.device, dtype=self.sadgs_eta_low_count.dtype
+            )
+            self.sadgs_eta_high_sum_3ch = torch.zeros(
+                shape_3, device=self.model.device, dtype=self.sadgs_eta_high_sum_3ch.dtype
+            )
+            self.sadgs_eta_mid_sum_3ch = torch.zeros(
+                shape_3, device=self.model.device, dtype=self.sadgs_eta_mid_sum_3ch.dtype
+            )
+            self.sadgs_accum_view_count = torch.zeros(
+                shape_1, device=self.model.device, dtype=self.sadgs_accum_view_count.dtype
+            )
+            self.sadgs_accum_weights_valid = torch.zeros(
+                shape_1, device=self.model.device, dtype=self.sadgs_accum_weights_valid.dtype
+            )
 
     def prune_densification_buffers(self, valid_mask: torch.Tensor) -> None:
         # Update non-optimizable buffers
@@ -2643,6 +2684,18 @@ class GSStrategy(BaseStrategy):
         self.structure_axis_y_accum = self.structure_axis_y_accum[valid_mask]
         self.structure_local_axis_accum = self.structure_local_axis_accum[valid_mask]
         self.structure_axis_denom = self.structure_axis_denom[valid_mask]
+        if self.sadgs_accum_eta.numel() > 0:
+            self.sadgs_accum_eta = self.sadgs_accum_eta[valid_mask]
+            self.sadgs_max_eta_3ch = self.sadgs_max_eta_3ch[valid_mask]
+            self.sadgs_eta_high_count = self.sadgs_eta_high_count[valid_mask]
+            self.sadgs_eta_mid_count = self.sadgs_eta_mid_count[valid_mask]
+            self.sadgs_eta_low_count = self.sadgs_eta_low_count[valid_mask]
+            self.sadgs_eta_high_sum_3ch = self.sadgs_eta_high_sum_3ch[valid_mask]
+            self.sadgs_eta_mid_sum_3ch = self.sadgs_eta_mid_sum_3ch[valid_mask]
+            self.sadgs_accum_view_count = self.sadgs_accum_view_count[valid_mask]
+            self.sadgs_accum_weights_valid = self.sadgs_accum_weights_valid[
+                valid_mask
+            ]
 
     def decay_density(self):
         def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
