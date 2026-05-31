@@ -30,14 +30,14 @@ cd dependencies/3dgrut
 ```
 
 The Pydantic cross-field validator in
-`blk_windows/process_b2g/splat/experiments/config_validators.py` runs
+`blk_windows/process_b2g/splat/ablations/config_validators.py` runs
 at config-load and rejects inconsistent combinations (e.g. setting
 `lambda_X` without the corresponding `use_X` boolean gate).
 
 ## Running the full matrix
 
 ```bash
-.venv/bin/python -m blk_windows.process_b2g.splat.experiments.run_ablation_matrix \
+.venv/bin/python -m blk_windows.process_b2g.splat.ablations.run_ablation_matrix \
     --cells A B C
 ```
 

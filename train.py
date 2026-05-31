@@ -46,7 +46,7 @@ def main(conf: DictConfig) -> None:
     # before any GPU work. Skip if Hax-CV isn't on sys.path (3DGRUT can be
     # used standalone).
     try:
-        from blk_windows.process_b2g.splat.experiments.config_validators import (
+        from blk_windows.process_b2g.splat.ablations.config_validators import (
             validate_3dgrut_config,
         )
 

@@ -10,7 +10,7 @@
 #
 # This file enforces the bool gate via the YAML AND the Pydantic
 # cross-field validator in:
-#   blk_windows/process_b2g/splat/experiments/config_validators.py
+#   blk_windows/process_b2g/splat/ablations/config_validators.py
 # If you delete `use_dense_depth_gradient: true` here, Pydantic will
 # raise ValidationError before training starts.
 #

@@ -7,7 +7,7 @@
 # this file via the defaults list and add their specific overrides on top.
 #
 # Sourced 1:1 from the bash driver. When updating, also update:
-#   blk_windows/process_b2g/splat/experiments/run_ablation_matrix.py
+#   blk_windows/process_b2g/splat/ablations/run_ablation_matrix.py
 #   blk_windows/process_b2g/splat/EXPERIMENTS.md (next-section anchor)
 #
 # Test scene: Scan_004 raw-fisheye 3-camera RATIONAL COLMAP export.
