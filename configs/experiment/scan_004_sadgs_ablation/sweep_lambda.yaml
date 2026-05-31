@@ -3,7 +3,12 @@
 # Hydra-Optuna sweep skeleton for lambda_shape_aligned hyperparameter.
 #
 # Scope: UMich SAD-GS port — DEFERRED until depth-supervision hypothesis
-# is re-justified on a different testbed. See SADGS_UMICH_PORT_PLAN.md.
+# is re-justified on a different testbed (C-grad floor check on Scan_004
+# at 5K steps produced -0.015 dB vs control; falsifies the depth-
+# supervision hypothesis for this regime). Keep this skeleton — when
+# reactivated, just rebuild the SAD-GS port (the shape-aligned loss is
+# the genuinely depth-supervised one; see Kung et al., CVPRW 2024,
+# https://umautobots.github.io/sad_gs).
 #
 # Invoked (when ready):
 #   python train.py -m \
