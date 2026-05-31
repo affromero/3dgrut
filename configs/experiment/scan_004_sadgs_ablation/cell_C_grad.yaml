@@ -1,0 +1,30 @@
+# @package _global_
+#
+# Cell C-grad — DA3 z-extended gradient depth loss only.
+#
+# Bug-fixed version of the original cell C. Original cell C set
+# lambda_dense_depth_gradient=0.05 but never flipped the boolean gate
+# use_dense_depth_gradient. The trainer gates loss compute on the bool
+# (trainer.py:3708), so the loss term was never computed. Cell C was
+# structurally identical to cell A.
+#
+# This file enforces the bool gate via the YAML AND the Pydantic
+# cross-field validator in:
+#   blk_windows/process_b2g/splat/experiments/config_validators.py
+# If you delete `use_dense_depth_gradient: true` here, Pydantic will
+# raise ValidationError before training starts.
+#
+# Historical result (bug-fixed re-run): mean_masked_psnr = 24.365 dB
+# at 5K. Δ vs A control = -0.015 dB (within noise). Falsifies depth-
+# supervision hypothesis on Scan_004 dense-scanner-init at 5K.
+
+defaults:
+  - base
+  - _self_
+
+experiment_name: cell_C_grad_5k
+
+loss:
+  use_dense_depth_gradient: true   # boolean gate — required for lambda
+  lambda_dense_depth_gradient: 0.05
+  dense_depth_dir: /home/ubuntu/Code/Hax-CV/data_haxscanapp/Processed/auth0_69f2515f3b60e77dd927642c/BAH_Leica_Combined/default/B2G/2026-05-06T19-05-59Z_Scan_004/b2g_processed/generated_files/exports/colmap/raw_fisheye_3cam_exclude_sky_person/depths

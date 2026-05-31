@@ -1,0 +1,15 @@
+# @package _global_
+#
+# Cell A — vanilla control.
+#
+# No SAD-GS, no depth supervision, no opacity decay.
+# Reference baseline for the ablation matrix.
+#
+# Historical result: mean_masked_psnr = 24.380 dB at 5K (prior run on
+# sadgs_ablation_v1/, pre-rebase, commit 4e975ccf).
+
+defaults:
+  - base
+  - _self_
+
+experiment_name: cell_A_control_5k

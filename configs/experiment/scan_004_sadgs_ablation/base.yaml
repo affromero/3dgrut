@@ -1,0 +1,101 @@
+# @package _global_
+#
+# Shared overrides for the Scan_004 SAD-GS ablation matrix.
+#
+# Single source of truth for what was previously SHARED_OVERRIDES in
+# /tmp/sadgs_ablation_driver.sh. Per-cell YAMLs in this directory inherit
+# this file via the defaults list and add their specific overrides on top.
+#
+# Sourced 1:1 from the bash driver. When updating, also update:
+#   blk_windows/process_b2g/splat/experiments/run_ablation_matrix.py
+#   blk_windows/process_b2g/splat/EXPERIMENTS.md (next-section anchor)
+#
+# Test scene: Scan_004 raw-fisheye 3-camera RATIONAL COLMAP export.
+# Scene extent ~30 m. Frame count 1065. SH degree 1.
+
+defaults:
+  - /apps/colmap_3dgut
+  - _self_
+
+path: /home/ubuntu/Code/Hax-CV/data_haxscanapp/Processed/auth0_69f2515f3b60e77dd927642c/BAH_Leica_Combined/default/B2G/2026-05-06T19-05-59Z_Scan_004/b2g_processed/generated_files/exports/colmap/raw_fisheye_3cam_exclude_sky_person
+out_dir: /home/ubuntu/Code/Hax-CV/data_haxscanapp/Processed/auth0_69f2515f3b60e77dd927642c/BAH_Leica_Combined/default/B2G/2026-05-06T19-05-59Z_Scan_004/b2g_processed/generated_files/experiments/3dgrut/runs/sadgs_ablation_v2
+
+n_iterations: 5000
+val_frequency: 1000
+test_last: true
+validate_first: false
+validate_final: true
+validate_only: false
+use_wandb: false
+
+checkpoint:
+  iterations: [1000, 5000]
+  keep_step_checkpoints: false
+  save_last_on_validation: true
+  save_best_on_validation: true
+
+export_ply:
+  enabled: false
+
+writer:
+  eval_image_count: 5
+  eval_image_group_size: 5
+  footprint_sample_count: 200000
+
+initialization:
+  use_observation_points: true
+
+strategy:
+  # Density control pinned to "off" — FROZEN preset. Cells that need
+  # densification (SAD-GS) re-enable it in their own YAML.
+  prune:
+    start_iteration: 100000
+    end_iteration: 100000
+  reset_density:
+    start_iteration: 100000
+    end_iteration: 100000
+
+model:
+  default_scale_factor: 1.0
+  progressive_training:
+    init_n_features: 1
+    max_n_features: 1
+
+render:
+  particle_radiance_sph_degree: 1
+
+early_stopping:
+  enabled: true
+  metric: masked_psnr_if_available
+  patience: 3
+  min_delta: 0.03
+  restore_best_on_end: true
+
+post_processing:
+  method: luminance_affine
+  lr: 0.001
+  reg_lambda: 0.01
+  use_frame_residual: false
+  max_log_gain: 0.25
+  max_bias: 0.1
+  use_residual_grid: true
+  residual_grid_size: 48
+  residual_grid_max: 0.04
+  residual_grid_reg_lambda: 0.05
+
+dataset:
+  sky_mask_folder: sky_masks
+
+loss:
+  use_sky_opacity: true
+  lambda_sky_opacity: 0.02
+
+diagnostics:
+  parquet_enabled: true
+  parquet_flush_steps: 100
+  snapshot_frequency: 500
+  snapshot_camera_index: 0
+  snapshot_resolution: 256
+  snapshot_include_gt: true
+  snapshot_contact_sheet_enabled: true
+  snapshot_grad_enabled: false
