@@ -30,6 +30,7 @@ import wandb
 from addict import Dict
 from klogr.path import path_abs, path_join, path_mkdir
 from omegaconf import DictConfig, OmegaConf
+from pixelcache import HashableImage
 from torch import nn
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -478,6 +479,53 @@ def _masked_mean(
         return value.mean()
     denominator = torch.clamp_min(mask.sum() * value.shape[-1], 1.0)
     return (value * mask).sum() / denominator
+
+
+def _resize_bhwc(
+    image: torch.Tensor,
+    *,
+    height: int,
+    width: int,
+    mode: str,
+) -> torch.Tensor:
+    """Resize a BHWC image tensor while preserving rank."""
+    if image.shape[1] == height and image.shape[2] == width:
+        return image
+    image_bchw = image.permute(0, 3, 1, 2)
+    if mode == "nearest":
+        resized = F.interpolate(image_bchw, size=(height, width), mode=mode)
+    else:
+        resized = F.interpolate(
+            image_bchw,
+            size=(height, width),
+            mode=mode,
+            align_corners=False,
+        )
+    return resized.permute(0, 2, 3, 1).contiguous()
+
+
+def _load_image_bhwc(
+    *,
+    path: str,
+    channels: int,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Load an RGB or single-channel image as a BHWC float tensor."""
+    image = (
+        HashableImage(path).to_rgb()
+        if channels == 3
+        else HashableImage(path).to_gray()
+    )
+    array = np.asarray(image.numpy(), dtype=np.float32)
+    if channels == 1:
+        if array.ndim == 2:
+            array = array[..., None]
+        else:
+            array = array[..., :1]
+    if array.max(initial=0.0) > 1.0:
+        array = array / np.float32(255.0)
+    return torch.from_numpy(array).unsqueeze(0).to(device=device, dtype=dtype)
 
 
 def _resolve_torch_hub_repo_dir(repo_name_prefix: str) -> str | None:
@@ -3353,6 +3401,246 @@ class Trainer3DGRUT:
 
         return metrics
 
+    def _generated_view_supervision_by_image_name(self):
+        """Return generated-view supervision items keyed by source image."""
+        manifest_path = str(
+            self.conf.loss.get("generated_view_supervision_manifest_path", "")
+        )
+        if not manifest_path:
+            return {}
+        cache_path = getattr(
+            self,
+            "_generated_view_supervision_manifest_path",
+            "",
+        )
+        cache = getattr(self, "_generated_view_supervision_items", None)
+        if cache is not None and cache_path == manifest_path:
+            return cache
+        if not os.path.exists(manifest_path):
+            msg = (
+                "loss.generated_view_supervision_manifest_path not found: "
+                f"{manifest_path}"
+            )
+            raise FileNotFoundError(msg)
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        items_by_name = {}
+        for item in payload.get("items", []):
+            source_name = str(item.get("source_image_name", ""))
+            if not source_name:
+                continue
+            items_by_name[os.path.basename(source_name)] = item
+            items_by_name[source_name] = item
+        self._generated_view_supervision_manifest_path = manifest_path
+        self._generated_view_supervision_items = items_by_name
+        self._generated_view_tensor_cache = {}
+        logger.info(
+            "Loaded generated-view supervision manifest "
+            f"{manifest_path} ({len(payload.get('items', []))} items)"
+        )
+        return items_by_name
+
+    def _generated_view_supervision_item(self, gpu_batch):
+        """Return generated-view supervision for the current batch if present."""
+        if not bool(self.conf.loss.get("use_generated_view_supervision", False)):
+            return None
+        image_path = getattr(gpu_batch, "image_path", "")
+        if not image_path:
+            return None
+        items_by_name = self._generated_view_supervision_by_image_name()
+        return items_by_name.get(os.path.basename(image_path))
+
+    def _cached_generated_view_image(
+        self,
+        *,
+        path: str,
+        channels: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Load one generated-view sidecar image with per-run caching."""
+        cache = getattr(self, "_generated_view_tensor_cache", None)
+        if cache is None:
+            cache = {}
+            self._generated_view_tensor_cache = cache
+        key = (path, channels, str(self.device), str(dtype))
+        tensor = cache.get(key)
+        if tensor is None:
+            if not os.path.exists(path):
+                msg = f"Generated-view supervision image not found: {path}"
+                raise FileNotFoundError(msg)
+            tensor = _load_image_bhwc(
+                path=path,
+                channels=channels,
+                device=self.device,
+                dtype=dtype,
+            )
+            cache[key] = tensor
+        return tensor
+
+    def _generated_view_sidecar_weight(
+        self,
+        *,
+        item,
+        key: str,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+        threshold: bool,
+    ) -> torch.Tensor | None:
+        """Load an optional one-channel generated-view weight sidecar."""
+        path = item.get(key)
+        if not path:
+            return None
+        weight = self._cached_generated_view_image(
+            path=str(path),
+            channels=1,
+            dtype=dtype,
+        )
+        weight = _resize_bhwc(
+            weight,
+            height=height,
+            width=width,
+            mode="nearest" if threshold else "bilinear",
+        )
+        if threshold:
+            return (weight > 0.5).to(dtype=dtype)
+        return weight.clip(0.0, 1.0)
+
+    def _generated_view_losses(
+        self,
+        *,
+        gpu_batch,
+        rgb_pred: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        """Return optional generated-view Stage 2 local loss terms."""
+        zero = torch.zeros(1, device=self.device, dtype=rgb_pred.dtype)
+        inactive = {
+            "generated_view_rgb_loss": zero,
+            "generated_view_rgb_loss_raw": zero,
+            "generated_view_edge_loss": zero,
+            "generated_view_edge_loss_raw": zero,
+            "generated_view_high_frequency_loss": zero,
+            "generated_view_high_frequency_loss_raw": zero,
+            "generated_view_effective_weight_mean": zero,
+            "generated_view_active": zero,
+        }
+        item = self._generated_view_supervision_item(gpu_batch)
+        if item is None:
+            return inactive
+        generated_rgb_path = str(item.get("generated_rgb_path", ""))
+        if not generated_rgb_path:
+            return inactive
+
+        height = int(rgb_pred.shape[1])
+        width = int(rgb_pred.shape[2])
+        target = self._cached_generated_view_image(
+            path=generated_rgb_path,
+            channels=3,
+            dtype=rgb_pred.dtype,
+        )
+        target = _resize_bhwc(
+            target,
+            height=height,
+            width=width,
+            mode="bilinear",
+        ).detach()
+
+        weight = torch.ones(
+            (1, height, width, 1),
+            device=self.device,
+            dtype=rgb_pred.dtype,
+        )
+        if mask is not None:
+            weight = weight * mask.to(device=self.device, dtype=rgb_pred.dtype)
+        sidecar_mask = self._generated_view_sidecar_weight(
+            item=item,
+            key="mask_path",
+            height=height,
+            width=width,
+            dtype=rgb_pred.dtype,
+            threshold=True,
+        )
+        if sidecar_mask is not None:
+            weight = weight * sidecar_mask
+        confidence = self._generated_view_sidecar_weight(
+            item=item,
+            key="confidence_path",
+            height=height,
+            width=width,
+            dtype=rgb_pred.dtype,
+            threshold=False,
+        )
+        if confidence is not None:
+            weight = weight * confidence
+        rejected = self._generated_view_sidecar_weight(
+            item=item,
+            key="rejected_region_mask_path",
+            height=height,
+            width=width,
+            dtype=rgb_pred.dtype,
+            threshold=True,
+        )
+        if rejected is not None:
+            weight = weight * (1.0 - rejected)
+        if not torch.any(weight > 0.0):
+            return inactive
+
+        loss_terms = {str(term) for term in item.get("loss_terms", [])}
+        rgb_weight = float(item.get("rgb_weight", 1.0))
+        geometry_weight = float(item.get("geometry_weight", 1.0))
+        lambda_rgb = float(self.conf.loss.get("lambda_generated_view_rgb", 0.0))
+        lambda_edge = float(
+            self.conf.loss.get("lambda_generated_view_edge", 0.0)
+        )
+        lambda_high = float(
+            self.conf.loss.get("lambda_generated_view_high_frequency", 0.0)
+        )
+
+        rgb_raw = zero
+        if "rgb_l1" in loss_terms:
+            rgb_raw = _masked_mean(torch.abs(rgb_pred - target), weight)
+        pred_luma = _rgb_to_luma(rgb_pred)
+        target_luma = _rgb_to_luma(target)
+        edge_raw = zero
+        if "edge_l1" in loss_terms:
+            edge_raw = _masked_mean(
+                torch.abs(
+                    _sobel_grad_bhwc(pred_luma)
+                    - _sobel_grad_bhwc(target_luma)
+                ),
+                weight,
+            )
+        high_raw = zero
+        if "high_frequency_l1" in loss_terms:
+            kernel_size = int(
+                self.conf.loss.get(
+                    "generated_view_high_frequency_kernel_size",
+                    31,
+                )
+            )
+            pred_high = rgb_pred - _box_blur_bhwc(rgb_pred, kernel_size)
+            target_high = target - _box_blur_bhwc(target, kernel_size)
+            high_raw = _masked_mean(torch.abs(pred_high - target_high), weight)
+
+        rgb_loss = rgb_raw * lambda_rgb * rgb_weight
+        edge_loss = edge_raw * lambda_edge * geometry_weight
+        high_loss = high_raw * lambda_high * geometry_weight
+        return {
+            "generated_view_rgb_loss": rgb_loss,
+            "generated_view_rgb_loss_raw": rgb_raw,
+            "generated_view_edge_loss": edge_loss,
+            "generated_view_edge_loss_raw": edge_raw,
+            "generated_view_high_frequency_loss": high_loss,
+            "generated_view_high_frequency_loss_raw": high_raw,
+            "generated_view_effective_weight_mean": weight.mean(),
+            "generated_view_active": torch.ones(
+                1,
+                device=self.device,
+                dtype=rgb_pred.dtype,
+            ),
+        }
+
     @torch.cuda.nvtx.range("get_losses")
     def get_losses(
         self,
@@ -3963,6 +4251,12 @@ class Trainer3DGRUT:
                     self.conf.loss.lambda_equirect_consistency
                 )
 
+        generated_view_losses = self._generated_view_losses(
+            gpu_batch=gpu_batch,
+            rgb_pred=rgb_pred,
+            mask=mask,
+        )
+
         # Total loss
         camera_loss_weight = torch.ones(1, device=self.device)
         if self.conf.loss.use_camera_loss_weights:
@@ -4000,6 +4294,9 @@ class Trainer3DGRUT:
             + lambda_dense_depth * loss_dense_depth
             + lambda_dense_depth_gradient * loss_dense_depth_gradient
             + lambda_equirect_consistency * loss_equirect_consistency
+            + generated_view_losses["generated_view_rgb_loss"]
+            + generated_view_losses["generated_view_edge_loss"]
+            + generated_view_losses["generated_view_high_frequency_loss"]
         )
         loss = loss * camera_loss_weight * frame_loss_weight
         return dict(
@@ -4051,6 +4348,7 @@ class Trainer3DGRUT:
                 lambda_view_density_delta * loss_view_density_delta
             ),
             view_density_delta_loss_raw=loss_view_density_delta,
+            **generated_view_losses,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -4984,6 +5282,42 @@ class Trainer3DGRUT:
                 writer.add_scalar(
                     "train/lambda/equirect_consistency",
                     self.conf.loss.lambda_equirect_consistency,
+                    global_step,
+                )
+            if self.conf.loss.get("use_generated_view_supervision", False):
+                writer.add_scalar(
+                    "train/loss/generated_view_rgb",
+                    np.mean(batch_metrics["losses"]["generated_view_rgb_loss"]),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/generated_view_edge",
+                    np.mean(
+                        batch_metrics["losses"]["generated_view_edge_loss"]
+                    ),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/generated_view_high_frequency",
+                    np.mean(
+                        batch_metrics["losses"][
+                            "generated_view_high_frequency_loss"
+                        ]
+                    ),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/generated_view_active",
+                    np.mean(batch_metrics["losses"]["generated_view_active"]),
+                    global_step,
+                )
+                writer.add_scalar(
+                    "train/loss/generated_view_weight_mean",
+                    np.mean(
+                        batch_metrics["losses"][
+                            "generated_view_effective_weight_mean"
+                        ]
+                    ),
                     global_step,
                 )
             if self.conf.loss.use_camera_loss_weights:

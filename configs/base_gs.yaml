@@ -287,6 +287,17 @@ loss:
   equirect_consistency_camera_weights: []
   equirect_consistency_radial_camera_weights: []
 
+  # Generated-view Stage 2 supervision. The manifest contains detached
+  # Qwen/FlowR/video targets keyed by source image name. When enabled, matching
+  # train batches receive confidence-weighted RGB, edge, and high-frequency
+  # losses whose gradients flow only through the local 3DGRUT render.
+  use_generated_view_supervision: false
+  generated_view_supervision_manifest_path: ""
+  lambda_generated_view_rgb: 0.0
+  lambda_generated_view_edge: 0.0
+  lambda_generated_view_high_frequency: 0.0
+  generated_view_high_frequency_kernel_size: 31
+
 foundation_features:
   enabled: false
   method: "dinov2_vitl14"

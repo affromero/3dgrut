@@ -82,6 +82,7 @@ class Renderer:
         writer=None,
         compute_extra_metrics=True,
         post_processing=None,
+        split="val",
     ) -> None:
         if path:  # Replace the path to the test data
             conf.path = path
@@ -92,6 +93,7 @@ class Renderer:
         self.path = path
         self.conf = conf
         self.global_step = global_step
+        self.split = split
         self.dataset, self.dataloader = self.create_test_dataloader(conf)
         self.writer = writer
         self.compute_extra_metrics = compute_extra_metrics
@@ -111,10 +113,21 @@ class Renderer:
             )
 
     def create_test_dataloader(self, conf):
-        """Create the test dataloader for the given configuration."""
+        """Create the requested render dataloader for the configuration."""
         from threedgrut.datasets.utils import configure_dataloader_for_platform
 
-        dataset = datasets.make_test(name=conf.dataset.type, config=conf)
+        if self.split == "train":
+            dataset, _ = datasets.make(
+                name=conf.dataset.type,
+                config=conf,
+                ray_jitter=None,
+            )
+        elif self.split == "val":
+            dataset = datasets.make_test(name=conf.dataset.type, config=conf)
+        else:
+            raise ValueError(
+                f"Unsupported render split {self.split!r}. Expected train or val."
+            )
 
         # Configure DataLoader arguments for the current platform
         dataloader_kwargs = configure_dataloader_for_platform(
@@ -139,6 +152,7 @@ class Renderer:
         writer=None,
         model=None,
         computes_extra_metrics=True,
+        split="val",
     ):
         """Loads checkpoint for test path.
         If path is stated, it will override the test path in checkpoint.
@@ -327,6 +341,7 @@ class Renderer:
             writer=writer,
             compute_extra_metrics=computes_extra_metrics,
             post_processing=post_processing,
+            split=split,
         )
 
     @classmethod
@@ -340,6 +355,7 @@ class Renderer:
         global_step=None,
         compute_extra_metrics=False,
         post_processing=None,
+        split=None,
     ):
         """Loads checkpoint for test path."""
 
@@ -357,6 +373,7 @@ class Renderer:
             writer=writer,
             compute_extra_metrics=compute_extra_metrics,
             post_processing=post_processing,
+            split=split or conf.render.get("split", "val"),
         )
 
     @torch.no_grad()
@@ -376,14 +393,16 @@ class Renderer:
                 ).to("cuda"),
             }
 
+        render_leaf = "renders" if self.split == "val" else "train_renders"
+        gt_leaf = "gt" if self.split == "val" else "train_gt"
         output_path_renders = os.path.join(
-            self.out_dir, f"ours_{int(self.global_step)}", "renders"
+            self.out_dir, f"ours_{int(self.global_step)}", render_leaf
         )
         os.makedirs(output_path_renders, exist_ok=True)
 
         if self.save_gt:
             output_path_gt = os.path.join(
-                self.out_dir, f"ours_{int(self.global_step)}", "gt"
+                self.out_dir, f"ours_{int(self.global_step)}", gt_leaf
             )
             os.makedirs(output_path_gt, exist_ok=True)
 
@@ -482,6 +501,7 @@ class Renderer:
             frame_metrics = {
                 "eval_index": int(iteration),
                 "split_frame_idx": int(gpu_batch.frame_idx),
+                "split": self.split,
                 "camera_idx": int(gpu_batch.camera_idx),
                 "image_name": os.path.basename(gpu_batch.image_path),
                 "image_path": gpu_batch.image_path,
@@ -601,9 +621,12 @@ class Renderer:
         with open(metrics_path, "w") as f:
             json.dump(metrics_json, f, indent=2)
         logger.info(f"📄 Metrics saved to: {metrics_path}")
-        per_frame_metrics_path = os.path.join(
-            self.out_dir, "per_frame_metrics.json"
+        per_frame_metrics_name = (
+            "per_frame_metrics.json"
+            if self.split == "val"
+            else "per_frame_train_metrics.json"
         )
+        per_frame_metrics_path = os.path.join(self.out_dir, per_frame_metrics_name)
         with open(per_frame_metrics_path, "w") as f:
             json.dump(per_frame_metrics, f, indent=2)
         logger.info(f"📄 Per-frame metrics saved to: {per_frame_metrics_path}")
