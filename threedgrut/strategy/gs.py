@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from typing import Optional
 
 import numpy as np
 import torch
+from klogr.path import path_basename, path_exists, path_open
+from pixelcache import HashableImage
 
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.strategy.base import BaseStrategy
@@ -60,6 +63,7 @@ class GSStrategy(BaseStrategy):
         self.abs_gradient_density_stats = {}
         self.camera_balance_density_stats = {}
         self.camera_radial_density_stats = {}
+        self.support_mask_density_stats = {}
         self.structure_density_stats = {}
         self.roma_precision_density_stats: dict = {}
         self.camera_balance_residual_ema = torch.empty((0,), device=self.model.device)
@@ -88,6 +92,9 @@ class GSStrategy(BaseStrategy):
         # Per-image RoMa precision tensors keyed by image stem (e.g. "left_0009").
         # Lazily filled on first read; small (~3 * frame_count entries).
         self._roma_precision_cache: dict = {}
+        self._support_mask_manifest_cache_path = ""
+        self._support_mask_items_by_image_name: dict[str, str] | None = None
+        self._support_mask_cache: dict[str, torch.Tensor | None] = {}
 
     def get_strategy_parameters(self) -> dict:
         params = {}
@@ -636,6 +643,11 @@ class GSStrategy(BaseStrategy):
             outputs,
         )
         roma_precision_weight = self.compute_roma_precision_weight(mask, batch, outputs)
+        support_mask_weight = self.compute_support_mask_weight(
+            mask,
+            batch,
+            outputs,
+        )
         structure_weight = self.compute_structure_density_weight(mask, batch, outputs)
         total_weight = (
             area_weight
@@ -645,6 +657,7 @@ class GSStrategy(BaseStrategy):
             * frequency_error_weight
             * camera_radial_weight
             * roma_precision_weight
+            * support_mask_weight
             * structure_weight
             * camera_balance_weight
         )
@@ -672,6 +685,8 @@ class GSStrategy(BaseStrategy):
             "camera_radial_weight_max": camera_radial_weight.max().item(),
             "roma_precision_weight_mean": roma_precision_weight.mean().item(),
             "roma_precision_weight_max": roma_precision_weight.max().item(),
+            "support_mask_weight_mean": support_mask_weight.mean().item(),
+            "support_mask_weight_max": support_mask_weight.max().item(),
             "structure_weight_mean": structure_weight.mean().item(),
             "structure_weight_max": structure_weight.max().item(),
             "camera_balance_weight": float(camera_balance_weight),
@@ -682,6 +697,7 @@ class GSStrategy(BaseStrategy):
         self.residual_density_stats.update(self.frequency_error_density_stats)
         self.residual_density_stats.update(self.camera_radial_density_stats)
         self.residual_density_stats.update(self.roma_precision_density_stats)
+        self.residual_density_stats.update(self.support_mask_density_stats)
         self.residual_density_stats.update(self.camera_balance_density_stats)
         self.residual_density_stats.update(self.structure_density_stats)
         if "mog_tiles_count" in outputs:
@@ -693,6 +709,175 @@ class GSStrategy(BaseStrategy):
                 }
             )
         return total_weight.unsqueeze(1)
+
+    def support_mask_items_by_image_name(self) -> dict[str, str]:
+        """Return support-confidence mask paths keyed by train image name."""
+        manifest_path = str(
+            self.residual_density_control.get("support_mask_manifest_path", "")
+        )
+        if not manifest_path:
+            return {}
+        if (
+            self._support_mask_items_by_image_name is not None
+            and self._support_mask_manifest_cache_path == manifest_path
+        ):
+            return self._support_mask_items_by_image_name
+        if not path_exists(manifest_path):
+            raise FileNotFoundError(
+                "strategy.residual_density_control.support_mask_manifest_path "
+                f"not found: {manifest_path}"
+            )
+        with path_open(manifest_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        items_by_name: dict[str, str] = {}
+        for item in payload.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            source_name = str(item.get("source_image_name", ""))
+            confidence_path = item.get("confidence_path")
+            if not source_name or not confidence_path:
+                continue
+            mask_path = str(confidence_path)
+            items_by_name[source_name] = mask_path
+            items_by_name[path_basename(source_name)] = mask_path
+        self._support_mask_manifest_cache_path = manifest_path
+        self._support_mask_items_by_image_name = items_by_name
+        self._support_mask_cache = {}
+        return items_by_name
+
+    def load_support_mask_for_image(self, image_path: str) -> torch.Tensor | None:
+        """Load the scanner-depth support mask for one train image."""
+        items_by_name = self.support_mask_items_by_image_name()
+        mask_path = items_by_name.get(path_basename(image_path))
+        if mask_path is None:
+            return None
+        if mask_path in self._support_mask_cache:
+            return self._support_mask_cache[mask_path]
+        if not path_exists(mask_path):
+            raise FileNotFoundError(
+                "Scanner-depth support mask not found: "
+                f"{mask_path} for image {image_path}"
+            )
+        image = HashableImage(mask_path).to_gray()
+        array = np.asarray(image.numpy(), dtype=np.float32)
+        if array.ndim == 3:
+            array = array[..., 0]
+        if array.max(initial=0.0) > 1.0:
+            array = array / np.float32(255.0)
+        tensor = torch.from_numpy(array).to(
+            device=self.model.device,
+            dtype=torch.float32,
+        )
+        self._support_mask_cache[mask_path] = tensor
+        return tensor
+
+    @torch.no_grad()
+    def compute_support_mask_weight(
+        self,
+        mask: torch.Tensor,
+        batch,
+        outputs,
+    ) -> torch.Tensor:
+        """Return per-Gaussian weights sampled from support confidence masks."""
+        selected_count = int(mask.sum().item())
+        self.support_mask_density_stats = {}
+        weights = torch.ones((selected_count,), device=self.model.device)
+        if selected_count == 0:
+            return weights
+        if not self.residual_density_control.get("use_support_mask_weight", False):
+            return weights
+        if "mog_projected_position" not in outputs:
+            return weights
+
+        support_mask = self.load_support_mask_for_image(
+            getattr(batch, "image_path", "")
+        )
+        if support_mask is None:
+            self.support_mask_density_stats = {
+                "support_mask_present": 0.0,
+                "support_mask_valid_fraction": 0.0,
+                "support_mask_mean": 0.0,
+                "support_mask_p95": 0.0,
+            }
+            return weights
+
+        positions = outputs["mog_projected_position"][mask].float()
+        x = torch.round(positions[:, 0]).long()
+        y = torch.round(positions[:, 1]).long()
+        height, width = support_mask.shape
+        valid = torch.logical_and(
+            torch.logical_and(x >= 0, x < width),
+            torch.logical_and(y >= 0, y < height),
+        )
+        if "mog_visibility" in outputs:
+            visible = outputs["mog_visibility"][mask].reshape(-1) > 0
+            valid = torch.logical_and(valid, visible)
+        if batch.mask is not None:
+            frame_mask = batch.mask
+            if frame_mask.dim() == 4:
+                frame_mask = frame_mask[0]
+            frame_mask = frame_mask.to(device=self.model.device)
+            frame_mask = frame_mask.squeeze(-1) > 0.5
+            valid_mask_sample = torch.zeros_like(valid)
+            valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            if valid_indices.numel() > 0:
+                valid_mask_sample[valid_indices] = frame_mask[
+                    y[valid_indices],
+                    x[valid_indices],
+                ]
+            valid = torch.logical_and(valid, valid_mask_sample)
+
+        sampled_support = torch.zeros_like(weights)
+        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
+        if valid_indices.numel() > 0:
+            sampled_support[valid_indices] = support_mask[
+                y[valid_indices],
+                x[valid_indices],
+            ].to(weights.dtype)
+
+        reference = float(
+            self.residual_density_control.get("support_mask_reference", 0.5)
+        )
+        power = float(
+            self.residual_density_control.get("support_mask_power", 1.0)
+        )
+        weights = torch.pow(sampled_support / max(reference, 1e-6), power)
+        weights = torch.clamp(
+            weights,
+            min=float(
+                self.residual_density_control.get(
+                    "support_mask_min_weight",
+                    0.05,
+                )
+            ),
+            max=float(
+                self.residual_density_control.get(
+                    "support_mask_max_weight",
+                    5.0,
+                )
+            ),
+        )
+        invalid_weight = float(
+            self.residual_density_control.get(
+                "support_mask_invalid_weight",
+                0.05,
+            )
+        )
+        weights = torch.where(valid, weights, torch.full_like(weights, invalid_weight))
+        valid_support = sampled_support[valid]
+        self.support_mask_density_stats = {
+            "support_mask_present": 1.0,
+            "support_mask_valid_fraction": valid.float().mean().item(),
+            "support_mask_mean": valid_support.mean().item()
+            if valid_support.numel() > 0
+            else 0.0,
+            "support_mask_p95": torch.quantile(valid_support, 0.95).item()
+            if valid_support.numel() > 0
+            else 0.0,
+            "support_mask_weight_mean": weights.mean().item(),
+            "support_mask_weight_max": weights.max().item(),
+        }
+        return weights
 
     @torch.no_grad()
     def compute_structure_density_weight(self, mask: torch.Tensor, batch, outputs) -> torch.Tensor:
