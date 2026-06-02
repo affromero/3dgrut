@@ -91,6 +91,11 @@ residual_density_control:
   support_mask_min_weight: 0.05
   support_mask_max_weight: 5.0
   support_mask_invalid_weight: 0.05
+  use_support_mask_item_weight: false
+  support_mask_item_weight_reference: 1.0
+  support_mask_item_weight_power: 1.0
+  support_mask_item_weight_min_weight: 0.25
+  support_mask_item_weight_max_weight: 3.0
   use_structure_density_weight: false
   structure_score_only: false
   structure_anisotropic_split: false

@@ -93,7 +93,9 @@ class GSStrategy(BaseStrategy):
         # Lazily filled on first read; small (~3 * frame_count entries).
         self._roma_precision_cache: dict = {}
         self._support_mask_manifest_cache_path = ""
-        self._support_mask_items_by_image_name: dict[str, str] | None = None
+        self._support_mask_items_by_image_name: (
+            dict[str, tuple[str, float]] | None
+        ) = None
         self._support_mask_cache: dict[str, torch.Tensor | None] = {}
 
     def get_strategy_parameters(self) -> dict:
@@ -710,8 +712,8 @@ class GSStrategy(BaseStrategy):
             )
         return total_weight.unsqueeze(1)
 
-    def support_mask_items_by_image_name(self) -> dict[str, str]:
-        """Return support-confidence mask paths keyed by train image name."""
+    def support_mask_items_by_image_name(self) -> dict[str, tuple[str, float]]:
+        """Return support mask paths and item weights keyed by image name."""
         manifest_path = str(
             self.residual_density_control.get("support_mask_manifest_path", "")
         )
@@ -729,7 +731,7 @@ class GSStrategy(BaseStrategy):
             )
         with path_open(manifest_path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
-        items_by_name: dict[str, str] = {}
+        items_by_name: dict[str, tuple[str, float]] = {}
         for item in payload.get("items", []):
             if not isinstance(item, dict):
                 continue
@@ -738,21 +740,34 @@ class GSStrategy(BaseStrategy):
             if not source_name or not confidence_path:
                 continue
             mask_path = str(confidence_path)
-            items_by_name[source_name] = mask_path
-            items_by_name[path_basename(source_name)] = mask_path
+            raw_item_weight = item.get("geometry_weight", 1.0)
+            item_weight = float(
+                raw_item_weight
+                if raw_item_weight is not None
+                else 1.0
+            )
+            items_by_name[source_name] = (mask_path, item_weight)
+            items_by_name[path_basename(source_name)] = (
+                mask_path,
+                item_weight,
+            )
         self._support_mask_manifest_cache_path = manifest_path
         self._support_mask_items_by_image_name = items_by_name
         self._support_mask_cache = {}
         return items_by_name
 
-    def load_support_mask_for_image(self, image_path: str) -> torch.Tensor | None:
-        """Load the scanner-depth support mask for one train image."""
+    def load_support_mask_for_image(
+        self,
+        image_path: str,
+    ) -> tuple[torch.Tensor | None, float]:
+        """Load the scanner-depth support mask and item weight for one image."""
         items_by_name = self.support_mask_items_by_image_name()
-        mask_path = items_by_name.get(path_basename(image_path))
-        if mask_path is None:
-            return None
+        item = items_by_name.get(path_basename(image_path))
+        if item is None:
+            return None, 1.0
+        mask_path, item_weight = item
         if mask_path in self._support_mask_cache:
-            return self._support_mask_cache[mask_path]
+            return self._support_mask_cache[mask_path], item_weight
         if not path_exists(mask_path):
             raise FileNotFoundError(
                 "Scanner-depth support mask not found: "
@@ -769,7 +784,45 @@ class GSStrategy(BaseStrategy):
             dtype=torch.float32,
         )
         self._support_mask_cache[mask_path] = tensor
-        return tensor
+        return tensor, item_weight
+
+    def support_mask_item_factor(self, item_weight: float) -> float:
+        """Return optional per-item density-allocation multiplier."""
+        if not self.residual_density_control.get(
+            "use_support_mask_item_weight",
+            False,
+        ):
+            return 1.0
+        reference = float(
+            self.residual_density_control.get(
+                "support_mask_item_weight_reference",
+                1.0,
+            )
+        )
+        power = float(
+            self.residual_density_control.get(
+                "support_mask_item_weight_power",
+                1.0,
+            )
+        )
+        factor = (item_weight / max(reference, 1e-6)) ** power
+        return min(
+            max(
+                factor,
+                float(
+                    self.residual_density_control.get(
+                        "support_mask_item_weight_min_weight",
+                        0.25,
+                    )
+                ),
+            ),
+            float(
+                self.residual_density_control.get(
+                    "support_mask_item_weight_max_weight",
+                    3.0,
+                )
+            ),
+        )
 
     @torch.no_grad()
     def compute_support_mask_weight(
@@ -789,7 +842,7 @@ class GSStrategy(BaseStrategy):
         if "mog_projected_position" not in outputs:
             return weights
 
-        support_mask = self.load_support_mask_for_image(
+        support_mask, item_weight = self.load_support_mask_for_image(
             getattr(batch, "image_path", "")
         )
         if support_mask is None:
@@ -800,6 +853,7 @@ class GSStrategy(BaseStrategy):
                 "support_mask_p95": 0.0,
             }
             return weights
+        item_factor = self.support_mask_item_factor(item_weight)
 
         positions = outputs["mog_projected_position"][mask].float()
         x = torch.round(positions[:, 0]).long()
@@ -841,7 +895,8 @@ class GSStrategy(BaseStrategy):
         power = float(
             self.residual_density_control.get("support_mask_power", 1.0)
         )
-        weights = torch.pow(sampled_support / max(reference, 1e-6), power)
+        weighted_support = sampled_support * item_factor
+        weights = torch.pow(weighted_support / max(reference, 1e-6), power)
         weights = torch.clamp(
             weights,
             min=float(
@@ -876,6 +931,8 @@ class GSStrategy(BaseStrategy):
             else 0.0,
             "support_mask_weight_mean": weights.mean().item(),
             "support_mask_weight_max": weights.max().item(),
+            "support_mask_item_weight": float(item_weight),
+            "support_mask_item_factor": float(item_factor),
         }
         return weights
 
