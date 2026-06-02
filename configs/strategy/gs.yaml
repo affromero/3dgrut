@@ -96,6 +96,14 @@ residual_density_control:
   support_mask_item_weight_power: 1.0
   support_mask_item_weight_min_weight: 0.25
   support_mask_item_weight_max_weight: 3.0
+  use_prior_anchor_field: false
+  prior_anchor_field_manifest_path: ""
+  prior_anchor_inject_iteration: 0
+  prior_anchor_max_points: 50000
+  prior_anchor_min_confidence: 0.0
+  prior_anchor_scale_m: 0.003
+  prior_anchor_normal_scale_multiplier: 0.35
+  prior_anchor_density_multiplier: 1.0
   use_structure_density_weight: false
   structure_score_only: false
   structure_anisotropic_split: false
