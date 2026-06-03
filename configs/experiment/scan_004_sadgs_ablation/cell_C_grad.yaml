@@ -13,10 +13,6 @@
 #   blk_windows/process_b2g/splat/ablations/config_validators.py
 # If you delete `use_dense_depth_gradient: true` here, Pydantic will
 # raise ValidationError before training starts.
-#
-# Historical result (bug-fixed re-run): mean_masked_psnr = 24.365 dB
-# at 5K. Δ vs A control = -0.015 dB (within noise). Falsifies depth-
-# supervision hypothesis on Scan_004 dense-scanner-init at 5K.
 
 defaults:
   - base

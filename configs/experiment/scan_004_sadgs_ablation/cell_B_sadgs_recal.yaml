@@ -19,12 +19,6 @@
 #
 # Densify schedule re-enabled — the FROZEN preset disables it; SAD-GS
 # needs splits to actually fire.
-#
-# Historical result: mean_masked_psnr = 24.482 dB at 5K (prior run on
-# sadgs_ablation_v1/, pre-rebase, +0.10 dB vs A — below signal threshold).
-#
-# RE-RUN at head SHA per plan Gotcha #6: Max Planck path has had ≥5
-# commits since prior B2 run; mixing step counts contaminates comparison.
 
 defaults:
   - base
