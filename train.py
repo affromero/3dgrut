@@ -39,27 +39,6 @@ def get_git_revision_hash() -> str:
 def main(conf: DictConfig) -> None:
     logger.info(f"Git hash: {get_git_revision_hash()}")
 
-    # Cross-field validation. Hydra struct mode rejects undeclared keys but
-    # not inconsistent combinations (e.g. lambda_dense_depth=0.05 without
-    # use_dense_depth=true — the trainer gates loss compute on the bool,
-    # not on lambda > 0). Pydantic catches the bug class at config-load,
-    # before any GPU work. Skip if Hax-CV isn't on sys.path (3DGRUT can be
-    # used standalone).
-    try:
-        from blk_windows.process_b2g.splat.ablations.config_validators import (
-            validate_3dgrut_config,
-        )
-
-        validate_3dgrut_config(
-            loss=OmegaConf.to_container(conf.loss, resolve=True),
-            strategy=OmegaConf.to_container(conf.strategy, resolve=True),
-        )
-    except ImportError:
-        logger.info(
-            "Hax-CV cross-field validators not available; skipping. "
-            "(Expected only outside the Hax-CV monorepo.)"
-        )
-
     logger.info(f"Compiling native code..")
     from threedgrut.trainer import Trainer3DGRUT
 
