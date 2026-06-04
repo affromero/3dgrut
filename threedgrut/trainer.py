@@ -135,7 +135,9 @@ def _robust_jet_map(
             1.0, device=value_map.device, dtype=value_map.dtype
         )
     else:
-        max_value = torch.quantile(valid_values, quantile).clamp_min(1e-6)
+        max_value = torch.quantile(
+            _quantile_values(valid_values), quantile
+        ).clamp_min(1e-6)
     return jet_map(value_map, max_value)
 
 
