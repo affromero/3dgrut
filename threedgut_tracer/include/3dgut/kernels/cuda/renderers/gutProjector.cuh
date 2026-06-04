@@ -134,15 +134,29 @@ struct GUTProjector : Params, UTParams {
         }
 
         const tcnn::vec3& particleMean = particles.position(particleParameters);
-        if ((particleMean.x * sensorMatrix[0][2] + particleMean.y * sensorMatrix[1][2] +
-             particleMean.z * sensorMatrix[2][2] + sensorMatrix[3][2]) < Params::ParticleMinSensorZ) {
+
+        // Camera-to-particle vector (world frame); its norm is the equirect
+        // projectPoint() radial distance and is reused below, so compute it
+        // before the visibility cull.
+        particleSensorRay = particleMean - sensorWorldPosition;
+
+        if (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel) {
+            // Full-sphere camera: every direction is imaged, so the
+            // forward-hemisphere depth cull must NOT run -- it would discard the
+            // entire rear hemisphere. The only invalid case is a particle
+            // coincident with the camera center (undefined bearing), matching
+            // projectPoint()'s n <= 0 guard.
+            if (length(particleSensorRay) < 1e-6f) {
+                return false;
+            }
+        } else if ((particleMean.x * sensorMatrix[0][2] + particleMean.y * sensorMatrix[1][2] +
+                    particleMean.z * sensorMatrix[2][2] + sensorMatrix[3][2]) < Params::ParticleMinSensorZ) {
+            // Perspective / fisheye / rational / ftheta: forward-hemisphere cull.
             return false;
         }
 
         const tcnn::vec3& particleScale   = particles.scale(particleParameters);
         const tcnn::mat3 particleRotation = particles.rotation(particleParameters);
-
-        particleSensorRay = particleMean - sensorWorldPosition;
 
         int numValidPoints = 0;
         tcnn::vec2 projectedSigmaPoints[2 * UTParams::D + 1];
@@ -340,9 +354,18 @@ struct GUTProjector : Params, UTParams {
         particlesProjectedConicOpacityPtr[particleIdx] = particleProjConicOpacity;
         particlesProjectedExtentPtr[particleIdx]       = particleProjExtent;
         if constexpr (Params::GlobalZOrder) {
-            const tcnn::vec3& particleMean       = particles.position(particleParameters);
-            particlesGlobalDepthPtr[particleIdx] = (particleMean.x * sensorViewMatrix[0][2] + particleMean.y * sensorViewMatrix[1][2] +
-                                                    particleMean.z * sensorViewMatrix[2][2] + sensorViewMatrix[3][2]);
+            if (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel) {
+                // Full-sphere camera: signed sensor-frame Z would corrupt the
+                // ascending unsigned-float-bits radix sort for the rear
+                // hemisphere (negative Z sorts as larger and reversed). Radial
+                // distance is non-negative and is the correct front-to-back
+                // ordering when there is no single forward axis.
+                particlesGlobalDepthPtr[particleIdx] = particleSensorDistance;
+            } else {
+                const tcnn::vec3& particleMean       = particles.position(particleParameters);
+                particlesGlobalDepthPtr[particleIdx] = (particleMean.x * sensorViewMatrix[0][2] + particleMean.y * sensorViewMatrix[1][2] +
+                                                        particleMean.z * sensorViewMatrix[2][2] + sensorViewMatrix[3][2]);
+            }
         } else {
             particlesGlobalDepthPtr[particleIdx] = particleSensorDistance;
         }
