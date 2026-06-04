@@ -120,13 +120,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 dtype=bool,
             )
             n_held = int(in_holdout.sum())
-            # Fail loud on a silent leak: a holdout list that matches no frame
-            # (e.g. a .png-suffix or name mismatch) would otherwise fall back to
-            # evaluating/ training on the wrong frames with no warning.
-            if n_held == 0:
+            # Fail loud on a silent leak: the holdout must match EXACTLY (every
+            # listed name present in the model). A partial match (e.g. a
+            # .png-suffix / basename mismatch on some frames) would otherwise
+            # silently leak one side into the other and shrink the eval set.
+            if n_held != len(holdout_names):
                 raise ValueError(
-                    f"holdout list ({len(holdout_names)} names) matched 0 of "
-                    f"{len(self.cam_extrinsics)} COLMAP frames -- name mismatch "
+                    f"holdout list has {len(holdout_names)} names but matched "
+                    f"{n_held} of {len(self.cam_extrinsics)} COLMAP frames -- "
+                    "a name mismatch would silently leak/shrink the eval "
                     "(check the .png suffix / basename)."
                 )
             logger.info(
