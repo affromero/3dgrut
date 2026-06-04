@@ -14,7 +14,6 @@ max_consecutive_bvh_update: 15
 enable_normals: false
 enable_hitcounts: true
 enable_kernel_timings: false
-split: val
 
 gaussian_dropout:
   enabled: false
