@@ -569,6 +569,41 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 pixel_coords,
             )
 
+        def create_equirect_camera(w, h):
+            # Full-sphere equirectangular rays in the [right, down, forward]
+            # camera frame (matches the CUDA projectPoint and the COLMAP poses
+            # loaded without a coordinate flip). Parameter-free beyond (w, h).
+            out_shape = (1, h, w, 3)
+            cols = np.tile(np.arange(w) + 0.5, h)
+            rows = (np.arange(h) + 0.5).repeat(w)
+            phi = (1.0 - 2.0 * cols / w) * np.pi
+            theta = (1.0 - 2.0 * rows / h) * (np.pi / 2.0)
+            cos_theta = np.cos(theta)
+            rays = np.stack(
+                [
+                    -cos_theta * np.sin(phi),
+                    -np.sin(theta),
+                    cos_theta * np.cos(phi),
+                ],
+                axis=-1,
+            )
+            rays = rays / np.linalg.norm(rays, axis=-1, keepdims=True)
+            rays_o_cam = np.zeros_like(rays)
+            pixel_coords = create_pixel_coords(w, h)
+            params_dict = {
+                "resolution": np.array([w, h], dtype=np.uint64),
+                "shutter_type": ShutterType.GLOBAL.name,
+            }
+            return (
+                params_dict,
+                torch.tensor(rays_o_cam, dtype=torch.float32).reshape(
+                    out_shape
+                ),
+                torch.tensor(rays, dtype=torch.float32).reshape(out_shape),
+                "EquirectCameraModelParameters",
+                pixel_coords,
+            )
+
         cam_id_to_image_name = {
             extr.camera_id: extr.name for extr in self.cam_extrinsics
         }
@@ -658,10 +693,18 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                     params, width, height, rotation
                 )
 
+            elif intr.model in (
+                "EQUIRECTANGULAR",
+                "SPHERICAL",
+                "OPENCV_SPHERICAL",
+            ):
+                self.intrinsics[intr.id] = create_equirect_camera(width, height)
+
             else:
                 assert False, (
                     f"Colmap camera model '{intr.model}' not handled: supported camera models are "
-                    "PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, OPENCV_FISHEYE, and RATIONAL."
+                    "PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, OPENCV_FISHEYE, "
+                    "RATIONAL, and EQUIRECTANGULAR/SPHERICAL."
                 )
 
         # Load poses and paths

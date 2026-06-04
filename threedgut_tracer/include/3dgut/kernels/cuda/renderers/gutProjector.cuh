@@ -196,6 +196,28 @@ struct GUTProjector : Params, UTParams {
             return false;
         }
 
+        // Equirectangular seam handling: sigma points straddling the +-180 deg
+        // azimuth seam wrap (u ~ 0 vs ~ width), which corrupts the averaged
+        // center and covariance below. Unwrap each sigma point's u onto the
+        // branch nearest the first point and recompute the mean; the center is
+        // wrapped back into [0, width) after the covariance is built.
+        const bool equirectModel =
+            (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel);
+        if (equirectModel) {
+            const float width = static_cast<float>(resolution.x);
+            const float refX  = projectedSigmaPoints[0].x;
+#pragma unroll
+            for (int i = 1; i < 2 * UTParams::D + 1; ++i) {
+                projectedSigmaPoints[i].x -= width * roundf((projectedSigmaPoints[i].x - refX) / width);
+            }
+            tcnn::vec2 unwrappedCenter = projectedSigmaPoints[0] * (Lambda / (UTParams::D + Lambda));
+#pragma unroll
+            for (int i = 1; i < 2 * UTParams::D + 1; ++i) {
+                unwrappedCenter += weightI * projectedSigmaPoints[i];
+            }
+            particleProjCenter = unwrappedCenter;
+        }
+
         {
             const tcnn::vec2 centeredPoint = projectedSigmaPoints[0] - particleProjCenter;
             constexpr float weight0        = Lambda / (UTParams::D + Lambda) + (1.f - UTParams::Alpha * UTParams::Alpha + UTParams::Beta);
@@ -209,6 +231,11 @@ struct GUTProjector : Params, UTParams {
             particleProjCovariance += weightI * tcnn::vec3(centeredPoint.x * centeredPoint.x,
                                                            centeredPoint.x * centeredPoint.y,
                                                            centeredPoint.y * centeredPoint.y);
+        }
+
+        if (equirectModel) {
+            const float width    = static_cast<float>(resolution.x);
+            particleProjCenter.x = particleProjCenter.x - width * floorf(particleProjCenter.x / width);
         }
 
         return true;

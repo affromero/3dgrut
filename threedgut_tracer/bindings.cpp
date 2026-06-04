@@ -135,6 +135,17 @@ fromRationalCameraModelParameters(std::array<uint64_t, 2> _resolution,
     return params;
 }
 
+threedgut::CameraModelParameters
+fromEquirectCameraModelParameters(std::array<uint64_t, 2> resolution,
+                                  threedgut::CameraModelParameters::ShutterType shutter_type) {
+    threedgut::CameraModelParameters params;
+    params.shutterType = static_cast<threedgut::CameraModelParameters::ShutterType>(shutter_type);
+    params.modelType   = threedgut::CameraModelParameters::EquirectangularModel;
+    params.equirectParams.resolution =
+        tcnn::vec2{static_cast<float>(resolution[0]), static_cast<float>(resolution[1])};
+    return params;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     pybind11::class_<SplatRaster>(m, "SplatRaster")
@@ -196,4 +207,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("affine_coeffs"),
           py::arg("tangential_coeffs"),
           py::arg("skew"));
+
+    m.def("fromEquirectCameraModelParameters", &fromEquirectCameraModelParameters,
+          py::arg("resolution"),
+          py::arg("shutter_type"));
 }

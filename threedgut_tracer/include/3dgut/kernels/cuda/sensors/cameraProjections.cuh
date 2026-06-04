@@ -251,6 +251,32 @@ static inline __device__ bool projectPoint(const FThetaProjectionParameters& sen
     return (theta < sensorParams.maxAngle) && withinResolution(resolution, tolerance, projected);
 }
 
+static inline __device__ bool projectPoint(const EquirectProjectionParameters& sensorParams,
+                                           const tcnn::ivec2& resolution,
+                                           const tcnn::vec3& position,
+                                           float tolerance,
+                                           tcnn::vec2& projected) {
+    // Full-sphere equirectangular projection in the [right, down, forward]
+    // camera frame (matches the dataset ray-gen and the COLMAP poses loaded
+    // without a coordinate flip). Every direction maps to a valid pixel.
+    constexpr float kPi = 3.14159265358979323846f;
+    const float n = sqrtf(position.x * position.x + position.y * position.y + position.z * position.z);
+    if (n <= 0.f) {
+        projected = tcnn::vec2::zero();
+        return false;
+    }
+    const float theta = asinf(fminf(fmaxf(-position.y / n, -1.f), 1.f)); // latitude  [-pi/2, pi/2]
+    const float phi   = atan2f(-position.x, position.z);                 // longitude [-pi, pi]
+    const float width  = static_cast<float>(resolution.x);
+    const float height = static_cast<float>(resolution.y);
+    float col = (1.f - phi / kPi) * 0.5f * width - 0.5f;
+    float row = (1.f - 2.f * theta / kPi) * 0.5f * height - 0.5f;
+    col       = col - width * floorf(col / width); // wrap azimuth into [0, width)
+    row       = fminf(fmaxf(row, 0.f), height - 1.f);
+    projected = tcnn::vec2{col, row};
+    return true;
+}
+
 static inline __device__ bool projectPoint(const TSensorModel& sensorModel,
                                            const tcnn::ivec2& resolution,
                                            const tcnn::vec3& position,
@@ -265,6 +291,8 @@ static inline __device__ bool projectPoint(const TSensorModel& sensorModel,
         return projectPoint(sensorModel.fthetaParams, resolution, position, tolerance, projected);
     case TSensorModel::RationalModel:
         return projectPoint(sensorModel.rationalParams, resolution, position, tolerance, projected);
+    case TSensorModel::EquirectangularModel:
+        return projectPoint(sensorModel.equirectParams, resolution, position, tolerance, projected);
     default:
         projected = tcnn::vec2::zero();
         return false;
