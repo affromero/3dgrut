@@ -229,6 +229,9 @@ def make_test(name: str, config):
                 test_split_interval=config.dataset.test_split_interval,
                 exif_exposures=exif_exposures,
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
             )
         case "scannetpp":
             dataset = ScannetppDataset(

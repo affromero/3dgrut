@@ -119,6 +119,20 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 [extr.name in holdout_names for extr in self.cam_extrinsics],
                 dtype=bool,
             )
+            n_held = int(in_holdout.sum())
+            # Fail loud on a silent leak: a holdout list that matches no frame
+            # (e.g. a .png-suffix or name mismatch) would otherwise fall back to
+            # evaluating/ training on the wrong frames with no warning.
+            if n_held == 0:
+                raise ValueError(
+                    f"holdout list ({len(holdout_names)} names) matched 0 of "
+                    f"{len(self.cam_extrinsics)} COLMAP frames -- name mismatch "
+                    "(check the .png suffix / basename)."
+                )
+            logger.info(
+                f"[holdout] split={self.split}: {n_held}/"
+                f"{len(self.cam_extrinsics)} frames held out by name"
+            )
             split_mask = in_holdout if self.split != "train" else ~in_holdout
         # If test_split_interval is set, every test_split_interval frame will be excluded from the training set
         # If test_split_interval is non-positive, all images will be used for training and testing
