@@ -221,6 +221,13 @@ loss:
   l1_loss_type: absolute
   charbonnier_epsilon: 0.01
 
+  # ErpGS-style distortion-aware latitude weighting of the RGB L1 term.
+  # When true AND the frame is equirectangular, the per-pixel L1 residual is
+  # weighted by a mean-1-normalized cos(latitude) map so the loss respects
+  # the true spherical sampling (poles are over-sampled in ERP). No-op on
+  # perspective/fisheye frames; SSIM is left unweighted.
+  erp_latitude_weighting: false
+
   use_l2: false
   lambda_l2: 1.0
 

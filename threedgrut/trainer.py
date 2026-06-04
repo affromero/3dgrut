@@ -821,6 +821,32 @@ def _radial_weight_map(
     return weight.unsqueeze(0)
 
 
+def _erp_latitude_weight_map(
+    *,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a [1, H, W, 1] cos(latitude) loss-weight map for ERP frames.
+
+    An equirectangular image over-samples the poles: a pixel at latitude
+    theta covers solid angle proportional to cos(theta). Weighting the
+    per-pixel RGB residual by cos(theta) makes the photometric loss respect
+    the true spherical sampling (ErpGS-style distortion-aware weighting).
+
+    Row v in [0, H) maps to latitude theta = (1 - 2*(v+0.5)/H)*(pi/2),
+    matching the dataset's `create_equirect_camera` ray construction. The
+    map is normalized so its mean over rows == 1 to preserve loss scale, then
+    broadcast over width and channels as [1, H, W, 1].
+    """
+    rows = torch.arange(height, device=device, dtype=dtype)
+    theta = (1.0 - 2.0 * (rows + 0.5) / float(height)) * (torch.pi / 2.0)
+    cos_theta = torch.cos(theta)
+    cos_theta = cos_theta / torch.clamp_min(cos_theta.mean(), 1e-6)
+    return cos_theta.reshape(1, height, 1, 1).expand(1, height, width, 1)
+
+
 def _radial_residual_metrics(
     *,
     rgb_gt: torch.Tensor,
@@ -3688,18 +3714,52 @@ class Trainer3DGRUT:
         if self.conf.loss.use_l1:
             with torch.cuda.nvtx.range("loss-l1"):
                 rgb_error = rgb_pred - rgb_gt
+                # ERP distortion-aware latitude weighting (ErpGS-style):
+                # weight the per-pixel L1 by a cached, mean-1-normalized
+                # cos(latitude) map so the loss respects the true spherical
+                # sampling of an equirectangular image. Gated on a new
+                # default-false flag AND on the current frame being ERP, so
+                # perspective/fisheye runs are byte-for-byte unchanged.
+                erp_weight = torch.ones(1, device=self.device)
+                if self.conf.loss.get(
+                    "erp_latitude_weighting", False
+                ) and (
+                    gpu_batch.intrinsics_EquirectCameraModelParameters
+                    is not None
+                ):
+                    height = rgb_error.shape[1]
+                    width = rgb_error.shape[2]
+                    cache = getattr(self, "_erp_latitude_weight_cache", None)
+                    if cache is None:
+                        cache = {}
+                        self._erp_latitude_weight_cache = cache
+                    cache_key = (height, width)
+                    erp_weight = cache.get(cache_key)
+                    if erp_weight is None:
+                        erp_weight = _erp_latitude_weight_map(
+                            height=height,
+                            width=width,
+                            device=self.device,
+                            dtype=rgb_error.dtype,
+                        )
+                        cache[cache_key] = erp_weight
                 l1_loss_type = str(
                     self.conf.loss.get("l1_loss_type", "absolute")
                 )
                 if l1_loss_type == "absolute":
-                    loss_l1 = torch.abs(rgb_error).sum() / loss_denominator
+                    loss_l1 = (
+                        torch.abs(rgb_error) * erp_weight
+                    ).sum() / loss_denominator
                 elif l1_loss_type == "charbonnier":
                     epsilon = float(
                         self.conf.loss.get("charbonnier_epsilon", 0.01)
                     )
                     loss_l1 = (
-                        torch.sqrt(rgb_error.square() + epsilon * epsilon)
-                        - epsilon
+                        (
+                            torch.sqrt(rgb_error.square() + epsilon * epsilon)
+                            - epsilon
+                        )
+                        * erp_weight
                     ).sum() / loss_denominator
                 else:
                     msg = (
