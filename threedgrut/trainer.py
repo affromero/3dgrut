@@ -60,6 +60,7 @@ from threedgrut.utils.misc import (
     check_step_condition,
     create_summary_writer,
     jet_map,
+    seed_everything,
 )
 from threedgrut.utils.render import apply_post_processing
 from threedgrut.utils.source_scan import source_scan_id_from_image_path
@@ -1652,6 +1653,11 @@ class Trainer3DGRUT:
     @torch.cuda.nvtx.range("setup-trainer")
     def __init__(self, conf: DictConfig, device=None):
         """Set up a new training session, or continue an existing one based on configuration"""
+        # Seed the whole run FIRST, before any RNG-consuming setup (dataset
+        # shuffling, model init, densification). seed_initialization is the
+        # single source of truth (base_gs.yaml=42). The returned generator is
+        # threaded into the training dataloader for reproducible shuffling.
+        self.run_generator = seed_everything(conf.seed_initialization)
         # Keep track of useful fields
         self.conf = conf
         """ Global configuration of model, scene, optimization, etc"""
@@ -1722,7 +1728,9 @@ class Trainer3DGRUT:
         )
 
         train_dataloader = MultiEpochsDataLoader(
-            train_dataset, **train_dataloader_kwargs
+            train_dataset,
+            generator=self.run_generator,
+            **train_dataloader_kwargs,
         )
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset, **val_dataloader_kwargs

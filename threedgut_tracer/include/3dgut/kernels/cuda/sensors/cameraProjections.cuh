@@ -272,9 +272,21 @@ static inline __device__ bool projectPoint(const EquirectProjectionParameters& s
     float col = (1.f - phi / kPi) * 0.5f * width - 0.5f;
     float row = (1.f - 2.f * theta / kPi) * 0.5f * height - 0.5f;
     col       = col - width * floorf(col / width); // wrap azimuth into [0, width)
+    // The floorf wrap is exact in real arithmetic but float32 rounding can
+    // round col up to exactly `width` for directions at azimuth ~+-pi (e.g.
+    // the seam ray of pixel column 0). Column `width` is congruent to column
+    // 0 (the seam), so fold it back -- this keeps col strictly inside
+    // [0, width) and is the exact inverse of create_equirect_camera's
+    // pixel-center ray-gen.
+    if (col >= width) {
+        col -= width;
+    }
     row       = fminf(fmaxf(row, 0.f), height - 1.f);
     projected = tcnn::vec2{col, row};
-    return true;
+    // Never report a valid projection for an out-of-range pixel: after the
+    // seam fold and row clamp this always holds, but assert it structurally
+    // so the (col == width) class of bug can never escape this function.
+    return (col >= 0.f) && (col < width) && (row >= 0.f) && (row < height);
 }
 
 static inline __device__ bool projectPoint(const TSensorModel& sensorModel,
