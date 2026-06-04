@@ -6,3 +6,4 @@ sky_mask_folder: null
 train_exclude_image_list_path: null
 train_focus_image_list_path: null
 train_focus_image_weight: 1.0
+holdout_image_list_path: null  # name-based held-out eval (val == these frames)

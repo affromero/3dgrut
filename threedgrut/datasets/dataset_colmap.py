@@ -62,6 +62,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         train_exclude_image_list_path: Optional[str] = None,
         train_focus_image_list_path: Optional[str] = None,
         train_focus_image_weight: float = 1.0,
+        holdout_image_list_path: Optional[str] = None,
     ):
         self.path = path
         self.device = device
@@ -75,6 +76,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.sky_mask_folder = sky_mask_folder
         self.train_exclude_image_list_path = train_exclude_image_list_path
         self.train_focus_image_list_path = train_focus_image_list_path
+        self.holdout_image_list_path = holdout_image_list_path
         self.train_focus_image_weight = float(train_focus_image_weight)
         if self.train_focus_image_weight <= 0.0:
             raise ValueError(
@@ -106,9 +108,21 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         all_indices = np.arange(self.n_frames)
         split_mask = np.ones(self.n_frames, dtype=bool)
 
+        # A name-based holdout list takes precedence over the positional
+        # test_split_interval. The COLMAP reader sorts frames by name, so a
+        # positional (index % interval) split cannot reproduce a designated
+        # train.txt/test.txt holdout; matching by name is order-independent.
+        # val == exactly the held-out frames, train == everything else.
+        holdout_names = self.load_holdout_image_names()
+        if holdout_names:
+            in_holdout = np.array(
+                [extr.name in holdout_names for extr in self.cam_extrinsics],
+                dtype=bool,
+            )
+            split_mask = in_holdout if self.split != "train" else ~in_holdout
         # If test_split_interval is set, every test_split_interval frame will be excluded from the training set
         # If test_split_interval is non-positive, all images will be used for training and testing
-        if self.test_split_interval > 0:
+        elif self.test_split_interval > 0:
             if self.split == "train":
                 split_mask = np.mod(all_indices, self.test_split_interval) != 0
             else:
@@ -151,6 +165,23 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         # Clear existing worker caches to force recreation with new intrinsics
         self._worker_gpu_cache.clear()
+
+    def load_holdout_image_names(self):
+        if not self.holdout_image_list_path:
+            return set()
+        if not os.path.exists(self.holdout_image_list_path):
+            raise FileNotFoundError(
+                f"Holdout image list not found: {self.holdout_image_list_path}"
+            )
+        holdout = set()
+        with open(
+            self.holdout_image_list_path, "r", encoding="utf-8"
+        ) as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    holdout.add(stripped)
+        return holdout
 
     def load_train_exclude_image_names(self):
         if not self.train_exclude_image_list_path:

@@ -104,6 +104,9 @@ def make(name: str, config, ray_jitter):
                 train_focus_image_weight=config.dataset.get(
                     "train_focus_image_weight", 1.0
                 ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -114,6 +117,9 @@ def make(name: str, config, ray_jitter):
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
                 train_exclude_image_list_path=config.dataset.get(
                     "train_exclude_image_list_path", None
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
                 ),
             )
         case "scannetpp":
