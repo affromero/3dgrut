@@ -32,7 +32,7 @@ from threedgrut.utils.logger import logger
 from threedgrut.utils.quantile import bounded_quantile
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 2
 
 # Per-attribute grad-norm summaries (one mean/p95/max each for 6 params).
 _GRAD_PARAMS = (
@@ -54,13 +54,7 @@ def _build_schema() -> pa.Schema:
         pa.field("loss_l1", pa.float32()),
         pa.field("loss_ssim", pa.float32()),
         pa.field("loss_depth", pa.float32()),
-        pa.field("loss_dense_depth_gradient", pa.float32()),
         pa.field("loss_equirect", pa.float32()),
-        pa.field("loss_generated_view_rgb", pa.float32()),
-        pa.field("loss_generated_view_edge", pa.float32()),
-        pa.field("loss_generated_view_high_frequency", pa.float32()),
-        pa.field("generated_view_active", pa.float32()),
-        pa.field("generated_view_weight_mean", pa.float32()),
         # Per-attribute grad summaries
         *[pa.field(f"grad_{a}_mean", pa.float32()) for a in _GRAD_PARAMS],
         *[pa.field(f"grad_{a}_p95", pa.float32()) for a in _GRAD_PARAMS],
@@ -90,13 +84,6 @@ def _scalar_summaries(t: torch.Tensor) -> tuple[float, float, float]:
         float(bounded_quantile(t, 0.95).item()),
         float(t.max().item()),
     )
-
-
-def _loss_value(batch_losses: dict, key: str) -> float:
-    """Return one scalar loss value from the current training batch."""
-    if not batch_losses:
-        return 0.0
-    return float(batch_losses.get(key, 0.0))
 
 
 class DiagnosticsWriter:
@@ -169,38 +156,11 @@ class DiagnosticsWriter:
     ) -> dict:
         """Convenience: collect the schema columns from training state."""
         out: dict[str, float | int] = {
-            "total_loss": _loss_value(batch_losses, "total_loss"),
-            "loss_l1": _loss_value(batch_losses, "l1_loss"),
-            "loss_ssim": _loss_value(batch_losses, "ssim_loss"),
-            "loss_depth": _loss_value(batch_losses, "dense_depth_loss"),
-            "loss_dense_depth_gradient": _loss_value(
-                batch_losses,
-                "dense_depth_gradient_loss",
-            ),
-            "loss_equirect": _loss_value(
-                batch_losses,
-                "equirect_consistency_loss",
-            ),
-            "loss_generated_view_rgb": _loss_value(
-                batch_losses,
-                "generated_view_rgb_loss",
-            ),
-            "loss_generated_view_edge": _loss_value(
-                batch_losses,
-                "generated_view_edge_loss",
-            ),
-            "loss_generated_view_high_frequency": _loss_value(
-                batch_losses,
-                "generated_view_high_frequency_loss",
-            ),
-            "generated_view_active": _loss_value(
-                batch_losses,
-                "generated_view_active",
-            ),
-            "generated_view_weight_mean": _loss_value(
-                batch_losses,
-                "generated_view_effective_weight_mean",
-            ),
+            "total_loss": float(batch_losses.get("total_loss", 0.0)) if batch_losses else 0.0,
+            "loss_l1": float(batch_losses.get("l1_loss", 0.0)) if batch_losses else 0.0,
+            "loss_ssim": float(batch_losses.get("ssim_loss", 0.0)) if batch_losses else 0.0,
+            "loss_depth": float(batch_losses.get("dense_depth_l1_loss", 0.0)) if batch_losses else 0.0,
+            "loss_equirect": float(batch_losses.get("equirect_consistency_l1_loss", 0.0)) if batch_losses else 0.0,
             "n_gaussians": int(n_gaussians),
             "step_total_ms": float(step_total_ms),
         }
@@ -210,19 +170,11 @@ class DiagnosticsWriter:
             out[f"grad_{attr}_p95"] = p95
             out[f"grad_{attr}_max"] = max_v
         bvh_stats = bvh_stats or {}
-        out["bvh_last_build_time_ms"] = float(
-            bvh_stats.get("last_build_time_ms", 0.0)
-        )
+        out["bvh_last_build_time_ms"] = float(bvh_stats.get("last_build_time_ms", 0.0))
         out["bvh_primitive_count"] = int(bvh_stats.get("primitive_count", 0))
-        out["bvh_gas_buffer_bytes"] = int(
-            bvh_stats.get("gas_buffer_bytes", 0)
-        )
-        out["bvh_gas_buffer_tmp_bytes"] = int(
-            bvh_stats.get("gas_buffer_tmp_bytes", 0)
-        )
-        out["bvh_g_prim_aabb_bytes"] = int(
-            bvh_stats.get("g_prim_aabb_bytes", 0)
-        )
+        out["bvh_gas_buffer_bytes"] = int(bvh_stats.get("gas_buffer_bytes", 0))
+        out["bvh_gas_buffer_tmp_bytes"] = int(bvh_stats.get("gas_buffer_tmp_bytes", 0))
+        out["bvh_g_prim_aabb_bytes"] = int(bvh_stats.get("g_prim_aabb_bytes", 0))
         out["bvh_last_build_was_full_rebuild"] = bool(
             bvh_stats.get("last_build_was_full_rebuild", False)
         )
