@@ -57,7 +57,6 @@ class GSStrategy(BaseStrategy):
         self.frequency_error_density_stats = {}
         self.abs_gradient_density_stats = {}
         self.camera_balance_density_stats = {}
-        self.camera_radial_density_stats = {}
         self.structure_density_stats = {}
         self.camera_balance_residual_ema = torch.empty((0,), device=self.model.device)
         self.densify_abs_grad_norm_accum = torch.empty([0, 1])
@@ -625,11 +624,6 @@ class GSStrategy(BaseStrategy):
             batch,
             outputs,
         )
-        camera_radial_weight = self.compute_camera_radial_density_weight(
-            mask,
-            batch,
-            outputs,
-        )
         structure_weight = self.compute_structure_density_weight(mask, batch, outputs)
         total_weight = (
             area_weight
@@ -637,7 +631,6 @@ class GSStrategy(BaseStrategy):
             * gradient_weight
             * edge_error_weight
             * frequency_error_weight
-            * camera_radial_weight
             * structure_weight
             * camera_balance_weight
         )
@@ -661,8 +654,6 @@ class GSStrategy(BaseStrategy):
             "edge_error_weight_max": edge_error_weight.max().item(),
             "frequency_error_weight_mean": frequency_error_weight.mean().item(),
             "frequency_error_weight_max": frequency_error_weight.max().item(),
-            "camera_radial_weight_mean": camera_radial_weight.mean().item(),
-            "camera_radial_weight_max": camera_radial_weight.max().item(),
             "structure_weight_mean": structure_weight.mean().item(),
             "structure_weight_max": structure_weight.max().item(),
             "camera_balance_weight": float(camera_balance_weight),
@@ -671,7 +662,6 @@ class GSStrategy(BaseStrategy):
         }
         self.residual_density_stats.update(self.edge_error_density_stats)
         self.residual_density_stats.update(self.frequency_error_density_stats)
-        self.residual_density_stats.update(self.camera_radial_density_stats)
         self.residual_density_stats.update(self.camera_balance_density_stats)
         self.residual_density_stats.update(self.structure_density_stats)
         if "mog_tiles_count" in outputs:
@@ -1807,124 +1797,6 @@ class GSStrategy(BaseStrategy):
             "camera_balance_ema_max": float(observed.max().item()),
         }
         return float(weight.item())
-
-    @torch.no_grad()
-    def compute_camera_radial_density_weight(
-        self,
-        mask: torch.Tensor,
-        batch,
-        outputs,
-    ) -> torch.Tensor:
-        selected_count = int(mask.sum().item())
-        self.camera_radial_density_stats = {}
-        weights = torch.ones((selected_count,), device=self.model.device)
-        if selected_count == 0:
-            return weights
-        if not self.residual_density_control.get("use_camera_radial_weight", False):
-            return weights
-
-        target_index = int(
-            self.residual_density_control.get("camera_radial_target_index", -1)
-        )
-        camera_index = self.batch_camera_index(batch)
-        other_weight = float(
-            self.residual_density_control.get("camera_radial_other_weight", 0.10)
-        )
-        if target_index >= 0 and camera_index != target_index:
-            weights = torch.full_like(weights, other_weight)
-            self.camera_radial_density_stats = {
-                "camera_radial_camera_idx": float(camera_index),
-                "camera_radial_target_match": 0.0,
-                "camera_radial_valid_fraction": 0.0,
-                "camera_radial_radius_mean": 0.0,
-            }
-            return weights
-        if "mog_projected_position" not in outputs:
-            return weights
-
-        positions = outputs["mog_projected_position"][mask].float()
-        x = positions[:, 0]
-        y = positions[:, 1]
-        if batch.rgb_gt.dim() == 4:
-            height = int(batch.rgb_gt.shape[1])
-            width = int(batch.rgb_gt.shape[2])
-        else:
-            height = int(batch.rgb_gt.shape[0])
-            width = int(batch.rgb_gt.shape[1])
-
-        valid = torch.logical_and(
-            torch.logical_and(x >= 0.0, x < float(width)),
-            torch.logical_and(y >= 0.0, y < float(height)),
-        )
-        if "mog_visibility" in outputs:
-            visible = outputs["mog_visibility"][mask].reshape(-1) > 0
-            valid = torch.logical_and(valid, visible)
-        if batch.mask is not None:
-            frame_mask = batch.mask
-            if frame_mask.dim() == 4:
-                frame_mask = frame_mask[0]
-            frame_mask = frame_mask.squeeze(-1) > 0.5
-            valid_mask_sample = torch.zeros_like(valid)
-            valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
-            if valid_indices.numel() > 0:
-                sample_x = torch.round(x[valid_indices]).long().clamp(
-                    min=0,
-                    max=width - 1,
-                )
-                sample_y = torch.round(y[valid_indices]).long().clamp(
-                    min=0,
-                    max=height - 1,
-                )
-                valid_mask_sample[valid_indices] = frame_mask[sample_y, sample_x]
-            valid = torch.logical_and(valid, valid_mask_sample)
-
-        center_x = (float(width) - 1.0) * 0.5
-        center_y = (float(height) - 1.0) * 0.5
-        max_radius = max((center_x * center_x + center_y * center_y) ** 0.5, 1e-6)
-        radius = torch.sqrt(
-            torch.clamp_min((x - center_x).square() + (y - center_y).square(), 0.0)
-        )
-        radius_fraction = torch.clamp(radius / max_radius, max=1.0)
-
-        center_fraction = float(
-            self.residual_density_control.get("camera_radial_center_fraction", 0.45)
-        )
-        mid_fraction = float(
-            self.residual_density_control.get("camera_radial_mid_fraction", 0.70)
-        )
-        outer_fraction = float(
-            self.residual_density_control.get("camera_radial_outer_fraction", 0.90)
-        )
-        center_weight = float(
-            self.residual_density_control.get("camera_radial_center_weight", 0.20)
-        )
-        mid_weight = float(
-            self.residual_density_control.get("camera_radial_mid_weight", 0.50)
-        )
-        outer_weight = float(
-            self.residual_density_control.get("camera_radial_outer_weight", 1.25)
-        )
-        rim_weight = float(
-            self.residual_density_control.get("camera_radial_rim_weight", 2.0)
-        )
-        invalid_weight = float(
-            self.residual_density_control.get("camera_radial_invalid_weight", 0.05)
-        )
-
-        weights = torch.full_like(weights, rim_weight)
-        weights[radius_fraction < outer_fraction] = outer_weight
-        weights[radius_fraction < mid_fraction] = mid_weight
-        weights[radius_fraction < center_fraction] = center_weight
-        weights[~valid] = invalid_weight
-        self.camera_radial_density_stats = {
-            "camera_radial_camera_idx": float(camera_index),
-            "camera_radial_target_match": 1.0,
-            "camera_radial_valid_fraction": valid.float().mean().item(),
-            "camera_radial_radius_mean": (
-                radius_fraction[valid].mean().item() if valid.any() else 0.0
-            ),
-        }
-        return weights
 
     @torch.no_grad()
     def compute_responsibility_gradient_weight(self, mask: torch.Tensor) -> torch.Tensor:

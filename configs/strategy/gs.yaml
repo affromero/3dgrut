@@ -131,17 +131,6 @@ residual_density_control:
   camera_balance_power: 1.0
   camera_balance_min_weight: 0.75
   camera_balance_max_weight: 2.0
-  use_camera_radial_weight: false
-  camera_radial_target_index: -1
-  camera_radial_other_weight: 0.10
-  camera_radial_center_fraction: 0.45
-  camera_radial_mid_fraction: 0.70
-  camera_radial_outer_fraction: 0.90
-  camera_radial_center_weight: 0.20
-  camera_radial_mid_weight: 0.50
-  camera_radial_outer_weight: 1.25
-  camera_radial_rim_weight: 2.0
-  camera_radial_invalid_weight: 0.05
   log_frequency: 100
 
 # They use the same values for pruning and densification so check the above values
