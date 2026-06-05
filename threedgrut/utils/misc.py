@@ -222,10 +222,11 @@ def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb
             if wandb_run_id
             else {}
         )
+        wandb_group = getattr(conf, "wandb_group", "") or experiment_name
         wandb_run = wandb.init(
             config=OmegaConf.to_container(DictConfig(conf)),
             project=conf.wandb_project,
-            group=experiment_name,
+            group=wandb_group,
             name=run_name,
             **wandb_resume_kwargs,
         )

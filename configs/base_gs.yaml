@@ -18,6 +18,7 @@ val_frequency: 5000
 num_workers: 24
 use_wandb: false
 wandb_project: "3dgrt"
+wandb_group: ""
 wandb_run_id: ""
 wandb_resume: "allow"
 test_last: true
