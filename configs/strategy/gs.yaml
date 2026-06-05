@@ -13,14 +13,6 @@ densify:
   split:
     n_gaussians: 2 # Hardcoded to 2 in 3DGS
 
-footprint_control:
-  enabled: false
-  min_radius_px: 0.75
-  max_radius_px: 8.0
-  subpixel_grad_boost: 3.0
-  oversized_grad_boost: 3.0
-  log_frequency: 100
-
 footprint_scale_control:
   enabled: false
   frequency: 100

@@ -43,14 +43,12 @@ class GSStrategy(BaseStrategy):
         self.clone_grad_threshold = self.conf.strategy.densify.clone_grad_threshold
         self.split_grad_threshold = self.conf.strategy.densify.split_grad_threshold
         self.new_max_density = self.conf.strategy.reset_density.new_max_density
-        self.footprint_control = self.conf.strategy.get("footprint_control", {})
         self.footprint_scale_control = self.conf.strategy.get("footprint_scale_control", {})
         self.residual_density_control = self.conf.strategy.get("residual_density_control", {})
 
         # Accumulation of the norms of the positions gradients
         self.densify_grad_norm_accum = torch.empty([0, 1])
         self.densify_grad_norm_denom = torch.empty([0, 1])
-        self.footprint_stats = {}
         self.footprint_scale_stats = {}
         self.residual_density_stats = {}
         self.edge_error_density_stats = {}
@@ -319,7 +317,6 @@ class GSStrategy(BaseStrategy):
         ):
             self.reset_density()
 
-        self.log_footprint_control(step, writer)
         self.log_footprint_scale_control(step, writer)
         self.log_residual_density_control(step, writer)
         self.log_structure_density_control(step, writer)
@@ -344,13 +341,6 @@ class GSStrategy(BaseStrategy):
         scaled_grad = params_grad[mask] * distance_to_camera / 2
         grad_norm = torch.norm(scaled_grad, dim=-1, keepdim=True)
         density_weight = torch.ones_like(grad_norm)
-
-        if self.footprint_control.get("enabled", False) and batch is not None:
-            density_weight = density_weight * self.compute_footprint_weights(
-                mask,
-                batch,
-                outputs,
-            )
 
         if self.residual_density_control.get("enabled", False) and batch is not None and outputs is not None:
             density_weight = density_weight * self.compute_residual_density_weights(
@@ -382,48 +372,6 @@ class GSStrategy(BaseStrategy):
         if batch.intrinsics is not None:
             return float(torch.as_tensor(batch.intrinsics[:2]).float().mean().item())
         return 1.0
-
-    @torch.no_grad()
-    def compute_footprint_weights(self, mask: torch.Tensor, batch, outputs=None) -> torch.Tensor:
-        selected_positions = self.model.positions[mask]
-        if selected_positions.numel() == 0:
-            return torch.ones((0, 1), device=self.model.device)
-
-        radius_px = self.compute_projected_radius(mask, batch, outputs)
-        in_front = radius_px > 0.0
-
-        min_radius = float(self.footprint_control.get("min_radius_px", 0.75))
-        max_radius = float(self.footprint_control.get("max_radius_px", 8.0))
-        subpixel_boost = float(self.footprint_control.get("subpixel_grad_boost", 3.0))
-        oversized_boost = float(self.footprint_control.get("oversized_grad_boost", 3.0))
-
-        weights = torch.ones_like(radius_px)
-        subpixel = torch.logical_and(in_front, radius_px < min_radius)
-        oversized = torch.logical_and(in_front, radius_px > max_radius)
-        weights[subpixel] = torch.clamp(min_radius / radius_px[subpixel].clamp_min(1e-6), max=subpixel_boost)
-        weights[oversized] = torch.clamp(radius_px[oversized] / max_radius, max=oversized_boost)
-        weights[~in_front] = 1.0
-
-        self.footprint_stats = {
-            "front_fraction": in_front.float().mean().item(),
-            "radius_px_mean": radius_px[in_front].mean().item() if in_front.any() else 0.0,
-            "subpixel_fraction": subpixel.float().mean().item(),
-            "oversized_fraction": oversized.float().mean().item(),
-            "weight_mean": weights.mean().item(),
-            "weight_max": weights.max().item(),
-        }
-        return weights.unsqueeze(1)
-
-    def log_footprint_control(self, step: int, writer) -> None:
-        if not self.footprint_control.get("enabled", False):
-            return
-        if writer is None or not hasattr(writer, "add_scalar"):
-            return
-        log_frequency = int(self.footprint_control.get("log_frequency", 100))
-        if not check_step_condition(step, 0, -1, log_frequency):
-            return
-        for name, value in self.footprint_stats.items():
-            writer.add_scalar(f"diagnostics/footprint_control/{name}", value, step)
 
     def should_apply_footprint_scale_control(self, step: int) -> bool:
         if not self.footprint_scale_control.get("enabled", False):
