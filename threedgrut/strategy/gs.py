@@ -13,14 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import os
 from typing import Optional
 
 import numpy as np
 import torch
-from klogr.path import path_basename, path_exists, path_open
-from pixelcache import HashableImage
 
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.strategy.base import BaseStrategy
@@ -35,7 +32,6 @@ from threedgrut.strategy.sadgs_structure_tensor import (
 )
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import check_step_condition, quaternion_to_so3
-from threedgrut.utils.render import RGB2SH
 
 
 class GSStrategy(BaseStrategy):
@@ -64,7 +60,6 @@ class GSStrategy(BaseStrategy):
         self.abs_gradient_density_stats = {}
         self.camera_balance_density_stats = {}
         self.camera_radial_density_stats = {}
-        self.support_mask_density_stats = {}
         self.structure_density_stats = {}
         self.roma_precision_density_stats: dict = {}
         self.camera_balance_residual_ema = torch.empty((0,), device=self.model.device)
@@ -93,12 +88,6 @@ class GSStrategy(BaseStrategy):
         # Per-image RoMa precision tensors keyed by image stem (e.g. "left_0009").
         # Lazily filled on first read; small (~3 * frame_count entries).
         self._roma_precision_cache: dict = {}
-        self._support_mask_manifest_cache_path = ""
-        self._support_mask_items_by_image_name: (
-            dict[str, tuple[str, float]] | None
-        ) = None
-        self._support_mask_cache: dict[str, torch.Tensor | None] = {}
-        self._prior_anchor_injected = False
 
     def get_strategy_parameters(self) -> dict:
         params = {}
@@ -285,9 +274,6 @@ class GSStrategy(BaseStrategy):
         """Callback function to be executed after the optimizer step."""
         scene_updated = False
 
-        if self.inject_prior_anchor_field_once(step, writer):
-            scene_updated = True
-
         # Densify the Gaussians
 
         if check_step_condition(
@@ -346,384 +332,6 @@ class GSStrategy(BaseStrategy):
         self.log_structure_density_control(step, writer)
 
         return scene_updated
-
-    @torch.no_grad()
-    def inject_prior_anchor_field_once(self, step: int, writer) -> bool:
-        """Inject detached scanner/prior anchors as optimizer-backed splats."""
-        if self._prior_anchor_injected:
-            return False
-        if not self.residual_density_control.get(
-            "use_prior_anchor_field", False
-        ):
-            return False
-
-        inject_iteration = int(
-            self.residual_density_control.get(
-                "prior_anchor_inject_iteration",
-                0,
-            )
-        )
-        if step < inject_iteration:
-            return False
-        if self.model.optimizer is None:
-            raise AssertionError(
-                "Optimizer must be initialized before injecting prior anchors"
-            )
-
-        manifest_path = str(
-            self.residual_density_control.get(
-                "prior_anchor_field_manifest_path",
-                "",
-            )
-        )
-        if not manifest_path:
-            raise ValueError(
-                "strategy.residual_density_control."
-                "prior_anchor_field_manifest_path is required when "
-                "use_prior_anchor_field=true"
-            )
-
-        payload = self.load_prior_anchor_field_manifest(manifest_path)
-        if str(payload.get("coordinate_frame", "")) != "world":
-            raise ValueError(
-                "Prior anchor field must be in world coordinates; got "
-                f"{payload.get('coordinate_frame')}"
-            )
-        if not bool(payload.get("detached", True)):
-            raise ValueError("Prior anchor field must be detached")
-
-        positions_path = self.required_prior_anchor_path(
-            payload,
-            "positions_path",
-        )
-        positions_np = self.load_prior_anchor_npy(positions_path)
-        if positions_np.ndim != 2 or positions_np.shape[1] != 3:
-            raise ValueError(
-                "Prior positions must have shape (N, 3); got "
-                f"{positions_np.shape}"
-            )
-
-        dtype = self.model.positions.dtype
-        device = self.model.device
-        positions = torch.as_tensor(
-            positions_np,
-            dtype=dtype,
-            device=device,
-        )
-
-        confidence_path = payload.get("confidence_path")
-        has_confidence = bool(confidence_path)
-        if has_confidence:
-            confidence_np = self.load_prior_anchor_npy(str(confidence_path))
-            if confidence_np.shape[0] != positions.shape[0]:
-                raise ValueError(
-                    "Prior confidence count must match positions: "
-                    f"{confidence_np.shape[0]} != {positions.shape[0]}"
-                )
-            confidence = torch.as_tensor(
-                confidence_np.reshape(-1),
-                dtype=dtype,
-                device=device,
-            )
-        else:
-            confidence = torch.ones((positions.shape[0],), dtype=dtype, device=device)
-
-        valid = torch.isfinite(positions).all(dim=1)
-        valid = torch.logical_and(valid, torch.isfinite(confidence))
-        min_confidence = float(
-            self.residual_density_control.get(
-                "prior_anchor_min_confidence",
-                0.0,
-            )
-        )
-        valid = torch.logical_and(valid, confidence >= min_confidence)
-        indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
-
-        max_points = int(
-            self.residual_density_control.get(
-                "prior_anchor_max_points",
-                50000,
-            )
-        )
-        if max_points > 0 and indices.numel() > max_points:
-            if has_confidence:
-                selected_confidence = confidence[indices]
-                top = torch.topk(selected_confidence, max_points).indices
-                indices = torch.sort(indices[top]).values
-            else:
-                linear = torch.linspace(
-                    0,
-                    indices.numel() - 1,
-                    max_points,
-                    device=device,
-                ).long()
-                indices = indices[linear]
-
-        if indices.numel() == 0:
-            self._prior_anchor_injected = True
-            self.residual_density_stats.update(
-                {
-                    "prior_anchor_injected_count": 0.0,
-                    "prior_anchor_candidate_count": 0.0,
-                    "prior_anchor_valid_count": 0.0,
-                }
-            )
-            return False
-
-        positions = positions[indices]
-        confidence = confidence[indices]
-        colors = self.load_prior_anchor_colors(payload, indices)
-        self.append_prior_anchor_parameters(positions, colors)
-
-        self._prior_anchor_injected = True
-        self.reset_densification_buffers()
-        stats = {
-            "prior_anchor_injected_count": float(indices.numel()),
-            "prior_anchor_candidate_count": float(positions_np.shape[0]),
-            "prior_anchor_valid_count": float(valid.sum().item()),
-            "prior_anchor_confidence_mean": confidence.mean().item(),
-            "prior_anchor_confidence_min": confidence.min().item(),
-            "prior_anchor_confidence_max": confidence.max().item(),
-        }
-        self.residual_density_stats.update(stats)
-        if writer is not None and hasattr(writer, "add_scalar"):
-            for name, value in stats.items():
-                writer.add_scalar(
-                    f"diagnostics/residual_density_control/{name}",
-                    value,
-                    step,
-                )
-        logger.info(
-            "Injected "
-            f"{indices.numel():,} prior-anchor Gaussians from {manifest_path}"
-        )
-        return True
-
-    def load_prior_anchor_field_manifest(self, manifest_path: str) -> dict:
-        """Load one detached prior-anchor manifest."""
-        if not path_exists(manifest_path):
-            raise FileNotFoundError(
-                f"Prior anchor field manifest not found: {manifest_path}"
-            )
-        with path_open(manifest_path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if not isinstance(payload, dict):
-            raise ValueError(
-                f"Prior anchor field manifest must be a JSON object: {manifest_path}"
-            )
-        return payload
-
-    def required_prior_anchor_path(self, payload: dict, key: str) -> str:
-        """Return a required sidecar path from a prior-anchor manifest."""
-        path = payload.get(key)
-        if not path:
-            raise ValueError(f"Prior anchor field missing required key: {key}")
-        return str(path)
-
-    def load_prior_anchor_npy(self, path: str) -> np.ndarray:
-        """Load one numpy sidecar from a prior-anchor field."""
-        if not path_exists(path):
-            raise FileNotFoundError(f"Prior anchor sidecar not found: {path}")
-        with path_open(path, "rb") as handle:
-            return np.load(handle)
-
-    def load_prior_anchor_colors(
-        self,
-        payload: dict,
-        indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Load selected prior RGB colors as SH albedo coefficients."""
-        color_path = payload.get("colors_path")
-        if not color_path:
-            return torch.zeros(
-                (indices.numel(), self.model.features_albedo.shape[1]),
-                dtype=self.model.features_albedo.dtype,
-                device=self.model.device,
-            )
-
-        colors_np = self.load_prior_anchor_npy(str(color_path))
-        if colors_np.ndim != 2 or colors_np.shape[1] != 3:
-            raise ValueError(
-                "Prior colors must have shape (N, 3); got "
-                f"{colors_np.shape}"
-            )
-        if colors_np.shape[0] <= int(indices.max().item()):
-            raise ValueError(
-                "Prior colors count must cover selected anchors: "
-                f"{colors_np.shape[0]} <= {int(indices.max().item())}"
-            )
-        colors = torch.as_tensor(
-            colors_np,
-            dtype=torch.float32,
-            device=self.model.device,
-        )[indices]
-        if colors.max() > 1.0:
-            colors = colors / 255.0
-        colors = torch.clamp(colors, min=0.0, max=1.0)
-        albedo = RGB2SH(colors).to(
-            dtype=self.model.features_albedo.dtype,
-            device=self.model.device,
-        )
-        expected_width = self.model.features_albedo.shape[1]
-        if albedo.shape[1] == expected_width:
-            return albedo
-        if albedo.shape[1] > expected_width:
-            return albedo[:, :expected_width]
-        padded = torch.zeros(
-            (albedo.shape[0], expected_width),
-            dtype=albedo.dtype,
-            device=albedo.device,
-        )
-        padded[:, : albedo.shape[1]] = albedo
-        return padded
-
-    @torch.no_grad()
-    def append_prior_anchor_parameters(
-        self,
-        positions: torch.Tensor,
-        colors: torch.Tensor,
-    ) -> None:
-        """Append prior anchors to Gaussian parameters and optimizer state."""
-        anchor_count = positions.shape[0]
-        rotations = torch.zeros(
-            (anchor_count, self.model.rotation.shape[1]),
-            dtype=self.model.rotation.dtype,
-            device=self.model.device,
-        )
-        rotations[:, 0] = 1.0
-        scales = self.prior_anchor_scale_tensor(anchor_count)
-        density = self.prior_anchor_density_tensor(anchor_count)
-        specular = torch.zeros(
-            (anchor_count, self.model.features_specular.shape[1]),
-            dtype=self.model.features_specular.dtype,
-            device=self.model.device,
-        )
-        new_params = {
-            "positions": positions.to(self.model.positions.dtype),
-            "rotation": rotations,
-            "scale": scales,
-            "density": density,
-            "features_albedo": colors.to(self.model.features_albedo.dtype),
-            "features_specular": specular,
-        }
-
-        def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
-            appended = new_params[name].to(dtype=param.dtype, device=param.device)
-            new_value = torch.cat([param, appended], dim=0)
-            return torch.nn.Parameter(
-                new_value,
-                requires_grad=param.requires_grad,
-            )
-
-        def update_optimizer_fn(key: str, value: torch.Tensor) -> torch.Tensor:
-            appended = torch.zeros(
-                (anchor_count, *value.shape[1:]),
-                dtype=value.dtype,
-                device=value.device,
-            )
-            return torch.cat([value, appended], dim=0)
-
-        self._update_param_with_optimizer(
-            update_param_fn,
-            update_optimizer_fn,
-            names=list(new_params),
-        )
-        self.append_prior_anchor_view_delta("view_albedo_delta_logits")
-        self.append_prior_anchor_view_delta("view_density_delta_logits")
-        self.model.position_anchor = torch.cat(
-            [self.model.position_anchor, positions.detach()],
-            dim=0,
-        )
-        neutral_normals = torch.zeros(
-            (anchor_count, 3),
-            dtype=self.model.tangent_plane_normal_anchor.dtype,
-            device=self.model.device,
-        )
-        neutral_normals[:, 2] = 1.0
-        self.model.tangent_plane_normal_anchor = torch.cat(
-            [self.model.tangent_plane_normal_anchor, neutral_normals],
-            dim=0,
-        )
-        self.model.validate_fields()
-
-    def prior_anchor_scale_tensor(self, anchor_count: int) -> torch.Tensor:
-        """Return inverse-activated scale parameters for prior anchors."""
-        scale_m = float(
-            self.residual_density_control.get("prior_anchor_scale_m", 0.003)
-        )
-        scale = torch.full(
-            (anchor_count, 3),
-            scale_m,
-            dtype=self.model.scale.dtype,
-            device=self.model.device,
-        )
-        return self.model.scale_activation_inv(scale)
-
-    def prior_anchor_density_tensor(self, anchor_count: int) -> torch.Tensor:
-        """Return inverse-activated density parameters for prior anchors."""
-        model_config = getattr(self.conf, "model", None)
-        default_density = (
-            float(getattr(model_config, "default_density", 1.0))
-            if model_config is not None
-            else 1.0
-        )
-        multiplier = float(
-            self.residual_density_control.get(
-                "prior_anchor_density_multiplier",
-                1.0,
-            )
-        )
-        density = torch.full(
-            (anchor_count, 1),
-            default_density * multiplier,
-            dtype=self.model.density.dtype,
-            device=self.model.device,
-        )
-        return self.model.density_activation_inv(density)
-
-    @torch.no_grad()
-    def append_prior_anchor_view_delta(self, name: str) -> None:
-        """Append zero view-conditioned deltas when those params are active."""
-        parameter = getattr(self.model, name, None)
-        if parameter is None or parameter.numel() == 0:
-            return
-        anchor_count = self.model.positions.shape[0] - parameter.shape[1]
-        if anchor_count <= 0:
-            return
-        appended = torch.zeros(
-            (parameter.shape[0], anchor_count, parameter.shape[2]),
-            dtype=parameter.dtype,
-            device=parameter.device,
-        )
-        new_parameter = torch.nn.Parameter(
-            torch.cat([parameter, appended], dim=1),
-            requires_grad=parameter.requires_grad,
-        )
-
-        if self.model.optimizer is not None:
-            for group in self.model.optimizer.param_groups:
-                if group.get("name") != name:
-                    continue
-                old_parameter = group["params"][0]
-                state = self.model.optimizer.state.pop(old_parameter, {})
-                for key, value in list(state.items()):
-                    if key == "step" or not torch.is_tensor(value):
-                        continue
-                    state[key] = torch.cat(
-                        [
-                            value,
-                            torch.zeros(
-                                (value.shape[0], anchor_count, value.shape[2]),
-                                dtype=value.dtype,
-                                device=value.device,
-                            ),
-                        ],
-                        dim=1,
-                    )
-                group["params"] = [new_parameter]
-                self.model.optimizer.state[new_parameter] = state
-                break
-        setattr(self.model, name, new_parameter)
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("update-gradient-buffer")
@@ -1029,11 +637,6 @@ class GSStrategy(BaseStrategy):
             outputs,
         )
         roma_precision_weight = self.compute_roma_precision_weight(mask, batch, outputs)
-        support_mask_weight = self.compute_support_mask_weight(
-            mask,
-            batch,
-            outputs,
-        )
         structure_weight = self.compute_structure_density_weight(mask, batch, outputs)
         total_weight = (
             area_weight
@@ -1043,7 +646,6 @@ class GSStrategy(BaseStrategy):
             * frequency_error_weight
             * camera_radial_weight
             * roma_precision_weight
-            * support_mask_weight
             * structure_weight
             * camera_balance_weight
         )
@@ -1071,8 +673,6 @@ class GSStrategy(BaseStrategy):
             "camera_radial_weight_max": camera_radial_weight.max().item(),
             "roma_precision_weight_mean": roma_precision_weight.mean().item(),
             "roma_precision_weight_max": roma_precision_weight.max().item(),
-            "support_mask_weight_mean": support_mask_weight.mean().item(),
-            "support_mask_weight_max": support_mask_weight.max().item(),
             "structure_weight_mean": structure_weight.mean().item(),
             "structure_weight_max": structure_weight.max().item(),
             "camera_balance_weight": float(camera_balance_weight),
@@ -1083,7 +683,6 @@ class GSStrategy(BaseStrategy):
         self.residual_density_stats.update(self.frequency_error_density_stats)
         self.residual_density_stats.update(self.camera_radial_density_stats)
         self.residual_density_stats.update(self.roma_precision_density_stats)
-        self.residual_density_stats.update(self.support_mask_density_stats)
         self.residual_density_stats.update(self.camera_balance_density_stats)
         self.residual_density_stats.update(self.structure_density_stats)
         if "mog_tiles_count" in outputs:
@@ -1095,230 +694,6 @@ class GSStrategy(BaseStrategy):
                 }
             )
         return total_weight.unsqueeze(1)
-
-    def support_mask_items_by_image_name(self) -> dict[str, tuple[str, float]]:
-        """Return support mask paths and item weights keyed by image name."""
-        manifest_path = str(
-            self.residual_density_control.get("support_mask_manifest_path", "")
-        )
-        if not manifest_path:
-            return {}
-        if (
-            self._support_mask_items_by_image_name is not None
-            and self._support_mask_manifest_cache_path == manifest_path
-        ):
-            return self._support_mask_items_by_image_name
-        if not path_exists(manifest_path):
-            raise FileNotFoundError(
-                "strategy.residual_density_control.support_mask_manifest_path "
-                f"not found: {manifest_path}"
-            )
-        with path_open(manifest_path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-        items_by_name: dict[str, tuple[str, float]] = {}
-        for item in payload.get("items", []):
-            if not isinstance(item, dict):
-                continue
-            source_name = str(item.get("source_image_name", ""))
-            confidence_path = item.get("confidence_path")
-            if not source_name or not confidence_path:
-                continue
-            mask_path = str(confidence_path)
-            raw_item_weight = item.get("geometry_weight", 1.0)
-            item_weight = float(
-                raw_item_weight
-                if raw_item_weight is not None
-                else 1.0
-            )
-            items_by_name[source_name] = (mask_path, item_weight)
-            items_by_name[path_basename(source_name)] = (
-                mask_path,
-                item_weight,
-            )
-        self._support_mask_manifest_cache_path = manifest_path
-        self._support_mask_items_by_image_name = items_by_name
-        self._support_mask_cache = {}
-        return items_by_name
-
-    def load_support_mask_for_image(
-        self,
-        image_path: str,
-    ) -> tuple[torch.Tensor | None, float]:
-        """Load the support mask and item weight for one image."""
-        items_by_name = self.support_mask_items_by_image_name()
-        item = items_by_name.get(path_basename(image_path))
-        if item is None:
-            return None, 1.0
-        mask_path, item_weight = item
-        if mask_path in self._support_mask_cache:
-            return self._support_mask_cache[mask_path], item_weight
-        if not path_exists(mask_path):
-            raise FileNotFoundError(
-                "Support mask not found: "
-                f"{mask_path} for image {image_path}"
-            )
-        image = HashableImage(mask_path).to_gray()
-        array = np.asarray(image.numpy(), dtype=np.float32)
-        if array.ndim == 3:
-            array = array[..., 0]
-        if array.max(initial=0.0) > 1.0:
-            array = array / np.float32(255.0)
-        tensor = torch.from_numpy(array).to(
-            device=self.model.device,
-            dtype=torch.float32,
-        )
-        self._support_mask_cache[mask_path] = tensor
-        return tensor, item_weight
-
-    def support_mask_item_factor(self, item_weight: float) -> float:
-        """Return optional per-item density-allocation multiplier."""
-        if not self.residual_density_control.get(
-            "use_support_mask_item_weight",
-            False,
-        ):
-            return 1.0
-        reference = float(
-            self.residual_density_control.get(
-                "support_mask_item_weight_reference",
-                1.0,
-            )
-        )
-        power = float(
-            self.residual_density_control.get(
-                "support_mask_item_weight_power",
-                1.0,
-            )
-        )
-        factor = (item_weight / max(reference, 1e-6)) ** power
-        return min(
-            max(
-                factor,
-                float(
-                    self.residual_density_control.get(
-                        "support_mask_item_weight_min_weight",
-                        0.25,
-                    )
-                ),
-            ),
-            float(
-                self.residual_density_control.get(
-                    "support_mask_item_weight_max_weight",
-                    3.0,
-                )
-            ),
-        )
-
-    @torch.no_grad()
-    def compute_support_mask_weight(
-        self,
-        mask: torch.Tensor,
-        batch,
-        outputs,
-    ) -> torch.Tensor:
-        """Return per-Gaussian weights sampled from support confidence masks."""
-        selected_count = int(mask.sum().item())
-        self.support_mask_density_stats = {}
-        weights = torch.ones((selected_count,), device=self.model.device)
-        if selected_count == 0:
-            return weights
-        if not self.residual_density_control.get("use_support_mask_weight", False):
-            return weights
-        if "mog_projected_position" not in outputs:
-            return weights
-
-        support_mask, item_weight = self.load_support_mask_for_image(
-            getattr(batch, "image_path", "")
-        )
-        if support_mask is None:
-            self.support_mask_density_stats = {
-                "support_mask_present": 0.0,
-                "support_mask_valid_fraction": 0.0,
-                "support_mask_mean": 0.0,
-                "support_mask_p95": 0.0,
-            }
-            return weights
-        item_factor = self.support_mask_item_factor(item_weight)
-
-        positions = outputs["mog_projected_position"][mask].float()
-        x = torch.round(positions[:, 0]).long()
-        y = torch.round(positions[:, 1]).long()
-        height, width = support_mask.shape
-        valid = torch.logical_and(
-            torch.logical_and(x >= 0, x < width),
-            torch.logical_and(y >= 0, y < height),
-        )
-        if "mog_visibility" in outputs:
-            visible = outputs["mog_visibility"][mask].reshape(-1) > 0
-            valid = torch.logical_and(valid, visible)
-        if batch.mask is not None:
-            frame_mask = batch.mask
-            if frame_mask.dim() == 4:
-                frame_mask = frame_mask[0]
-            frame_mask = frame_mask.to(device=self.model.device)
-            frame_mask = frame_mask.squeeze(-1) > 0.5
-            valid_mask_sample = torch.zeros_like(valid)
-            valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
-            if valid_indices.numel() > 0:
-                valid_mask_sample[valid_indices] = frame_mask[
-                    y[valid_indices],
-                    x[valid_indices],
-                ]
-            valid = torch.logical_and(valid, valid_mask_sample)
-
-        sampled_support = torch.zeros_like(weights)
-        valid_indices = torch.nonzero(valid, as_tuple=False).squeeze(1)
-        if valid_indices.numel() > 0:
-            sampled_support[valid_indices] = support_mask[
-                y[valid_indices],
-                x[valid_indices],
-            ].to(weights.dtype)
-
-        reference = float(
-            self.residual_density_control.get("support_mask_reference", 0.5)
-        )
-        power = float(
-            self.residual_density_control.get("support_mask_power", 1.0)
-        )
-        weighted_support = sampled_support * item_factor
-        weights = torch.pow(weighted_support / max(reference, 1e-6), power)
-        weights = torch.clamp(
-            weights,
-            min=float(
-                self.residual_density_control.get(
-                    "support_mask_min_weight",
-                    0.05,
-                )
-            ),
-            max=float(
-                self.residual_density_control.get(
-                    "support_mask_max_weight",
-                    5.0,
-                )
-            ),
-        )
-        invalid_weight = float(
-            self.residual_density_control.get(
-                "support_mask_invalid_weight",
-                0.05,
-            )
-        )
-        weights = torch.where(valid, weights, torch.full_like(weights, invalid_weight))
-        valid_support = sampled_support[valid]
-        self.support_mask_density_stats = {
-            "support_mask_present": 1.0,
-            "support_mask_valid_fraction": valid.float().mean().item(),
-            "support_mask_mean": valid_support.mean().item()
-            if valid_support.numel() > 0
-            else 0.0,
-            "support_mask_p95": torch.quantile(valid_support, 0.95).item()
-            if valid_support.numel() > 0
-            else 0.0,
-            "support_mask_weight_mean": weights.mean().item(),
-            "support_mask_weight_max": weights.max().item(),
-            "support_mask_item_weight": float(item_weight),
-            "support_mask_item_factor": float(item_factor),
-        }
-        return weights
 
     @torch.no_grad()
     def compute_structure_density_weight(self, mask: torch.Tensor, batch, outputs) -> torch.Tensor:
@@ -1660,7 +1035,6 @@ class GSStrategy(BaseStrategy):
         eta_pr = eta_3ch_projection(projected_axes, sampled_st)
 
         eta_wl_max = eta_wl.max(dim=1).values
-        eta_pr_max = eta_pr.max(dim=1).values
 
         if valid.any():
             self.structure_density_stats.update(
