@@ -219,7 +219,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return self.n_active_features
 
     def get_features_albedo(self) -> torch.Tensor:
-        return self.features_albedo + self._get_view_albedo_delta()
+        return self.features_albedo
 
     def get_features_specular(self) -> torch.Tensor:
         return self.features_specular
@@ -242,11 +242,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             return self.rotation_activation(self.rotation)
 
     def get_density(self, preactivation=False):
-        density = self.density + self._get_view_density_delta()
         if preactivation:
-            return density
+            return self.density
         else:
-            return self.density_activation(density)
+            return self.density_activation(self.density)
 
     def get_covariance(self) -> torch.Tensor:
         scales = self.get_scale()
@@ -294,15 +293,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         if self.feature_type == "sh":
             model_params["features_albedo"] = self.features_albedo
             model_params["features_specular"] = self.features_specular
-        if self._view_conditioned_albedo_enabled():
-            model_params["view_albedo_delta_logits"] = (
-                self.view_albedo_delta_logits
-            )
-        if self._view_conditioned_density_enabled():
-            model_params["view_density_delta_logits"] = (
-                self.view_density_delta_logits
-            )
-
         return model_params
 
     def __init__(self, conf, scene_extent=None):
@@ -336,17 +326,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.features_specular = torch.nn.Parameter(
             torch.empty([0, specular_dim])
         )  # Features of the higher order SH coefficients [n_gaussians, specular_dim]
-        self.view_albedo_delta_logits = torch.nn.Parameter(
-            torch.empty([0, 0, 3]), requires_grad=False
-        )
-        self.view_density_delta_logits = torch.nn.Parameter(
-            torch.empty([0, 0, 1]), requires_grad=False
-        )
         self.max_sh_degree = sh_degree
 
         self.conf = conf
         self.scene_extent = scene_extent
-        self._active_batch = None
         self.positions_gradient_norm = None
         # Per-attribute per-gaussian gradient L2 norms, populated each
         # training step by Trainer3DGRUT._compute_per_gaussian_grad_norms.
@@ -404,211 +387,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self._gaussians_frozen = False
         self._resume_lr_scale = 1.0
 
-    def _view_conditioned_albedo_enabled(self) -> bool:
-        if "conf" not in self.__dict__:
-            return False
-        model_conf = self.conf.get("model", {})
-        view_conf = model_conf.get("view_conditioned_albedo", {})
-        return bool(view_conf.get("enabled", False))
-
-    def _view_conditioned_density_enabled(self) -> bool:
-        if "conf" not in self.__dict__:
-            return False
-        model_conf = self.conf.get("model", {})
-        view_conf = model_conf.get("view_conditioned_density", {})
-        return bool(view_conf.get("enabled", False))
-
-    def _make_optional_parameter(
-        self, value: torch.Tensor, *, requires_grad: bool
-    ) -> torch.nn.Parameter:
-        return torch.nn.Parameter(value, requires_grad=requires_grad)
-
-    def _store_view_albedo_delta(
-        self, parameter: torch.nn.Parameter
-    ) -> None:
-        if "_parameters" in self.__dict__:
-            self.view_albedo_delta_logits = parameter
-            return
-        self.__dict__["view_albedo_delta_logits"] = parameter
-
-    def _store_view_density_delta(
-        self, parameter: torch.nn.Parameter
-    ) -> None:
-        if "_parameters" in self.__dict__:
-            self.view_density_delta_logits = parameter
-            return
-        self.__dict__["view_density_delta_logits"] = parameter
-
-    def _empty_view_albedo_delta_parameter(self) -> torch.nn.Parameter:
-        return self._make_optional_parameter(
-            torch.empty(
-                (0, 0, 3),
-                dtype=self.features_albedo.dtype,
-                device=self.features_albedo.device,
-            ),
-            requires_grad=False,
-        )
-
-    def _empty_view_density_delta_parameter(self) -> torch.nn.Parameter:
-        return self._make_optional_parameter(
-            torch.empty(
-                (0, 0, 1),
-                dtype=self.density.dtype,
-                device=self.density.device,
-            ),
-            requires_grad=False,
-        )
-
-    def _view_albedo_delta_parameter(
-        self, value: torch.Tensor, *, requires_grad: bool
-    ) -> torch.nn.Parameter:
-        parameter = self._make_optional_parameter(
-            value,
-            requires_grad=requires_grad,
-        )
-        self._store_view_albedo_delta(parameter)
-        return parameter
-
-    def _view_density_delta_parameter(
-        self, value: torch.Tensor, *, requires_grad: bool
-    ) -> torch.nn.Parameter:
-        parameter = torch.nn.Parameter(value, requires_grad=requires_grad)
-        self._store_view_density_delta(parameter)
-        return parameter
-
-    def _ensure_view_albedo_delta(self) -> None:
-        if not self._view_conditioned_albedo_enabled():
-            self._store_view_albedo_delta(
-                self._empty_view_albedo_delta_parameter()
-            )
-            return
-        num_cameras = int(
-            self.conf.model.view_conditioned_albedo.get("num_cameras", 3)
-        )
-        expected_shape = (num_cameras, self.num_gaussians, 3)
-        current = self.__dict__.get("view_albedo_delta_logits")
-        if current is not None and tuple(current.shape) == expected_shape:
-            self.view_albedo_delta_logits.requires_grad = True
-            return
-        init_std = float(
-            self.conf.model.view_conditioned_albedo.get("init_std", 0.0)
-        )
-        values = torch.zeros(
-            expected_shape,
-            dtype=self.features_albedo.dtype,
-            device=self.features_albedo.device,
-        )
-        if init_std > 0.0:
-            values = values + torch.randn_like(values) * init_std
-        self._view_albedo_delta_parameter(
-            values,
-            requires_grad=True,
-        )
-
-    def _ensure_view_density_delta(self) -> None:
-        if not self._view_conditioned_density_enabled():
-            self._store_view_density_delta(
-                self._empty_view_density_delta_parameter()
-            )
-            return
-        num_cameras = int(
-            self.conf.model.view_conditioned_density.get("num_cameras", 3)
-        )
-        expected_shape = (num_cameras, self.num_gaussians, 1)
-        current = self.__dict__.get("view_density_delta_logits")
-        if current is not None and tuple(current.shape) == expected_shape:
-            self.view_density_delta_logits.requires_grad = True
-            return
-        init_std = float(
-            self.conf.model.view_conditioned_density.get("init_std", 0.0)
-        )
-        values = torch.zeros(
-            expected_shape,
-            dtype=self.density.dtype,
-            device=self.density.device,
-        )
-        if init_std > 0.0:
-            values = values + torch.randn_like(values) * init_std
-        self._view_density_delta_parameter(
-            values,
-            requires_grad=True,
-        )
-
-    def _current_camera_idx(self) -> int | None:
-        batch = self._active_batch
-        if batch is None:
-            return None
-        if "camera_idx" not in batch.__dict__:
-            return None
-        camera_idx = batch.camera_idx
-        if isinstance(camera_idx, torch.Tensor):
-            if camera_idx.numel() != 1:
-                return None
-            camera_idx = int(camera_idx.detach().item())
-        else:
-            camera_idx = int(camera_idx)
-        if camera_idx < 0:
-            return None
-        if camera_idx >= self.view_albedo_delta_logits.shape[0]:
-            return None
-        return camera_idx
-
-    def _get_view_albedo_delta(self) -> torch.Tensor:
-        if not self._view_conditioned_albedo_enabled():
-            return torch.zeros_like(self.features_albedo)
-        if self.view_albedo_delta_logits.numel() == 0:
-            return torch.zeros_like(self.features_albedo)
-        camera_idx = self._current_camera_idx()
-        if camera_idx is None:
-            return torch.zeros_like(self.features_albedo)
-        max_delta = float(
-            self.conf.model.view_conditioned_albedo.get("max_delta", 0.25)
-        )
-        return (
-            torch.tanh(self.view_albedo_delta_logits[camera_idx]) * max_delta
-        )
-
-    def _get_view_density_delta(self) -> torch.Tensor:
-        if not self._view_conditioned_density_enabled():
-            return torch.zeros_like(self.density)
-        if self.view_density_delta_logits.numel() == 0:
-            return torch.zeros_like(self.density)
-        camera_idx = self._current_camera_idx()
-        if camera_idx is None:
-            return torch.zeros_like(self.density)
-        max_delta = float(
-            self.conf.model.view_conditioned_density.get("max_delta", 0.75)
-        )
-        return (
-            torch.tanh(self.view_density_delta_logits[camera_idx]) * max_delta
-        )
-
-    def get_view_albedo_delta_regularization_loss(self) -> torch.Tensor:
-        if not self._view_conditioned_albedo_enabled():
-            return torch.zeros(
-                1, dtype=self.features_albedo.dtype, device=self.device
-            )
-        if self.view_albedo_delta_logits.numel() == 0:
-            return torch.zeros(
-                1, dtype=self.features_albedo.dtype, device=self.device
-            )
-        max_delta = float(
-            self.conf.model.view_conditioned_albedo.get("max_delta", 0.25)
-        )
-        delta = torch.tanh(self.view_albedo_delta_logits) * max_delta
-        return delta.square().mean()
-
-    def get_view_density_delta_regularization_loss(self) -> torch.Tensor:
-        if not self._view_conditioned_density_enabled():
-            return torch.zeros(1, dtype=self.density.dtype, device=self.device)
-        if self.view_density_delta_logits.numel() == 0:
-            return torch.zeros(1, dtype=self.density.dtype, device=self.device)
-        max_delta = float(
-            self.conf.model.view_conditioned_density.get("max_delta", 0.75)
-        )
-        delta = torch.tanh(self.view_density_delta_logits) * max_delta
-        return delta.square().mean()
-
     @torch.no_grad()
     def build_acc(self, rebuild=True):
         self.renderer.build_acc(self, rebuild)
@@ -628,8 +406,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density.requires_grad = False
         self.features_albedo.requires_grad = False
         self.features_specular.requires_grad = False
-        self.view_albedo_delta_logits.requires_grad = False
-        self.view_density_delta_logits.requires_grad = False
 
         self._gaussians_frozen = True
         logger.info("❄️ [Distillation] Gaussian parameters frozen")
@@ -640,24 +416,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         assert self.density.shape == (num_gaussians, 1)
         assert self.rotation.shape == (num_gaussians, 4)
         assert self.scale.shape == (num_gaussians, 3)
-        if self._view_conditioned_albedo_enabled():
-            expected_num_cameras = int(
-                self.conf.model.view_conditioned_albedo.get("num_cameras", 3)
-            )
-            assert self.view_albedo_delta_logits.shape == (
-                expected_num_cameras,
-                num_gaussians,
-                3,
-            )
-        if self._view_conditioned_density_enabled():
-            expected_num_cameras = int(
-                self.conf.model.view_conditioned_density.get("num_cameras", 3)
-            )
-            assert self.view_density_delta_logits.shape == (
-                expected_num_cameras,
-                num_gaussians,
-                1,
-            )
 
         if self.feature_type == "sh":
             assert self.features_albedo.shape == (num_gaussians, 3)
@@ -927,9 +685,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
         self.features_specular = torch.nn.Parameter(feats_sph)
-        self._ensure_view_albedo_delta()
-        self._ensure_view_density_delta()
-
         if set_optimizable_parameters:
             self.set_optimizable_parameters()
         self.validate_fields()
@@ -1000,9 +755,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.features_specular = torch.nn.Parameter(
             features_specular.to(dtype=dtype, device=self.device)
         )
-        self._ensure_view_albedo_delta()
-        self._ensure_view_density_delta()
-
         if set_optimizable_parameters:
             self.set_optimizable_parameters()
         self.validate_fields()
@@ -1016,32 +768,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.features_specular = checkpoint["features_specular"]
         if "rotation_activation" not in self.__dict__:
             self.rotation_activation = get_activation_function("normalize")
-        self._ensure_view_albedo_delta()
-        self._ensure_view_density_delta()
-        checkpoint_view_delta = checkpoint.get("view_albedo_delta_logits")
-        if (
-            checkpoint_view_delta is not None
-            and checkpoint_view_delta.shape
-            == self.view_albedo_delta_logits.shape
-        ):
-            self.view_albedo_delta_logits = torch.nn.Parameter(
-                checkpoint_view_delta.to(
-                    dtype=self.features_albedo.dtype,
-                    device=self.device,
-                )
-            )
-        checkpoint_density_delta = checkpoint.get("view_density_delta_logits")
-        if (
-            checkpoint_density_delta is not None
-            and checkpoint_density_delta.shape
-            == self.view_density_delta_logits.shape
-        ):
-            self.view_density_delta_logits = torch.nn.Parameter(
-                checkpoint_density_delta.to(
-                    dtype=self.density.dtype,
-                    device=self.device,
-                )
-            )
         self.n_active_features = checkpoint["n_active_features"]
         self.max_n_features = checkpoint["max_n_features"]
         self.scene_extent = checkpoint["scene_extent"]
@@ -1339,9 +1065,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.features_specular = torch.nn.Parameter(
             features_specular.to(dtype=dtype, device=self.device)
         )
-        self._ensure_view_albedo_delta()
-        self._ensure_view_density_delta()
-
         self.set_optimizable_parameters()
         self.setup_optimizer()
         self.validate_fields()
@@ -1471,15 +1194,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.scale.requires_grad = False
         if not self.conf.model.optimize_position:
             self.positions.requires_grad = False
-        if self._view_conditioned_albedo_enabled():
-            self.view_albedo_delta_logits.requires_grad = True
-        else:
-            self.view_albedo_delta_logits.requires_grad = False
-        if self._view_conditioned_density_enabled():
-            self.view_density_delta_logits.requires_grad = True
-        else:
-            self.view_density_delta_logits.requires_grad = False
-
     def update_optimizable_parameters(
         self, optimizable_tensors: dict[str, torch.Tensor]
     ):
@@ -1529,12 +1243,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         Returns:
             A dictionary containing the output of the model
         """
-        previous_batch = self._active_batch
-        self._active_batch = batch
-        try:
-            return self.renderer.render(self, batch, train, frame_id)
-        finally:
-            self._active_batch = previous_batch
+        return self.renderer.render(self, batch, train, frame_id)
 
     def trace(self, rays_o, rays_d, T_to_world=None):
         """Traces the model with the given rays. This method is a convenience method for ray-traced inference mode.
@@ -1694,9 +1403,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 mogt_rotation, dtype=self.rotation.dtype, device=self.device
             )
         )
-        self._ensure_view_albedo_delta()
-        self._ensure_view_density_delta()
-
         self.n_active_features = self.max_n_features
 
         if init_model:

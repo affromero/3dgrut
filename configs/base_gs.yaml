@@ -151,16 +151,6 @@ model:
   optimize_rotation: true
   optimize_scale: true
   bvh_update_frequency: 1
-  view_conditioned_albedo:
-    enabled: false
-    num_cameras: 3
-    max_delta: 0.25
-    init_std: 0.0
-  view_conditioned_density:
-    enabled: false
-    num_cameras: 3
-    max_delta: 0.75
-    init_std: 0.0
   progressive_training:
     feature_type: "sh" # one of [sh, mlp], currently only sh supported
     init_n_features: 0 # sh: initial sh deg | mlp: num of dims initially unmasked
@@ -194,10 +184,6 @@ optimizer:
       lr: 0.0025 # 3DGS value: 0.0025
     features_specular:
       lr: ${div:${optimizer.params.features_albedo.lr},20} # 3DGS value 20x smaller than lr of features_albedo
-    view_albedo_delta_logits:
-      lr: 0.0005
-    view_density_delta_logits:
-      lr: 0.0005
     rotation:
       lr: 0.001 # 3DGS value: 0.001
     scale:
@@ -238,11 +224,6 @@ loss:
 
   use_sky_opacity: false
   lambda_sky_opacity: 0.0
-
-  use_view_albedo_delta: false
-  lambda_view_albedo_delta: 0.0
-  use_view_density_delta: false
-  lambda_view_density_delta: 0.0
 
   use_foundation_feature: false
   lambda_foundation_feature: 0.0

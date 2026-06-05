@@ -3440,28 +3440,6 @@ class Trainer3DGRUT:
                 ).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
-        loss_view_albedo_delta = torch.zeros(1, device=self.device)
-        lambda_view_albedo_delta = 0.0
-        if self.conf.loss.get("use_view_albedo_delta", False):
-            with torch.cuda.nvtx.range("loss-view-albedo-delta"):
-                loss_view_albedo_delta = (
-                    self.model.get_view_albedo_delta_regularization_loss()
-                )
-                lambda_view_albedo_delta = (
-                    self.conf.loss.lambda_view_albedo_delta
-                )
-
-        loss_view_density_delta = torch.zeros(1, device=self.device)
-        lambda_view_density_delta = 0.0
-        if self.conf.loss.get("use_view_density_delta", False):
-            with torch.cuda.nvtx.range("loss-view-density-delta"):
-                loss_view_density_delta = (
-                    self.model.get_view_density_delta_regularization_loss()
-                )
-                lambda_view_density_delta = (
-                    self.conf.loss.lambda_view_density_delta
-                )
-
         # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps)
         loss_equirect_consistency = torch.zeros(1, device=self.device)
         loss_equirect_consistency_raw = torch.zeros(1, device=self.device)
@@ -3672,8 +3650,6 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
-            + lambda_view_albedo_delta * loss_view_albedo_delta
-            + lambda_view_density_delta * loss_view_density_delta
             + lambda_equirect_consistency * loss_equirect_consistency
         )
         loss = loss * camera_loss_weight * frame_loss_weight
@@ -3702,14 +3678,6 @@ class Trainer3DGRUT:
             scale_loss=lambda_scale * loss_scale,
             sky_opacity_loss=lambda_sky_opacity * loss_sky_opacity,
             sky_opacity_loss_raw=loss_sky_opacity,
-            view_albedo_delta_loss=(
-                lambda_view_albedo_delta * loss_view_albedo_delta
-            ),
-            view_albedo_delta_loss_raw=loss_view_albedo_delta,
-            view_density_delta_loss=(
-                lambda_view_density_delta * loss_view_density_delta
-            ),
-            view_density_delta_loss_raw=loss_view_density_delta,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
