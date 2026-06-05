@@ -108,6 +108,9 @@ def make(name: str, config, ray_jitter):
                     "holdout_image_list_path", None
                 ),
                 shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                ),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -123,6 +126,9 @@ def make(name: str, config, ray_jitter):
                     "holdout_image_list_path", None
                 ),
                 shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                ),
             )
         case "scannetpp":
             train_dataset = ScannetppDataset(
@@ -235,6 +241,9 @@ def make_test(name: str, config):
                     "holdout_image_list_path", None
                 ),
                 shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                ),
             )
         case "scannetpp":
             dataset = ScannetppDataset(
