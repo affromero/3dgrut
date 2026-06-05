@@ -63,6 +63,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         train_focus_image_list_path: Optional[str] = None,
         train_focus_image_weight: float = 1.0,
         holdout_image_list_path: Optional[str] = None,
+        shutter_type: str = "GLOBAL",
     ):
         self.path = path
         self.device = device
@@ -77,6 +78,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.train_exclude_image_list_path = train_exclude_image_list_path
         self.train_focus_image_list_path = train_focus_image_list_path
         self.holdout_image_list_path = holdout_image_list_path
+        self.shutter_type = ShutterType[shutter_type].name
         self.train_focus_image_weight = float(train_focus_image_weight)
         if self.train_focus_image_weight <= 0.0:
             raise ValueError(
@@ -149,6 +151,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             self.cam_extrinsics[i] for i in selected_indices
         ]
         self.poses = self.poses[split_mask].astype(np.float32)
+        if self.poses_end is not None:
+            self.poses_end = self.poses_end[split_mask].astype(np.float32)
 
         # numpy str array of image paths and mask paths
         self.image_paths = self.image_paths[split_mask]
@@ -321,6 +325,17 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             self.cam_intrinsics = read_colmap_intrinsics_text(
                 cameras_intrinsic_file
             )
+
+        # Optional per-frame shutter END poses for rolling-shutter studies.
+        # sparse/0/images_end.txt uses the images.txt format and holds the
+        # END (t=+0.5) pose per frame, keyed by image name; absent -> global.
+        end_file = os.path.join(self.path, "sparse/0", "images_end.txt")
+        if os.path.exists(end_file):
+            self._end_pose_by_name = {
+                e.name: e for e in read_colmap_extrinsics_text(end_file)
+            }
+        else:
+            self._end_pose_by_name = None
 
     def get_images_folder(self):
         downsample_suffix = (
@@ -639,7 +654,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             pixel_coords = create_pixel_coords(w, h)
             params_dict = {
                 "resolution": np.array([w, h], dtype=np.uint64),
-                "shutter_type": ShutterType.GLOBAL.name,
+                "shutter_type": self.shutter_type,
             }
             return (
                 params_dict,
@@ -759,6 +774,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.image_paths = []
         self.mask_paths = []
         self.sky_mask_paths = [] if self.sky_mask_folder is not None else None
+        self.poses_end = (
+            [] if self._end_pose_by_name is not None else None
+        )
 
         cam_centers = []
         for extr in logger.track(
@@ -775,6 +793,18 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             C2W = np.linalg.inv(W2C)
             self.poses.append(C2W)
             cam_centers.append(C2W[:3, 3])
+
+            if self.poses_end is not None:
+                end_extr = self._end_pose_by_name.get(extr.name)
+                if end_extr is None:
+                    raise ValueError(
+                        f"images_end.txt has no END pose for '{extr.name}'."
+                    )
+                W2C_end = np.zeros((4, 4), dtype=np.float32)
+                W2C_end[:3, 3] = np.array(end_extr.tvec)
+                W2C_end[:3, :3] = qvec_to_so3(end_extr.qvec)
+                W2C_end[3, 3] = 1.0
+                self.poses_end.append(np.linalg.inv(W2C_end))
 
             image_path = os.path.join(
                 self.path, self.get_images_folder(), extr.name
@@ -793,6 +823,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.cameras_extent = diagonal * 1.1
 
         self.poses = np.stack(self.poses)
+        if self.poses_end is not None:
+            self.poses_end = np.stack(self.poses_end)
 
         self.image_paths = np.stack(self.image_paths, dtype=str)
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
@@ -979,6 +1011,11 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             ),
         }
 
+        if self.poses_end is not None:
+            output_dict["pose_end"] = torch.tensor(
+                self.poses_end[idx]
+            ).unsqueeze(0)
+
         # Only add mask to dictionary if it exists
         if os.path.exists(mask_path := self.mask_paths[idx]):
             mask = torch.from_numpy(
@@ -1037,6 +1074,25 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "image_path": batch["image_path"][0],
             "pixel_coords": pixel_coords,
         }
+
+        if "pose_end" in batch:
+            sample["T_to_world_end"] = batch["pose_end"][0].to(
+                self.device, non_blocking=True
+            )
+        # A ROLLING shutter MUST carry a distinct END pose; otherwise the
+        # kernel collapses to global shutter (RS1 == RS0) with no warning.
+        shutter = camera_params_dict.get(
+            "shutter_type", ShutterType.GLOBAL.name
+        )
+        if shutter != ShutterType.GLOBAL.name:
+            end = sample.get("T_to_world_end")
+            if end is None or torch.allclose(end, pose, atol=1e-6):
+                raise ValueError(
+                    f"shutter_type={shutter} but T_to_world_end is missing or "
+                    "equal to T_to_world; rolling-shutter training would "
+                    "silently no-op to global shutter. Provide distinct "
+                    "per-frame END poses via images_end.txt."
+                )
 
         if "mask" in batch:
             mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0

@@ -107,6 +107,7 @@ def make(name: str, config, ray_jitter):
                 holdout_image_list_path=config.dataset.get(
                     "holdout_image_list_path", None
                 ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -121,6 +122,7 @@ def make(name: str, config, ray_jitter):
                 holdout_image_list_path=config.dataset.get(
                     "holdout_image_list_path", None
                 ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
             )
         case "scannetpp":
             train_dataset = ScannetppDataset(
@@ -232,6 +234,7 @@ def make_test(name: str, config):
                 holdout_image_list_path=config.dataset.get(
                     "holdout_image_list_path", None
                 ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
             )
         case "scannetpp":
             dataset = ScannetppDataset(
