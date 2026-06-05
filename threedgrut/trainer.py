@@ -6032,10 +6032,19 @@ class Trainer3DGRUT:
             ]
             if len(matched) < 2:
                 return None
-            sheet = np.concatenate(
-                [_labeled_panel(label, arr) for label, arr in matched],
-                axis=1,
-            )
+            labeled = [_labeled_panel(label, arr) for label, arr in matched]
+            # Insert a framed seam between panels so the columns read as
+            # clearly separated (mirrors blk_windows save_horizontal_panels).
+            # Dark edges + a bright center stay visible over both bright sky
+            # and dark shadow regions of an ERP panorama.
+            seam = np.full((labeled[0].shape[0], 8, 3), 24, dtype=np.uint8)
+            seam[:, 2:6, :] = 235
+            parts: list[np.ndarray] = []
+            for index, panel in enumerate(labeled):
+                parts.append(panel)
+                if index < len(labeled) - 1:
+                    parts.append(seam)
+            sheet = np.concatenate(parts, axis=1)
             sp = path_join(
                 snapshots_dir,
                 f"step_{global_step:06d}_contact_sheet.png",
