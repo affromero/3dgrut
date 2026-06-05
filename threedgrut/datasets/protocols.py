@@ -50,8 +50,6 @@ class Batch:
     )
     # Exposure prior from EXIF metadata (mean-normalized log2 exposure [1], None if unavailable)
     exposure: Optional[torch.Tensor] = None
-    # Optional per-frame training loss multiplier.
-    loss_weight: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         batch_size = self.T_to_world.shape[0]

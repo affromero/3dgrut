@@ -98,12 +98,6 @@ def make(name: str, config, ray_jitter):
                 train_exclude_image_list_path=config.dataset.get(
                     "train_exclude_image_list_path", None
                 ),
-                train_focus_image_list_path=config.dataset.get(
-                    "train_focus_image_list_path", None
-                ),
-                train_focus_image_weight=config.dataset.get(
-                    "train_focus_image_weight", 1.0
-                ),
             )
             val_dataset = ColmapDataset(
                 config.path,

@@ -3636,13 +3636,6 @@ class Trainer3DGRUT:
                 device=self.device,
                 dtype=rgb_pred.dtype,
             )
-        frame_loss_weight = torch.ones(1, device=self.device)
-        batch_loss_weight = gpu_batch.__dict__.get("loss_weight")
-        if batch_loss_weight is not None:
-            frame_loss_weight = batch_loss_weight.to(
-                device=self.device,
-                dtype=rgb_pred.dtype,
-            ).reshape(1)
         loss = (
             lambda_l1 * loss_l1
             + lambda_ssim * loss_ssim
@@ -3652,14 +3645,13 @@ class Trainer3DGRUT:
             + lambda_sky_opacity * loss_sky_opacity
             + lambda_equirect_consistency * loss_equirect_consistency
         )
-        loss = loss * camera_loss_weight * frame_loss_weight
+        loss = loss * camera_loss_weight
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
             l2_loss=lambda_l2 * loss_l2,
             ssim_loss=lambda_ssim * loss_ssim,
             camera_loss_weight=camera_loss_weight,
-            frame_loss_weight=frame_loss_weight,
             equirect_consistency_loss=(
                 lambda_equirect_consistency * loss_equirect_consistency
             ),

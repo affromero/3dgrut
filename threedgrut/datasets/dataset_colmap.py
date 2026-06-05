@@ -60,8 +60,6 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         exif_exposures: Optional[list[Optional[float]]] = None,
         sky_mask_folder: Optional[str] = None,
         train_exclude_image_list_path: Optional[str] = None,
-        train_focus_image_list_path: Optional[str] = None,
-        train_focus_image_weight: float = 1.0,
     ):
         self.path = path
         self.device = device
@@ -74,12 +72,6 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         )
         self.sky_mask_folder = sky_mask_folder
         self.train_exclude_image_list_path = train_exclude_image_list_path
-        self.train_focus_image_list_path = train_focus_image_list_path
-        self.train_focus_image_weight = float(train_focus_image_weight)
-        if self.train_focus_image_weight <= 0.0:
-            raise ValueError(
-                f"train_focus_image_weight must be positive, got {self.train_focus_image_weight}"
-            )
 
         # Worker-based GPU cache for multiprocessing compatibility
         self._worker_gpu_cache = {}
@@ -142,10 +134,6 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         if self.split == "train":
             self.apply_train_exclude_image_list()
 
-        self.loss_weights = np.ones(len(self.image_paths), dtype=np.float32)
-        if self.split == "train":
-            self.apply_train_focus_image_list()
-
         # Update the number of frames to only include the samples from the split
         self.n_frames = self.poses.shape[0]
 
@@ -206,46 +194,6 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 for exposure, keep_item in zip(self.exif_exposures, keep)
                 if keep_item
             ]
-
-    def load_train_focus_image_names(self):
-        if not self.train_focus_image_list_path:
-            return set()
-        if not os.path.exists(self.train_focus_image_list_path):
-            raise FileNotFoundError(
-                f"Train focus image list not found: {self.train_focus_image_list_path}"
-            )
-        focused = set()
-        with open(
-            self.train_focus_image_list_path, "r", encoding="utf-8"
-        ) as f:
-            for line in f:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    focused.add(stripped)
-        return focused
-
-    def apply_train_focus_image_list(self):
-        focused = self.load_train_focus_image_names()
-        if not focused:
-            return
-        image_names = np.array(
-            [os.path.basename(path) for path in self.image_paths],
-            dtype=object,
-        )
-        focus_mask = np.array(
-            [name in focused for name in image_names], dtype=bool
-        )
-        if not np.any(focus_mask):
-            logger.warning(
-                f"Train focus image list matched no images: {self.train_focus_image_list_path}"
-            )
-            return
-        focused_count = int(np.count_nonzero(focus_mask))
-        self.loss_weights[focus_mask] = self.train_focus_image_weight
-        logger.info(
-            f"Weighted {focused_count} train images from {self.train_focus_image_list_path} "
-            f"by {self.train_focus_image_weight:g}"
-        )
 
     def load_intrinsics_and_extrinsics(self):
         try:
@@ -884,9 +832,6 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 self.image_paths[idx]
             ),
             "image_path": self.image_paths[idx],
-            "loss_weight": torch.tensor(
-                self.loss_weights[idx], dtype=torch.float32
-            ),
         }
 
         # Only add mask to dictionary if it exists
@@ -963,13 +908,6 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # Add exposure prior from EXIF if available (move to GPU)
         if "exposure" in batch and batch["exposure"][0] is not None:
             sample["exposure"] = batch["exposure"].to(self.device)
-
-        if "loss_weight" in batch:
-            sample["loss_weight"] = (
-                batch["loss_weight"]
-                .reshape(1)
-                .to(self.device, non_blocking=True)
-            )
 
         return Batch(**sample)
 
