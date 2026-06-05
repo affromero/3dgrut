@@ -3440,28 +3440,6 @@ class Trainer3DGRUT:
                 ).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
-        loss_position_anchor = torch.zeros(1, device=self.device)
-        lambda_position_anchor = 0.0
-        if self.conf.loss.use_position_anchor:
-            if self.model.position_anchor.shape != self.model.positions.shape:
-                msg = (
-                    "loss.use_position_anchor requires position_anchor and "
-                    "positions to have the same shape. Disable densify/prune "
-                    "or refresh the anchor after topology changes."
-                )
-                raise RuntimeError(msg)
-            with torch.cuda.nvtx.range("loss-position-anchor"):
-                epsilon = float(self.conf.loss.position_anchor_epsilon)
-                squared_distance = (
-                    (self.model.positions - self.model.position_anchor)
-                    .square()
-                    .sum(dim=1)
-                )
-                loss_position_anchor = (
-                    torch.sqrt(squared_distance + epsilon * epsilon) - epsilon
-                ).mean()
-                lambda_position_anchor = self.conf.loss.lambda_position_anchor
-
         loss_view_albedo_delta = torch.zeros(1, device=self.device)
         lambda_view_albedo_delta = 0.0
         if self.conf.loss.get("use_view_albedo_delta", False):
@@ -3694,7 +3672,6 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
-            + lambda_position_anchor * loss_position_anchor
             + lambda_view_albedo_delta * loss_view_albedo_delta
             + lambda_view_density_delta * loss_view_density_delta
             + lambda_equirect_consistency * loss_equirect_consistency
@@ -3725,10 +3702,6 @@ class Trainer3DGRUT:
             scale_loss=lambda_scale * loss_scale,
             sky_opacity_loss=lambda_sky_opacity * loss_sky_opacity,
             sky_opacity_loss_raw=loss_sky_opacity,
-            position_anchor_loss=(
-                lambda_position_anchor * loss_position_anchor
-            ),
-            position_anchor_loss_raw=loss_position_anchor,
             view_albedo_delta_loss=(
                 lambda_view_albedo_delta * loss_view_albedo_delta
             ),
@@ -4241,28 +4214,6 @@ class Trainer3DGRUT:
             writer.add_scalar(
                 "val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step
             )
-        if self.conf.loss.use_position_anchor:
-            position_anchor_loss = np.mean(
-                metrics["losses"]["position_anchor_loss"]
-            )
-            position_anchor_loss_raw = np.mean(
-                metrics["losses"]["position_anchor_loss_raw"]
-            )
-            writer.add_scalar(
-                "val/loss/position_anchor",
-                position_anchor_loss,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/loss/position_anchor_raw",
-                position_anchor_loss_raw,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/lambda/position_anchor",
-                self.conf.loss.lambda_position_anchor,
-                global_step,
-            )
         table = {
             k: np.mean(v)
             for k, v in metrics.items()
@@ -4612,28 +4563,6 @@ class Trainer3DGRUT:
                 writer.add_scalar(
                     "train/loss/sky_opacity_raw",
                     sky_opacity_loss_raw,
-                    global_step,
-                )
-            if self.conf.loss.use_position_anchor:
-                position_anchor_loss = np.mean(
-                    batch_metrics["losses"]["position_anchor_loss"]
-                )
-                position_anchor_loss_raw = np.mean(
-                    batch_metrics["losses"]["position_anchor_loss_raw"]
-                )
-                writer.add_scalar(
-                    "train/loss/position_anchor",
-                    position_anchor_loss,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/position_anchor_raw",
-                    position_anchor_loss_raw,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/lambda/position_anchor",
-                    self.conf.loss.lambda_position_anchor,
                     global_step,
                 )
             if (

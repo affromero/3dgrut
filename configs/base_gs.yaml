@@ -239,11 +239,6 @@ loss:
   use_sky_opacity: false
   lambda_sky_opacity: 0.0
 
-  # Scanner-surface prior: penalize Gaussian center drift away from the
-  # initialization points with a robust Charbonnier distance in meters.
-  use_position_anchor: false
-  lambda_position_anchor: 0.0
-  position_anchor_epsilon: 0.02
   use_view_albedo_delta: false
   lambda_view_albedo_delta: 0.0
   use_view_density_delta: false

@@ -13,16 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gzip
 import os
 from pathlib import Path
-from typing import Any
 
-import msgpack
 import numpy as np
 import sklearn.neighbors
 import torch
-from plyfile import PlyData, PlyElement
+from plyfile import PlyData
 
 import threedgrt_tracer
 import threedgrut.model.background as background
@@ -272,8 +269,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         model_params = {
             "positions": self.positions,
-            "position_anchor": self.position_anchor,
-            "tangent_plane_normal_anchor": self.tangent_plane_normal_anchor,
             "rotation": self.rotation,
             "scale": self.scale,
             "density": self.density,
@@ -326,8 +321,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Positions of the 3D Gaussians (x, y, z) [n_gaussians, 3]
-        self.position_anchor = torch.empty([0, 3])
-        self.tangent_plane_normal_anchor = torch.empty([0, 3])
         self.rotation = torch.nn.Parameter(
             torch.empty([0, 4])
         )  # Rotation of each Gaussian represented as a unit quaternion [n_gaussians, 4]
@@ -616,21 +609,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         delta = torch.tanh(self.view_density_delta_logits) * max_delta
         return delta.square().mean()
 
-    def reset_position_anchor(self) -> None:
-        self.position_anchor = self.positions.detach().clone()
-        self.reset_tangent_plane_normal_anchor()
-
-    def reset_tangent_plane_normal_anchor(self) -> None:
-        if self.positions.numel() == 0 or self.rotation.numel() == 0:
-            self.tangent_plane_normal_anchor = torch.empty(
-                (self.positions.shape[0], 3),
-                dtype=self.positions.dtype,
-                device=self.positions.device,
-            )
-            return
-        rotations = quaternion_to_so3(self.get_rotation())
-        self.tangent_plane_normal_anchor = rotations[:, :, 2].detach().clone()
-
     @torch.no_grad()
     def build_acc(self, rebuild=True):
         self.renderer.build_acc(self, rebuild)
@@ -659,8 +637,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     def validate_fields(self):
         num_gaussians = self.num_gaussians
         assert self.positions.shape == (num_gaussians, 3)
-        assert self.position_anchor.shape == (num_gaussians, 3)
-        assert self.tangent_plane_normal_anchor.shape == (num_gaussians, 3)
         assert self.density.shape == (num_gaussians, 1)
         assert self.rotation.shape == (num_gaussians, 4)
         assert self.scale.shape == (num_gaussians, 3)
@@ -951,7 +927,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
         self.features_specular = torch.nn.Parameter(feats_sph)
-        self.reset_position_anchor()
         self._ensure_view_albedo_delta()
         self._ensure_view_density_delta()
 
@@ -1025,7 +1000,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.features_specular = torch.nn.Parameter(
             features_specular.to(dtype=dtype, device=self.device)
         )
-        self.reset_position_anchor()
         self._ensure_view_albedo_delta()
         self._ensure_view_density_delta()
 
@@ -1068,30 +1042,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                     device=self.device,
                 )
             )
-        checkpoint_anchor = checkpoint.get("position_anchor")
-        if (
-            checkpoint_anchor is None
-            or checkpoint_anchor.shape != self.positions.shape
-        ):
-            self.reset_position_anchor()
-        else:
-            self.position_anchor = checkpoint_anchor.to(
-                dtype=self.positions.dtype,
-                device=self.device,
-            )
-        checkpoint_normal_anchor = checkpoint.get(
-            "tangent_plane_normal_anchor"
-        )
-        if (
-            checkpoint_normal_anchor is None
-            or checkpoint_normal_anchor.shape != self.positions.shape
-        ):
-            self.reset_tangent_plane_normal_anchor()
-        else:
-            self.tangent_plane_normal_anchor = checkpoint_normal_anchor.to(
-                dtype=self.positions.dtype,
-                device=self.device,
-            )
         self.n_active_features = checkpoint["n_active_features"]
         self.max_n_features = checkpoint["max_n_features"]
         self.scene_extent = checkpoint["scene_extent"]
@@ -1118,7 +1068,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         Observer points can be any set locations that observation came from.
         Camera centers, ray source points, etc. They are used to estimate initial scales.
         """
-        logger.info(f"Initializing based on lidar point cloud ...")
+        logger.info("Initializing based on lidar point cloud ...")
 
         self.default_initialize_from_points(
             point_cloud.xyz_end.to(device=self.device),
@@ -1389,7 +1339,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.features_specular = torch.nn.Parameter(
             features_specular.to(dtype=dtype, device=self.device)
         )
-        self.reset_position_anchor()
         self._ensure_view_albedo_delta()
         self._ensure_view_density_delta()
 
@@ -1683,7 +1632,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         elif len(extra_f_names) == 0:
             # Only DC components available, create zero-filled higher-order harmonics
             logger.info(
-                f"PLY file only contains DC components, initializing higher-order spherical harmonics to zero"
+                "PLY file only contains DC components, initializing higher-order spherical harmonics to zero"
             )
         else:
             # Partial data - this is unexpected
@@ -1745,7 +1694,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 mogt_rotation, dtype=self.rotation.dtype, device=self.device
             )
         )
-        self.reset_position_anchor()
         self._ensure_view_albedo_delta()
         self._ensure_view_density_delta()
 
@@ -1775,10 +1723,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.features_specular = torch.nn.Parameter(
                 other.features_specular.clone()
             )
-            self.position_anchor = other.position_anchor.clone()
-            self.tangent_plane_normal_anchor = (
-                other.tangent_plane_normal_anchor.clone()
-            )
         else:  # shared tensors
             self.positions = torch.nn.Parameter(other.positions)
             self.rotation = torch.nn.Parameter(other.rotation)
@@ -1787,10 +1731,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.features_albedo = torch.nn.Parameter(other.features_albedo)
             self.features_specular = torch.nn.Parameter(
                 other.features_specular
-            )
-            self.position_anchor = other.position_anchor
-            self.tangent_plane_normal_anchor = (
-                other.tangent_plane_normal_anchor
             )
         self.max_sh_degree = other.max_sh_degree
         self.n_active_features = other.n_active_features
@@ -1824,10 +1764,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
         sliced.features_specular = torch.nn.Parameter(
             sliced.features_specular[idx]
-        )
-        sliced.position_anchor = sliced.position_anchor[idx]
-        sliced.tangent_plane_normal_anchor = (
-            sliced.tangent_plane_normal_anchor[idx]
         )
         return sliced
 

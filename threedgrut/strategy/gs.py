@@ -2386,31 +2386,7 @@ class GSStrategy(BaseStrategy):
             v_split = torch.zeros((self.split_n_gaussians * int(mask.sum()), *v.shape[1:]), device=v.device)
             return torch.cat([v[~mask], v_split])
 
-        position_anchor = self.model.position_anchor
-        if position_anchor.shape != self.model.positions.shape:
-            self.model.reset_position_anchor()
-            position_anchor = self.model.position_anchor
-        tangent_normal_anchor = self.model.tangent_plane_normal_anchor
-        if tangent_normal_anchor.shape != self.model.positions.shape:
-            self.model.reset_tangent_plane_normal_anchor()
-            tangent_normal_anchor = self.model.tangent_plane_normal_anchor
-        repeats = [self.split_n_gaussians] + [1] * (
-            position_anchor.dim() - 1
-        )
-        split_position_anchor = position_anchor[mask].repeat(repeats)
-        split_tangent_normal_anchor = tangent_normal_anchor[mask].repeat(
-            repeats
-        )
-
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
-        self.model.position_anchor = torch.cat(
-            [position_anchor[~mask], split_position_anchor],
-            dim=0,
-        )
-        self.model.tangent_plane_normal_anchor = torch.cat(
-            [tangent_normal_anchor[~mask], split_tangent_normal_anchor],
-            dim=0,
-        )
         self.reset_densification_buffers()
 
     @torch.no_grad()
@@ -2501,24 +2477,7 @@ class GSStrategy(BaseStrategy):
         def update_optimizer_fn(key: str, v: torch.Tensor) -> torch.Tensor:
             return torch.cat([v, torch.zeros((int(mask.sum()), *v.shape[1:]), device=v.device)])
 
-        position_anchor = self.model.position_anchor
-        if position_anchor.shape != self.model.positions.shape:
-            self.model.reset_position_anchor()
-            position_anchor = self.model.position_anchor
-        tangent_normal_anchor = self.model.tangent_plane_normal_anchor
-        if tangent_normal_anchor.shape != self.model.positions.shape:
-            self.model.reset_tangent_plane_normal_anchor()
-            tangent_normal_anchor = self.model.tangent_plane_normal_anchor
-
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
-        self.model.position_anchor = torch.cat(
-            [position_anchor, position_anchor[mask]],
-            dim=0,
-        )
-        self.model.tangent_plane_normal_anchor = torch.cat(
-            [tangent_normal_anchor, tangent_normal_anchor[mask]],
-            dim=0,
-        )
         if self.should_preserve_structure_buffers_for_split():
             self.extend_densification_buffers_for_clones(int(mask.sum().item()))
         else:
