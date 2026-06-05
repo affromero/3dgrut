@@ -13,10 +13,9 @@ Uses `pyarrow.parquet.ParquetWriter` in row-group append mode — multiple
 hard kill mid-write may leave a truncated file (acceptable risk; reruns
 regenerate).
 
-Schema v1 columns are FIXED. Phase 6/7 (loss volume / BVH stats) add
-new columns by ALWAYS using `pd.read_parquet` (handles missing as NaN);
-the schema itself stays append-only. Bump `SCHEMA_VERSION` if structure
-ever needs to change.
+Schema columns are versioned. Readers should use `pd.read_parquet`,
+which handles missing legacy columns as NaN. Bump `SCHEMA_VERSION` when
+the structure changes.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ from threedgrut.utils.logger import logger
 from threedgrut.utils.quantile import bounded_quantile
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Per-attribute grad-norm summaries (one mean/p95/max each for 6 params).
 _GRAD_PARAMS = (
@@ -53,7 +52,6 @@ def _build_schema() -> pa.Schema:
         pa.field("total_loss", pa.float32()),
         pa.field("loss_l1", pa.float32()),
         pa.field("loss_ssim", pa.float32()),
-        pa.field("loss_depth", pa.float32()),
         pa.field("loss_equirect", pa.float32()),
         # Per-attribute grad summaries
         *[pa.field(f"grad_{a}_mean", pa.float32()) for a in _GRAD_PARAMS],
@@ -159,7 +157,6 @@ class DiagnosticsWriter:
             "total_loss": float(batch_losses.get("total_loss", 0.0)) if batch_losses else 0.0,
             "loss_l1": float(batch_losses.get("l1_loss", 0.0)) if batch_losses else 0.0,
             "loss_ssim": float(batch_losses.get("ssim_loss", 0.0)) if batch_losses else 0.0,
-            "loss_depth": 0.0,
             "loss_equirect": float(batch_losses.get("equirect_consistency_l1_loss", 0.0)) if batch_losses else 0.0,
             "n_gaussians": int(n_gaussians),
             "step_total_ms": float(step_total_ms),
