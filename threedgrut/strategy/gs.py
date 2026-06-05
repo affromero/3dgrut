@@ -64,12 +64,12 @@ class GSStrategy(BaseStrategy):
         self.structure_local_axis_accum = torch.empty([0, 3])
         self.structure_axis_denom = torch.empty([0, 1])
         # SAD-GS multi-view consistency state (see arxiv 2604.28016 Sec. 3.3).
-        # Accumulates per-Gaussian eta statistics across training views so the
-        # Phase 4 densification can use N_high / N_total > tau_split as the
-        # split criterion and N_low / N_total dominance + low opacity as the
-        # prune criterion. All zero-sized at init; init_densification_buffer
-        # resizes to num_gaussians, densify ops resize to match the new
-        # gaussian count post-split/clone/prune.
+        # Accumulates per-Gaussian eta statistics across training views so
+        # densification can use N_high / N_total > tau_split as an overlay on
+        # the existing split criterion. Low-view counts are tracked for
+        # diagnostics/future pruning. All zero-sized at init;
+        # init_densification_buffer resizes to num_gaussians, densify ops
+        # resize to match the new gaussian count post-split/clone/prune.
         self.sadgs_accum_eta = torch.empty([0, 1])
         self.sadgs_max_eta_3ch = torch.empty([0, 3])
         self.sadgs_eta_high_count = torch.empty([0, 1])
@@ -791,7 +791,7 @@ class GSStrategy(BaseStrategy):
         per-Gaussian counters and per-axis sums based on whether each
         Gaussian's max-axis eta in this view crosses ``TAU_HIGH=1.0``
         (split candidate) or stays below ``TAU_LOW=0.1`` (smooth-region
-        prune candidate). Both thresholds are config-overridable via
+        diagnostic). Both thresholds are config-overridable via
         ``sadgs_tau_high`` and ``sadgs_tau_low``.
 
         Only valid Gaussians (visible + in-mask + in-frame) contribute;
@@ -1209,7 +1209,7 @@ class GSStrategy(BaseStrategy):
 
         sadgs_st_components: dict[str, torch.Tensor] | None = None
         if self.residual_density_control.get("sadgs_enabled", False):
-            # SAD-GS-faithful production path: use the principal-eigenvalue
+            # SAD-GS structure-tensor path: use the principal-eigenvalue
             # wavelength_min from a multi-channel multi-scale structure
             # tensor on the GT image as the per-pixel dominant scale.
             # Replaces the legacy edge/laplacian heuristic with a physically

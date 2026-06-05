@@ -11,10 +11,9 @@ These tests cover:
   hand-computable.
 
 A separate numerical-equivalence script outside the test suite compares
-each function against the SAD-GS reference implementation at
-``/tmp/SADGS/utils/freq_utils.py``. We deliberately do not import the
-reference inside pytest because the reference path is a developer-only
-artefact.
+each function against the SAD-GS reference implementation. We deliberately
+do not import that reference inside pytest because it is a developer-only
+artifact.
 """
 
 from __future__ import annotations
