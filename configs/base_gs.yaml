@@ -244,9 +244,6 @@ loss:
   use_position_anchor: false
   lambda_position_anchor: 0.0
   position_anchor_epsilon: 0.02
-  use_tangent_plane_anchor: false
-  lambda_tangent_plane_anchor: 0.0
-  tangent_plane_anchor_epsilon: 0.02
   use_view_albedo_delta: false
   lambda_view_albedo_delta: 0.0
   use_view_density_delta: false
@@ -254,23 +251,6 @@ loss:
 
   use_foundation_feature: false
   lambda_foundation_feature: 0.0
-
-  # Dense depth supervision (Phase 3c: DA3 z-extended).
-  # Stem-keyed [H, W] float32 metric depth .npy files in `dense_depth_dir`,
-  # one per image (e.g. `left_0009.npy`). Pixels with `gt > 0` contribute
-  # to a masked L1 against `outputs["pred_dist"]`.
-  use_dense_depth: false
-  lambda_dense_depth: 0.0
-  dense_depth_dir: ""
-  dense_depth_camera_weights: []
-  dense_depth_radial_camera_weights: []
-
-  # Dense depth gradient L1 (Phase 3c-redesign): supervise per-pixel finite
-  # differences of depth instead of absolute values. Edge-aware and scale-
-  # invariant — fires at object boundaries, ignores smooth regions. Reuses
-  # `dense_depth_dir` for the GT source (DA3 z-extended cache).
-  use_dense_depth_gradient: false
-  lambda_dense_depth_gradient: 0.0
 
   # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps).
   # Warp + overlap `.npz` files keyed by image stem (e.g. `left_0009.npz`)

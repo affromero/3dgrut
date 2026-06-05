@@ -104,11 +104,6 @@ def test_position_anchor_loss_penalizes_center_drift() -> None:
                 "use_position_anchor": True,
                 "lambda_position_anchor": 0.003,
                 "position_anchor_epsilon": 0.02,
-                "use_dense_depth": False,
-                "lambda_dense_depth": 0.0,
-                "dense_depth_dir": "",
-                "use_dense_depth_gradient": False,
-                "lambda_dense_depth_gradient": 0.0,
                 "use_equirect_consistency": False,
                 "lambda_equirect_consistency": 0.0,
                 "use_camera_loss_weights": False,
@@ -360,7 +355,6 @@ def test_prior_anchor_field_injection_appends_anchored_gaussians() -> None:
         "prior_anchor_max_points": 2,
         "prior_anchor_min_confidence": 0.2,
         "prior_anchor_scale_m": 0.01,
-        "prior_anchor_normal_scale_multiplier": 0.2,
         "prior_anchor_density_multiplier": 0.5,
     }
     strategy._prior_anchor_injected = False
@@ -377,7 +371,6 @@ def test_prior_anchor_field_injection_appends_anchored_gaussians() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         positions_path = os.path.join(directory, "positions.npy")
-        normals_path = os.path.join(directory, "normals.npy")
         colors_path = os.path.join(directory, "colors.npy")
         confidence_path = os.path.join(directory, "confidence.npy")
         manifest_path = os.path.join(directory, "anchors.json")
@@ -389,18 +382,6 @@ def test_prior_anchor_field_injection_appends_anchored_gaussians() -> None:
                     [20.0, 0.0, 0.0],
                     [30.0, 0.0, 0.0],
                     [40.0, 0.0, 0.0],
-                ],
-                dtype=np.float32,
-            ),
-        )
-        np.save(
-            normals_path,
-            np.asarray(
-                [
-                    [0.0, 0.0, 1.0],
-                    [0.0, 0.0, 1.0],
-                    [0.0, 1.0, 0.0],
-                    [0.0, 0.0, -1.0],
                 ],
                 dtype=np.float32,
             ),
@@ -427,7 +408,6 @@ def test_prior_anchor_field_injection_appends_anchored_gaussians() -> None:
                     "coordinate_frame": "world",
                     "detached": True,
                     "positions_path": positions_path,
-                    "normals_path": normals_path,
                     "colors_path": colors_path,
                     "confidence_path": confidence_path,
                 },
@@ -452,11 +432,11 @@ def test_prior_anchor_field_injection_appends_anchored_gaussians() -> None:
     assert torch.equal(model.position_anchor, expected_positions)
     assert torch.equal(
         model.tangent_plane_normal_anchor[-2:],
-        torch.tensor([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]),
+        torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]),
     )
     assert torch.equal(
         model.scale.detach()[-2:],
-        torch.tensor([[0.01, 0.01, 0.002], [0.01, 0.01, 0.002]]),
+        torch.tensor([[0.01, 0.01, 0.01], [0.01, 0.01, 0.01]]),
     )
     assert torch.equal(model.density.detach()[-2:], torch.ones((2, 1)))
     assert model.features_albedo.detach()[-2:].abs().sum() > 0

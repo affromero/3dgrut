@@ -102,7 +102,6 @@ residual_density_control:
   prior_anchor_max_points: 50000
   prior_anchor_min_confidence: 0.0
   prior_anchor_scale_m: 0.003
-  prior_anchor_normal_scale_multiplier: 0.35
   prior_anchor_density_multiplier: 1.0
   use_structure_density_weight: false
   structure_score_only: false

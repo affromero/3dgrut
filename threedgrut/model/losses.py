@@ -33,35 +33,6 @@ def ssim(img1, img2, window_size=11, size_average=True):
     return fused_ssim(img1, img2, padding="valid")
 
 
-@torch.cuda.nvtx.range("dense_depth_l1_loss")
-def dense_depth_l1_loss(pred_dist, gt_depth, valid_mask, pixel_weight=None):
-    """L1 loss on per-pixel dense depth, masked to pixels with valid GT.
-
-    Args:
-        pred_dist: [B, H, W, 1] or [B, H, W] predicted distance (metres) from
-            the renderer (`outputs["pred_dist"]`).
-        gt_depth: [B, H, W] ground-truth depth (metres) loaded from the per-image
-            DA3 z-extended sidecar.
-        valid_mask: [B, H, W] boolean mask where `gt_depth > 0` (and any other
-            constraints from the dataset, e.g. training mask).
-        pixel_weight: Optional [B, H, W] non-negative per-pixel weights applied
-            inside the valid depth mask.
-    Returns:
-        Scalar masked-mean L1 loss; returns a zero-tensor on the predicted
-        device if no valid pixels exist (dataset has no DA3 cache for this
-        frame).
-    """
-    if pred_dist.dim() == 4 and pred_dist.shape[-1] == 1:
-        pred_dist = pred_dist[..., 0]
-    if not valid_mask.any():
-        return torch.zeros(1, device=pred_dist.device, dtype=pred_dist.dtype)
-    diff = (pred_dist - gt_depth).abs()
-    weight = valid_mask.to(diff.dtype)
-    if pixel_weight is not None:
-        weight = weight * pixel_weight.to(diff.dtype).clamp_min(0.0)
-    return (diff * weight).sum() / weight.sum().clamp_min(1.0)
-
-
 @torch.cuda.nvtx.range("equirect_consistency_l1_loss")
 def equirect_consistency_l1_loss(
     pred_rgb,
@@ -97,39 +68,3 @@ def equirect_consistency_l1_loss(
         weight = weight * pixel_weight.to(diff.dtype).clamp_min(0.0)
     denominator = weight.sum().clamp_min(1.0).mul(diff.shape[-1])
     return (diff * weight).sum() / denominator
-
-
-@torch.cuda.nvtx.range("dense_depth_gradient_l1_loss")
-def dense_depth_gradient_l1_loss(pred_dist, gt_depth, valid_mask):
-    """L1 loss on per-pixel depth gradients (edge-aware, scale-invariant).
-
-    Phase 3c-redesign: instead of L1 on depth values (which fights the
-    monocular DA3 metric-scale bias), supervise the per-pixel finite-
-    difference gradients of depth. This naturally focuses loss energy at
-    object boundaries (high `|∇z|`) and ignores smooth regions, which is
-    exactly the "sharper objects" goal.
-
-    Args:
-        pred_dist: [B, H, W, 1] or [B, H, W] predicted distance (metres).
-        gt_depth: [B, H, W] ground-truth depth (metres) from DA3 z-extended.
-        valid_mask: [B, H, W] boolean mask where `gt_depth > 0`.
-    Returns:
-        Mean of horizontal + vertical gradient L1, computed only on pairs
-        where both endpoints have valid GT. Zero scalar tensor on the
-        predicted device when no valid pairs exist.
-    """
-    if pred_dist.dim() == 4 and pred_dist.shape[-1] == 1:
-        pred_dist = pred_dist[..., 0]
-    if not valid_mask.any():
-        return torch.zeros(1, device=pred_dist.device, dtype=pred_dist.dtype)
-    pred_dx = pred_dist[..., :, 1:] - pred_dist[..., :, :-1]
-    pred_dy = pred_dist[..., 1:, :] - pred_dist[..., :-1, :]
-    gt_dx = gt_depth[..., :, 1:] - gt_depth[..., :, :-1]
-    gt_dy = gt_depth[..., 1:, :] - gt_depth[..., :-1, :]
-    mask_dx = valid_mask[..., :, 1:] & valid_mask[..., :, :-1]
-    mask_dy = valid_mask[..., 1:, :] & valid_mask[..., :-1, :]
-    diff_dx = (pred_dx - gt_dx).abs() * mask_dx.to(pred_dx.dtype)
-    diff_dy = (pred_dy - gt_dy).abs() * mask_dy.to(pred_dy.dtype)
-    n_dx = mask_dx.sum().clamp_min(1.0)
-    n_dy = mask_dy.sum().clamp_min(1.0)
-    return 0.5 * (diff_dx.sum() / n_dx + diff_dy.sum() / n_dy)

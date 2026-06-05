@@ -396,17 +396,7 @@ class GSStrategy(BaseStrategy):
             payload,
             "positions_path",
         )
-        normals_path = self.required_prior_anchor_path(
-            payload,
-            "normals_path",
-        )
         positions_np = self.load_prior_anchor_npy(positions_path)
-        normals_np = self.load_prior_anchor_npy(normals_path)
-        if positions_np.shape != normals_np.shape:
-            raise ValueError(
-                "Prior positions and normals must have matching shapes: "
-                f"{positions_np.shape} != {normals_np.shape}"
-            )
         if positions_np.ndim != 2 or positions_np.shape[1] != 3:
             raise ValueError(
                 "Prior positions must have shape (N, 3); got "
@@ -420,8 +410,6 @@ class GSStrategy(BaseStrategy):
             dtype=dtype,
             device=device,
         )
-        normals = torch.as_tensor(normals_np, dtype=dtype, device=device)
-        normals = torch.nn.functional.normalize(normals, dim=1, eps=1e-6)
 
         confidence_path = payload.get("confidence_path")
         has_confidence = bool(confidence_path)
@@ -441,7 +429,6 @@ class GSStrategy(BaseStrategy):
             confidence = torch.ones((positions.shape[0],), dtype=dtype, device=device)
 
         valid = torch.isfinite(positions).all(dim=1)
-        valid = torch.logical_and(valid, torch.isfinite(normals).all(dim=1))
         valid = torch.logical_and(valid, torch.isfinite(confidence))
         min_confidence = float(
             self.residual_density_control.get(
@@ -484,10 +471,9 @@ class GSStrategy(BaseStrategy):
             return False
 
         positions = positions[indices]
-        normals = normals[indices]
         confidence = confidence[indices]
         colors = self.load_prior_anchor_colors(payload, indices)
-        self.append_prior_anchor_parameters(positions, normals, colors)
+        self.append_prior_anchor_parameters(positions, colors)
 
         self._prior_anchor_injected = True
         self.reset_densification_buffers()
@@ -595,15 +581,16 @@ class GSStrategy(BaseStrategy):
     def append_prior_anchor_parameters(
         self,
         positions: torch.Tensor,
-        normals: torch.Tensor,
         colors: torch.Tensor,
     ) -> None:
         """Append prior anchors to Gaussian parameters and optimizer state."""
         anchor_count = positions.shape[0]
-        rotations = self.quaternion_from_z_axis(normals).to(
+        rotations = torch.zeros(
+            (anchor_count, self.model.rotation.shape[1]),
             dtype=self.model.rotation.dtype,
             device=self.model.device,
         )
+        rotations[:, 0] = 1.0
         scales = self.prior_anchor_scale_tensor(anchor_count)
         density = self.prior_anchor_density_tensor(anchor_count)
         specular = torch.zeros(
@@ -647,8 +634,14 @@ class GSStrategy(BaseStrategy):
             [self.model.position_anchor, positions.detach()],
             dim=0,
         )
+        neutral_normals = torch.zeros(
+            (anchor_count, 3),
+            dtype=self.model.tangent_plane_normal_anchor.dtype,
+            device=self.model.device,
+        )
+        neutral_normals[:, 2] = 1.0
         self.model.tangent_plane_normal_anchor = torch.cat(
-            [self.model.tangent_plane_normal_anchor, normals.detach()],
+            [self.model.tangent_plane_normal_anchor, neutral_normals],
             dim=0,
         )
         self.model.validate_fields()
@@ -658,19 +651,12 @@ class GSStrategy(BaseStrategy):
         scale_m = float(
             self.residual_density_control.get("prior_anchor_scale_m", 0.003)
         )
-        normal_multiplier = float(
-            self.residual_density_control.get(
-                "prior_anchor_normal_scale_multiplier",
-                0.35,
-            )
-        )
         scale = torch.full(
             (anchor_count, 3),
             scale_m,
             dtype=self.model.scale.dtype,
             device=self.model.device,
         )
-        scale[:, 2] = scale[:, 2] * normal_multiplier
         return self.model.scale_activation_inv(scale)
 
     def prior_anchor_density_tensor(self, anchor_count: int) -> torch.Tensor:
@@ -738,27 +724,6 @@ class GSStrategy(BaseStrategy):
                 self.model.optimizer.state[new_parameter] = state
                 break
         setattr(self.model, name, new_parameter)
-
-    def quaternion_from_z_axis(self, normals: torch.Tensor) -> torch.Tensor:
-        """Return WXYZ quaternions rotating local +Z to each normal."""
-        normals = torch.nn.functional.normalize(normals, dim=1, eps=1e-6)
-        cross = torch.zeros_like(normals)
-        cross[:, 0] = -normals[:, 1]
-        cross[:, 1] = normals[:, 0]
-        dot = torch.clamp(normals[:, 2], min=-1.0, max=1.0)
-        quat = torch.zeros(
-            (normals.shape[0], 4),
-            dtype=normals.dtype,
-            device=normals.device,
-        )
-        regular = dot > -0.999
-        if regular.any():
-            scale = torch.sqrt((1.0 + dot[regular]) * 2.0).clamp_min(1e-6)
-            quat[regular, 0] = 0.5 * scale
-            quat[regular, 1:] = cross[regular] / scale[:, None]
-        if (~regular).any():
-            quat[~regular, 1] = 1.0
-        return torch.nn.functional.normalize(quat, dim=1, eps=1e-6)
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("update-gradient-buffer")

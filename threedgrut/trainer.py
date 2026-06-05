@@ -44,8 +44,6 @@ from threedgrut.datasets.utils import (
 )
 from threedgrut.model.camera_residual import CameraResidual
 from threedgrut.model.losses import (
-    dense_depth_gradient_l1_loss,
-    dense_depth_l1_loss,
     equirect_consistency_l1_loss,
     ssim,
 )
@@ -1350,7 +1348,6 @@ def _make_validation_image_tiles(
     sky_mask: torch.Tensor | None,
     semantic_label_masks: dict[str, torch.Tensor] | None,
     max_hit_count: int,
-    gt_depth: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build aligned validation tiles for grouped W&B image grids."""
     rgb_gt = rgb_gt.clip(0, 1.0)
@@ -1422,24 +1419,6 @@ def _make_validation_image_tiles(
             tiles[SEMANTIC_OPACITY_TILE] = sky_mask.clip(0, 1.0).expand_as(
                 rgb_gt
             )
-    if gt_depth is not None:
-        # `_robust_jet_map` / `jet_map` expect the same shape `pred_dist`
-        # has at this point — sliced last batch element, ``[H, W, 1]``.
-        # Anything else silently produces a black panel.
-        gt = gt_depth
-        if gt.dim() == 4:
-            gt = gt[0]
-        if gt.dim() == 2:
-            gt = gt.unsqueeze(-1)
-        gt_valid = (gt > 0.0).to(gt.dtype)
-        if valid_mask is not None and gt_valid.shape == valid_mask.shape:
-            gt_valid = gt_valid * valid_mask
-        if gt.shape[:2] != depth_rgb.shape[:2]:
-            h = min(gt.shape[0], depth_rgb.shape[0])
-            w = min(gt.shape[1], depth_rgb.shape[1])
-            gt = gt[:h, :w]
-            gt_valid = gt_valid[:h, :w]
-        tiles["depth_gt"] = _robust_jet_map(gt, gt_valid)
     return tiles
 
 
@@ -3296,33 +3275,6 @@ class Trainer3DGRUT:
                     device=self.device,
                     dtype=gpu_batch.rgb_gt.dtype,
                 )
-                gt_depth_for_tile = None
-                dense_depth_dir = (
-                    self.conf.loss.get("dense_depth_dir", "")
-                    if hasattr(self.conf.loss, "get")
-                    else getattr(self.conf.loss, "dense_depth_dir", "")
-                )
-                if dense_depth_dir:
-                    image_path = getattr(gpu_batch, "image_path", "")
-                    stem = (
-                        os.path.splitext(os.path.basename(image_path))[0]
-                        if image_path
-                        else ""
-                    )
-                    cache = getattr(self, "_dense_depth_cache", None)
-                    if cache is None:
-                        cache = {}
-                        self._dense_depth_cache = cache
-                    if stem and stem in cache:
-                        gt_depth_for_tile = cache[stem]
-                    elif stem:
-                        npy_path = os.path.join(dense_depth_dir, f"{stem}.npy")
-                        if os.path.exists(npy_path):
-                            gt_arr = np.load(npy_path).astype("float32")
-                            gt_depth_for_tile = torch.from_numpy(gt_arr).to(
-                                self.device
-                            )
-                            cache[stem] = gt_depth_for_tile
                 metrics["img_eval_tiles"] = _make_validation_image_tiles(
                     rgb_gt=gpu_batch.rgb_gt[-1],
                     rgb_pred=outputs["pred_rgb"][-1],
@@ -3333,7 +3285,6 @@ class Trainer3DGRUT:
                     sky_mask=sky_mask,
                     semantic_label_masks=semantic_label_masks,
                     max_hit_count=self.conf.writer.max_num_hits,
-                    gt_depth=gt_depth_for_tile,
                 )
                 if foundation_feature_error_map is not None and bool(
                     feature_conf.get("log_error_tile", True)
@@ -3511,44 +3462,6 @@ class Trainer3DGRUT:
                 ).mean()
                 lambda_position_anchor = self.conf.loss.lambda_position_anchor
 
-        loss_tangent_plane_anchor = torch.zeros(1, device=self.device)
-        lambda_tangent_plane_anchor = 0.0
-        if self.conf.loss.get("use_tangent_plane_anchor", False):
-            if self.model.position_anchor.shape != self.model.positions.shape:
-                msg = (
-                    "loss.use_tangent_plane_anchor requires position_anchor "
-                    "and positions to have the same shape."
-                )
-                raise RuntimeError(msg)
-            if (
-                self.model.tangent_plane_normal_anchor.shape
-                != self.model.positions.shape
-            ):
-                msg = (
-                    "loss.use_tangent_plane_anchor requires "
-                    "tangent_plane_normal_anchor and positions to have the "
-                    "same shape."
-                )
-                raise RuntimeError(msg)
-            with torch.cuda.nvtx.range("loss-tangent-plane-anchor"):
-                epsilon = float(self.conf.loss.tangent_plane_anchor_epsilon)
-                normals = torch.nn.functional.normalize(
-                    self.model.tangent_plane_normal_anchor.to(
-                        dtype=self.model.positions.dtype,
-                        device=self.model.positions.device,
-                    ),
-                    dim=1,
-                )
-                offset = self.model.positions - self.model.position_anchor
-                signed_distance = (offset * normals).sum(dim=1)
-                loss_tangent_plane_anchor = (
-                    torch.sqrt(signed_distance.square() + epsilon * epsilon)
-                    - epsilon
-                ).mean()
-                lambda_tangent_plane_anchor = (
-                    self.conf.loss.lambda_tangent_plane_anchor
-                )
-
         loss_view_albedo_delta = torch.zeros(1, device=self.device)
         lambda_view_albedo_delta = 0.0
         if self.conf.loss.get("use_view_albedo_delta", False):
@@ -3569,218 +3482,6 @@ class Trainer3DGRUT:
                 )
                 lambda_view_density_delta = (
                     self.conf.loss.lambda_view_density_delta
-                )
-
-        # Dense depth supervision (Phase 3c: DA3 z-extended)
-        loss_dense_depth = torch.zeros(1, device=self.device)
-        dense_depth_camera_weight = torch.ones(1, device=self.device)
-        dense_depth_radial_weight = torch.ones(1, device=self.device)
-        lambda_dense_depth = 0.0
-        if self.conf.loss.use_dense_depth:
-            dense_depth_dir = self.conf.loss.dense_depth_dir
-            if not dense_depth_dir:
-                raise RuntimeError(
-                    "loss.use_dense_depth requires loss.dense_depth_dir."
-                )
-            with torch.cuda.nvtx.range("loss-dense-depth"):
-                image_path = getattr(gpu_batch, "image_path", "")
-                stem = (
-                    os.path.splitext(os.path.basename(image_path))[0]
-                    if image_path
-                    else ""
-                )
-                cache = getattr(self, "_dense_depth_cache", None)
-                if cache is None:
-                    cache = {}
-                    self._dense_depth_cache = cache
-                gt_depth = cache.get(stem) if stem else None
-                if gt_depth is None and stem:
-                    npy_path = os.path.join(dense_depth_dir, f"{stem}.npy")
-                    if os.path.exists(npy_path):
-                        gt_arr = np.load(npy_path).astype("float32")
-                        gt_depth = torch.from_numpy(gt_arr).to(self.device)
-                        cache[stem] = gt_depth
-                if gt_depth is not None:
-                    pred_dist = outputs["pred_dist"]
-                    if pred_dist.dim() == 4 and pred_dist.shape[-1] == 1:
-                        pred_dist_2d = pred_dist[0, ..., 0]
-                    else:
-                        pred_dist_2d = pred_dist[0]
-                    # `pred_dist` is hit distance ALONG the ray; `gt_depth`
-                    # is z-depth (DA3 inferred at the pinhole proxy then
-                    # remapped to fisheye coords). For ~180° fisheyes those
-                    # differ by a per-pixel `cos(theta)` factor that ranges
-                    # from 1.0 at the optical axis to ~0.17 near the rim;
-                    # without this conversion the loss compares apples to
-                    # oranges and silently fights the cosine rather than
-                    # the geometry.
-                    rays_dir = getattr(gpu_batch, "rays_dir", None)
-                    if (
-                        rays_dir is not None
-                        and not getattr(
-                            gpu_batch, "rays_in_world_space", False
-                        )
-                        and rays_dir.dim() == 4
-                        and rays_dir.shape[-1] == 3
-                    ):
-                        cos_theta = rays_dir[0, ..., 2]
-                        if cos_theta.shape == pred_dist_2d.shape:
-                            pred_dist_2d = pred_dist_2d * cos_theta
-                    if pred_dist_2d.shape != gt_depth.shape:
-                        # Renderer sometimes pads/crops; align to GT shape.
-                        h = min(pred_dist_2d.shape[0], gt_depth.shape[0])
-                        w = min(pred_dist_2d.shape[1], gt_depth.shape[1])
-                        pred_dist_2d = pred_dist_2d[:h, :w]
-                        gt_depth = gt_depth[:h, :w]
-                    valid_mask = gt_depth > 0.0
-                    if mask is not None:
-                        m = mask
-                        if m.dim() == 4:
-                            m = m[0]
-                        m = m.squeeze(-1) > 0.5
-                        if m.shape != valid_mask.shape:
-                            mh = min(m.shape[0], valid_mask.shape[0])
-                            mw = min(m.shape[1], valid_mask.shape[1])
-                            m = m[:mh, :mw]
-                            valid_mask = valid_mask[:mh, :mw]
-                            pred_dist_2d = pred_dist_2d[:mh, :mw]
-                            gt_depth = gt_depth[:mh, :mw]
-                        valid_mask = valid_mask & m
-                    pixel_weight = None
-                    radial_weights = list(
-                        self.conf.loss.get(
-                            "dense_depth_radial_camera_weights",
-                            [],
-                        )
-                    )
-                    if radial_weights:
-                        camera_idx = int(gpu_batch.camera_idx)
-                        if camera_idx >= len(radial_weights):
-                            msg = (
-                                "loss.dense_depth_radial_camera_weights must "
-                                "include one four-band entry per camera. "
-                                f"Missing index {camera_idx}."
-                            )
-                            raise RuntimeError(msg)
-                        band_weights = [
-                            float(weight)
-                            for weight in list(radial_weights[camera_idx])
-                        ]
-                        pixel_weight = _radial_weight_map(
-                            height=valid_mask.shape[0],
-                            width=valid_mask.shape[1],
-                            device=self.device,
-                            dtype=pred_dist_2d.dtype,
-                            band_weights=band_weights,
-                        )
-                        dense_depth_radial_weight = pixel_weight.mean()
-                    loss_dense_depth = dense_depth_l1_loss(
-                        pred_dist_2d.unsqueeze(0),
-                        gt_depth.unsqueeze(0),
-                        valid_mask.unsqueeze(0),
-                        pixel_weight=pixel_weight,
-                    )
-                    configured_weights = list(
-                        self.conf.loss.get("dense_depth_camera_weights", [])
-                    )
-                    if configured_weights:
-                        camera_idx = int(gpu_batch.camera_idx)
-                        if camera_idx >= len(configured_weights):
-                            msg = (
-                                "loss.dense_depth_camera_weights must include "
-                                "one weight per camera. Missing index "
-                                f"{camera_idx}."
-                            )
-                            raise RuntimeError(msg)
-                        dense_depth_camera_weight = torch.tensor(
-                            float(configured_weights[camera_idx]),
-                            device=self.device,
-                            dtype=pred_dist_2d.dtype,
-                        )
-                        loss_dense_depth = (
-                            loss_dense_depth * dense_depth_camera_weight
-                        )
-                lambda_dense_depth = self.conf.loss.lambda_dense_depth
-
-        # Dense depth gradient supervision (Phase 3c-redesign)
-        loss_dense_depth_gradient = torch.zeros(1, device=self.device)
-        lambda_dense_depth_gradient = 0.0
-        if self.conf.loss.use_dense_depth_gradient:
-            dense_depth_dir = self.conf.loss.dense_depth_dir
-            if not dense_depth_dir:
-                raise RuntimeError(
-                    "loss.use_dense_depth_gradient requires loss.dense_depth_dir."
-                )
-            with torch.cuda.nvtx.range("loss-dense-depth-gradient"):
-                image_path = getattr(gpu_batch, "image_path", "")
-                stem = (
-                    os.path.splitext(os.path.basename(image_path))[0]
-                    if image_path
-                    else ""
-                )
-                cache = getattr(self, "_dense_depth_cache", None)
-                if cache is None:
-                    cache = {}
-                    self._dense_depth_cache = cache
-                gt_depth = cache.get(stem) if stem else None
-                if gt_depth is None and stem:
-                    npy_path = os.path.join(dense_depth_dir, f"{stem}.npy")
-                    if os.path.exists(npy_path):
-                        gt_arr = np.load(npy_path).astype("float32")
-                        gt_depth = torch.from_numpy(gt_arr).to(self.device)
-                        cache[stem] = gt_depth
-                if gt_depth is not None:
-                    pred_dist = outputs["pred_dist"]
-                    if pred_dist.dim() == 4 and pred_dist.shape[-1] == 1:
-                        pred_dist_2d = pred_dist[0, ..., 0]
-                    else:
-                        pred_dist_2d = pred_dist[0]
-                    # `pred_dist` is hit distance ALONG the ray; `gt_depth`
-                    # is z-depth (DA3 inferred at the pinhole proxy then
-                    # remapped to fisheye coords). For ~180° fisheyes those
-                    # differ by a per-pixel `cos(theta)` factor that ranges
-                    # from 1.0 at the optical axis to ~0.17 near the rim;
-                    # without this conversion the loss compares apples to
-                    # oranges and silently fights the cosine rather than
-                    # the geometry.
-                    rays_dir = getattr(gpu_batch, "rays_dir", None)
-                    if (
-                        rays_dir is not None
-                        and not getattr(
-                            gpu_batch, "rays_in_world_space", False
-                        )
-                        and rays_dir.dim() == 4
-                        and rays_dir.shape[-1] == 3
-                    ):
-                        cos_theta = rays_dir[0, ..., 2]
-                        if cos_theta.shape == pred_dist_2d.shape:
-                            pred_dist_2d = pred_dist_2d * cos_theta
-                    if pred_dist_2d.shape != gt_depth.shape:
-                        h = min(pred_dist_2d.shape[0], gt_depth.shape[0])
-                        w = min(pred_dist_2d.shape[1], gt_depth.shape[1])
-                        pred_dist_2d = pred_dist_2d[:h, :w]
-                        gt_depth = gt_depth[:h, :w]
-                    valid_mask = gt_depth > 0.0
-                    if mask is not None:
-                        m = mask
-                        if m.dim() == 4:
-                            m = m[0]
-                        m = m.squeeze(-1) > 0.5
-                        if m.shape != valid_mask.shape:
-                            mh = min(m.shape[0], valid_mask.shape[0])
-                            mw = min(m.shape[1], valid_mask.shape[1])
-                            m = m[:mh, :mw]
-                            valid_mask = valid_mask[:mh, :mw]
-                            pred_dist_2d = pred_dist_2d[:mh, :mw]
-                            gt_depth = gt_depth[:mh, :mw]
-                        valid_mask = valid_mask & m
-                    loss_dense_depth_gradient = dense_depth_gradient_l1_loss(
-                        pred_dist_2d.unsqueeze(0),
-                        gt_depth.unsqueeze(0),
-                        valid_mask.unsqueeze(0),
-                    )
-                lambda_dense_depth_gradient = (
-                    self.conf.loss.lambda_dense_depth_gradient
                 )
 
         # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps)
@@ -3994,11 +3695,8 @@ class Trainer3DGRUT:
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
             + lambda_position_anchor * loss_position_anchor
-            + lambda_tangent_plane_anchor * loss_tangent_plane_anchor
             + lambda_view_albedo_delta * loss_view_albedo_delta
             + lambda_view_density_delta * loss_view_density_delta
-            + lambda_dense_depth * loss_dense_depth
-            + lambda_dense_depth_gradient * loss_dense_depth_gradient
             + lambda_equirect_consistency * loss_equirect_consistency
         )
         loss = loss * camera_loss_weight * frame_loss_weight
@@ -4009,14 +3707,6 @@ class Trainer3DGRUT:
             ssim_loss=lambda_ssim * loss_ssim,
             camera_loss_weight=camera_loss_weight,
             frame_loss_weight=frame_loss_weight,
-            dense_depth_loss=lambda_dense_depth * loss_dense_depth,
-            dense_depth_loss_raw=loss_dense_depth,
-            dense_depth_camera_weight=dense_depth_camera_weight,
-            dense_depth_radial_weight=dense_depth_radial_weight,
-            dense_depth_gradient_loss=(
-                lambda_dense_depth_gradient * loss_dense_depth_gradient
-            ),
-            dense_depth_gradient_loss_raw=loss_dense_depth_gradient,
             equirect_consistency_loss=(
                 lambda_equirect_consistency * loss_equirect_consistency
             ),
@@ -4039,10 +3729,6 @@ class Trainer3DGRUT:
                 lambda_position_anchor * loss_position_anchor
             ),
             position_anchor_loss_raw=loss_position_anchor,
-            tangent_plane_anchor_loss=(
-                lambda_tangent_plane_anchor * loss_tangent_plane_anchor
-            ),
-            tangent_plane_anchor_loss_raw=loss_tangent_plane_anchor,
             view_albedo_delta_loss=(
                 lambda_view_albedo_delta * loss_view_albedo_delta
             ),
@@ -4489,46 +4175,6 @@ class Trainer3DGRUT:
         if self.conf.loss.use_ssim:
             ssim_loss = np.mean(metrics["losses"]["ssim_loss"])
             writer.add_scalar("val/loss/ssim", ssim_loss, global_step)
-        if self.conf.loss.use_dense_depth:
-            dense_depth_loss = np.mean(metrics["losses"]["dense_depth_loss"])
-            dense_depth_loss_raw = np.mean(
-                metrics["losses"]["dense_depth_loss_raw"]
-            )
-            writer.add_scalar(
-                "val/loss/dense_depth", dense_depth_loss, global_step
-            )
-            writer.add_scalar(
-                "val/loss/dense_depth_raw",
-                dense_depth_loss_raw,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/lambda/dense_depth",
-                self.conf.loss.lambda_dense_depth,
-                global_step,
-            )
-        if self.conf.loss.use_dense_depth_gradient:
-            dense_depth_gradient_loss = np.mean(
-                metrics["losses"]["dense_depth_gradient_loss"]
-            )
-            dense_depth_gradient_loss_raw = np.mean(
-                metrics["losses"]["dense_depth_gradient_loss_raw"]
-            )
-            writer.add_scalar(
-                "val/loss/dense_depth_gradient",
-                dense_depth_gradient_loss,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/loss/dense_depth_gradient_raw",
-                dense_depth_gradient_loss_raw,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/lambda/dense_depth_gradient",
-                self.conf.loss.lambda_dense_depth_gradient,
-                global_step,
-            )
         if self.conf.loss.use_equirect_consistency:
             equirect_consistency_loss = np.mean(
                 metrics["losses"]["equirect_consistency_loss"]
@@ -4617,29 +4263,6 @@ class Trainer3DGRUT:
                 self.conf.loss.lambda_position_anchor,
                 global_step,
             )
-        if self.conf.loss.get("use_tangent_plane_anchor", False):
-            tangent_plane_anchor_loss = np.mean(
-                metrics["losses"]["tangent_plane_anchor_loss"]
-            )
-            tangent_plane_anchor_loss_raw = np.mean(
-                metrics["losses"]["tangent_plane_anchor_loss_raw"]
-            )
-            writer.add_scalar(
-                "val/loss/tangent_plane_anchor",
-                tangent_plane_anchor_loss,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/loss/tangent_plane_anchor_raw",
-                tangent_plane_anchor_loss_raw,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/lambda/tangent_plane_anchor",
-                self.conf.loss.lambda_tangent_plane_anchor,
-                global_step,
-            )
-
         table = {
             k: np.mean(v)
             for k, v in metrics.items()
@@ -4900,50 +4523,6 @@ class Trainer3DGRUT:
             if self.conf.loss.use_ssim:
                 ssim_loss = np.mean(batch_metrics["losses"]["ssim_loss"])
                 writer.add_scalar("train/loss/ssim", ssim_loss, global_step)
-            if self.conf.loss.use_dense_depth:
-                dense_depth_loss = np.mean(
-                    batch_metrics["losses"]["dense_depth_loss"]
-                )
-                dense_depth_loss_raw = np.mean(
-                    batch_metrics["losses"]["dense_depth_loss_raw"]
-                )
-                writer.add_scalar(
-                    "train/loss/dense_depth",
-                    dense_depth_loss,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/dense_depth_raw",
-                    dense_depth_loss_raw,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/lambda/dense_depth",
-                    self.conf.loss.lambda_dense_depth,
-                    global_step,
-                )
-            if self.conf.loss.use_dense_depth_gradient:
-                dense_depth_gradient_loss = np.mean(
-                    batch_metrics["losses"]["dense_depth_gradient_loss"]
-                )
-                dense_depth_gradient_loss_raw = np.mean(
-                    batch_metrics["losses"]["dense_depth_gradient_loss_raw"]
-                )
-                writer.add_scalar(
-                    "train/loss/dense_depth_gradient",
-                    dense_depth_gradient_loss,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/dense_depth_gradient_raw",
-                    dense_depth_gradient_loss_raw,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/lambda/dense_depth_gradient",
-                    self.conf.loss.lambda_dense_depth_gradient,
-                    global_step,
-                )
             if self.conf.loss.use_equirect_consistency:
                 equirect_consistency_loss = np.mean(
                     batch_metrics["losses"]["equirect_consistency_loss"]
@@ -5055,28 +4634,6 @@ class Trainer3DGRUT:
                 writer.add_scalar(
                     "train/lambda/position_anchor",
                     self.conf.loss.lambda_position_anchor,
-                    global_step,
-                )
-            if self.conf.loss.get("use_tangent_plane_anchor", False):
-                tangent_plane_anchor_loss = np.mean(
-                    batch_metrics["losses"]["tangent_plane_anchor_loss"]
-                )
-                tangent_plane_anchor_loss_raw = np.mean(
-                    batch_metrics["losses"]["tangent_plane_anchor_loss_raw"]
-                )
-                writer.add_scalar(
-                    "train/loss/tangent_plane_anchor",
-                    tangent_plane_anchor_loss,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/tangent_plane_anchor_raw",
-                    tangent_plane_anchor_loss_raw,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/lambda/tangent_plane_anchor",
-                    self.conf.loss.lambda_tangent_plane_anchor,
                     global_step,
                 )
             if (
