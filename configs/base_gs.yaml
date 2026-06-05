@@ -35,7 +35,7 @@ diagnostics:
   snapshot_resolution: 256  # Thumbnail edge length
   snapshot_include_gt: true  # Include GT RGB when the train batch exposes it
   snapshot_contact_sheet_enabled: true  # Log GT/render/residual/grad in one PNG
-  snapshot_grad_enabled: false  # Grad panels are sparse on dense-prior smoke runs; opt in when needed
+  snapshot_grad_enabled: false  # Grad panels are sparse; opt in when needed
   snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
   snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
   loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
@@ -263,8 +263,8 @@ post_processing:
   # When > 0, enables distillation mode: Gaussians and PPISP params are frozen,
   # only the controller is trained for these additional steps.
   n_distillation_steps: 5000
-  # Luminance affine parameters. The first B2G experiment uses camera-only
-  # correction; frame residuals are optional and strongly regularized.
+  # Luminance affine parameters. Camera-only correction is the default;
+  # frame residuals are optional and strongly regularized.
   lr: 0.001
   reg_lambda: 0.01
   use_frame_residual: false
