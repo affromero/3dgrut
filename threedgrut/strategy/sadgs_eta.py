@@ -34,7 +34,7 @@ Two scoring modes are provided, both verbatim from SAD-GS:
   square root. Direction-aware: axes aligned with the local edge get
   higher eta than axes parallel to it.
 
-SAD-GS's default is wavelength. Hax-CV's port exposes both for ablation.
+SAD-GS's default is wavelength. Hax-CV's port exposes both for diagnostics.
 
 The pinhole reference projection :func:`compute_projected_axes_pinhole`
 is used only for cross-validation against the SAD-GS reference; production

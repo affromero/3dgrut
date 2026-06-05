@@ -776,8 +776,8 @@ class GSStrategy(BaseStrategy):
             # multiplier (1 + normalized_residual) and the reliable_structure
             # weighting; SAD-GS argues eta = projected_axis_length /
             # wavelength_min is the principled score on its own. The legacy
-            # residual term moves to the Phase 6 ablation (--use_residual_
-            # weight) where we can A/B against the SAD-GS-faithful default.
+            # residual term remains a diagnostic switch for A/B comparison
+            # against the SAD-GS-faithful default.
             score = sadgs_eta_3ch.max(dim=1).values
             self._accumulate_sadgs_multiview_state(
                 mask=mask, valid=valid, eta_3ch=sadgs_eta_3ch
@@ -901,9 +901,8 @@ class GSStrategy(BaseStrategy):
             valid.unsqueeze(1), eta_total.unsqueeze(1), torch.zeros_like(eta_total.unsqueeze(1))
         )
         self.sadgs_accum_view_count[masked_indices] += valid.float().unsqueeze(1)
-        # accum_weights_valid increments by 1.0 per valid view (matches
-        # SAD-GS when transmittance is 1; the per-view transmittance
-        # weighting is a Phase 6 ablation).
+        # accum_weights_valid increments by 1.0 per valid view, matching
+        # SAD-GS when transmittance is 1.
         self.sadgs_accum_weights_valid[masked_indices] += valid.float().unsqueeze(
             1
         )
