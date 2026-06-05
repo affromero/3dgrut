@@ -1144,7 +1144,7 @@ class GSStrategy(BaseStrategy):
         self,
         image_path: str,
     ) -> tuple[torch.Tensor | None, float]:
-        """Load the scanner-depth support mask and item weight for one image."""
+        """Load the support mask and item weight for one image."""
         items_by_name = self.support_mask_items_by_image_name()
         item = items_by_name.get(path_basename(image_path))
         if item is None:
@@ -1154,7 +1154,7 @@ class GSStrategy(BaseStrategy):
             return self._support_mask_cache[mask_path], item_weight
         if not path_exists(mask_path):
             raise FileNotFoundError(
-                "Scanner-depth support mask not found: "
+                "Support mask not found: "
                 f"{mask_path} for image {image_path}"
             )
         image = HashableImage(mask_path).to_gray()
