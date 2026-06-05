@@ -75,15 +75,6 @@ residual_density_control:
   frequency_edge_power: 0.5
   frequency_edge_min_weight: 0.75
   frequency_edge_max_weight: 2.0
-  # RoMa-guided density control (Phase 3a): per-image precision lookup
-  # Hydra struct mode rejects unknown keys, so all defaults must be
-  # declared here even when the feature is off (use_roma_precision_weight=false).
-  use_roma_precision_weight: false
-  roma_precision_dir: ""
-  roma_precision_reference: 0.5
-  roma_precision_power: 1.0
-  roma_precision_min_weight: 0.5
-  roma_precision_max_weight: 3.0
   use_structure_density_weight: false
   structure_score_only: false
   structure_anisotropic_split: false
