@@ -43,10 +43,7 @@ from threedgrut.datasets.utils import (
     PointCloud,
 )
 from threedgrut.model.camera_residual import CameraResidual
-from threedgrut.model.losses import (
-    equirect_consistency_l1_loss,
-    ssim,
-)
+from threedgrut.model.losses import ssim
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.post_processing import LuminanceAffine
@@ -731,41 +728,6 @@ def _region_mask(
     return ((radius >= lower) & (radius < upper)).to(radius.dtype)[
         None, :, :, None
     ]
-
-
-def _radial_weight_map(
-    *,
-    height: int,
-    width: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    band_weights: list[float],
-) -> torch.Tensor:
-    """Return a [1, H, W] radial loss-weight map."""
-    if len(band_weights) != 4:
-        raise RuntimeError(
-            "Radial loss-weight entries must have four values: center, "
-            "mid, outer, rim."
-        )
-    radius = _image_radius(
-        height=height,
-        width=width,
-        device=device,
-        dtype=dtype,
-    )
-    radius = radius / torch.clamp_min(radius.max(), 1e-6)
-    bands = (
-        (0.00, 0.33),
-        (0.33, 0.66),
-        (0.66, 0.90),
-        (0.90, 1.01),
-    )
-    weight = torch.ones_like(radius)
-    for band_weight, (lower, upper) in zip(band_weights, bands):
-        band_mask = (radius >= lower) & (radius < upper)
-        band_value = torch.full_like(weight, float(band_weight))
-        weight = torch.where(band_mask, band_value, weight)
-    return weight.unsqueeze(0)
 
 
 def _radial_residual_metrics(
@@ -3440,186 +3402,6 @@ class Trainer3DGRUT:
                 ).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
-        # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps)
-        loss_equirect_consistency = torch.zeros(1, device=self.device)
-        loss_equirect_consistency_raw = torch.zeros(1, device=self.device)
-        equirect_consistency_camera_weight = torch.ones(
-            1,
-            device=self.device,
-        )
-        equirect_consistency_radial_weight = torch.ones(
-            1,
-            device=self.device,
-        )
-        lambda_equirect_consistency = 0.0
-        if self.conf.loss.use_equirect_consistency:
-            warp_dir = self.conf.loss.equirect_warp_dir
-            image_dir = self.conf.loss.equirect_image_dir
-            if not warp_dir or not image_dir:
-                raise RuntimeError(
-                    "loss.use_equirect_consistency requires "
-                    "loss.equirect_warp_dir and loss.equirect_image_dir."
-                )
-            with torch.cuda.nvtx.range("loss-equirect-consistency"):
-                image_path = getattr(gpu_batch, "image_path", "")
-                stem = (
-                    os.path.splitext(os.path.basename(image_path))[0]
-                    if image_path
-                    else ""
-                )
-                warp_cache = getattr(self, "_equirect_warp_cache", None)
-                if warp_cache is None:
-                    warp_cache = {}
-                    self._equirect_warp_cache = warp_cache
-                eq_image_cache = getattr(self, "_equirect_image_cache", None)
-                if eq_image_cache is None:
-                    eq_image_cache = {}
-                    self._equirect_image_cache = eq_image_cache
-                warp_overlap = warp_cache.get(stem) if stem else None
-                if warp_overlap is None and stem:
-                    npz_path = os.path.join(warp_dir, f"{stem}.npz")
-                    if os.path.exists(npz_path):
-                        payload = np.load(npz_path)
-                        warp_np = payload["warp_AB"].astype("float32")
-                        overlap_np = payload["overlap_AB"].astype("float32")
-                        warp_t = torch.from_numpy(warp_np).to(self.device)
-                        overlap_t = torch.from_numpy(overlap_np).to(
-                            self.device
-                        )
-                        warp_cache[stem] = (warp_t, overlap_t)
-                        warp_overlap = (warp_t, overlap_t)
-                # Frame index from stem (e.g. "front_0009" -> "0009").
-                eq_image_t = None
-                if stem:
-                    parts = stem.split("_")
-                    if len(parts) >= 2 and parts[-1].isdigit():
-                        frame_key = parts[-1]
-                        eq_image_t = eq_image_cache.get(frame_key)
-                        if eq_image_t is None:
-                            eq_path = os.path.join(
-                                image_dir, f"{frame_key}.png"
-                            )
-                            if os.path.exists(eq_path):
-                                from PIL import Image
-
-                                arr = (
-                                    np.asarray(
-                                        Image.open(eq_path).convert("RGB")
-                                    ).astype("float32")
-                                    / 255.0
-                                )
-                                eq_image_t = (
-                                    torch.from_numpy(arr)
-                                    .permute(2, 0, 1)
-                                    .unsqueeze(0)
-                                    .to(self.device)
-                                )
-                                eq_image_cache[frame_key] = eq_image_t
-                if warp_overlap is not None and eq_image_t is not None:
-                    warp_t, overlap_t = warp_overlap
-                    h_p, w_p = rgb_pred.shape[1], rgb_pred.shape[2]
-                    if warp_t.shape[0] != h_p or warp_t.shape[1] != w_p:
-                        # Resize warp + overlap to render resolution if needed.
-                        warp_b = warp_t.permute(2, 0, 1).unsqueeze(0)
-                        warp_b = torch.nn.functional.interpolate(
-                            warp_b,
-                            size=(h_p, w_p),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        warp_t = warp_b[0].permute(1, 2, 0).contiguous()
-                        overlap_b = overlap_t.unsqueeze(0).unsqueeze(0)
-                        overlap_b = torch.nn.functional.interpolate(
-                            overlap_b,
-                            size=(h_p, w_p),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                        overlap_t = overlap_b[0, 0].contiguous()
-                    # Sample equirect GT into fisheye coords.
-                    sampled = torch.nn.functional.grid_sample(
-                        eq_image_t,
-                        warp_t.unsqueeze(0),
-                        mode="bilinear",
-                        padding_mode="zeros",
-                        align_corners=False,
-                    )
-                    sampled = sampled[0].permute(1, 2, 0).unsqueeze(0)
-                    threshold = float(
-                        self.conf.loss.equirect_consistency_overlap_threshold
-                    )
-                    loss_equirect_consistency_raw = (
-                        equirect_consistency_l1_loss(
-                            rgb_pred,
-                            sampled,
-                            overlap_t.unsqueeze(0),
-                            threshold,
-                        )
-                    )
-                    loss_equirect_consistency = loss_equirect_consistency_raw
-                    radial_weights = list(
-                        self.conf.loss.get(
-                            "equirect_consistency_radial_camera_weights",
-                            [],
-                        )
-                    )
-                    if radial_weights:
-                        camera_idx = int(gpu_batch.camera_idx)
-                        if camera_idx >= len(radial_weights):
-                            msg = (
-                                "loss.equirect_consistency_radial_camera_weights "
-                                "must include one four-band entry per camera. "
-                                f"Missing index {camera_idx}."
-                            )
-                            raise RuntimeError(msg)
-                        band_weights = [
-                            float(weight)
-                            for weight in list(radial_weights[camera_idx])
-                        ]
-                        pixel_weight = _radial_weight_map(
-                            height=h_p,
-                            width=w_p,
-                            device=self.device,
-                            dtype=rgb_pred.dtype,
-                            band_weights=band_weights,
-                        )
-                        equirect_consistency_radial_weight = (
-                            pixel_weight.mean()
-                        )
-                        loss_equirect_consistency = (
-                            equirect_consistency_l1_loss(
-                                rgb_pred,
-                                sampled,
-                                overlap_t.unsqueeze(0),
-                                threshold,
-                                pixel_weight=pixel_weight,
-                            )
-                        )
-                    configured_weights = list(
-                        self.conf.loss.equirect_consistency_camera_weights
-                    )
-                    if configured_weights:
-                        camera_idx = int(gpu_batch.camera_idx)
-                        if camera_idx >= len(configured_weights):
-                            msg = (
-                                "loss.equirect_consistency_camera_weights "
-                                "must include one weight per camera. Missing "
-                                f"index {camera_idx}."
-                            )
-                            raise RuntimeError(msg)
-                        equirect_consistency_camera_weight = torch.tensor(
-                            float(configured_weights[camera_idx]),
-                            device=self.device,
-                            dtype=rgb_pred.dtype,
-                        )
-                        loss_equirect_consistency = (
-                            loss_equirect_consistency
-                            * equirect_consistency_camera_weight
-                        )
-                lambda_equirect_consistency = (
-                    self.conf.loss.lambda_equirect_consistency
-                )
-
         # Total loss
         camera_loss_weight = torch.ones(1, device=self.device)
         if self.conf.loss.use_camera_loss_weights:
@@ -3643,7 +3425,6 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
-            + lambda_equirect_consistency * loss_equirect_consistency
         )
         loss = loss * camera_loss_weight
         return dict(
@@ -3652,16 +3433,6 @@ class Trainer3DGRUT:
             l2_loss=lambda_l2 * loss_l2,
             ssim_loss=lambda_ssim * loss_ssim,
             camera_loss_weight=camera_loss_weight,
-            equirect_consistency_loss=(
-                lambda_equirect_consistency * loss_equirect_consistency
-            ),
-            equirect_consistency_loss_raw=loss_equirect_consistency_raw,
-            equirect_consistency_camera_weight=(
-                equirect_consistency_camera_weight
-            ),
-            equirect_consistency_radial_weight=(
-                equirect_consistency_radial_weight
-            ),
             foundation_feature_loss=(
                 lambda_foundation_feature * loss_foundation_feature
             ),
@@ -4108,44 +3879,6 @@ class Trainer3DGRUT:
         if self.conf.loss.use_ssim:
             ssim_loss = np.mean(metrics["losses"]["ssim_loss"])
             writer.add_scalar("val/loss/ssim", ssim_loss, global_step)
-        if self.conf.loss.use_equirect_consistency:
-            equirect_consistency_loss = np.mean(
-                metrics["losses"]["equirect_consistency_loss"]
-            )
-            equirect_consistency_loss_raw = np.mean(
-                metrics["losses"]["equirect_consistency_loss_raw"]
-            )
-            equirect_camera_weight = np.mean(
-                metrics["losses"]["equirect_consistency_camera_weight"]
-            )
-            equirect_radial_weight = np.mean(
-                metrics["losses"]["equirect_consistency_radial_weight"]
-            )
-            writer.add_scalar(
-                "val/loss/equirect_consistency",
-                equirect_consistency_loss,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/loss/equirect_consistency_raw",
-                equirect_consistency_loss_raw,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/loss/equirect_camera_weight",
-                equirect_camera_weight,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/loss/equirect_radial_weight",
-                equirect_radial_weight,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/lambda/equirect_consistency",
-                self.conf.loss.lambda_equirect_consistency,
-                global_step,
-            )
         if self.conf.loss.use_foundation_feature:
             foundation_feature_loss = np.mean(
                 metrics["losses"]["foundation_feature_loss"]
@@ -4434,48 +4167,6 @@ class Trainer3DGRUT:
             if self.conf.loss.use_ssim:
                 ssim_loss = np.mean(batch_metrics["losses"]["ssim_loss"])
                 writer.add_scalar("train/loss/ssim", ssim_loss, global_step)
-            if self.conf.loss.use_equirect_consistency:
-                equirect_consistency_loss = np.mean(
-                    batch_metrics["losses"]["equirect_consistency_loss"]
-                )
-                equirect_consistency_loss_raw = np.mean(
-                    batch_metrics["losses"]["equirect_consistency_loss_raw"]
-                )
-                equirect_camera_weight = np.mean(
-                    batch_metrics["losses"][
-                        "equirect_consistency_camera_weight"
-                    ]
-                )
-                equirect_radial_weight = np.mean(
-                    batch_metrics["losses"][
-                        "equirect_consistency_radial_weight"
-                    ]
-                )
-                writer.add_scalar(
-                    "train/loss/equirect_consistency",
-                    equirect_consistency_loss,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/equirect_consistency_raw",
-                    equirect_consistency_loss_raw,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/equirect_camera_weight",
-                    equirect_camera_weight,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/equirect_radial_weight",
-                    equirect_radial_weight,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/lambda/equirect_consistency",
-                    self.conf.loss.lambda_equirect_consistency,
-                    global_step,
-                )
             if self.conf.loss.use_camera_loss_weights:
                 camera_loss_weight = np.mean(
                     batch_metrics["losses"]["camera_loss_weight"]

@@ -208,21 +208,6 @@ loss:
   use_foundation_feature: false
   lambda_foundation_feature: 0.0
 
-  # Equirect consistency loss (Phase 3b: RoMa fisheye→equirect warps).
-  # Warp + overlap `.npz` files keyed by image stem (e.g. `left_0009.npz`)
-  # in `equirect_warp_dir` plus an equirect-stitched RGB per frame
-  # (`{frame:04d}.png` in `equirect_image_dir`). Pixels with
-  # `overlap >= equirect_consistency_overlap_threshold` contribute a
-  # masked L1 between the rendered fisheye and the equirect color
-  # sampled into fisheye coords via `F.grid_sample`.
-  use_equirect_consistency: false
-  lambda_equirect_consistency: 0.0
-  equirect_warp_dir: ""
-  equirect_image_dir: ""
-  equirect_consistency_overlap_threshold: 0.5
-  equirect_consistency_camera_weights: []
-  equirect_consistency_radial_camera_weights: []
-
 foundation_features:
   enabled: false
   method: "dinov2_vitl14"

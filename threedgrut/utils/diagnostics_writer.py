@@ -52,7 +52,6 @@ def _build_schema() -> pa.Schema:
         pa.field("total_loss", pa.float32()),
         pa.field("loss_l1", pa.float32()),
         pa.field("loss_ssim", pa.float32()),
-        pa.field("loss_equirect", pa.float32()),
         # Per-attribute grad summaries
         *[pa.field(f"grad_{a}_mean", pa.float32()) for a in _GRAD_PARAMS],
         *[pa.field(f"grad_{a}_p95", pa.float32()) for a in _GRAD_PARAMS],
@@ -157,7 +156,6 @@ class DiagnosticsWriter:
             "total_loss": float(batch_losses.get("total_loss", 0.0)) if batch_losses else 0.0,
             "loss_l1": float(batch_losses.get("l1_loss", 0.0)) if batch_losses else 0.0,
             "loss_ssim": float(batch_losses.get("ssim_loss", 0.0)) if batch_losses else 0.0,
-            "loss_equirect": float(batch_losses.get("equirect_consistency_l1_loss", 0.0)) if batch_losses else 0.0,
             "n_gaussians": int(n_gaussians),
             "step_total_ms": float(step_total_ms),
         }
