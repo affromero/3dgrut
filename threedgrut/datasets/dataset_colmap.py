@@ -1096,20 +1096,24 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                     "silently no-op to global shutter. Provide distinct "
                     "per-frame END poses via images_end.txt."
                 )
-            # 3dgrt RAY path: bake each row's interpolated pose into the
-            # world-space rays + an identity world transform -- true per-pixel
-            # rolling shutter, no per-Gaussian single-pose approximation. The
-            # UT splat path keeps the camera model + shutter_type instead.
-            if self.rs_ray_injection:
-                rays_ori_w, rays_dir_w = build_rs_world_rays(
-                    rays_dir, pose, end
-                )
-                sample["rays_ori"] = rays_ori_w
-                sample["rays_dir"] = rays_dir_w
-                sample["T_to_world"] = torch.eye(
-                    4, device=self.device, dtype=pose.dtype
-                )
-                sample["rays_in_world_space"] = True
+
+        # 3dgrt RAY path: the equirect camera model lives only in the UT tracer,
+        # so the ray path needs EXPLICIT per-pixel world rays. GLOBAL = single
+        # pose; ROLLING = per-row interpolation (true per-pixel rolling shutter,
+        # no per-Gaussian single-pose approximation). Identity world transform
+        # makes the tracer's rayToWorld a pure passthrough. The UT splat path
+        # keeps the camera model + shutter_type instead.
+        if self.rs_ray_injection:
+            rs_end = sample.get("T_to_world_end")
+            if rs_end is None:
+                rs_end = pose
+            rays_ori_w, rays_dir_w = build_rs_world_rays(rays_dir, pose, rs_end)
+            sample["rays_ori"] = rays_ori_w
+            sample["rays_dir"] = rays_dir_w
+            sample["T_to_world"] = torch.eye(
+                4, device=self.device, dtype=pose.dtype
+            )
+            sample["rays_in_world_space"] = True
 
         if "mask" in batch:
             mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
