@@ -70,18 +70,6 @@ import_ply:
   path: ""
   init_global_step: 0
 
-surface_aligned_init:
-  enabled: false
-  use_confidence_gating: false
-  n_neighbors: 12
-  chunk_size: 200000
-  tangent_scale_multiplier: 1.0
-  normal_scale_multiplier: 0.25
-  min_planarity: 0.25
-  max_scattering: 0.15
-  min_scale: 0.002
-  max_scale: 0.05
-
 micro_splat_init:
   enabled: false
   fraction: 0.10
