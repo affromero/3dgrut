@@ -330,6 +330,16 @@ static inline __device__ bool projectPointWithShutter(const tcnn::vec3& position
     const tcnn::vec3 tEnd = sensorState.endPose.slice<0, 3>();
     const tcnn::quat qEnd = tcnn::quat{sensorState.endPose[6], sensorState.endPose[3], sensorState.endPose[4], sensorState.endPose[5]};
 
+    // Rolling-shutter pose interpolation must interpolate the camera CENTER,
+    // not the world->camera translation. Since t = -R*C, linearly mixing t is
+    // only correct when R is constant across the shutter; with rotation during
+    // readout it is wrong. Interpolating the center C and applying the slerped
+    // rotation is the physically-correct rigid (screw) motion. This is an
+    // upstream bug that also affects pinhole/fisheye RS-with-rotation; the
+    // wide-FOV equirect sweep just made it large and measurable.
+    const tcnn::vec3 cStart = -tcnn::transpose(tcnn::to_mat3(qStart)) * tStart;
+    const tcnn::vec3 cEnd   = -tcnn::transpose(tcnn::to_mat3(qEnd)) * tEnd;
+
     if (!validProjection) {
         validProjection = projectPoint(sensorModel, resolution, tcnn::to_mat3(qEnd) * position + tEnd, tolerance, projectedPosition);
         if (!validProjection) {
@@ -344,7 +354,7 @@ static inline __device__ bool projectPointWithShutter(const tcnn::vec3& position
         validProjection   = projectPoint(
             sensorModel,
             resolution,
-            tcnn::to_mat3(tcnn::slerp(qStart, qEnd, alpha)) * position + tcnn::mix(tStart, tEnd, alpha),
+            tcnn::to_mat3(tcnn::slerp(qStart, qEnd, alpha)) * (position - tcnn::mix(cStart, cEnd, alpha)),
             tolerance,
             projectedPosition);
     }

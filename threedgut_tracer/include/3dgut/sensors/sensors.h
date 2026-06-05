@@ -55,11 +55,17 @@ static inline TCNN_HOST_DEVICE TSensorPose interpolatedSensorPose(const TSensorP
                                                                   float relativeTime) {
     using namespace tcnn;
 
-    const quat interpolatedQuat = slerp(quat{startPose[6], startPose[3], startPose[4], startPose[5]},
-                                        quat{endPose[6], endPose[3], endPose[4], endPose[5]},
-                                        relativeTime);
+    const quat startQuat        = quat{startPose[6], startPose[3], startPose[4], startPose[5]};
+    const quat endQuat          = quat{endPose[6], endPose[3], endPose[4], endPose[5]};
+    const quat interpolatedQuat = slerp(startQuat, endQuat, relativeTime);
+    // Interpolate the camera CENTER (t = -R*C), not the world->camera
+    // translation: linearly mixing t is only correct when R is constant across
+    // the shutter. Interpolate C and re-apply the slerped rotation.
+    const vec3 startCenter  = -transpose(to_mat3(startQuat)) * startPose.slice<0, 3>();
+    const vec3 endCenter    = -transpose(to_mat3(endQuat)) * endPose.slice<0, 3>();
+    const vec3 interpCenter = mix(startCenter, endCenter, relativeTime);
     TSensorPose interpolated;
-    interpolated.slice<0, 3>() = mix(startPose.slice<0, 3>(), endPose.slice<0, 3>(), relativeTime);
+    interpolated.slice<0, 3>() = -to_mat3(interpolatedQuat) * interpCenter;
     interpolated.slice<3, 4>() = vec4{interpolatedQuat.x, interpolatedQuat.y, interpolatedQuat.z, interpolatedQuat.w};
 
     return interpolated;
