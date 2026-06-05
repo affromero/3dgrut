@@ -70,14 +70,6 @@ import_ply:
   path: ""
   init_global_step: 0
 
-micro_splat_init:
-  enabled: false
-  fraction: 0.10
-  scale_multiplier: 0.25
-  density_multiplier: 0.50
-  jitter_multiplier: 0.0
-  min_scale: 0.002
-
 camera_residual:
   enabled: false
   lr: 0.0001
