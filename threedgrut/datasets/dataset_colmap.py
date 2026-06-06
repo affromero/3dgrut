@@ -1104,15 +1104,28 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # makes the tracer's rayToWorld a pure passthrough. The UT splat path
         # keeps the camera model + shutter_type instead.
         if self.rs_ray_injection:
-            rs_end = sample.get("T_to_world_end")
+            # GLOBAL must stay global-naive: only a ROLLING shutter consumes the
+            # END pose. rs_ray_injection is gated on method==3dgrt (not on
+            # shutter), so without this guard an images_end.txt present in
+            # scene_rs would silently feed per-row END poses into a GLOBAL run
+            # too -- making RS0 (global-naive) identical to RS1 (rolling) and
+            # contaminating the whole RS0-vs-RS1 ablation.
+            rs_end = (
+                sample.get("T_to_world_end")
+                if shutter != ShutterType.GLOBAL.name
+                else None
+            )
             if rs_end is None:
                 rs_end = pose
             rays_ori_w, rays_dir_w = build_rs_world_rays(rays_dir, pose, rs_end)
             sample["rays_ori"] = rays_ori_w
             sample["rays_dir"] = rays_dir_w
+            # Identity world transform = pure passthrough (rays are already
+            # world-space). Keep the [1, 4, 4] shape the non-injected path
+            # uses so downstream rayToWorld handling is unchanged.
             sample["T_to_world"] = torch.eye(
                 4, device=self.device, dtype=pose.dtype
-            )
+            ).unsqueeze(0)
             sample["rays_in_world_space"] = True
 
         if "mask" in batch:

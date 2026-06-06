@@ -8,3 +8,4 @@ train_focus_image_list_path: null
 train_focus_image_weight: 1.0
 holdout_image_list_path: null  # name-based held-out eval (val == these frames)
 shutter_type: GLOBAL  # GLOBAL or ROLLING_TOP_TO_BOTTOM (needs images_end.txt)
+rs_ray_injection: true  # 3dgrt ray path: inject per-pixel world rays (diag toggle)

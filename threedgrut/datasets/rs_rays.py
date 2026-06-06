@@ -30,6 +30,10 @@ def build_rs_world_rays(rays_dir_cam, c2w_start, c2w_end):
         ``(rays_ori_world, rays_dir_world)``, each ``[1, H, W, 3]``.
     """
     device, dtype = rays_dir_cam.device, rays_dir_cam.dtype
+    # The dataset stores poses as [1, 4, 4] (an unsqueeze(0) survives the
+    # collate strip), so accept either [1, 4, 4] or [4, 4].
+    c2w_start = c2w_start.reshape(4, 4)
+    c2w_end = c2w_end.reshape(4, 4)
     h, w = int(rays_dir_cam.shape[1]), int(rays_dir_cam.shape[2])
     alphas = np.arange(h, dtype=np.float64) / max(h - 1, 1)
     r0 = c2w_start[:3, :3].detach().cpu().numpy()
