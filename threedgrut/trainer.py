@@ -4661,7 +4661,6 @@ class Trainer3DGRUT:
                 train_dataset=self.train_dataset,
                 batch=gpu_batch,
                 writer=self.tracking.writer,
-                outputs=outputs,
             )
 
         # Optimizer step
