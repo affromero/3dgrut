@@ -119,6 +119,13 @@ residual_density_control:
   use_camera_balance: false
   camera_balance_ema_decay: 0.95
   camera_balance_power: 1.0
+  use_frame_risk_weight: false
+  frame_risk_manifest_path: ""
+  frame_risk_selected_weight: 1.0
+  frame_risk_rejected_weight: 0.35
+  frame_risk_default_weight: 1.0
+  frame_risk_min_weight: 0.1
+  frame_risk_max_weight: 1.0
   camera_balance_min_weight: 0.75
   camera_balance_max_weight: 2.0
   log_frequency: 100
