@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-import os
 from typing import Optional
 
 import torch
@@ -58,10 +56,7 @@ class GSStrategy(BaseStrategy):
         self.abs_gradient_density_stats = {}
         self.camera_balance_density_stats = {}
         self.structure_density_stats = {}
-        self.frame_risk_density_stats = {}
         self.camera_balance_residual_ema = torch.empty((0,), device=self.model.device)
-        self.frame_risk_weights: dict[str, float] | None = None
-        self.frame_risk_manifest_row_count = 0
         self.densify_abs_grad_norm_accum = torch.empty([0, 1])
         self.densify_signed_grad_accum = torch.empty([0, 3])
         self.structure_axis_x_accum = torch.empty([0, 1])
@@ -594,7 +589,6 @@ class GSStrategy(BaseStrategy):
             outputs,
         )
         structure_weight = self.compute_structure_density_weight(mask, batch, outputs)
-        frame_risk_weight = self.compute_frame_risk_weight(batch)
         total_weight = (
             area_weight
             * residual_weight
@@ -603,7 +597,6 @@ class GSStrategy(BaseStrategy):
             * frequency_error_weight
             * structure_weight
             * camera_balance_weight
-            * frame_risk_weight
         )
         total_weight = torch.clamp(
             total_weight,
@@ -628,7 +621,6 @@ class GSStrategy(BaseStrategy):
             "structure_weight_mean": structure_weight.mean().item(),
             "structure_weight_max": structure_weight.max().item(),
             "camera_balance_weight": float(camera_balance_weight),
-            "frame_risk_weight": float(frame_risk_weight),
             "total_weight_mean": total_weight.mean().item(),
             "total_weight_max": total_weight.max().item(),
         }
@@ -636,7 +628,6 @@ class GSStrategy(BaseStrategy):
         self.residual_density_stats.update(self.frequency_error_density_stats)
         self.residual_density_stats.update(self.camera_balance_density_stats)
         self.residual_density_stats.update(self.structure_density_stats)
-        self.residual_density_stats.update(self.frame_risk_density_stats)
         if "mog_tiles_count" in outputs:
             tiles_count = outputs["mog_tiles_count"][mask].float()
             self.residual_density_stats.update(
@@ -646,161 +637,6 @@ class GSStrategy(BaseStrategy):
                 }
             )
         return total_weight.unsqueeze(1)
-
-    @torch.no_grad()
-    def compute_frame_risk_weight(self, batch) -> float:
-        if not self.residual_density_control.get("use_frame_risk_weight", False):
-            self.frame_risk_density_stats = {}
-            return 1.0
-        weights = self.load_frame_risk_weights()
-        default_weight = float(
-            self.residual_density_control.get("frame_risk_default_weight", 1.0)
-        )
-        image_path = str(getattr(batch, "image_path", ""))
-        image_name = os.path.basename(image_path)
-        raw_weight = weights.get(image_path, weights.get(image_name, default_weight))
-        min_weight = float(
-            self.residual_density_control.get("frame_risk_min_weight", 0.1)
-        )
-        max_weight = float(
-            self.residual_density_control.get("frame_risk_max_weight", 1.0)
-        )
-        weight = min(max(float(raw_weight), min_weight), max_weight)
-        self.frame_risk_density_stats = {
-            "frame_risk_matched": float(image_path in weights or image_name in weights),
-            "frame_risk_weight": weight,
-            "frame_risk_row_count": float(self.frame_risk_manifest_row_count),
-        }
-        return weight
-
-    def load_frame_risk_weights(self) -> dict[str, float]:
-        if self.frame_risk_weights is not None:
-            return self.frame_risk_weights
-        manifest_path = str(
-            self.residual_density_control.get("frame_risk_manifest_path", "")
-            or ""
-        )
-        if not manifest_path:
-            raise ValueError(
-                "Frame-risk density weighting is enabled, but "
-                "frame_risk_manifest_path is empty."
-            )
-        if not os.path.exists(manifest_path):
-            raise FileNotFoundError(
-                f"Frame-risk manifest does not exist: {manifest_path}"
-            )
-        rows = self.frame_risk_rows_from_manifest(manifest_path)
-        selected_weight = float(
-            self.residual_density_control.get("frame_risk_selected_weight", 1.0)
-        )
-        rejected_weight = float(
-            self.residual_density_control.get("frame_risk_rejected_weight", 0.35)
-        )
-        weights: dict[str, float] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            image_name = row.get("image_name")
-            if not isinstance(image_name, str) or not image_name:
-                continue
-            raw_weight = row.get("weight")
-            row_source = row.get("predicted_source", row.get("source"))
-            if isinstance(row_source, str):
-                row_source = row_source.lower()
-            if isinstance(raw_weight, (int, float)):
-                weight = float(raw_weight)
-            elif row_source == "candidate":
-                weight = selected_weight
-            else:
-                weight = rejected_weight
-            weights[image_name] = weight
-            weights[os.path.basename(image_name)] = weight
-        self.frame_risk_manifest_row_count = len(rows)
-        self.frame_risk_weights = weights
-        logger.info(
-            "Loaded frame-risk density weights from "
-            f"{manifest_path}: {len(weights)} keys / {len(rows)} rows"
-        )
-        return weights
-
-    def frame_risk_rows_from_manifest(self, manifest_path: str) -> list[object]:
-        payload = self.read_json_payload(manifest_path)
-        if isinstance(payload, list):
-            return payload
-        if not isinstance(payload, dict):
-            raise TypeError(
-                f"Frame-risk manifest must be a JSON object or list: {manifest_path}"
-            )
-        weights = payload.get("weights")
-        if isinstance(weights, dict):
-            rows: list[object] = []
-            for image_name, weight in weights.items():
-                if isinstance(image_name, str):
-                    rows.append({"image_name": image_name, "weight": weight})
-            return rows
-        scene_name = payload.get("scene_name")
-        scene_filter = scene_name if isinstance(scene_name, str) else ""
-        rows_payload = payload.get("rows")
-        if isinstance(rows_payload, list):
-            return self.filter_frame_risk_rows(rows_payload, scene_filter)
-        for rows_key in ("rows_path", "prediction_rows_path"):
-            rows_path = payload.get(rows_key)
-            if isinstance(rows_path, str):
-                return self.frame_risk_rows_from_path(
-                    manifest_path=manifest_path,
-                    rows_path=rows_path,
-                    scene_name=scene_filter,
-                )
-        raise KeyError(
-            "Frame-risk manifest must contain weights, rows, rows_path, or "
-            f"prediction_rows_path: {manifest_path}"
-        )
-
-    def frame_risk_rows_from_path(
-        self, *, manifest_path: str, rows_path: str, scene_name: str
-    ) -> list[object]:
-        resolved_rows_path = self.resolve_frame_risk_rows_path(
-            manifest_path=manifest_path,
-            rows_path=rows_path,
-        )
-        rows = self.read_json_payload(resolved_rows_path)
-        if isinstance(rows, list):
-            return self.filter_frame_risk_rows(rows, scene_name)
-        raise TypeError(
-            "Frame-risk prediction rows must be a JSON list: "
-            f"{resolved_rows_path}"
-        )
-
-    def filter_frame_risk_rows(
-        self, rows: list[object], scene_name: str
-    ) -> list[object]:
-        if not scene_name:
-            return rows
-        return [
-            row
-            for row in rows
-            if not isinstance(row, dict) or row.get("scene_name") == scene_name
-        ]
-
-    def resolve_frame_risk_rows_path(
-        self, *, manifest_path: str, rows_path: str
-    ) -> str:
-        if os.path.isabs(rows_path) and os.path.exists(rows_path):
-            return rows_path
-        manifest_dir = os.path.dirname(os.path.abspath(manifest_path))
-        relative_candidate = os.path.join(manifest_dir, rows_path)
-        if os.path.exists(relative_candidate):
-            return relative_candidate
-        basename_candidate = os.path.join(manifest_dir, os.path.basename(rows_path))
-        if os.path.exists(basename_candidate):
-            return basename_candidate
-        if os.path.isabs(rows_path):
-            return rows_path
-        return relative_candidate
-
-    def read_json_payload(self, path: str) -> object:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
 
     @torch.no_grad()
     def compute_structure_density_weight(self, mask: torch.Tensor, batch, outputs) -> torch.Tensor:
