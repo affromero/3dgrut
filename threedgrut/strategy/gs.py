@@ -257,6 +257,7 @@ class GSStrategy(BaseStrategy):
                     sensor_position=batch.T_to_world[0, :3, 3],
                     batch=batch,
                     outputs=outputs,
+                    step=step,
                 )
 
         # Clamp density
@@ -330,11 +331,18 @@ class GSStrategy(BaseStrategy):
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("update-gradient-buffer")
-    def update_gradient_buffer(self, sensor_position: torch.Tensor, batch=None, outputs=None) -> None:
+    def update_gradient_buffer(
+        self,
+        sensor_position: torch.Tensor,
+        batch=None,
+        outputs=None,
+        step: int | None = None,
+    ) -> None:
         params_grad = self.model.positions.grad
         assert params_grad is not None
         mask = (params_grad != 0).max(dim=1)[0]
-        if self.residual_density_control.get("enabled", False) and outputs is not None:
+        residual_density_active = self.should_apply_residual_density_control(step)
+        if residual_density_active and outputs is not None:
             visibility = outputs.get("mog_visibility")
             if visibility is not None and self.residual_density_control.get("use_visibility", True):
                 mask = torch.logical_and(mask, visibility.reshape(-1) > 0)
@@ -347,7 +355,7 @@ class GSStrategy(BaseStrategy):
         grad_norm = torch.norm(scaled_grad, dim=-1, keepdim=True)
         density_weight = torch.ones_like(grad_norm)
 
-        if self.residual_density_control.get("enabled", False) and batch is not None and outputs is not None:
+        if residual_density_active and batch is not None and outputs is not None:
             density_weight = density_weight * self.compute_residual_density_weights(
                 mask,
                 batch,
@@ -363,6 +371,14 @@ class GSStrategy(BaseStrategy):
         )
         self.densify_signed_grad_accum[mask] += weighted_grad
         self.densify_grad_norm_denom[mask] += 1
+
+    def should_apply_residual_density_control(self, step: int | None) -> bool:
+        if not self.residual_density_control.get("enabled", False):
+            return False
+        start_iteration = int(
+            self.residual_density_control.get("start_iteration", 0)
+        )
+        return step is None or step >= start_iteration
 
     def camera_focal_mean(self, batch) -> float:
         camera_params = (

@@ -31,6 +31,7 @@ footprint_scale_control:
 
 residual_density_control:
   enabled: false
+  start_iteration: 0
   area_source: projected_extent
   tile_area_px: 256.0
   max_area_px: 65536.0
