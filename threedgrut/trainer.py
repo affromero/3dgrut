@@ -475,235 +475,6 @@ def _masked_mean(
     return (value * mask).sum() / denominator
 
 
-def _resolve_torch_hub_repo_dir(repo_name_prefix: str) -> str | None:
-    """Resolve a cached torch hub repo by prefix without hardcoded paths."""
-    hub_dir = torch.hub.get_dir()
-    if not os.path.isdir(hub_dir):
-        return None
-    candidates = [
-        os.path.join(hub_dir, item)
-        for item in os.listdir(hub_dir)
-        if item.startswith(repo_name_prefix)
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=os.path.getmtime, reverse=True)
-    return candidates[0]
-
-
-class FoundationFeatureProbe(nn.Module):
-    """Frozen image foundation-model probe for structural diagnostics/losses."""
-
-    def __init__(
-        self,
-        *,
-        method: str,
-        repo_dir: str,
-        weights: str,
-        image_size: int,
-    ) -> None:
-        super().__init__()
-        self.method = method
-        self.image_size = image_size
-        self.model = self._load_model(
-            method=method,
-            repo_dir=repo_dir,
-            weights=weights,
-        )
-        self.model.eval()
-        for parameter in self.model.parameters():
-            parameter.requires_grad_(False)
-        self.register_buffer(
-            "mean",
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "std",
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
-        )
-
-    def _load_model(
-        self,
-        *,
-        method: str,
-        repo_dir: str,
-        weights: str,
-    ) -> nn.Module:
-        if method == "tuna_pixel_patch":
-            return nn.Identity()
-        source = "github"
-        repo = repo_dir
-        if not repo:
-            if method.startswith("dinov2_"):
-                repo = _resolve_torch_hub_repo_dir("facebookresearch_dinov2")
-                if repo is None:
-                    repo = "facebookresearch/dinov2"
-                else:
-                    source = "local"
-            elif method.startswith("dinov3_"):
-                if not weights:
-                    msg = (
-                        "DINOv3 weights are gated by Meta/Hugging Face. "
-                        "Set foundation_features.weights to an accepted "
-                        "checkpoint path or URL."
-                    )
-                    raise ValueError(msg)
-                repo = _resolve_torch_hub_repo_dir("facebookresearch_dinov3")
-                if repo is None:
-                    repo = "facebookresearch/dinov3"
-                else:
-                    source = "local"
-            else:
-                msg = f"Unsupported foundation feature method: {method}"
-                raise ValueError(msg)
-        else:
-            source = "local"
-        if weights:
-            model = torch.hub.load(
-                repo,
-                method,
-                source=source,
-                pretrained=True,
-                weights=weights,
-            )
-        else:
-            model = torch.hub.load(
-                repo, method, source=source, pretrained=True
-            )
-        if not isinstance(model, nn.Module):
-            msg = (
-                f"Foundation feature method did not return nn.Module: {method}"
-            )
-            raise TypeError(msg)
-        return model
-
-    def _pixel_patch_features(
-        self,
-        image: torch.Tensor,
-        mask: torch.Tensor | None,
-    ) -> dict[str, torch.Tensor]:
-        batched, _ = _ensure_bhwc(image.clip(0, 1))
-        if mask is not None:
-            batched_mask, _ = _ensure_bhwc(mask.clip(0, 1))
-            batched = batched * batched_mask
-        bchw = batched.permute(0, 3, 1, 2)
-        resized = F.interpolate(
-            bchw,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        patch_size = 16
-        patches = F.unfold(resized, kernel_size=patch_size, stride=patch_size)
-        patch_side = self.image_size // patch_size
-        if patch_side * patch_side != patches.shape[-1]:
-            msg = (
-                "tuna_pixel_patch requires image_size divisible by 16; got "
-                f"{self.image_size}."
-            )
-            raise ValueError(msg)
-        patch_tokens = F.normalize(patches.transpose(1, 2), dim=2)
-        patch_grid = patch_tokens.reshape(
-            patch_tokens.shape[0],
-            patch_side,
-            patch_side,
-            patch_tokens.shape[2],
-        )
-        return {
-            "cls": patch_tokens.mean(dim=1),
-            "patch": patch_grid.permute(0, 3, 1, 2),
-        }
-
-    def _prepare(
-        self,
-        image: torch.Tensor,
-        mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        batched, _ = _ensure_bhwc(image.clip(0, 1))
-        if mask is not None:
-            batched_mask, _ = _ensure_bhwc(mask.clip(0, 1))
-            batched = batched * batched_mask
-        bchw = batched.permute(0, 3, 1, 2)
-        resized = F.interpolate(
-            bchw,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return (resized - self.mean.to(resized)) / self.std.to(resized)
-
-    def _features(
-        self, image: torch.Tensor, mask: torch.Tensor | None
-    ) -> dict[str, torch.Tensor]:
-        if self.method == "tuna_pixel_patch":
-            return self._pixel_patch_features(image, mask)
-        prepared = self._prepare(image, mask)
-        if hasattr(self.model, "forward_features"):
-            features = self.model.forward_features(prepared)
-            if isinstance(features, dict) and "x_norm_clstoken" in features:
-                result = {"cls": features["x_norm_clstoken"]}
-                patch_tokens = features.get("x_norm_patchtokens")
-                if patch_tokens is not None:
-                    token_count = patch_tokens.shape[1]
-                    side = int(round(token_count**0.5))
-                    if side * side == token_count:
-                        patch = patch_tokens.reshape(
-                            patch_tokens.shape[0],
-                            side,
-                            side,
-                            patch_tokens.shape[2],
-                        )
-                        result["patch"] = patch.permute(0, 3, 1, 2)
-                return result
-        output = self.model(prepared)
-        if not torch.is_tensor(output):
-            msg = f"Unsupported feature output for {self.method}"
-            raise TypeError(msg)
-        if output.ndim > 2:
-            output = output.flatten(start_dim=1)
-        return {"cls": output}
-
-    def compare(
-        self,
-        *,
-        rgb_pred: torch.Tensor,
-        rgb_gt: torch.Tensor,
-        mask: torch.Tensor | None,
-    ) -> dict[str, torch.Tensor]:
-        pred_features = self._features(rgb_pred, mask)
-        with torch.no_grad():
-            gt_features = self._features(rgb_gt, mask)
-        cls_cosine = F.cosine_similarity(
-            pred_features["cls"],
-            gt_features["cls"],
-            dim=1,
-        )
-        result = {
-            "foundation_feature_cosine": cls_cosine.mean(),
-            "foundation_feature_distance": (1.0 - cls_cosine).mean(),
-        }
-        if "patch" in pred_features and "patch" in gt_features:
-            patch_cosine = F.cosine_similarity(
-                pred_features["patch"],
-                gt_features["patch"],
-                dim=1,
-            )
-            patch_error = 1.0 - patch_cosine
-            result["foundation_feature_patch_cosine"] = patch_cosine.mean()
-            result["foundation_feature_patch_error"] = patch_error.mean()
-            target_size = rgb_gt.shape[1:3]
-            error_map = F.interpolate(
-                patch_error[:, None],
-                size=target_size,
-                mode="bilinear",
-                align_corners=False,
-            ).permute(0, 2, 3, 1)
-            if mask is not None:
-                error_map = error_map * mask
-            result["foundation_feature_error_map"] = error_map
-        return result
-
-
 def _image_radius(
     *,
     height: int,
@@ -1519,9 +1290,6 @@ class Trainer3DGRUT:
     camera_residual_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     """ LR scheduler for camera residual module """
 
-    foundation_feature_probe: FoundationFeatureProbe | None = None
-    """ Optional frozen foundation-model probe for feature diagnostics """
-
     _distillation_start_step: int = -1
     """ Step at which distillation starts (-1 means disabled) """
 
@@ -1573,7 +1341,6 @@ class Trainer3DGRUT:
         self.init_densification_and_pruning_strategy(conf)
         logger.log_rule("Setup Model Weights & Training")
         self.init_metrics()
-        self.init_foundation_feature_probe(conf)
         self.init_post_processing(conf)
         self.init_camera_residual(conf)
         self.setup_training(conf, self.model, self.train_dataset)
@@ -1904,23 +1671,6 @@ class Trainer3DGRUT:
                 ).to(self.device),
             )
         self.criterions = criterions
-
-    def init_foundation_feature_probe(self, conf: DictConfig) -> None:
-        """Initialize optional frozen image feature probe."""
-        feature_conf = conf.get("foundation_features", {})
-        if not bool(feature_conf.get("enabled", False)):
-            return
-        method = str(feature_conf.get("method", "dinov2_vitl14"))
-        repo_dir = str(feature_conf.get("repo_dir", ""))
-        weights = str(feature_conf.get("weights", ""))
-        image_size = int(feature_conf.get("image_size", 224))
-        self.foundation_feature_probe = FoundationFeatureProbe(
-            method=method,
-            repo_dir=repo_dir,
-            weights=weights,
-            image_size=image_size,
-        ).to(self.device)
-        logger.info(f"🧠 Foundation feature probe enabled: {method}")
 
     def init_experiments_tracking(self, conf: DictConfig):
         # Initialize the tensorboard writer
@@ -3179,27 +2929,7 @@ class Trainer3DGRUT:
                         pred_rgb_full_clipped, rgb_gt_full
                     ).item()
 
-            foundation_feature_error_map = None
-            feature_conf = self.conf.get("foundation_features", {})
-            use_logged_views_only = bool(
-                feature_conf.get("eval_on_logged_views_only", True)
-            )
             is_logged_view = iteration in self._validation_log_image_views()
-            should_compute_features = (
-                self.foundation_feature_probe is not None
-                and (not use_logged_views_only or is_logged_view)
-            )
-            if should_compute_features:
-                feature_metrics = self.foundation_feature_probe.compare(
-                    rgb_pred=rgb_pred.clip(0, 1),
-                    rgb_gt=rgb_gt.clip(0, 1),
-                    mask=gpu_batch.mask,
-                )
-                for metric_name, metric_value in feature_metrics.items():
-                    if metric_name == "foundation_feature_error_map":
-                        foundation_feature_error_map = metric_value
-                    else:
-                        metrics[metric_name] = metric_value.detach().item()
 
             metrics.update(
                 _diagnostic_metrics(
@@ -3248,13 +2978,6 @@ class Trainer3DGRUT:
                     semantic_label_masks=semantic_label_masks,
                     max_hit_count=self.conf.writer.max_num_hits,
                 )
-                if foundation_feature_error_map is not None and bool(
-                    feature_conf.get("log_error_tile", True)
-                ):
-                    error_map = foundation_feature_error_map[-1]
-                    metrics["img_eval_tiles"]["foundation_feature_error"] = (
-                        _robust_jet_map(error_map, mask, quantile=0.95)
-                    )
 
         if profilers:
             timings = {}
@@ -3344,33 +3067,6 @@ class Trainer3DGRUT:
                 loss_ssim = 1.0 - ssim(pred_rgb_full, rgb_gt_full)
                 lambda_ssim = self.conf.loss.lambda_ssim
 
-        loss_foundation_feature = torch.zeros(1, device=self.device)
-        lambda_foundation_feature = 0.0
-        if self.conf.loss.use_foundation_feature:
-            if self.foundation_feature_probe is None:
-                msg = (
-                    "loss.use_foundation_feature requires "
-                    "foundation_features.enabled=true."
-                )
-                raise RuntimeError(msg)
-            with torch.cuda.nvtx.range("loss-foundation-feature"):
-                feature_metrics = self.foundation_feature_probe.compare(
-                    rgb_pred=rgb_pred.clip(0, 1),
-                    rgb_gt=rgb_gt.clip(0, 1),
-                    mask=mask,
-                )
-                loss_foundation_feature = feature_metrics[
-                    "foundation_feature_distance"
-                ]
-                if "foundation_feature_patch_error" in feature_metrics:
-                    loss_foundation_feature = 0.5 * (
-                        loss_foundation_feature
-                        + feature_metrics["foundation_feature_patch_error"]
-                    )
-                lambda_foundation_feature = (
-                    self.conf.loss.lambda_foundation_feature
-                )
-
         # Opacity regularization
         loss_opacity = torch.zeros(1, device=self.device)
         lambda_opacity = 0.0
@@ -3421,7 +3117,6 @@ class Trainer3DGRUT:
         loss = (
             lambda_l1 * loss_l1
             + lambda_ssim * loss_ssim
-            + lambda_foundation_feature * loss_foundation_feature
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
@@ -3433,10 +3128,6 @@ class Trainer3DGRUT:
             l2_loss=lambda_l2 * loss_l2,
             ssim_loss=lambda_ssim * loss_ssim,
             camera_loss_weight=camera_loss_weight,
-            foundation_feature_loss=(
-                lambda_foundation_feature * loss_foundation_feature
-            ),
-            foundation_feature_loss_raw=loss_foundation_feature,
             opacity_loss=lambda_opacity * loss_opacity,
             scale_loss=lambda_scale * loss_scale,
             sky_opacity_loss=lambda_sky_opacity * loss_sky_opacity,
@@ -3496,7 +3187,6 @@ class Trainer3DGRUT:
                 "low_freq_error",
                 "high_freq_error",
                 "edge_error",
-                "foundation_feature_error",
                 "depth_gt",
                 "predicted_depth",
                 "opacity",
@@ -3575,31 +3265,6 @@ class Trainer3DGRUT:
             writer.add_scalar(
                 "val/lpips", np.mean(metrics["lpips"]), global_step
             )
-        feature_metric_names = (
-            (
-                "foundation_feature_cosine",
-                "metrics/feature/foundation_cosine",
-            ),
-            (
-                "foundation_feature_distance",
-                "metrics/feature/foundation_distance",
-            ),
-            (
-                "foundation_feature_patch_cosine",
-                "metrics/feature/foundation_patch_cosine",
-            ),
-            (
-                "foundation_feature_patch_error",
-                "metrics/feature/foundation_patch_error",
-            ),
-        )
-        for metric_name, writer_name in feature_metric_names:
-            if metric_name in metrics:
-                writer.add_scalar(
-                    writer_name,
-                    np.mean(metrics[metric_name]),
-                    global_step,
-                )
         writer.add_scalar(
             "diagnostics/residual/low_freq_l1",
             np.mean(metrics["low_freq_l1"]),
@@ -3879,23 +3544,6 @@ class Trainer3DGRUT:
         if self.conf.loss.use_ssim:
             ssim_loss = np.mean(metrics["losses"]["ssim_loss"])
             writer.add_scalar("val/loss/ssim", ssim_loss, global_step)
-        if self.conf.loss.use_foundation_feature:
-            foundation_feature_loss = np.mean(
-                metrics["losses"]["foundation_feature_loss"]
-            )
-            foundation_feature_loss_raw = np.mean(
-                metrics["losses"]["foundation_feature_loss_raw"]
-            )
-            writer.add_scalar(
-                "val/loss/foundation_feature",
-                foundation_feature_loss,
-                global_step,
-            )
-            writer.add_scalar(
-                "val/loss/foundation_feature_raw",
-                foundation_feature_loss_raw,
-                global_step,
-            )
         if self.conf.loss.use_sky_opacity:
             sky_opacity_loss = np.mean(metrics["losses"]["sky_opacity_loss"])
             sky_opacity_loss_raw = np.mean(
@@ -3945,10 +3593,6 @@ class Trainer3DGRUT:
                 "radial_mid_edge_energy_ratio",
                 "radial_outer_edge_energy_ratio",
                 "radial_rim_edge_energy_ratio",
-                "foundation_feature_cosine",
-                "foundation_feature_distance",
-                "foundation_feature_patch_cosine",
-                "foundation_feature_patch_error",
             )
         }
         for time_key in mean_timings:
@@ -4174,23 +3818,6 @@ class Trainer3DGRUT:
                 writer.add_scalar(
                     "train/loss/camera_weight",
                     camera_loss_weight,
-                    global_step,
-                )
-            if self.conf.loss.use_foundation_feature:
-                foundation_feature_loss = np.mean(
-                    batch_metrics["losses"]["foundation_feature_loss"]
-                )
-                foundation_feature_loss_raw = np.mean(
-                    batch_metrics["losses"]["foundation_feature_loss_raw"]
-                )
-                writer.add_scalar(
-                    "train/loss/foundation_feature",
-                    foundation_feature_loss,
-                    global_step,
-                )
-                writer.add_scalar(
-                    "train/loss/foundation_feature_raw",
-                    foundation_feature_loss_raw,
                     global_step,
                 )
             if self.conf.loss.use_opacity:

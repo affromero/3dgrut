@@ -205,18 +205,6 @@ loss:
   use_sky_opacity: false
   lambda_sky_opacity: 0.0
 
-  use_foundation_feature: false
-  lambda_foundation_feature: 0.0
-
-foundation_features:
-  enabled: false
-  method: "dinov2_vitl14"
-  repo_dir: ""
-  weights: ""
-  image_size: 224
-  eval_on_logged_views_only: false
-  log_error_tile: true
-
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp", "luminance_affine"
