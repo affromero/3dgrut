@@ -164,7 +164,6 @@ class GSStrategy(BaseStrategy):
                     sensor_position=batch.T_to_world[0, :3, 3],
                     batch=batch,
                     outputs=outputs,
-                    step=step,
                 )
 
         # Clamp density
@@ -243,12 +242,11 @@ class GSStrategy(BaseStrategy):
         sensor_position: torch.Tensor,
         batch=None,
         outputs=None,
-        step: int | None = None,
     ) -> None:
         params_grad = self.model.positions.grad
         assert params_grad is not None
         mask = (params_grad != 0).max(dim=1)[0]
-        residual_density_active = self.should_apply_residual_density_control(step)
+        residual_density_active = self.residual_density_control.get("enabled", False)
         if residual_density_active and outputs is not None:
             visibility = outputs.get("mog_visibility")
             if visibility is not None and self.residual_density_control.get("use_visibility", True):
@@ -278,14 +276,6 @@ class GSStrategy(BaseStrategy):
         )
         self.densify_signed_grad_accum[mask] += weighted_grad
         self.densify_grad_norm_denom[mask] += 1
-
-    def should_apply_residual_density_control(self, step: int | None) -> bool:
-        if not self.residual_density_control.get("enabled", False):
-            return False
-        start_iteration = int(
-            self.residual_density_control.get("start_iteration", 0)
-        )
-        return step is None or step >= start_iteration
 
     def camera_focal_mean(self, batch) -> float:
         camera_params = (
