@@ -176,6 +176,70 @@ static inline __device__ float3 radianceFromSpHBwd(
     return grad;
 }
 
+static inline __device__ float3
+radianceFromSpHDirBwd(int deg, const float3* sphCoefficients, const float3& rdir, const float3& dL_drad) {
+    float3 dL_ddir = make_float3(0.f, 0.f, 0.f);
+
+    const float3 gradu = radianceFromSpH(deg, sphCoefficients, rdir, false);
+    float3 dL_dRGB     = dL_drad;
+    dL_dRGB.x *= (gradu.x > 0.0f ? 1.f : 0.f);
+    dL_dRGB.y *= (gradu.y > 0.0f ? 1.f : 0.f);
+    dL_dRGB.z *= (gradu.z > 0.0f ? 1.f : 0.f);
+
+    if (deg > 0) {
+        const float x = rdir.x, y = rdir.y, z = rdir.z;
+
+        // Band 1: rad += -C1*y*c1 + C1*z*c2 - C1*x*c3
+        // d/dx = -C1*c3, d/dy = -C1*c1, d/dz = C1*c2
+        dL_ddir.x += dot(dL_dRGB, -SH_C1 * sphCoefficients[3]);
+        dL_ddir.y += dot(dL_dRGB, -SH_C1 * sphCoefficients[1]);
+        dL_ddir.z += dot(dL_dRGB, SH_C1 * sphCoefficients[2]);
+
+        if (deg > 1) {
+            // Band 2:
+            // sh4 = C2[0]*xy  -> dx=C2[0]*y, dy=C2[0]*x
+            // sh5 = C2[1]*yz  -> dy=C2[1]*z, dz=C2[1]*y
+            // sh6 = C2[2]*(2zz-xx-yy) -> dx=-2*C2[2]*x, dy=-2*C2[2]*y, dz=4*C2[2]*z
+            // sh7 = C2[3]*xz  -> dx=C2[3]*z, dz=C2[3]*x
+            // sh8 = C2[4]*(xx-yy) -> dx=2*C2[4]*x, dy=-2*C2[4]*y
+            dL_ddir.x += dot(dL_dRGB, SH_C2[0] * y * sphCoefficients[4] - 2.f * SH_C2[2] * x * sphCoefficients[6] +
+                                           SH_C2[3] * z * sphCoefficients[7] + 2.f * SH_C2[4] * x * sphCoefficients[8]);
+            dL_ddir.y += dot(dL_dRGB, SH_C2[0] * x * sphCoefficients[4] + SH_C2[1] * z * sphCoefficients[5] -
+                                           2.f * SH_C2[2] * y * sphCoefficients[6] - 2.f * SH_C2[4] * y * sphCoefficients[8]);
+            dL_ddir.z += dot(dL_dRGB, SH_C2[1] * y * sphCoefficients[5] + 4.f * SH_C2[2] * z * sphCoefficients[6] +
+                                           SH_C2[3] * x * sphCoefficients[7]);
+
+            if (deg > 2) {
+                const float xx = x * x, yy = y * y, zz = z * z;
+                // Band 3: differentiate each term w.r.t. x, y, z.
+                dL_ddir.x += dot(dL_dRGB,
+                                  6.f * SH_C3[0] * x * y * sphCoefficients[9] +
+                                      SH_C3[1] * y * z * sphCoefficients[10] -
+                                      2.f * SH_C3[2] * x * y * sphCoefficients[11] -
+                                      6.f * SH_C3[3] * x * z * sphCoefficients[12] +
+                                      SH_C3[4] * (4.f * zz - 3.f * xx - yy) * sphCoefficients[13] +
+                                      2.f * SH_C3[5] * x * z * sphCoefficients[14] +
+                                      SH_C3[6] * (3.f * xx - 3.f * yy) * sphCoefficients[15]);
+                dL_ddir.y += dot(dL_dRGB,
+                                  SH_C3[0] * (3.f * xx - 3.f * yy) * sphCoefficients[9] +
+                                      SH_C3[1] * x * z * sphCoefficients[10] +
+                                      SH_C3[2] * (4.f * zz - xx - 3.f * yy) * sphCoefficients[11] -
+                                      6.f * SH_C3[3] * y * z * sphCoefficients[12] -
+                                      2.f * SH_C3[4] * x * y * sphCoefficients[13] -
+                                      2.f * SH_C3[5] * y * z * sphCoefficients[14] -
+                                      6.f * SH_C3[6] * x * y * sphCoefficients[15]);
+                dL_ddir.z += dot(dL_dRGB,
+                                  SH_C3[1] * x * y * sphCoefficients[10] +
+                                      8.f * SH_C3[2] * y * z * sphCoefficients[11] +
+                                      SH_C3[3] * (6.f * zz - 3.f * xx - 3.f * yy) * sphCoefficients[12] +
+                                      8.f * SH_C3[4] * x * z * sphCoefficients[13] +
+                                      SH_C3[5] * (xx - yy) * sphCoefficients[14]);
+            }
+        }
+    }
+    return dL_ddir;
+}
+
 static inline __device__ void fetchParticleDensity(
     const int32_t particleIdx,
     const ParticleDensity* particlesDensity,
@@ -480,6 +544,8 @@ __device__ inline void processHitBwd(
     float integratedTransmittance,
     float& transmittance,
     float transmittanceGrad,
+    float3& rayOriginGrad,
+    float3& rayDirectionGrad,
     float3 integratedRadiance,
     float3& radiance,
     float3 radianceGrad,
@@ -580,6 +646,7 @@ __device__ inline void processHitBwd(
             particleRadiancePtr,
             &sphCoefficients[0]);
         const float3 grad = radianceFromSpHBwd(sphEvalDegree, &sphCoefficients[0], rayDirection, weight, radianceGrad, (float3*)&particleRadianceGradPtr[particleIdx * SPH_MAX_NUM_COEFFS * 3]);
+        rayDirectionGrad += weight * radianceFromSpHDirBwd(sphEvalDegree, &sphCoefficients[0], rayDirection, radianceGrad);
 
         // >>> rayRadiance = accumulatedRayRad + weigth * rayRad + (1-galpha)*transmit * residualRayRad
         const float3 rayRad = weight * grad;
@@ -699,10 +766,12 @@ __device__ inline void processHitBwd(
         // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         // ---> gposc = rayOri - gpos
         // ===> d_gposc / d_gpos = -1
+        // ===> d_gposc / d_rayOri = +1
         const float3 rayMoGPosGrd = -gposcGrd;
         atomicAdd(&particleDensityGrad.position.x, rayMoGPosGrd.x);
         atomicAdd(&particleDensityGrad.position.y, rayMoGPosGrd.y);
         atomicAdd(&particleDensityGrad.position.z, rayMoGPosGrd.z);
+        rayOriginGrad += gposcGrd;
 
         // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         // ---> grd = safe_normalize(grdu)
@@ -720,7 +789,9 @@ __device__ inline void processHitBwd(
 
         // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         // ---> rayDirR = matmul(rayDir, grotMat)
+        // ===> d_rayDirR / d_rayDir = matmul_bw_vec(grotMat)
         // ===> d_rayDirR / d_grotmat = matmul_bw_mat(rayDir, grotMat)
+        rayDirectionGrad += matmul_bw_vec(particleRotation, rayDirRGrd);
         const float4 grotGrdRayDirR = matmul_bw_quat(rayDirection, rayDirRGrd, grot);
         atomicAdd(&particleDensityGrad.quaternion.x, grotGrdPoscr.x + grotGrdRayDirR.x);
         atomicAdd(&particleDensityGrad.quaternion.y, grotGrdPoscr.y + grotGrdRayDirR.y);

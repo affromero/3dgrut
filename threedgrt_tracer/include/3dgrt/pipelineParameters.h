@@ -120,7 +120,18 @@ struct PipelineBackwardParameters : PipelineParameters {
     PackedTensorAccessor32<float, 4> rayDensityGrad;     ///< integrated ray density gradient
     PackedTensorAccessor32<float, 4> rayHitDistanceGrad; ///< integrated ray hit distance gradient
     PackedTensorAccessor32<float, 4> rayNormalGrad;      ///< integrated ray hit distance gradient
+    PackedTensorAccessor32<float, 4> rayOriginGrad;      ///< output ray origin gradient
+    PackedTensorAccessor32<float, 4> rayDirectionGrad;   ///< output ray direction gradient
 
     ParticleDensity* particleDensityGrad; ///< output position, scale, quaternions, density gradient
     float* particleFeaturesGrad;          ///< per-particle features gradient (fp32)
+
+#ifdef __CUDACC__
+    inline __device__ float3 rayWorldToInputGradient(const float3& worldGradient) const {
+        return make_float3(
+            rayToWorld[0].x * worldGradient.x + rayToWorld[1].x * worldGradient.y + rayToWorld[2].x * worldGradient.z,
+            rayToWorld[0].y * worldGradient.x + rayToWorld[1].y * worldGradient.y + rayToWorld[2].y * worldGradient.z,
+            rayToWorld[0].z * worldGradient.x + rayToWorld[1].z * worldGradient.y + rayToWorld[2].z * worldGradient.z);
+    }
+#endif
 };
