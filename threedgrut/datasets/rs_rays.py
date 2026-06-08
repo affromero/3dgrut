@@ -12,6 +12,8 @@ CUDA change (the tracer applies T_to_world as the rayToWorld affine, so
 identity is a pure passthrough; backward treats rays as constants).
 """
 
+import os
+
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation, Slerp
@@ -40,6 +42,11 @@ def build_rs_world_rays(rays_dir_cam, c2w_start, c2w_end):
     r1 = c2w_end[:3, :3].detach().cpu().numpy()
     t0 = c2w_start[:3, 3].detach().cpu().numpy()
     t1 = c2w_end[:3, 3].detach().cpu().numpy()
+    if os.environ.get("GRADPROBE"):
+        ang = float(np.degrees(np.arccos(np.clip(
+            (np.trace(r0.T @ r1) - 1.0) / 2.0, -1.0, 1.0))))
+        print(f"[RS-RAYS] within-frame |t_end-t_start|="
+              f"{float(np.linalg.norm(t1 - t0)):.4f}m rot={ang:.2f}deg", flush=True)
     rot_rows = (
         Slerp([0.0, 1.0], Rotation.from_matrix(np.stack([r0, r1])))(alphas)
         .as_matrix()
