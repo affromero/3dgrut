@@ -531,8 +531,6 @@ struct GUTKBufferRenderer : Params {
                 TFeaturesVec featuresGrad = TFeaturesVec::zero();
 
                 if (ray.isAlive()) {
-                    float3 hitRayOriGrd    = make_float3(0.f, 0.f, 0.f);
-                    float3 hitRayDirGrd    = make_float3(0.f, 0.f, 0.f);
                     particles.processHitBwd<Params::PerRayParticleFeatures>(
                         ray.origin,
                         ray.direction,
@@ -549,11 +547,7 @@ struct GUTKBufferRenderer : Params {
                         ray.featuresGradient,
                         ray.hitT,
                         ray.hitTBackward,
-                        ray.hitTGradient,
-                        hitRayOriGrd,
-                        hitRayDirGrd);
-                    ray.originGradient    = ray.originGradient + tcnn::vec3{hitRayOriGrd.x, hitRayOriGrd.y, hitRayOriGrd.z};
-                    ray.directionGradient = ray.directionGradient + tcnn::vec3{hitRayDirGrd.x, hitRayDirGrd.y, hitRayDirGrd.z};
+                        ray.hitTGradient);
                     if (ray.transmittance < Particles::MinTransmittanceThreshold) {
                         ray.kill();
                     }

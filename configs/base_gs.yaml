@@ -70,32 +70,6 @@ import_ply:
   path: ""
   init_global_step: 0
 
-camera_residual:
-  enabled: false
-  lr: 0.0001
-  lr_end_fraction: 0.01
-  warmup_steps: 0
-  reg_lambda: 1.0
-  max_rotation_rad: 0.0174533
-  max_translation_m: 0.02
-  max_rolling_rotation_rad: 0.004
-  max_rolling_translation_m: 0.005
-  optimize_global: true
-  optimize_per_camera: false
-  optimize_per_image: false
-  optimize_rolling_per_camera: false
-  fail_on_zero_grad: true
-  fail_after_steps: 5
-  min_abs_grad: 1.e-12
-  finite_difference_audit:
-    enabled: false
-    max_views: 12
-    rotation_step_rad: 0.001
-    translation_step_m: 0.002
-    per_view: false
-    target_image_names: ""
-    exit_after: true
-
 camera_intrinsics_audit:
   enabled: false
   camera_indices: [0, 2]

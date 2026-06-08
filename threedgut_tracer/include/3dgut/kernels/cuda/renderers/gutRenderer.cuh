@@ -265,10 +265,8 @@ __global__ void renderBackward(threedgut::RenderParameters params,
                                particlesPrecomputedFeaturesGradPtr,
                                {parameterGradientMemoryHandles});
 
-    if (worldRayOriginGradientPtr && ray.idx != ~0u) {
-        worldRayOriginGradientPtr[ray.idx]    = ray.originGradient;
-        worldRayDirectionGradientPtr[ray.idx] = ray.directionGradient;
-    }
+    (void)worldRayOriginGradientPtr;
+    (void)worldRayDirectionGradientPtr;
 }
 
 __global__ void projectBackward(tcnn::uvec2 tileGrid,
