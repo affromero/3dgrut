@@ -303,8 +303,11 @@ class CameraResidual(nn.Module):
             batch.rays_dir @ rotation_matrix.transpose(0, 1),
             dim=-1,
         )
-        rays_ori = batch.rays_ori @ rotation_matrix.transpose(0, 1)
-        rays_ori = rays_ori + translation.reshape(1, 1, 1, 3)
+        # A camera rotation keeps the optical centre fixed: rotate only the ray
+        # DIRECTIONS, not the origins. (The COLMAP 3dgrt path uses world-space
+        # rays with T_to_world=I, so rotating origins would orbit the camera
+        # centre about the world origin -- wrong for a central pose residual.)
+        rays_ori = batch.rays_ori + translation.reshape(1, 1, 1, 3)
         rays_ori, rays_dir = self._apply_rolling_residual(
             batch,
             rays_ori,

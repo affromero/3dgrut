@@ -935,7 +935,7 @@ OptixTracer::trace(uint32_t frameNumber,
     return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(rayRad, rayDns, rayHit, rayNrm, rayHitsCount, particleVisibility);
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 OptixTracer::traceBwd(uint32_t frameNumber,
                       torch::Tensor rayToWorld,
                       torch::Tensor rayOri,
@@ -957,6 +957,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     const torch::TensorOptions opts    = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     torch::Tensor particleDensityGrad  = torch::zeros({particleDensity.size(0), particleDensity.size(1)}, opts);
     torch::Tensor particleRadianceGrad = torch::zeros({particleRadiance.size(0), particleRadiance.size(1)}, opts);
+    torch::Tensor rayOriGrad           = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
+    torch::Tensor rayDirGrad           = torch::zeros({rayDir.size(0), rayDir.size(1), rayDir.size(2), 3}, opts);
 
     PipelineBackwardParameters paramsHost;
     paramsHost.handle = _state->gasHandle;
@@ -992,6 +994,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.rayDensityGrad     = packed_accessor32<float, 4>(rayDnsGrd);
     paramsHost.rayHitDistanceGrad = packed_accessor32<float, 4>(rayHitGrd);
     paramsHost.rayNormalGrad      = packed_accessor32<float, 4>(rayNrmGrd);
+    paramsHost.rayOriginGrad      = packed_accessor32<float, 4>(rayOriGrad);
+    paramsHost.rayDirectionGrad   = packed_accessor32<float, 4>(rayDirGrad);
 
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
 
@@ -1003,5 +1007,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                             sizeof(PipelineBackwardParameters), &_state->sbtTracingBwd,
                             rayRad.size(2), rayRad.size(1), rayRad.size(0)));
 
-    return std::tuple<torch::Tensor, torch::Tensor>(particleDensityGrad, particleRadianceGrad);
+    CUDA_CHECK_LAST();
+
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(particleDensityGrad, particleRadianceGrad, rayOriGrad, rayDirGrad);
 }

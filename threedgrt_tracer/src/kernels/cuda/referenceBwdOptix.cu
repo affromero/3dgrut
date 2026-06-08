@@ -127,6 +127,8 @@ extern "C" __global__ void __raygen__rg() {
     float3 rayRadiance     = make_float3(0.f);
     float rayTransmittance = 1.f;
     float rayHitDistance   = 0.f;
+    float3 rayOriginGrad   = make_float3(0.f);
+    float3 rayDirectionGrad = make_float3(0.f);
 
     RayPayload rayPayload;
 
@@ -156,6 +158,8 @@ extern "C" __global__ void __raygen__rg() {
                     rayIntegratedTransmittance,
                     rayTransmittance,
                     rayTransmittanceGrad,
+                    rayOriginGrad,
+                    rayDirectionGrad,
                     rayIntegratedRadiance,
                     rayRadiance,
                     rayRadianceGrad,
@@ -167,6 +171,15 @@ extern "C" __global__ void __raygen__rg() {
             }
         }
     }
+
+    const float3 rayInputOriginGrad    = params.rayWorldToInputGradient(rayOriginGrad);
+    const float3 rayInputDirectionGrad = params.rayWorldToInputGradient(rayDirectionGrad);
+    params.rayOriginGrad[idx.z][idx.y][idx.x][0]    = rayInputOriginGrad.x;
+    params.rayOriginGrad[idx.z][idx.y][idx.x][1]    = rayInputOriginGrad.y;
+    params.rayOriginGrad[idx.z][idx.y][idx.x][2]    = rayInputOriginGrad.z;
+    params.rayDirectionGrad[idx.z][idx.y][idx.x][0] = rayInputDirectionGrad.x;
+    params.rayDirectionGrad[idx.z][idx.y][idx.x][1] = rayInputDirectionGrad.y;
+    params.rayDirectionGrad[idx.z][idx.y][idx.x][2] = rayInputDirectionGrad.z;
 }
 
 extern "C" __global__ void __intersection__is() {
