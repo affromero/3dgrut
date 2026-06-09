@@ -27,6 +27,7 @@
             ss << "CUDA call (" << #call << " ) failed with error: '" \
                << cudaGetErrorString(error)                           \
                << "' (" __FILE__ << ":" << __LINE__ << ")\n";         \
+            throw std::runtime_error(ss.str());                       \
         }                                                             \
     } while (0)
 

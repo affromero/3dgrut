@@ -132,7 +132,17 @@ extern "C" __global__ void __raygen__rg() {
 
     RayPayload rayPayload;
 
+    // Hard backstop mirroring the forward kernel: guarantee the backward march always
+    // terminates (iteration cap + forced monotonic progress) regardless of what trace()
+    // returns. Diagnostic hardening; does NOT fix the concurrent multi-process wedge.
+    constexpr int kMaxMarchIters = 4096;
+    int marchIters               = 0;
+
     while (startT < endT) {
+        if (++marchIters > kMaxMarchIters) {
+            break;
+        }
+        const float prevStartT = startT;
         trace(rayPayload, rayOrigin, rayDirection, startT + epsT, endT);
         if (rayPayload[0].particleId == RayHit::InvalidParticleId) {
             break;
@@ -169,6 +179,12 @@ extern "C" __global__ void __raygen__rg() {
 
                 startT = fmaxf(startT, rayHit.distance);
             }
+        }
+
+        // Force forward progress when no hit advanced startT (float ULP at large t, or a
+        // degenerate payload), preventing an infinite march.
+        if (startT <= prevStartT) {
+            startT = nextafterf(prevStartT + epsT, RayHit::InfiniteDistance);
         }
     }
 

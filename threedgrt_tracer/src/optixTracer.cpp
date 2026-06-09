@@ -252,6 +252,28 @@ OptixTracer::OptixTracer(
         // device context
         CUcontext cuCtx = 0; // zero means take the current context
         OPTIX_CHECK(optixDeviceContextCreate(cuCtx, &options, &_state->context));
+
+        // Disable the OptiX on-disk module cache. Its default location (~/.cache/optix)
+        // is shared per-user, so concurrent training processes contend on it (file lock)
+        // at pipeline creation. We NVRTC-compile the kernels fresh anyway, so caching
+        // buys nothing here; disabling removes the only cross-process OptiX host resource.
+        // (Hardening for multi-process runs; does NOT fix the concurrent launch wedge.)
+        OPTIX_CHECK(optixDeviceContextSetCacheEnabled(_state->context, 0));
+    }
+
+    // Stream-ordered allocator (cudaMallocAsync, used throughout this tracer) has
+    // a default release threshold of 0: the pool returns ALL free memory to the
+    // OS on every stream sync. That release/trim path can deadlock a subsequent
+    // cuLaunchKernel under OptiX + autograd (observed as a host-side libcuda
+    // deadlock with the GPU idle in the grad-tracked camera-pose recovery path).
+    // Keep freed memory in the pool (never release to the OS) to avoid it.
+    {
+        int memDev = 0;
+        CUDA_CHECK(cudaGetDevice(&memDev));
+        cudaMemPool_t memPool;
+        CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, memDev));
+        cuuint64_t releaseThreshold = 0xFFFFFFFFFFFFFFFFULL;
+        CUDA_CHECK(cudaMemPoolSetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &releaseThreshold));
     }
 
     _state->particleRadianceSphDegree     = particleRadianceSphDegree;
