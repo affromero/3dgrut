@@ -313,8 +313,18 @@ class CameraResidual(nn.Module):
         image_idx = getattr(batch, "frame_idx", -1)
         rotation, translation = self._bounded(batch.camera_idx, image_idx)
         rotation_matrix = _axis_angle_to_matrix(rotation)[0]
+        # Fisheye unprojection emits NaN directions for pixels outside the
+        # calibrated image circle, and the tracer relies on those NaN rays
+        # missing everything. Transform only the finite rays (zero stand-ins
+        # keep the backward finite and contribute exactly-zero parameter
+        # gradients) and pass the NaN sentinels through untouched so the
+        # OptiX-facing ray stream is unchanged.
+        finite_mask = torch.isfinite(batch.rays_dir).all(dim=-1, keepdim=True)
+        dirs_valid = torch.where(
+            finite_mask, batch.rays_dir, torch.zeros_like(batch.rays_dir)
+        )
         rays_dir = _safe_normalize(
-            batch.rays_dir @ rotation_matrix.transpose(0, 1)
+            dirs_valid @ rotation_matrix.transpose(0, 1)
         )
         # A camera rotation keeps the optical centre fixed: rotate only the ray
         # DIRECTIONS, not the origins. (The COLMAP 3dgrt path uses world-space
@@ -326,6 +336,7 @@ class CameraResidual(nn.Module):
             rays_ori,
             rays_dir,
         )
+        rays_dir = torch.where(finite_mask, rays_dir, batch.rays_dir)
         return replace(batch, rays_ori=rays_ori, rays_dir=rays_dir)
 
     def get_regularization_loss(self) -> torch.Tensor:
