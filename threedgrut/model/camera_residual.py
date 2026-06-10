@@ -18,8 +18,23 @@ def _skew(vector: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _safe_normalize(vector: torch.Tensor) -> torch.Tensor:
+    # F.normalize backprops NaN through zero rows (d|v|/dv = 0/0). Fisheye
+    # frames carry exact-zero directions outside the image circle, and that
+    # NaN poisons every parameter upstream of the normalize. Padding inside
+    # the rsqrt keeps the backward finite; zero rows stay exactly zero and
+    # contribute exactly-zero gradients via their zero Jacobians.
+    squared_norm = (vector * vector).sum(dim=-1, keepdim=True)
+    return vector * torch.rsqrt(squared_norm + 1e-12)
+
+
 def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
-    angle = torch.linalg.norm(axis_angle, dim=-1, keepdim=True).clamp_min(1e-8)
+    # norm().clamp_min() still backprops NaN at exactly zero rotation
+    # (clamp's zero gradient multiplies the norm's 0/0). Pad inside the
+    # sqrt instead so the gradient at zero is finite (and correct: the
+    # sin*skew term reduces to the so3 generators).
+    squared_angle = (axis_angle * axis_angle).sum(dim=-1, keepdim=True)
+    angle = torch.sqrt(squared_angle + 1e-16)
     axis = axis_angle / angle
     skew = _skew(axis)
     eye = torch.eye(3, device=axis_angle.device, dtype=axis_angle.dtype)
@@ -286,9 +301,8 @@ class CameraResidual(nn.Module):
         )
         row_weight = self._normalized_rows(batch)
         per_pixel_rotation = row_weight * rolling_rotation.reshape(1, 1, 1, 3)
-        rays_dir = torch.nn.functional.normalize(
-            rays_dir + torch.cross(per_pixel_rotation, rays_dir, dim=-1),
-            dim=-1,
+        rays_dir = _safe_normalize(
+            rays_dir + torch.cross(per_pixel_rotation, rays_dir, dim=-1)
         )
         rays_ori = rays_ori + row_weight * rolling_translation.reshape(1, 1, 1, 3)
         return rays_ori, rays_dir
@@ -299,9 +313,8 @@ class CameraResidual(nn.Module):
         image_idx = getattr(batch, "frame_idx", -1)
         rotation, translation = self._bounded(batch.camera_idx, image_idx)
         rotation_matrix = _axis_angle_to_matrix(rotation)[0]
-        rays_dir = torch.nn.functional.normalize(
-            batch.rays_dir @ rotation_matrix.transpose(0, 1),
-            dim=-1,
+        rays_dir = _safe_normalize(
+            batch.rays_dir @ rotation_matrix.transpose(0, 1)
         )
         # A camera rotation keeps the optical centre fixed: rotate only the ray
         # DIRECTIONS, not the origins. (The COLMAP 3dgrt path uses world-space
