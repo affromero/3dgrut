@@ -101,6 +101,7 @@ protected:
         size_t iasBufferSz;
         CUdeviceptr gPipelineParticleData; ///< buffer containing pipeline specific particle data
         size_t gPipelineParticleDataSz;
+        CUdeviceptr badPrimCounter; ///< device counter of sanitized non-finite primitives (diagnostic)
 
         OptixPipeline pipelineTracingFwd;
         OptixShaderBindingTable sbtTracingFwd;

@@ -35,6 +35,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAUtils.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <fstream>
 #include <nvrtc.h>
@@ -248,6 +249,16 @@ OptixTracer::OptixTracer(
         options.logCallbackFunction       = &contextLogCB;
         options.logCallbackLevel          = 3;
 
+        // HAX_OPTIX_VALIDATION=1 turns on OptiX's internal device-side checks:
+        // if the stochastic traversal wedge is a malformed tree / illegal
+        // traversal state, validation should surface a named error instead of
+        // a silent infinite spin. Diagnostic only (large perf cost).
+        const char* validationEnv = std::getenv("HAX_OPTIX_VALIDATION");
+        if (validationEnv != nullptr && validationEnv[0] == '1') {
+            options.validationMode   = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
+            options.logCallbackLevel = 4;
+        }
+
         // Associate a CUDA context (and therefore a specific GPU) with this
         // device context
         CUcontext cuCtx = 0; // zero means take the current context
@@ -326,6 +337,7 @@ OptixTracer::~OptixTracer(void) {
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gPrimTri)));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gPrimAABB)));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->iasBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->badPrimCounter)));
 
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->optixAabbPtr)));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->paramsDevice)));
@@ -363,6 +375,11 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
         pipeline_compile_options.traversableGraphFlags            = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
         pipeline_compile_options.numPayloadValues                 = numPayloadValues;
         pipeline_compile_options.numAttributeValues               = 0;
+        // NOTE: OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW does NOT detect the
+        // [INTERNAL_TRAVERSAL_STACK_OVERFLOW] that wedges full-res training
+        // (tested: flags compiled in + enabled, the hang stayed silent). Only
+        // validation mode (HAX_OPTIX_VALIDATION=1, ctor above) checks the
+        // internal traversal stack — use it to diagnose, not in production.
         pipeline_compile_options.exceptionFlags                   = OPTIX_EXCEPTION_FLAG_NONE;
         pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
         pipeline_compile_options.usesPrimitiveTypeFlags           = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
@@ -674,6 +691,11 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
             _state->gPrimNumTri  = 20;
             reallocatePrimGeomBuffer(cudaStream);
 
+            if (!_state->badPrimCounter) {
+                CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&_state->badPrimCounter), sizeof(unsigned int)));
+            }
+            CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(_state->badPrimCounter), 0, sizeof(unsigned int), cudaStream));
+
             computeGaussianEnclosingIcosaHedron(gNum,
                                                 getPtr<float3>(mogPos),
                                                 getPtr<float4>(mogRot),
@@ -683,7 +705,9 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
                                                 primitiveOpts,
                                                 _state->particleKernelDegree,
                                                 reinterpret_cast<float3*>(_state->gPrimVrt),
-                                                reinterpret_cast<int3*>(_state->gPrimTri), cudaStream);
+                                                reinterpret_cast<int3*>(_state->gPrimTri),
+                                                reinterpret_cast<unsigned int*>(_state->badPrimCounter),
+                                                cudaStream);
         } else if (_state->gPrimType == MOGTracingOctraHedron) {
             _state->gPrimNumVert = 6;
             _state->gPrimNumTri  = 8;
@@ -877,6 +901,19 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
     }
 
     CUDA_CHECK_LAST();
+
+    // Surface sanitized non-finite primitives (see particlePrimitives.cu); a
+    // non-zero count right before a would-be wedge is the root-cause signal.
+    if (_state->badPrimCounter) {
+        unsigned int badPrims = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&badPrims, reinterpret_cast<void*>(_state->badPrimCounter),
+                                   sizeof(unsigned int), cudaMemcpyDeviceToHost, cudaStream));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStream));
+        if (badPrims > 0) {
+            std::cerr << "[3dgrt] buildBVH sanitized " << badPrims
+                      << " non-finite primitive(s) of " << gNum << std::endl;
+        }
+    }
 
     // Diagnostic: capture buildBVH timing + buffer sizes.
     cudaEventRecord(_bvhEndEvt, at::cuda::getCurrentCUDAStream());

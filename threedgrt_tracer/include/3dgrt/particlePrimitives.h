@@ -27,6 +27,7 @@ void computeGaussianEnclosingIcosaHedron(uint32_t gNum,
                                          float degree,
                                          float3* gPrimVrt,
                                          int3* gPrimTri,
+                                         unsigned int* badPrimCounter,
                                          cudaStream_t stream);
 
 void computeGaussianEnclosingOctaHedron(uint32_t gNum,
