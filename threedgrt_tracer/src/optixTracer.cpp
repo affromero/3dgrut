@@ -812,7 +812,16 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
 
     {
         OptixAccelBuildOptions accel_options = {};
-        accel_options.buildFlags             = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+        // HAX_OPTIX_FAST_BUILD=1 selects PREFER_FAST_BUILD: NOT a fix for the
+        // [INTERNAL_TRAVERSAL_STACK_OVERFLOW] wedge, but its shallower trees
+        // measurably lower the per-build overflow hazard (~2.3x later wedge in
+        // A/B). Used as a throughput multiplier for supervisor-grinding
+        // through dense mid-training hot zones; rendering math is identical
+        // (same hits, different tree), traversal is ~10-20% slower.
+        const char* fastBuildEnv = std::getenv("HAX_OPTIX_FAST_BUILD");
+        accel_options.buildFlags = (fastBuildEnv != nullptr && fastBuildEnv[0] == '1')
+                                       ? OPTIX_BUILD_FLAG_PREFER_FAST_BUILD
+                                       : OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
         if (allow_update) {
             accel_options.buildFlags |= OPTIX_BUILD_FLAG_ALLOW_UPDATE;
         }
