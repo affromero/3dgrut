@@ -493,7 +493,10 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 radial_coeffs=radial_coeffs,
                 resolution=resolution,
                 max_angle=max_angle,
-                shutter_type=ShutterType.GLOBAL,
+                # Inherit the configured shutter (dataset.shutter_type) so a
+                # ROLLING fisheye scene consumes images_end.txt; the other
+                # camera creators keep GLOBAL until they need RS support.
+                shutter_type=ShutterType[self.shutter_type],
             )
             camera_model = ncore.sensors.CameraModel.from_parameters(
                 params, device="cpu", dtype=torch.float32
