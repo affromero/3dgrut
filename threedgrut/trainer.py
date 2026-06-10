@@ -2331,7 +2331,12 @@ class Trainer3DGRUT:
         if not bool(camera_conf.get("fail_on_zero_grad", True)):
             return
         fail_after_steps = int(camera_conf.get("fail_after_steps", 5))
-        if global_step < fail_after_steps:
+        # CameraResidual.forward returns the batch untouched while
+        # global_step < warmup_steps, so no gradient CAN reach the residual
+        # params during warmup. Start counting the zero-grad grace window
+        # after warmup ends; warmup_steps=0 keeps the original behavior.
+        warmup_steps = int(getattr(self.camera_residual, "warmup_steps", 0))
+        if global_step < warmup_steps + fail_after_steps:
             return
         max_abs_grad = self.camera_residual.max_abs_grad()
         min_abs_grad = float(camera_conf.get("min_abs_grad", 1e-12))
@@ -2339,7 +2344,8 @@ class Trainer3DGRUT:
             return
         msg = (
             "Camera residual is enabled, but no gradient reached the SO3/SE3 "
-            f"residual parameters by step {global_step}. "
+            f"residual parameters by step {global_step} "
+            f"(warmup_steps={warmup_steps}). "
             f"camera_residual/max_abs_grad={max_abs_grad:.3e}, "
             f"threshold={min_abs_grad:.3e}. "
             "This is not a valid camera finetuning run. Fix the tracer "
