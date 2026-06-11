@@ -56,11 +56,14 @@ class Batch:
 
     def __post_init__(self):
         batch_size = self.T_to_world.shape[0]
-        assert self.rays_ori.shape[0] == batch_size, (
-            "rays_ori must have the same batch size"
+        # Exposure-time blur sampling supplies K world-space ray bundles
+        # per frame (rays dim 0 = K * batch, identity world transform), so
+        # the ray batch may be an integer multiple of the pose batch.
+        assert self.rays_ori.shape[0] % batch_size == 0, (
+            "rays_ori batch must be a multiple of the pose batch size"
         )
-        assert self.rays_dir.shape[0] == batch_size, (
-            "rays_dir must have the same batch size"
+        assert self.rays_dir.shape[0] == self.rays_ori.shape[0], (
+            "rays_dir must match the rays_ori batch size"
         )
         if self.rgb_gt is not None:
             assert self.rgb_gt.ndim == 4, (
