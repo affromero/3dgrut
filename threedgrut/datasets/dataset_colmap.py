@@ -1143,6 +1143,44 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         return output_dict
 
+    def build_blur_bundles(self, image_name, rays_dir):
+        """Build the K exposure-time ray bundles for one frame.
+
+        Used by the train fetch path and by post-hoc parity evaluation
+        (rendering a checkpoint WITH the blur forward model applied).
+
+        Args:
+            image_name: Frame key as in images.txt (e.g. ``cam0/x.jpg``).
+            rays_dir: ``[1, H, W, 3]`` camera-space bearings for the
+                frame's camera model.
+
+        Returns:
+            ``(rays_ori, rays_dir)`` world-space bundles, each
+            ``[K, H, W, 3]``.
+        """
+        if self._blur_pose_pairs is None:
+            raise RuntimeError(
+                "build_blur_bundles needs blur_samples > 1 (no pose-knot "
+                "pairs were loaded for this dataset)."
+            )
+        pairs = self._blur_pose_pairs.get(image_name)
+        if pairs is None:
+            raise KeyError(
+                f"pose_knots.json has no entry for '{image_name}'; re-emit "
+                "the knot sidecar for this scene."
+            )
+        bundle_oris = []
+        bundle_dirs = []
+        for k in range(pairs.shape[0]):
+            ori_k, dir_k = build_rs_world_rays(
+                rays_dir,
+                pairs[k, 0].to(self.device),
+                pairs[k, 1].to(self.device),
+            )
+            bundle_oris.append(ori_k)
+            bundle_dirs.append(dir_k)
+        return torch.cat(bundle_oris, dim=0), torch.cat(bundle_dirs, dim=0)
+
     def get_gpu_batch_with_intrinsics(self, batch):
         """Add the intrinsics to the batch and move data to GPU."""
 
@@ -1207,24 +1245,11 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 name = "/".join(
                     batch["image_path"][0].replace("\\", "/").split("/")[-2:]
                 )
-                pairs = self._blur_pose_pairs.get(name)
-                if pairs is None:
-                    raise KeyError(
-                        f"pose_knots.json has no entry for '{name}'; re-emit "
-                        "the knot sidecar for this scene."
-                    )
-                sample_oris = []
-                sample_dirs = []
-                for k in range(pairs.shape[0]):
-                    ori_k, dir_k = build_rs_world_rays(
-                        rays_dir,
-                        pairs[k, 0].to(self.device),
-                        pairs[k, 1].to(self.device),
-                    )
-                    sample_oris.append(ori_k)
-                    sample_dirs.append(dir_k)
-                sample["rays_ori"] = torch.cat(sample_oris, dim=0)
-                sample["rays_dir"] = torch.cat(sample_dirs, dim=0)
+                rays_ori_k, rays_dir_k = self.build_blur_bundles(
+                    name, rays_dir
+                )
+                sample["rays_ori"] = rays_ori_k
+                sample["rays_dir"] = rays_dir_k
             else:
                 # GLOBAL must stay global-naive: only a ROLLING shutter
                 # consumes the END pose. rs_ray_injection is gated on
