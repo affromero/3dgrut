@@ -4565,12 +4565,40 @@ class Trainer3DGRUT:
             self.global_step,
         )
 
-        mean_psnr = np.mean(metrics["psnr"])
+        psnr_values = np.asarray(metrics["psnr"], dtype=np.float64)
+        mean_psnr = float(psnr_values.mean())
         writer.add_scalar("val/psnr", mean_psnr, global_step)
+        writer.add_scalar(
+            "val/psnr_best_view", float(psnr_values.max()), global_step
+        )
+        writer.add_scalar(
+            "val/psnr_worst_view", float(psnr_values.min()), global_step
+        )
+        eval_paths = metrics.get("eval_image_path")
+        if eval_paths is not None and len(eval_paths) == len(psnr_values):
+            worst_idx = int(psnr_values.argmin())
+            best_idx = int(psnr_values.argmax())
+            logger.info(
+                f"val PSNR best={psnr_values[best_idx]:.2f} "
+                f"({os.path.basename(eval_paths[best_idx])}) "
+                f"worst={psnr_values[worst_idx]:.2f} "
+                f"({os.path.basename(eval_paths[worst_idx])})"
+            )
         if "masked_psnr" in metrics:
+            masked_values = np.asarray(
+                metrics["masked_psnr"], dtype=np.float64
+            )
             writer.add_scalar(
-                "val/masked_psnr",
-                np.mean(metrics["masked_psnr"]),
+                "val/masked_psnr", float(masked_values.mean()), global_step
+            )
+            writer.add_scalar(
+                "val/masked_psnr_best_view",
+                float(masked_values.max()),
+                global_step,
+            )
+            writer.add_scalar(
+                "val/masked_psnr_worst_view",
+                float(masked_values.min()),
                 global_step,
             )
         if "mask_coverage" in metrics:
@@ -5183,6 +5211,12 @@ class Trainer3DGRUT:
             logger.info(
                 f"Best validation {metric_name}={score:.6f} "
                 f"at step {self.global_step}"
+            )
+        if self._best_validation_score is not None:
+            self.tracking.writer.add_scalar(
+                f"val/{metric_name}_best_so_far",
+                float(self._best_validation_score),
+                self.global_step,
             )
         if not bool(early_stopping_conf.get("enabled", False)):
             return
