@@ -425,6 +425,34 @@ def _rgb_to_luma(image: torch.Tensor) -> torch.Tensor:
     return (image[..., :3] * weights).sum(dim=-1, keepdim=True)
 
 
+def collapse_blur_samples(outputs: dict, gpu_batch) -> dict:
+    """Average K exposure-time render samples into one sensor image.
+
+    The blur-aware dataset path supplies [K, H, W, 3] ray bundles per frame;
+    the sensor integrates radiance over the exposure, so the K renders must
+    be averaged BEFORE any loss. (A mean of per-sample losses would instead
+    force every instantaneous sample to reproduce the blurred photo,
+    re-blurring the reconstructed scene.) Image-shaped outputs ([K, H, W, C])
+    are averaged on dim 0; everything else (per-Gaussian visibility, counts)
+    passes through untouched.
+    """
+    n_gt = gpu_batch.rgb_gt.shape[0]
+    n_pred = outputs["pred_rgb"].shape[0]
+    if n_pred == n_gt:
+        return outputs
+    collapsed = {}
+    for key, value in outputs.items():
+        if (
+            torch.is_tensor(value)
+            and value.ndim == 4
+            and value.shape[0] == n_pred
+        ):
+            collapsed[key] = value.mean(dim=0, keepdim=True)
+        else:
+            collapsed[key] = value
+    return collapsed
+
+
 def _box_blur_bhwc(image: torch.Tensor, kernel_size: int) -> torch.Tensor:
     """Apply a per-channel box low-pass filter to a BHWC/HWC image tensor."""
     batched, squeezed = _ensure_bhwc(image)
@@ -6218,6 +6246,7 @@ class Trainer3DGRUT:
             profilers["inference"].start()
             outputs = self.model(gpu_batch, train=True, frame_id=global_step)
             profilers["inference"].end()
+        outputs = collapse_blur_samples(outputs, gpu_batch)
 
         # Apply post-processing to rendered output
         if self.post_processing is not None:

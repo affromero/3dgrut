@@ -112,6 +112,10 @@ def make(name: str, config, ray_jitter):
                     config.render.get("method", "3dgut") == "3dgrt"
                     and config.dataset.get("rs_ray_injection", True)
                 ),
+                # Exposure-time sampling is a TRAIN-only forward model; the
+                # val dataset stays single-instant so metrics and snapshots
+                # evaluate the sharp underlying scene.
+                blur_samples=int(config.dataset.get("blur_samples", 1)),
             )
             val_dataset = ColmapDataset(
                 config.path,

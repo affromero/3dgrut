@@ -28,12 +28,34 @@ from ncore.data import (
     ShutterType,
 )
 from PIL import Image
+from scipy.spatial.transform import Rotation, Slerp
 from torch.utils.data import Dataset
 
 from threedgrut.utils.logger import logger
 
 from .protocols import Batch, BoundedMultiViewDataset, DatasetVisualization
 from .rs_rays import build_rs_world_rays
+
+
+def _interp_c2w_knots(slerp, rel_stamps, translations, query_stamps):
+    """Interpolate camera-to-world matrices from knot poses.
+
+    Args:
+        slerp: scipy Slerp over the knot rotations.
+        rel_stamps: [J] knot stamps (seconds, relative to the frame stamp).
+        translations: [J, 3] knot camera centers.
+        query_stamps: [Q] query stamps within the knot span.
+
+    Returns:
+        [Q, 4, 4] camera-to-world matrices.
+    """
+    matrices = np.repeat(np.eye(4)[None], len(query_stamps), axis=0)
+    matrices[:, :3, :3] = slerp(query_stamps).as_matrix()
+    for axis in range(3):
+        matrices[:, axis, 3] = np.interp(
+            query_stamps, rel_stamps, translations[:, axis]
+        )
+    return matrices
 from .utils import (
     compute_max_radius,
     create_camera_visualization,
@@ -66,6 +88,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         holdout_image_list_path: Optional[str] = None,
         shutter_type: str = "GLOBAL",
         rs_ray_injection: bool = False,
+        blur_samples: int = 1,
     ):
         self.path = path
         self.device = device
@@ -82,6 +105,17 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.holdout_image_list_path = holdout_image_list_path
         self.shutter_type = ShutterType[shutter_type].name
         self.rs_ray_injection = rs_ray_injection
+        self.blur_samples = int(blur_samples)
+        if self.blur_samples < 1:
+            raise ValueError(
+                f"blur_samples must be >= 1, got {self.blur_samples}."
+            )
+        if self.blur_samples > 1 and not rs_ray_injection:
+            raise ValueError(
+                "blur_samples > 1 requires the 3dgrt ray-injection path "
+                "(rs_ray_injection=True); the UT splat path has no "
+                "exposure-time sampling."
+            )
         self.train_focus_image_weight = float(train_focus_image_weight)
         if self.train_focus_image_weight <= 0.0:
             raise ValueError(
@@ -339,6 +373,64 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             }
         else:
             self._end_pose_by_name = None
+
+        # Exposure-trajectory blur sampling: sparse/0/pose_knots.json holds
+        # per-frame camera-to-world knot poses on stamps relative to each
+        # frame's capture stamp. K (start, end) pose pairs per frame are
+        # precomputed here — sample k starts at offset (k+0.5)/K * t_exp and,
+        # under a ROLLING shutter, ends one readout later — and the fetch
+        # path turns each pair into one RS ray bundle ([K, H, W, 3] total);
+        # the trainer averages the K renders before any loss.
+        self._blur_pose_pairs = None
+        if self.blur_samples > 1:
+            knots_file = os.path.join(self.path, "sparse/0", "pose_knots.json")
+            if not os.path.exists(knots_file):
+                raise FileNotFoundError(
+                    f"blur_samples={self.blur_samples} requires {knots_file}; "
+                    "emit it with `hilti_ingest colmapize` (pose-knot sidecar)."
+                )
+            with open(knots_file, "r", encoding="utf-8") as f:
+                knots = json.load(f)
+            readout_s = float(knots["readout_s"])
+            rel_stamps = np.asarray(
+                knots["knot_stamps_rel_s"], dtype=np.float64
+            )
+            rolling = self.shutter_type != ShutterType.GLOBAL.name
+            self._blur_pose_pairs = {}
+            for name, frame in knots["frames"].items():
+                t_exp = float(frame["t_exp_s"])
+                offsets = (
+                    (np.arange(self.blur_samples, dtype=np.float64) + 0.5)
+                    / self.blur_samples
+                    * t_exp
+                )
+                last_query = offsets[-1] + (readout_s if rolling else 0.0)
+                if last_query > rel_stamps[-1]:
+                    raise ValueError(
+                        f"pose_knots.json span [0, {rel_stamps[-1]:.4f}]s does "
+                        f"not cover sample offset {last_query:.4f}s for "
+                        f"'{name}'; re-emit knots with a larger t_exp margin."
+                    )
+                slerp = Slerp(
+                    rel_stamps,
+                    Rotation.from_quat(
+                        np.asarray(frame["c2w_q_xyzw"], dtype=np.float64)
+                    ),
+                )
+                translations = np.asarray(frame["c2w_t"], dtype=np.float64)
+                starts = _interp_c2w_knots(
+                    slerp, rel_stamps, translations, offsets
+                )
+                ends = (
+                    _interp_c2w_knots(
+                        slerp, rel_stamps, translations, offsets + readout_s
+                    )
+                    if rolling
+                    else starts
+                )
+                self._blur_pose_pairs[name] = torch.tensor(
+                    np.stack([starts, ends], axis=1), dtype=torch.float32
+                )
 
     def get_images_folder(self):
         downsample_suffix = (
@@ -1107,22 +1199,52 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # makes the tracer's rayToWorld a pure passthrough. The UT splat path
         # keeps the camera model + shutter_type instead.
         if self.rs_ray_injection:
-            # GLOBAL must stay global-naive: only a ROLLING shutter consumes the
-            # END pose. rs_ray_injection is gated on method==3dgrt (not on
-            # shutter), so without this guard an images_end.txt present in
-            # scene_rs would silently feed per-row END poses into a GLOBAL run
-            # too -- making RS0 (global-naive) identical to RS1 (rolling) and
-            # contaminating the whole RS0-vs-RS1 ablation.
-            rs_end = (
-                sample.get("T_to_world_end")
-                if shutter != ShutterType.GLOBAL.name
-                else None
-            )
-            if rs_end is None:
-                rs_end = pose
-            rays_ori_w, rays_dir_w = build_rs_world_rays(rays_dir, pose, rs_end)
-            sample["rays_ori"] = rays_ori_w
-            sample["rays_dir"] = rays_dir_w
+            if self._blur_pose_pairs is not None and self.split == "train":
+                # Exposure-trajectory blur: K time-sampled RS bundles per
+                # frame, stacked on dim 0 (the OptiX launch treats dim 0 as
+                # depth, so the K bundles trace in one launch). The trainer
+                # averages the K renders BEFORE the loss.
+                name = "/".join(
+                    batch["image_path"][0].replace("\\", "/").split("/")[-2:]
+                )
+                pairs = self._blur_pose_pairs.get(name)
+                if pairs is None:
+                    raise KeyError(
+                        f"pose_knots.json has no entry for '{name}'; re-emit "
+                        "the knot sidecar for this scene."
+                    )
+                sample_oris = []
+                sample_dirs = []
+                for k in range(pairs.shape[0]):
+                    ori_k, dir_k = build_rs_world_rays(
+                        rays_dir,
+                        pairs[k, 0].to(self.device),
+                        pairs[k, 1].to(self.device),
+                    )
+                    sample_oris.append(ori_k)
+                    sample_dirs.append(dir_k)
+                sample["rays_ori"] = torch.cat(sample_oris, dim=0)
+                sample["rays_dir"] = torch.cat(sample_dirs, dim=0)
+            else:
+                # GLOBAL must stay global-naive: only a ROLLING shutter
+                # consumes the END pose. rs_ray_injection is gated on
+                # method==3dgrt (not on shutter), so without this guard an
+                # images_end.txt present in scene_rs would silently feed
+                # per-row END poses into a GLOBAL run too -- making RS0
+                # (global-naive) identical to RS1 (rolling) and contaminating
+                # the whole RS0-vs-RS1 ablation.
+                rs_end = (
+                    sample.get("T_to_world_end")
+                    if shutter != ShutterType.GLOBAL.name
+                    else None
+                )
+                if rs_end is None:
+                    rs_end = pose
+                rays_ori_w, rays_dir_w = build_rs_world_rays(
+                    rays_dir, pose, rs_end
+                )
+                sample["rays_ori"] = rays_ori_w
+                sample["rays_dir"] = rays_dir_w
             # Identity world transform = pure passthrough (rays are already
             # world-space). Keep the [1, 4, 4] shape the non-injected path
             # uses so downstream rayToWorld handling is unchanged.
