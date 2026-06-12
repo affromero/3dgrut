@@ -258,7 +258,7 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         particleTilesCount);
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
                       torch::Tensor particleDensity,
                       torch::Tensor particleRadiance,
@@ -288,6 +288,15 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
 
     torch::Tensor particleDensityGradient  = torch::zeros({particleDensity.size(0), particleDensity.size(1)}, opts);
     torch::Tensor particleRadianceGradient = torch::zeros({particleRadiance.size(0), particleRadiance.size(1)}, opts);
+
+    const bool rayBackpropagation = true;
+
+    torch::Tensor rayOriginGradient;
+    torch::Tensor rayDirectionGradient;
+    if (rayBackpropagation) {
+        rayOriginGradient    = torch::zeros({rayOrigin.size(0), rayOrigin.size(1), rayOrigin.size(2), 3}, opts);
+        rayDirectionGradient = torch::zeros({rayDirection.size(0), rayDirection.size(1), rayDirection.size(2), 3}, opts);
+    }
 
     m_parameters.values.numParticles               = numParticles;
     m_parameters.values.radianceSphDegree          = numActiveFeatures;
@@ -324,8 +333,8 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
         reinterpret_cast<float*>(voidDataPtr(rayHitDistanceGradient)),
         reinterpret_cast<tcnn::vec4*>(voidDataPtr(rayRadianceDensity)),
         reinterpret_cast<tcnn::vec4*>(voidDataPtr(rayRadianceDensityGradient)),
-        nullptr,
-        nullptr,
+        rayBackpropagation ? reinterpret_cast<tcnn::vec3*>(voidDataPtr(rayOriginGradient)) : nullptr,
+        rayBackpropagation ? reinterpret_cast<tcnn::vec3*>(voidDataPtr(rayDirectionGradient)) : nullptr,
         m_parameters, cudaDeviceIndex, cudaStream);
 
     CUDA_CHECK_LAST(m_logger);
@@ -334,8 +343,8 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
         timer->stop();
     }
 
-    return std::tuple<torch::Tensor, torch::Tensor>(
-        particleDensityGradient, particleRadianceGradient);
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+        particleDensityGradient, particleRadianceGradient, rayOriginGradient, rayDirectionGradient);
 }
 
 std::map<std::string, float>
