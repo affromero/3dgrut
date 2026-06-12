@@ -35,6 +35,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAUtils.h>
 #include <algorithm>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <fstream>
 #include <nvrtc.h>
@@ -248,10 +249,42 @@ OptixTracer::OptixTracer(
         options.logCallbackFunction       = &contextLogCB;
         options.logCallbackLevel          = 3;
 
+        // HAX_OPTIX_VALIDATION=1 turns on OptiX's internal device-side checks:
+        // if the stochastic traversal wedge is a malformed tree / illegal
+        // traversal state, validation should surface a named error instead of
+        // a silent infinite spin. Diagnostic only (large perf cost).
+        const char* validationEnv = std::getenv("HAX_OPTIX_VALIDATION");
+        if (validationEnv != nullptr && validationEnv[0] == '1') {
+            options.validationMode   = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
+            options.logCallbackLevel = 4;
+        }
+
         // Associate a CUDA context (and therefore a specific GPU) with this
         // device context
         CUcontext cuCtx = 0; // zero means take the current context
         OPTIX_CHECK(optixDeviceContextCreate(cuCtx, &options, &_state->context));
+
+        // Disable the OptiX on-disk module cache. Its default location (~/.cache/optix)
+        // is shared per-user, so concurrent training processes contend on it (file lock)
+        // at pipeline creation. We NVRTC-compile the kernels fresh anyway, so caching
+        // buys nothing here; disabling removes the only cross-process OptiX host resource.
+        // (Hardening for multi-process runs; does NOT fix the concurrent launch wedge.)
+        OPTIX_CHECK(optixDeviceContextSetCacheEnabled(_state->context, 0));
+    }
+
+    // Stream-ordered allocator (cudaMallocAsync, used throughout this tracer) has
+    // a default release threshold of 0: the pool returns ALL free memory to the
+    // OS on every stream sync. That release/trim path can deadlock a subsequent
+    // cuLaunchKernel under OptiX + autograd (observed as a host-side libcuda
+    // deadlock with the GPU idle in the grad-tracked camera-pose recovery path).
+    // Keep freed memory in the pool (never release to the OS) to avoid it.
+    {
+        int memDev = 0;
+        CUDA_CHECK(cudaGetDevice(&memDev));
+        cudaMemPool_t memPool;
+        CUDA_CHECK(cudaDeviceGetDefaultMemPool(&memPool, memDev));
+        cuuint64_t releaseThreshold = 0xFFFFFFFFFFFFFFFFULL;
+        CUDA_CHECK(cudaMemPoolSetAttribute(memPool, cudaMemPoolAttrReleaseThreshold, &releaseThreshold));
     }
 
     _state->particleRadianceSphDegree     = particleRadianceSphDegree;
@@ -304,6 +337,7 @@ OptixTracer::~OptixTracer(void) {
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gPrimTri)));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gPrimAABB)));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->iasBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->badPrimCounter)));
 
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->optixAabbPtr)));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->paramsDevice)));
@@ -335,12 +369,17 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
         OptixModuleCompileOptions module_compile_options = {};
         module_compile_options.maxRegisterCount          = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
         module_compile_options.optLevel                  = OPTIX_COMPILE_OPTIMIZATION_LEVEL_3;
-        module_compile_options.debugLevel                = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
+        module_compile_options.debugLevel                = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
 
         pipeline_compile_options.usesMotionBlur                   = false;
         pipeline_compile_options.traversableGraphFlags            = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
         pipeline_compile_options.numPayloadValues                 = numPayloadValues;
         pipeline_compile_options.numAttributeValues               = 0;
+        // NOTE: OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW does NOT detect the
+        // [INTERNAL_TRAVERSAL_STACK_OVERFLOW] that wedges full-res training
+        // (tested: flags compiled in + enabled, the hang stayed silent). Only
+        // validation mode (HAX_OPTIX_VALIDATION=1, ctor above) checks the
+        // internal traversal stack — use it to diagnose, not in production.
         pipeline_compile_options.exceptionFlags                   = OPTIX_EXCEPTION_FLAG_NONE;
         pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
         pipeline_compile_options.usesPrimitiveTypeFlags           = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
@@ -361,7 +400,7 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
                                          (const char**)&log, extra_includes);
         size_t sizeof_log = sizeof(log);
 
-        OPTIX_CHECK_LOG(optixModuleCreateFromPTX(
+        OPTIX_CHECK_LOG(optixModuleCreate(
             context, &module_compile_options, &pipeline_compile_options, input, inputSize, log, &sizeof_log, module));
 
         if (!(flags & PipelineFlag_HasIS) && (flags & PipelineFlag_SpherePrim)) {
@@ -440,7 +479,6 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
 
         OptixPipelineLinkOptions pipeline_link_options = {};
         pipeline_link_options.maxTraceDepth            = max_trace_depth;
-        pipeline_link_options.debugLevel               = OPTIX_COMPILE_DEBUG_LEVEL_DEFAULT;
         size_t sizeof_log                              = sizeof(log);
         OPTIX_CHECK_LOG(optixPipelineCreate(context, &pipeline_compile_options, &pipeline_link_options,
                                             program_groups.data(), static_cast<unsigned int>(program_groups.size()),
@@ -448,7 +486,7 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
 
         OptixStackSizes stack_sizes = {};
         for (auto& prog_group : program_groups) {
-            OPTIX_CHECK(optixUtilAccumulateStackSizes(prog_group, &stack_sizes));
+            OPTIX_CHECK(optixUtilAccumulateStackSizes(prog_group, &stack_sizes, *pipeline));
         }
 
         uint32_t direct_callable_stack_size_from_traversal;
@@ -653,6 +691,11 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
             _state->gPrimNumTri  = 20;
             reallocatePrimGeomBuffer(cudaStream);
 
+            if (!_state->badPrimCounter) {
+                CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&_state->badPrimCounter), sizeof(unsigned int)));
+            }
+            CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(_state->badPrimCounter), 0, sizeof(unsigned int), cudaStream));
+
             computeGaussianEnclosingIcosaHedron(gNum,
                                                 getPtr<float3>(mogPos),
                                                 getPtr<float4>(mogRot),
@@ -662,7 +705,9 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
                                                 primitiveOpts,
                                                 _state->particleKernelDegree,
                                                 reinterpret_cast<float3*>(_state->gPrimVrt),
-                                                reinterpret_cast<int3*>(_state->gPrimTri), cudaStream);
+                                                reinterpret_cast<int3*>(_state->gPrimTri),
+                                                reinterpret_cast<unsigned int*>(_state->badPrimCounter),
+                                                cudaStream);
         } else if (_state->gPrimType == MOGTracingOctraHedron) {
             _state->gPrimNumVert = 6;
             _state->gPrimNumTri  = 8;
@@ -767,7 +812,16 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
 
     {
         OptixAccelBuildOptions accel_options = {};
-        accel_options.buildFlags             = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+        // HAX_OPTIX_FAST_BUILD=1 selects PREFER_FAST_BUILD: NOT a fix for the
+        // [INTERNAL_TRAVERSAL_STACK_OVERFLOW] wedge, but its shallower trees
+        // measurably lower the per-build overflow hazard (~2.3x later wedge in
+        // A/B). Used as a throughput multiplier for supervisor-grinding
+        // through dense mid-training hot zones; rendering math is identical
+        // (same hits, different tree), traversal is ~10-20% slower.
+        const char* fastBuildEnv = std::getenv("HAX_OPTIX_FAST_BUILD");
+        accel_options.buildFlags = (fastBuildEnv != nullptr && fastBuildEnv[0] == '1')
+                                       ? OPTIX_BUILD_FLAG_PREFER_FAST_BUILD
+                                       : OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
         if (allow_update) {
             accel_options.buildFlags |= OPTIX_BUILD_FLAG_ALLOW_UPDATE;
         }
@@ -857,6 +911,19 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
 
     CUDA_CHECK_LAST();
 
+    // Surface sanitized non-finite primitives (see particlePrimitives.cu); a
+    // non-zero count right before a would-be wedge is the root-cause signal.
+    if (_state->badPrimCounter) {
+        unsigned int badPrims = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&badPrims, reinterpret_cast<void*>(_state->badPrimCounter),
+                                   sizeof(unsigned int), cudaMemcpyDeviceToHost, cudaStream));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStream));
+        if (badPrims > 0) {
+            std::cerr << "[3dgrt] buildBVH sanitized " << badPrims
+                      << " non-finite primitive(s) of " << gNum << std::endl;
+        }
+    }
+
     // Diagnostic: capture buildBVH timing + buffer sizes.
     cudaEventRecord(_bvhEndEvt, at::cuda::getCurrentCUDAStream());
     cudaEventSynchronize(_bvhEndEvt);
@@ -936,7 +1003,7 @@ OptixTracer::trace(uint32_t frameNumber,
     return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(rayRad, rayDns, rayHit, rayNrm, rayHitsCount, particleVisibility);
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 OptixTracer::traceBwd(uint32_t frameNumber,
                       torch::Tensor rayToWorld,
                       torch::Tensor rayOri,
@@ -958,6 +1025,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     const torch::TensorOptions opts    = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     torch::Tensor particleDensityGrad  = torch::zeros({particleDensity.size(0), particleDensity.size(1)}, opts);
     torch::Tensor particleRadianceGrad = torch::zeros({particleRadiance.size(0), particleRadiance.size(1)}, opts);
+    torch::Tensor rayOriGrad           = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
+    torch::Tensor rayDirGrad           = torch::zeros({rayDir.size(0), rayDir.size(1), rayDir.size(2), 3}, opts);
 
     PipelineBackwardParameters paramsHost;
     paramsHost.handle = _state->gasHandle;
@@ -993,6 +1062,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.rayDensityGrad     = packed_accessor32<float, 4>(rayDnsGrd);
     paramsHost.rayHitDistanceGrad = packed_accessor32<float, 4>(rayHitGrd);
     paramsHost.rayNormalGrad      = packed_accessor32<float, 4>(rayNrmGrd);
+    paramsHost.rayOriginGrad      = packed_accessor32<float, 4>(rayOriGrad);
+    paramsHost.rayDirectionGrad   = packed_accessor32<float, 4>(rayDirGrad);
 
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
 
@@ -1004,5 +1075,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                             sizeof(PipelineBackwardParameters), &_state->sbtTracingBwd,
                             rayRad.size(2), rayRad.size(1), rayRad.size(0)));
 
-    return std::tuple<torch::Tensor, torch::Tensor>(particleDensityGrad, particleRadianceGrad);
+    CUDA_CHECK_LAST();
+
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(particleDensityGrad, particleRadianceGrad, rayOriGrad, rayDirGrad);
 }

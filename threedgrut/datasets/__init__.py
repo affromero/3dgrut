@@ -98,6 +98,24 @@ def make(name: str, config, ray_jitter):
                 train_exclude_image_list_path=config.dataset.get(
                     "train_exclude_image_list_path", None
                 ),
+                train_focus_image_list_path=config.dataset.get(
+                    "train_focus_image_list_path", None
+                ),
+                train_focus_image_weight=config.dataset.get(
+                    "train_focus_image_weight", 1.0
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                    and config.dataset.get("rs_ray_injection", True)
+                ),
+                # Exposure-time sampling is a TRAIN-only forward model; the
+                # val dataset stays single-instant so metrics and snapshots
+                # evaluate the sharp underlying scene.
+                blur_samples=int(config.dataset.get("blur_samples", 1)),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -108,6 +126,14 @@ def make(name: str, config, ray_jitter):
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
                 train_exclude_image_list_path=config.dataset.get(
                     "train_exclude_image_list_path", None
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                    and config.dataset.get("rs_ray_injection", True)
                 ),
             )
         case "scannetpp":
@@ -217,6 +243,14 @@ def make_test(name: str, config):
                 test_split_interval=config.dataset.test_split_interval,
                 exif_exposures=exif_exposures,
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                    and config.dataset.get("rs_ray_injection", True)
+                ),
             )
         case "scannetpp":
             dataset = ScannetppDataset(

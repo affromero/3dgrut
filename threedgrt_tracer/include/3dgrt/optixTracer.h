@@ -101,6 +101,7 @@ protected:
         size_t iasBufferSz;
         CUdeviceptr gPipelineParticleData; ///< buffer containing pipeline specific particle data
         size_t gPipelineParticleDataSz;
+        CUdeviceptr badPrimCounter; ///< device counter of sanitized non-finite primitives (diagnostic)
 
         OptixPipeline pipelineTracingFwd;
         OptixShaderBindingTable sbtTracingFwd;
@@ -161,23 +162,23 @@ public:
                                                                                                                        int sphDegree,
                                                                                                                        float minTransmittance);
 
-    std::tuple<torch::Tensor, torch::Tensor> virtual traceBwd(uint32_t frameNumber,
-                                                              torch::Tensor rayToWorld,
-                                                              torch::Tensor rayOri,
-                                                              torch::Tensor rayDir,
-                                                              torch::Tensor rayRad,
-                                                              torch::Tensor rayDns,
-                                                              torch::Tensor rayHit,
-                                                              torch::Tensor rayNrm,
-                                                              torch::Tensor particleDensity,
-                                                              torch::Tensor particleRadiance,
-                                                              torch::Tensor rayRadGrd,
-                                                              torch::Tensor rayDnsGrd,
-                                                              torch::Tensor rayHitGrd,
-                                                              torch::Tensor rayNrmGrd,
-                                                              uint32_t renderOpts,
-                                                              int sphDegree,
-                                                              float minTransmittance);
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> virtual traceBwd(uint32_t frameNumber,
+                                                                                            torch::Tensor rayToWorld,
+                                                                                            torch::Tensor rayOri,
+                                                                                            torch::Tensor rayDir,
+                                                                                            torch::Tensor rayRad,
+                                                                                            torch::Tensor rayDns,
+                                                                                            torch::Tensor rayHit,
+                                                                                            torch::Tensor rayNrm,
+                                                                                            torch::Tensor particleDensity,
+                                                                                            torch::Tensor particleRadiance,
+                                                                                            torch::Tensor rayRadGrd,
+                                                                                            torch::Tensor rayDnsGrd,
+                                                                                            torch::Tensor rayHitGrd,
+                                                                                            torch::Tensor rayNrmGrd,
+                                                                                            uint32_t renderOpts,
+                                                                                            int sphDegree,
+                                                                                            float minTransmittance);
 
     virtual void buildBVH(torch::Tensor mogPos,
                           torch::Tensor mogRot,

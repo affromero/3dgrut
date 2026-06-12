@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import random
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -37,6 +38,33 @@ def ensure_wandb_api_key_env() -> None:
         "W&B logging is enabled, but WANDB_API_KEY is not set. "
         "Export WANDB_API_KEY before starting a tracked training run."
     )
+
+
+def seed_everything(seed: int) -> torch.Generator:
+    """Seed all RNGs for a reproducible run and return a seeded generator.
+
+    Seeds python ``random``, numpy, and torch (CPU + every visible CUDA
+    device), and enables cheap determinism flags. The returned
+    ``torch.Generator`` is meant to be handed to the training DataLoader so
+    its ``shuffle=True`` sampler and per-worker base seeds are reproducible.
+
+    Args:
+        seed: Base run seed (e.g. ``conf.seed_initialization``).
+
+    Returns:
+        A CPU ``torch.Generator`` already seeded with ``seed``.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Cheap, non-perf-destroying determinism knobs. Do NOT enable
+    # torch.use_deterministic_algorithms(True) here: several CUDA kernels in
+    # the splat path have no deterministic implementation and it would raise.
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
 
 
 def to_torch(data: npt.NDArray, device: str, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
@@ -194,10 +222,11 @@ def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb
             if wandb_run_id
             else {}
         )
+        wandb_group = getattr(conf, "wandb_group", "") or experiment_name
         wandb_run = wandb.init(
             config=OmegaConf.to_container(DictConfig(conf)),
             project=conf.wandb_project,
-            group=experiment_name,
+            group=wandb_group,
             name=run_name,
             **wandb_resume_kwargs,
         )

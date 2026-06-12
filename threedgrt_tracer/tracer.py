@@ -66,11 +66,16 @@ class Tracer:
             min_transmittance,
         ):
             particle_density = torch.concat([mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1)
+            # OptiX is the geometry query; ray gradients are supplied by trace_bwd.
+            # Keep autograd-connected rays as Function inputs, but do not hand
+            # their TensorImpls to the asynchronous forward launch.
+            ray_ori_trace = ray_ori.detach()
+            ray_dir_trace = ray_dir.detach()
             ray_radiance, ray_density, ray_hit_distance, ray_normals, hits_count, mog_visibility = tracer_wrapper.trace(
                 frame_id,
                 ray_to_world,
-                ray_ori,
-                ray_dir,
+                ray_ori_trace,
+                ray_dir_trace,
                 particle_density,
                 mog_sph,
                 render_opts,
@@ -79,8 +84,8 @@ class Tracer:
             )
             ctx.save_for_backward(
                 ray_to_world,
-                ray_ori,
-                ray_dir,
+                ray_ori_trace,
+                ray_dir_trace,
                 ray_radiance,
                 ray_density,
                 ray_hit_distance,
@@ -124,7 +129,7 @@ class Tracer:
                 mog_sph,
             ) = ctx.saved_variables
             frame_id = ctx.frame_id
-            particle_density_grd, mog_sph_grd = ctx.tracer_wrapper.trace_bwd(
+            particle_density_grd, mog_sph_grd, ray_ori_grd, ray_dir_grd = ctx.tracer_wrapper.trace_bwd(
                 frame_id,
                 ray_to_world,
                 ray_ori,
@@ -150,8 +155,11 @@ class Tracer:
                 None,
                 None,
                 None,
-                None,
-                None,
+                # 3dgrt CUDA accumulates dL/d(world ray) and pulls it back through
+                # ray_to_world^T, so these are direct input-ray gradients. This
+                # sign convention MUST be finite-difference validated on GPU.
+                ray_ori_grd,
+                ray_dir_grd,
                 mog_pos_grd,
                 mog_rot_grd,
                 mog_scl_grd,

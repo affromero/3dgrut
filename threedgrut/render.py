@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +26,8 @@ import torchvision
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+from typing import Optional
 
 import threedgrut.datasets as datasets
 from threedgrut.model.model import MixtureOfGaussians
@@ -68,6 +72,41 @@ def _load_luminance_affine_state_compat(
         filtered[key] = value
     module.load_state_dict(filtered, strict=False)
     return dropped
+
+
+def _git_sha_and_dirty(repo_dir: str) -> tuple[str, bool]:
+    """Return (HEAD sha, dirty) for the git repo containing ``repo_dir``.
+
+    Returns ("Unknown", False) if ``repo_dir`` is not inside a git work tree
+    or git is unavailable, so provenance never crashes a render.
+    """
+    try:
+        sha = (
+            subprocess.check_output(
+                ["git", "-C", repo_dir, "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode("ascii")
+            .strip()
+        )
+        status = subprocess.check_output(
+            ["git", "-C", repo_dir, "status", "--porcelain"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8")
+        return sha, bool(status.strip())
+    except Exception:
+        return "Unknown", False
+
+
+def _sha256_of_file(path: Optional[str]) -> Optional[str]:
+    """Return the hex sha256 of ``path``, or None if missing/unreadable."""
+    if not path or not os.path.exists(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class Renderer:
@@ -630,6 +669,43 @@ class Renderer:
         with open(per_frame_metrics_path, "w") as f:
             json.dump(per_frame_metrics, f, indent=2)
         logger.info(f"📄 Per-frame metrics saved to: {per_frame_metrics_path}")
+
+        # Provenance sidecar: pin exactly which code + seed + holdout produced
+        # these metrics so a run is reproducible and auditable.
+        submodule_dir = os.path.dirname(os.path.abspath(__file__))
+        parent_dir = os.path.abspath(
+            os.path.join(submodule_dir, os.pardir, os.pardir, os.pardir)
+        )
+        submodule_sha, submodule_dirty = _git_sha_and_dirty(submodule_dir)
+        parent_sha, parent_dirty = _git_sha_and_dirty(parent_dir)
+        holdout_path = getattr(
+            self.dataset, "holdout_image_list_path", None
+        )
+        evaluated_frames = [
+            fm["image_name"] for fm in per_frame_metrics if "image_name" in fm
+        ]
+        provenance = {
+            "submodule_git_sha": submodule_sha,
+            "submodule_git_dirty": submodule_dirty,
+            "parent_git_sha": parent_sha,
+            "parent_git_dirty": parent_dirty,
+            "experiment_name": self.conf.get("experiment_name", ""),
+            "config_path": self.conf.get("path", ""),
+            "n_iterations": int(self.conf.get("n_iterations", 0)),
+            "global_step": int(self.global_step),
+            "seed_initialization": int(
+                self.conf.get("seed_initialization", -1)
+            ),
+            "split": self.split,
+            "holdout_image_list_path": holdout_path,
+            "holdout_image_list_sha256": _sha256_of_file(holdout_path),
+            "evaluated_frame_count": len(evaluated_frames),
+            "evaluated_frame_names": evaluated_frames,
+        }
+        provenance_path = os.path.join(self.out_dir, "provenance.json")
+        with open(provenance_path, "w") as f:
+            json.dump(provenance, f, indent=2)
+        logger.info(f"📄 Provenance saved to: {provenance_path}")
 
         logger.log_table(
             f"⭐ Test Metrics - Step {self.global_step}", record=table

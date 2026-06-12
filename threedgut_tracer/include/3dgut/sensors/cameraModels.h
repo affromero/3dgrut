@@ -59,6 +59,14 @@ struct RationalProjectionParameters {
     int imageRotationQuadrantsCw;
 };
 
+// Equirectangular (full-sphere) camera. The projection is parameter-free
+// beyond the image resolution (passed separately to projectPoint); the
+// camera frame is [right, down, forward] to match the COLMAP poses 3DGUT
+// loads without a coordinate flip.
+struct EquirectProjectionParameters {
+    tcnn::vec2 resolution;
+};
+
 struct CameraModelParameters {
     enum ShutterType {
         RollingTopToBottomShutter,
@@ -73,6 +81,7 @@ struct CameraModelParameters {
         OpenCVFisheyeModel,
         FThetaModel,
         RationalModel,
+        EquirectangularModel,
         EmptyModel,
         Unsupported
     } modelType = EmptyModel;
@@ -82,6 +91,7 @@ struct CameraModelParameters {
         OpenCVFisheyeProjectionParameters ocvFisheyeParams;
         FThetaProjectionParameters fthetaParams;
         RationalProjectionParameters rationalParams;
+        EquirectProjectionParameters equirectParams;
     };
 };
 

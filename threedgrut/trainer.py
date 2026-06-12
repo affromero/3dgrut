@@ -53,6 +53,7 @@ from threedgrut.utils.misc import (
     check_step_condition,
     create_summary_writer,
     jet_map,
+    seed_everything,
 )
 from threedgrut.utils.render import apply_post_processing
 from threedgrut.utils.source_scan import source_scan_id_from_image_path
@@ -128,7 +129,9 @@ def _robust_jet_map(
             1.0, device=value_map.device, dtype=value_map.dtype
         )
     else:
-        max_value = torch.quantile(valid_values, quantile).clamp_min(1e-6)
+        max_value = torch.quantile(
+            _quantile_values(valid_values), quantile
+        ).clamp_min(1e-6)
     return jet_map(value_map, max_value)
 
 
@@ -415,6 +418,34 @@ def _rgb_to_luma(image: torch.Tensor) -> torch.Tensor:
     return (image[..., :3] * weights).sum(dim=-1, keepdim=True)
 
 
+def collapse_blur_samples(outputs: dict, gpu_batch) -> dict:
+    """Average K exposure-time render samples into one sensor image.
+
+    The blur-aware dataset path supplies [K, H, W, 3] ray bundles per frame;
+    the sensor integrates radiance over the exposure, so the K renders must
+    be averaged BEFORE any loss. (A mean of per-sample losses would instead
+    force every instantaneous sample to reproduce the blurred photo,
+    re-blurring the reconstructed scene.) Image-shaped outputs ([K, H, W, C])
+    are averaged on dim 0; everything else (per-Gaussian visibility, counts)
+    passes through untouched.
+    """
+    n_gt = gpu_batch.rgb_gt.shape[0]
+    n_pred = outputs["pred_rgb"].shape[0]
+    if n_pred == n_gt:
+        return outputs
+    collapsed = {}
+    for key, value in outputs.items():
+        if (
+            torch.is_tensor(value)
+            and value.ndim == 4
+            and value.shape[0] == n_pred
+        ):
+            collapsed[key] = value.mean(dim=0, keepdim=True)
+        else:
+            collapsed[key] = value
+    return collapsed
+
+
 def _box_blur_bhwc(image: torch.Tensor, kernel_size: int) -> torch.Tensor:
     """Apply a per-channel box low-pass filter to a BHWC/HWC image tensor."""
     batched, squeezed = _ensure_bhwc(image)
@@ -498,6 +529,67 @@ def _region_mask(
     return ((radius >= lower) & (radius < upper)).to(radius.dtype)[
         None, :, :, None
     ]
+
+
+def _radial_weight_map(
+    *,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    band_weights: list[float],
+) -> torch.Tensor:
+    """Return a [1, H, W] radial loss-weight map."""
+    if len(band_weights) != 4:
+        raise RuntimeError(
+            "Radial loss-weight entries must have four values: center, "
+            "mid, outer, rim."
+        )
+    radius = _image_radius(
+        height=height,
+        width=width,
+        device=device,
+        dtype=dtype,
+    )
+    radius = radius / torch.clamp_min(radius.max(), 1e-6)
+    bands = (
+        (0.00, 0.33),
+        (0.33, 0.66),
+        (0.66, 0.90),
+        (0.90, 1.01),
+    )
+    weight = torch.ones_like(radius)
+    for band_weight, (lower, upper) in zip(band_weights, bands):
+        band_mask = (radius >= lower) & (radius < upper)
+        band_value = torch.full_like(weight, float(band_weight))
+        weight = torch.where(band_mask, band_value, weight)
+    return weight.unsqueeze(0)
+
+
+def _erp_latitude_weight_map(
+    *,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a [1, H, W, 1] cos(latitude) loss-weight map for ERP frames.
+
+    An equirectangular image over-samples the poles: a pixel at latitude
+    theta covers solid angle proportional to cos(theta). Weighting the
+    per-pixel RGB residual by cos(theta) makes the photometric loss respect
+    the true spherical sampling (ErpGS-style distortion-aware weighting).
+
+    Row v in [0, H) maps to latitude theta = (1 - 2*(v+0.5)/H)*(pi/2),
+    matching the dataset's `create_equirect_camera` ray construction. The
+    map is normalized so its mean over rows == 1 to preserve loss scale, then
+    broadcast over width and channels as [1, H, W, 1].
+    """
+    rows = torch.arange(height, device=device, dtype=dtype)
+    theta = (1.0 - 2.0 * (rows + 0.5) / float(height)) * (torch.pi / 2.0)
+    cos_theta = torch.cos(theta)
+    cos_theta = cos_theta / torch.clamp_min(cos_theta.mean(), 1e-6)
+    return cos_theta.reshape(1, height, 1, 1).expand(1, height, width, 1)
 
 
 def _radial_residual_metrics(
@@ -1301,6 +1393,11 @@ class Trainer3DGRUT:
     @torch.cuda.nvtx.range("setup-trainer")
     def __init__(self, conf: DictConfig, device=None):
         """Set up a new training session, or continue an existing one based on configuration"""
+        # Seed the whole run FIRST, before any RNG-consuming setup (dataset
+        # shuffling, model init, densification). seed_initialization is the
+        # single source of truth (base_gs.yaml=42). The returned generator is
+        # threaded into the training dataloader for reproducible shuffling.
+        self.run_generator = seed_everything(conf.seed_initialization)
         # Keep track of useful fields
         self.conf = conf
         """ Global configuration of model, scene, optimization, etc"""
@@ -1369,7 +1466,9 @@ class Trainer3DGRUT:
         )
 
         train_dataloader = MultiEpochsDataLoader(
-            train_dataset, **train_dataloader_kwargs
+            train_dataset,
+            generator=self.run_generator,
+            **train_dataloader_kwargs,
         )
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset, **val_dataloader_kwargs
@@ -1865,6 +1964,598 @@ class Trainer3DGRUT:
             )
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
+
+    def init_camera_residual(self, conf: DictConfig) -> None:
+        """Initialize optional bounded camera residual calibration."""
+        if not conf.camera_residual.enabled:
+            return
+        frames_per_camera = self.train_dataset.get_frames_per_camera()
+        optimize_per_image = getattr(conf.camera_residual, "optimize_per_image", False)
+        num_images = len(self.train_dataset) if optimize_per_image else 0
+        warmup_steps = getattr(conf.camera_residual, "warmup_steps", 0)
+        lr_end_fraction = getattr(conf.camera_residual, "lr_end_fraction", 0.01)
+        self.camera_residual = CameraResidual(
+            num_cameras=len(frames_per_camera),
+            num_images=num_images,
+            lr=conf.camera_residual.lr,
+            lr_end_fraction=lr_end_fraction,
+            warmup_steps=warmup_steps,
+            reg_lambda=conf.camera_residual.reg_lambda,
+            max_rotation_rad=conf.camera_residual.max_rotation_rad,
+            max_translation_m=conf.camera_residual.max_translation_m,
+            max_rolling_rotation_rad=(
+                conf.camera_residual.max_rolling_rotation_rad
+            ),
+            max_rolling_translation_m=(
+                conf.camera_residual.max_rolling_translation_m
+            ),
+            optimize_global=conf.camera_residual.optimize_global,
+            optimize_per_camera=conf.camera_residual.optimize_per_camera,
+            optimize_per_image=optimize_per_image,
+            optimize_rolling_per_camera=(
+                conf.camera_residual.optimize_rolling_per_camera
+            ),
+            n_iterations=conf.n_iterations,
+        ).to(self.device)
+        self.camera_residual_optimizer, self.camera_residual_scheduler = (
+            self.camera_residual.create_optimizer()
+        )
+        logger.warning(
+            "📷 CAMERA_RESIDUAL enabled. Current 3DGUT CUDA backward does not "
+            "return ray/sensor gradients; monitor camera_residual/max_abs_grad."
+        )
+
+    def _validate_camera_residual_gradient(self, global_step: int) -> None:
+        """Abort invalid camera-residual runs with no pose gradients."""
+        if self.camera_residual is None:
+            return
+        camera_conf = self.conf.camera_residual
+        if not bool(camera_conf.get("fail_on_zero_grad", True)):
+            return
+        fail_after_steps = int(camera_conf.get("fail_after_steps", 5))
+        # CameraResidual.forward returns the batch untouched while
+        # global_step < warmup_steps, so no gradient CAN reach the residual
+        # params during warmup. Start counting the zero-grad grace window
+        # after warmup ends; warmup_steps=0 keeps the original behavior.
+        warmup_steps = int(getattr(self.camera_residual, "warmup_steps", 0))
+        if global_step < warmup_steps + fail_after_steps:
+            return
+        max_abs_grad = self.camera_residual.max_abs_grad()
+        min_abs_grad = float(camera_conf.get("min_abs_grad", 1e-12))
+        if max_abs_grad > min_abs_grad:
+            return
+        msg = (
+            "Camera residual is enabled, but no gradient reached the SO3/SE3 "
+            f"residual parameters by step {global_step} "
+            f"(warmup_steps={warmup_steps}). "
+            f"camera_residual/max_abs_grad={max_abs_grad:.3e}, "
+            f"threshold={min_abs_grad:.3e}. "
+            "This is not a valid camera finetuning run. Fix the tracer "
+            "backward to propagate ray/sensor gradients, or disable "
+            "camera_residual.fail_on_zero_grad only for an explicit diagnostic."
+        )
+        raise RuntimeError(msg)
+
+    def _apply_camera_residual(self, gpu_batch, global_step: int = -1):
+        if self.camera_residual is None:
+            return gpu_batch
+        return self.camera_residual(gpu_batch, global_step=global_step)
+
+    def _camera_residual_audit_axis_candidates(
+        self,
+        *,
+        prefix: str,
+        camera_idx: int | None,
+    ) -> list[tuple[str, int | None, torch.Tensor, torch.Tensor]]:
+        """Return fixed axis perturbations for finite-difference audit."""
+        audit_conf = self.conf.camera_residual.finite_difference_audit
+        rotation_step = float(audit_conf.rotation_step_rad)
+        translation_step = float(audit_conf.translation_step_m)
+        candidates = [
+            (
+                f"{prefix}_baseline",
+                camera_idx,
+                torch.zeros(3, device=self.device),
+                torch.zeros(3, device=self.device),
+            )
+        ]
+        axes = ("x", "y", "z")
+        for axis_idx, axis_name in enumerate(axes):
+            for sign in (-1.0, 1.0):
+                rotation = torch.zeros(3, device=self.device)
+                rotation[axis_idx] = sign * rotation_step
+                candidates.append(
+                    (
+                        f"{prefix}_rot_{axis_name}_{sign:+.0f}",
+                        camera_idx,
+                        rotation,
+                        torch.zeros(3, device=self.device),
+                    )
+                )
+        for axis_idx, axis_name in enumerate(axes):
+            for sign in (-1.0, 1.0):
+                translation = torch.zeros(3, device=self.device)
+                translation[axis_idx] = sign * translation_step
+                candidates.append(
+                    (
+                        f"{prefix}_trans_{axis_name}_{sign:+.0f}",
+                        camera_idx,
+                        torch.zeros(3, device=self.device),
+                        translation,
+                    )
+                )
+        return candidates
+
+    def _camera_residual_audit_rolling_candidates(
+        self,
+        *,
+        camera_idx: int,
+    ) -> list[tuple[str, int | None, torch.Tensor, torch.Tensor]]:
+        """Return fixed row-linear residual perturbations for one camera."""
+        return self._camera_residual_audit_axis_candidates(
+            prefix=f"rolling_camera_{camera_idx}",
+            camera_idx=camera_idx,
+        )
+
+    def _camera_residual_audit_is_rolling_candidate(
+        self,
+        candidate_name: str,
+    ) -> bool:
+        """Return whether an audit candidate targets row-linear residuals."""
+        return candidate_name.startswith("rolling_camera_")
+
+    def _camera_residual_audit_candidates(
+        self,
+    ) -> list[tuple[str, int | None, torch.Tensor, torch.Tensor]]:
+        """Return global and optional per-camera pose audit candidates."""
+        candidates = self._camera_residual_audit_axis_candidates(
+            prefix="global",
+            camera_idx=None,
+        )
+        if not self.camera_residual.optimize_per_camera:
+            if not self.camera_residual.optimize_rolling_per_camera:
+                return candidates
+            camera_count = int(
+                self.camera_residual.rolling_rotation_raw.shape[0]
+            )
+            for camera_idx in range(camera_count):
+                candidates.extend(
+                    self._camera_residual_audit_rolling_candidates(
+                        camera_idx=camera_idx,
+                    )
+                )
+            return candidates
+        camera_count = int(self.camera_residual.camera_rotation_raw.shape[0])
+        for camera_idx in range(camera_count):
+            candidates.extend(
+                self._camera_residual_audit_axis_candidates(
+                    prefix=f"camera_{camera_idx}",
+                    camera_idx=camera_idx,
+                )
+            )
+        if self.camera_residual.optimize_rolling_per_camera:
+            for camera_idx in range(camera_count):
+                candidates.extend(
+                    self._camera_residual_audit_rolling_candidates(
+                        camera_idx=camera_idx,
+                    )
+                )
+        return candidates
+
+    def _camera_residual_audit_target_image_names(self) -> set[str]:
+        """Return the optional image-name filter for pose residual audits."""
+        audit_conf = self.conf.camera_residual.finite_difference_audit
+        raw_names = str(audit_conf.get("target_image_names", "")).strip()
+        if not raw_names:
+            return set()
+        normalized = raw_names.replace("|", ",")
+        return {name.strip() for name in normalized.split(",") if name.strip()}
+
+    def _set_camera_residual_audit_delta(
+        self,
+        *,
+        candidate_name: str = "",
+        camera_idx: int | None,
+        rotation: torch.Tensor,
+        translation: torch.Tensor,
+    ) -> None:
+        """Apply one fixed residual candidate to the audit module."""
+        if self.camera_residual is None:
+            raise RuntimeError("Camera residual module is not initialized.")
+        if self._camera_residual_audit_is_rolling_candidate(candidate_name):
+            if camera_idx is None:
+                raise RuntimeError(
+                    "Rolling camera residual audit requires a camera index."
+                )
+            self.camera_residual.set_rolling_camera_delta(
+                camera_idx=camera_idx,
+                rotation=rotation,
+                translation=translation,
+            )
+            return
+        if camera_idx is None:
+            self.camera_residual.set_global_delta(
+                rotation=rotation,
+                translation=translation,
+            )
+            return
+        self.camera_residual.set_camera_delta(
+            camera_idx=camera_idx,
+            rotation=rotation,
+            translation=translation,
+        )
+
+    def _camera_residual_audit_batch_metrics(
+        self, gpu_batch
+    ) -> dict[str, float]:
+        """Evaluate one validation batch under the active residual candidate."""
+        if self.camera_residual is None:
+            raise RuntimeError("Camera residual module is not initialized.")
+        residual_batch = self._apply_camera_residual(gpu_batch)
+        outputs = self.model(residual_batch, train=False)
+        if self.post_processing is not None:
+            outputs = apply_post_processing(
+                self.post_processing,
+                outputs,
+                residual_batch,
+                training=False,
+            )
+        rgb_error = torch.square(outputs["pred_rgb"] - residual_batch.rgb_gt)
+        psnr_value = (
+            -10.0 * torch.log10(torch.clamp_min(rgb_error.mean(), 1e-12))
+        ).item()
+        metrics = {"psnr": float(psnr_value)}
+        if residual_batch.mask is not None:
+            mask = residual_batch.mask
+            masked_error = rgb_error * mask
+            denominator = torch.clamp_min(
+                mask.sum() * residual_batch.rgb_gt.shape[-1],
+                1.0,
+            )
+            masked_mse = masked_error.sum() / denominator
+            metrics["masked_psnr"] = float(
+                (
+                    -10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))
+                ).item()
+            )
+        return metrics
+
+    @torch.no_grad()
+    def run_camera_residual_per_view_finite_difference_audit(self) -> None:
+        """Evaluate per-image SO3/SE3 nudges on selected validation views."""
+        if self.camera_residual is None:
+            raise RuntimeError(
+                "camera_residual.finite_difference_audit requires "
+                "camera_residual.enabled=true."
+            )
+        audit_conf = self.conf.camera_residual.finite_difference_audit
+        max_views = int(audit_conf.max_views)
+        if max_views <= 0:
+            raise ValueError(
+                "camera_residual.finite_difference_audit.max_views must be positive."
+            )
+        original_global_rotation = (
+            self.camera_residual.global_rotation_raw.detach().clone()
+        )
+        original_global_translation = (
+            self.camera_residual.global_translation_raw.detach().clone()
+        )
+        original_camera_rotation = (
+            self.camera_residual.camera_rotation_raw.detach().clone()
+        )
+        original_camera_translation = (
+            self.camera_residual.camera_translation_raw.detach().clone()
+        )
+        original_rolling_rotation = (
+            self.camera_residual.rolling_rotation_raw.detach().clone()
+        )
+        original_rolling_translation = (
+            self.camera_residual.rolling_translation_raw.detach().clone()
+        )
+        target_image_names = self._camera_residual_audit_target_image_names()
+        rows = []
+        selected_views = 0
+        try:
+            for _, batch_idx in enumerate(self.val_dataloader):
+                gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
+                    batch_idx
+                )
+                image_name = os.path.basename(gpu_batch.image_path)
+                if target_image_names and image_name not in target_image_names:
+                    continue
+                if selected_views >= max_views:
+                    break
+                selected_views += 1
+                prefix = os.path.splitext(image_name)[0]
+                candidates = self._camera_residual_audit_axis_candidates(
+                    prefix=prefix,
+                    camera_idx=None,
+                )
+                baseline_metrics: dict[str, float] | None = None
+                for name, camera_idx, rotation, translation in candidates:
+                    self._set_camera_residual_audit_delta(
+                        candidate_name=name,
+                        camera_idx=camera_idx,
+                        rotation=rotation,
+                        translation=translation,
+                    )
+                    logger.info(
+                        "Camera residual per-view finite-difference candidate: "
+                        f"{image_name} {name}"
+                    )
+                    metrics = self._camera_residual_audit_batch_metrics(
+                        gpu_batch
+                    )
+                    if baseline_metrics is None:
+                        baseline_metrics = metrics
+                    row = {
+                        "candidate": name,
+                        "image_name": image_name,
+                        "split_frame_idx": int(gpu_batch.frame_idx),
+                        "camera_idx": int(gpu_batch.camera_idx),
+                        "rotation_x": float(rotation[0].item()),
+                        "rotation_y": float(rotation[1].item()),
+                        "rotation_z": float(rotation[2].item()),
+                        "translation_x": float(translation[0].item()),
+                        "translation_y": float(translation[1].item()),
+                        "translation_z": float(translation[2].item()),
+                        "mean_psnr": metrics["psnr"],
+                        "delta_psnr": (
+                            metrics["psnr"] - baseline_metrics["psnr"]
+                        ),
+                    }
+                    if "masked_psnr" in metrics:
+                        baseline_masked = baseline_metrics["masked_psnr"]
+                        row["mean_masked_psnr"] = metrics["masked_psnr"]
+                        row["delta_masked_psnr"] = (
+                            metrics["masked_psnr"] - baseline_masked
+                        )
+                    rows.append(row)
+        finally:
+            with torch.no_grad():
+                self.camera_residual.global_rotation_raw.copy_(
+                    original_global_rotation
+                )
+                self.camera_residual.global_translation_raw.copy_(
+                    original_global_translation
+                )
+                self.camera_residual.camera_rotation_raw.copy_(
+                    original_camera_rotation
+                )
+                self.camera_residual.camera_translation_raw.copy_(
+                    original_camera_translation
+                )
+                self.camera_residual.rolling_rotation_raw.copy_(
+                    original_rolling_rotation
+                )
+                self.camera_residual.rolling_translation_raw.copy_(
+                    original_rolling_translation
+                )
+        if target_image_names and selected_views != len(target_image_names):
+            found = {str(row["image_name"]) for row in rows}
+            missing = sorted(target_image_names - found)
+            logger.warning(
+                "Camera residual per-view audit did not find all targets: "
+                f"{missing}"
+            )
+        if not rows:
+            raise RuntimeError(
+                "Camera residual per-view finite-difference audit selected no "
+                "validation views."
+            )
+        score_key = (
+            "delta_masked_psnr"
+            if any("delta_masked_psnr" in row for row in rows)
+            else "delta_psnr"
+        )
+        finite_rows = [row for row in rows if np.isfinite(row[score_key])]
+        best = max(finite_rows, key=lambda row: row[score_key])
+        baselines = [
+            row for row in rows if row["candidate"].endswith("_baseline")
+        ]
+        for row in rows:
+            display_row = {
+                key: str(value) if isinstance(value, int) else value
+                for key, value in row.items()
+            }
+            logger.log_table(
+                "Camera Residual Per-View Finite-Difference Audit - "
+                f"{row['image_name']} {row['candidate']}",
+                record=display_row,
+            )
+        output_path = os.path.join(
+            self.tracking.output_dir,
+            "camera_residual_per_view_finite_difference_audit.json",
+        )
+        with open(output_path, "w", encoding="utf-8") as fp:
+            json.dump(
+                {
+                    "score_key": score_key,
+                    "per_view": True,
+                    "target_image_names": sorted(target_image_names),
+                    "baseline": baselines,
+                    "best": best,
+                    "rows": rows,
+                },
+                fp,
+                indent=2,
+            )
+        logger.info(
+            "Camera residual per-view finite-difference best: "
+            f"{best['image_name']} {best['candidate']} "
+            f"{score_key}={best[score_key]:.6f}"
+        )
+        logger.info(
+            "Camera residual per-view finite-difference audit JSON: "
+            f"{output_path}"
+        )
+
+    @torch.no_grad()
+    def run_camera_residual_finite_difference_audit(self) -> None:
+        """Evaluate fixed SO3/SE3 residual nudges without ray gradients."""
+        if self.camera_residual is None:
+            raise RuntimeError(
+                "camera_residual.finite_difference_audit requires "
+                "camera_residual.enabled=true."
+            )
+        audit_conf = self.conf.camera_residual.finite_difference_audit
+        max_views = int(audit_conf.max_views)
+        if max_views <= 0:
+            raise ValueError(
+                "camera_residual.finite_difference_audit.max_views must be positive."
+            )
+        if bool(audit_conf.get("per_view", False)):
+            self.run_camera_residual_per_view_finite_difference_audit()
+            return
+
+        original_rotation = (
+            self.camera_residual.global_rotation_raw.detach().clone()
+        )
+        original_translation = (
+            self.camera_residual.global_translation_raw.detach().clone()
+        )
+        original_camera_rotation = (
+            self.camera_residual.camera_rotation_raw.detach().clone()
+        )
+        original_camera_translation = (
+            self.camera_residual.camera_translation_raw.detach().clone()
+        )
+        original_rolling_rotation = (
+            self.camera_residual.rolling_rotation_raw.detach().clone()
+        )
+        original_rolling_translation = (
+            self.camera_residual.rolling_translation_raw.detach().clone()
+        )
+        rows = []
+        try:
+            for (
+                name,
+                camera_idx,
+                rotation,
+                translation,
+            ) in self._camera_residual_audit_candidates():
+                self._set_camera_residual_audit_delta(
+                    candidate_name=name,
+                    camera_idx=camera_idx,
+                    rotation=rotation,
+                    translation=translation,
+                )
+                psnr_values = []
+                masked_psnr_values = []
+                logger.info(
+                    f"Camera residual finite-difference candidate: {name}"
+                )
+                for _, batch_idx in enumerate(self.val_dataloader):
+                    gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
+                        batch_idx
+                    )
+                    if (
+                        camera_idx is not None
+                        and gpu_batch.camera_idx != camera_idx
+                    ):
+                        continue
+                    if len(psnr_values) >= max_views:
+                        break
+                    metrics = self._camera_residual_audit_batch_metrics(
+                        gpu_batch
+                    )
+                    psnr_values.append(metrics["psnr"])
+                    if "masked_psnr" in metrics:
+                        masked_psnr_values.append(metrics["masked_psnr"])
+                mean_psnr = (
+                    float(np.mean(psnr_values))
+                    if psnr_values
+                    else float("nan")
+                )
+                mean_masked_psnr = (
+                    float(np.mean(masked_psnr_values))
+                    if masked_psnr_values
+                    else float("nan")
+                )
+                rows.append(
+                    {
+                        "candidate": name,
+                        "camera_idx": -1 if camera_idx is None else camera_idx,
+                        "rotation_x": float(rotation[0].item()),
+                        "rotation_y": float(rotation[1].item()),
+                        "rotation_z": float(rotation[2].item()),
+                        "translation_x": float(translation[0].item()),
+                        "translation_y": float(translation[1].item()),
+                        "translation_z": float(translation[2].item()),
+                        "mean_psnr": mean_psnr,
+                        "mean_masked_psnr": mean_masked_psnr,
+                    }
+                )
+        finally:
+            with torch.no_grad():
+                self.camera_residual.global_rotation_raw.copy_(
+                    original_rotation
+                )
+                self.camera_residual.global_translation_raw.copy_(
+                    original_translation
+                )
+                self.camera_residual.camera_rotation_raw.copy_(
+                    original_camera_rotation
+                )
+                self.camera_residual.camera_translation_raw.copy_(
+                    original_camera_translation
+                )
+                self.camera_residual.rolling_rotation_raw.copy_(
+                    original_rolling_rotation
+                )
+                self.camera_residual.rolling_translation_raw.copy_(
+                    original_rolling_translation
+                )
+
+        score_key = "mean_masked_psnr"
+        if not rows or all(np.isnan(row[score_key]) for row in rows):
+            score_key = "mean_psnr"
+        finite_rows = [row for row in rows if not np.isnan(row[score_key])]
+        best = max(finite_rows, key=lambda row: row[score_key])
+        if self._camera_residual_audit_is_rolling_candidate(
+            str(best["candidate"])
+        ):
+            baseline_name = f"rolling_camera_{best['camera_idx']}_baseline"
+        elif best["camera_idx"] >= 0:
+            baseline_name = f"camera_{best['camera_idx']}_baseline"
+        else:
+            baseline_name = "global_baseline"
+        baseline = next(
+            row for row in rows if row["candidate"] == baseline_name
+        )
+        for row in rows:
+            display_row = {
+                key: str(value) if isinstance(value, int) else value
+                for key, value in row.items()
+            }
+            logger.log_table(
+                f"Camera Residual Finite-Difference Audit - {row['candidate']}",
+                record=display_row,
+            )
+        output_path = os.path.join(
+            self.tracking.output_dir,
+            "camera_residual_finite_difference_audit.json",
+        )
+        with open(output_path, "w", encoding="utf-8") as fp:
+            json.dump(
+                {
+                    "score_key": score_key,
+                    "baseline": baseline,
+                    "best": best,
+                    "rows": rows,
+                },
+                fp,
+                indent=2,
+            )
+        logger.info(
+            "Camera residual finite-difference best: "
+            f"{best['candidate']} {score_key}={best[score_key]:.6f}; "
+            f"baseline={baseline[score_key]:.6f}; "
+            f"delta={best[score_key] - baseline[score_key]:.6f}"
+        )
+        logger.info(
+            f"Camera residual finite-difference audit JSON: {output_path}"
+        )
 
     def _camera_intrinsics_audit_candidates(self) -> list[dict[str, Any]]:
         """Return renderer-side RATIONAL intrinsics perturbation candidates."""
@@ -2416,18 +3107,52 @@ class Trainer3DGRUT:
         if self.conf.loss.use_l1:
             with torch.cuda.nvtx.range("loss-l1"):
                 rgb_error = rgb_pred - rgb_gt
+                # ERP distortion-aware latitude weighting (ErpGS-style):
+                # weight the per-pixel L1 by a cached, mean-1-normalized
+                # cos(latitude) map so the loss respects the true spherical
+                # sampling of an equirectangular image. Gated on a new
+                # default-false flag AND on the current frame being ERP, so
+                # perspective/fisheye runs are byte-for-byte unchanged.
+                erp_weight = torch.ones(1, device=self.device)
+                if self.conf.loss.get(
+                    "erp_latitude_weighting", False
+                ) and (
+                    gpu_batch.intrinsics_EquirectCameraModelParameters
+                    is not None
+                ):
+                    height = rgb_error.shape[1]
+                    width = rgb_error.shape[2]
+                    cache = getattr(self, "_erp_latitude_weight_cache", None)
+                    if cache is None:
+                        cache = {}
+                        self._erp_latitude_weight_cache = cache
+                    cache_key = (height, width)
+                    erp_weight = cache.get(cache_key)
+                    if erp_weight is None:
+                        erp_weight = _erp_latitude_weight_map(
+                            height=height,
+                            width=width,
+                            device=self.device,
+                            dtype=rgb_error.dtype,
+                        )
+                        cache[cache_key] = erp_weight
                 l1_loss_type = str(
                     self.conf.loss.get("l1_loss_type", "absolute")
                 )
                 if l1_loss_type == "absolute":
-                    loss_l1 = torch.abs(rgb_error).sum() / loss_denominator
+                    loss_l1 = (
+                        torch.abs(rgb_error) * erp_weight
+                    ).sum() / loss_denominator
                 elif l1_loss_type == "charbonnier":
                     epsilon = float(
                         self.conf.loss.get("charbonnier_epsilon", 0.01)
                     )
                     loss_l1 = (
-                        torch.sqrt(rgb_error.square() + epsilon * epsilon)
-                        - epsilon
+                        (
+                            torch.sqrt(rgb_error.square() + epsilon * epsilon)
+                            - epsilon
+                        )
+                        * erp_weight
                     ).sum() / loss_denominator
                 else:
                     msg = (
@@ -2633,12 +3358,40 @@ class Trainer3DGRUT:
             self.global_step,
         )
 
-        mean_psnr = np.mean(metrics["psnr"])
+        psnr_values = np.asarray(metrics["psnr"], dtype=np.float64)
+        mean_psnr = float(psnr_values.mean())
         writer.add_scalar("val/psnr", mean_psnr, global_step)
+        writer.add_scalar(
+            "val/psnr_best_view", float(psnr_values.max()), global_step
+        )
+        writer.add_scalar(
+            "val/psnr_worst_view", float(psnr_values.min()), global_step
+        )
+        eval_paths = metrics.get("eval_image_path")
+        if eval_paths is not None and len(eval_paths) == len(psnr_values):
+            worst_idx = int(psnr_values.argmin())
+            best_idx = int(psnr_values.argmax())
+            logger.info(
+                f"val PSNR best={psnr_values[best_idx]:.2f} "
+                f"({os.path.basename(eval_paths[best_idx])}) "
+                f"worst={psnr_values[worst_idx]:.2f} "
+                f"({os.path.basename(eval_paths[worst_idx])})"
+            )
         if "masked_psnr" in metrics:
+            masked_values = np.asarray(
+                metrics["masked_psnr"], dtype=np.float64
+            )
             writer.add_scalar(
-                "val/masked_psnr",
-                np.mean(metrics["masked_psnr"]),
+                "val/masked_psnr", float(masked_values.mean()), global_step
+            )
+            writer.add_scalar(
+                "val/masked_psnr_best_view",
+                float(masked_values.max()),
+                global_step,
+            )
+            writer.add_scalar(
+                "val/masked_psnr_worst_view",
+                float(masked_values.min()),
                 global_step,
             )
         if "mask_coverage" in metrics:
@@ -3075,6 +3828,12 @@ class Trainer3DGRUT:
             logger.info(
                 f"Best validation {metric_name}={score:.6f} "
                 f"at step {self.global_step}"
+            )
+        if self._best_validation_score is not None:
+            self.tracking.writer.add_scalar(
+                f"val/{metric_name}_best_so_far",
+                float(self._best_validation_score),
+                self.global_step,
             )
         if not bool(early_stopping_conf.get("enabled", False)):
             return
@@ -3745,10 +4504,19 @@ class Trainer3DGRUT:
             ]
             if len(matched) < 2:
                 return None
-            sheet = np.concatenate(
-                [_labeled_panel(label, arr) for label, arr in matched],
-                axis=1,
-            )
+            labeled = [_labeled_panel(label, arr) for label, arr in matched]
+            # Insert a framed seam between panels so the columns read as
+            # clearly separated (mirrors blk_windows save_horizontal_panels).
+            # Dark edges + a bright center stay visible over both bright sky
+            # and dark shadow regions of an ERP panorama.
+            seam = np.full((labeled[0].shape[0], 8, 3), 24, dtype=np.uint8)
+            seam[:, 2:6, :] = 235
+            parts: list[np.ndarray] = []
+            for index, panel in enumerate(labeled):
+                parts.append(panel)
+                if index < len(labeled) - 1:
+                    parts.append(seam)
+            sheet = np.concatenate(parts, axis=1)
             sp = path_join(
                 snapshots_dir,
                 f"step_{global_step:06d}_contact_sheet.png",
@@ -3915,6 +4683,7 @@ class Trainer3DGRUT:
             profilers["inference"].start()
             outputs = self.model(gpu_batch, train=True, frame_id=global_step)
             profilers["inference"].end()
+        outputs = collapse_blur_samples(outputs, gpu_batch)
 
         # Apply post-processing to rendered output
         if self.post_processing is not None:

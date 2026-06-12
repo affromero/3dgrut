@@ -125,7 +125,20 @@ extern "C" __global__ void __raygen__rg() {
     float rayLastHitDistance = fmaxf(0.0f, minMaxT.x - epsT);
     RayPayload rayPayload;
 
+    // Hard backstop against a non-terminating march. Under concurrent multi-process
+    // OptiX traversal the driver scheduler can hand back degenerate/incomplete
+    // payloads that fail to advance rayLastHitDistance, spinning this loop forever
+    // (GPU pinned at 100% with zero step progress -- the observed concurrency wedge).
+    // Cap the iteration count AND force monotonic forward progress so the raygen
+    // kernel always terminates regardless of what trace() returns.
+    constexpr int kMaxMarchIters = 4096;
+    int marchIters               = 0;
+
     while ((rayLastHitDistance <= minMaxT.y) && (rayTransmittance > params.minTransmittance)) {
+        if (++marchIters > kMaxMarchIters) {
+            break;
+        }
+        const float prevLastHitDistance = rayLastHitDistance;
         trace(rayPayload, rayOrigin, rayDirection, rayLastHitDistance + epsT, minMaxT.y + epsT);
         if (rayPayload[0].particleId == RayHit::InvalidParticleId) {
             break;
@@ -166,6 +179,12 @@ extern "C" __global__ void __raygen__rg() {
                 rayHitsCount += acceptedHit ? 1.0f : 0.f;
 #endif
             }
+        }
+
+        // Force forward progress when no accepted hit advanced rayLastHitDistance
+        // (float ULP at large t, or a degenerate payload), preventing an infinite march.
+        if (rayLastHitDistance <= prevLastHitDistance) {
+            rayLastHitDistance = nextafterf(prevLastHitDistance + epsT, RayHit::InfiniteDistance);
         }
     }
 

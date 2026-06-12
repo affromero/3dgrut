@@ -891,13 +891,28 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                     param_group["lr"] = lr
 
     def ensure_scene_extent_from_points(self, points: torch.Tensor) -> None:
-        """Use point geometry when camera-center extent is degenerate."""
+        """Use point geometry when camera-center extent is degenerate.
+
+        A centered / near-stationary rig (e.g. a 360 panorama capture) yields
+        a camera-derived extent ~0 even though the scene has real scale. An
+        extent that is tiny *relative to* the point-cloud radius is degenerate
+        and would freeze the position LR (``lr * scene_extent``), so fall back
+        to the geometry-derived radius. The check is scale-invariant, so a
+        genuine multi-view rig (camera extent ~ scene radius) keeps its
+        camera-derived extent; only a stationary/centered rig triggers the
+        fallback.
+        """
+        point_extent = _estimate_scene_extent_from_points(points)
         if self.scene_extent is not None:
             scene_extent = float(self.scene_extent)
-            if np.isfinite(scene_extent) and scene_extent > SCENE_EXTENT_MIN:
+            if (
+                np.isfinite(scene_extent)
+                and scene_extent > SCENE_EXTENT_MIN
+                and scene_extent >= 0.05 * point_extent
+            ):
                 return
 
-        self.scene_extent = _estimate_scene_extent_from_points(points)
+        self.scene_extent = point_extent
         logger.warning(
             "Camera-derived scene extent is degenerate; using point-cloud "
             f"fallback scene_extent={self.scene_extent:.6f}"
