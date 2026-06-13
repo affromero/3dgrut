@@ -235,10 +235,16 @@ def compute_fisheye_max_angle(
     The legacy estimate ``max_radius / focal`` (the equidistant inverse of the
     image-*corner* radius) routinely lands far past ``theta_peak`` for wide 360
     lenses — e.g. 152 deg for a ~200 deg lens whose KB4 peaks at 117 deg. This
-    instead returns the tighter of (a) the angle subtended by the farthest image
-    pixel and (b) a safety back-off below ``theta_peak``, so ``max_angle`` always
-    stays inside the monotonic, well-conditioned domain. A purely monotonic lens
-    (no turning point) simply gets its true image field of view.
+    instead returns the tighter of (a) the angle subtended by the inscribed image
+    circle and (b) a safety back-off below ``theta_peak``, so ``max_angle`` always
+    stays inside the monotonic, well-conditioned domain.
+
+    The content extent uses the *inscribed* circle (the nearest image edge), not
+    the farthest corner: a circular fisheye fills the frame only to its nearest
+    edges and the corners are black border, so inverting the KB4 at the corner
+    radius extrapolates far past the real lens field of view — for a monotonic
+    lens (no turning point to clamp it) that extrapolation poisons the backward
+    polynomial just as the corner fold does for a folding lens.
 
     Args:
         image_size: ``[width, height]`` in pixels.
@@ -267,12 +273,18 @@ def compute_fisheye_max_angle(
     positive = sorted(math.sqrt(r.real) for r in roots if abs(r.imag) < 1e-9 and r.real > 1e-12)
     theta_peak = min(positive[0], hard_ceiling) if positive else hard_ceiling
 
-    # Farthest image pixel, normalised per-axis (= the forward radius it maps to).
-    corners = np.array(
-        [[0.0, 0.0], [image_size[0], 0.0], [0.0, image_size[1]], [image_size[0], image_size[1]]],
-        dtype=np.float64,
+    # Inscribed image circle: the nearest edge (where a frame-filling circular
+    # fisheye is tangent), in normalised per-axis coords (= the forward radius
+    # it maps to). The corners are black border for a circular fisheye, so the
+    # farthest corner would over-extend max_angle past the real lens FOV.
+    r_image = float(
+        min(
+            pp[0] / f[0],
+            (image_size[0] - pp[0]) / f[0],
+            pp[1] / f[1],
+            (image_size[1] - pp[1]) / f[1],
+        )
     )
-    r_image = float(np.max(np.linalg.norm((corners - pp) / f, axis=1)))
     r_target = min(r_image, forward(peak_safety * theta_peak))
 
     # Newton-invert forward(theta) = r_target, clamped to the monotonic domain.

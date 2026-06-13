@@ -30,30 +30,45 @@ def test_x5_max_angle_stays_inside_the_kb4_monotonic_domain() -> None:
     assert max_angle_deg < 152.0
 
 
-def test_monotonic_lens_keeps_its_true_image_fov() -> None:
+def test_monotonic_lens_keeps_its_inscribed_image_fov() -> None:
     # A purely equidistant lens never folds; max_angle must equal the angle
-    # subtended by the farthest pixel, not an artificial cap.
+    # subtended by the inscribed image circle (nearest edge), not the corner
+    # (black border) and not an artificial cap. r(theta)=theta here, so the
+    # angle equals the inscribed normalised radius directly.
     image = np.array([1920.0, 1920.0])
     pp = np.array([960.0, 960.0])
     focal = np.array([1000.0, 1000.0])
     k = np.zeros(4)
     max_angle = compute_fisheye_max_angle(image, pp, focal, k)
-    corner_norm = float(np.linalg.norm((np.array([1920.0, 1920.0]) - pp) / focal))
-    assert np.isclose(max_angle, corner_norm, atol=1e-6)
+    inscribed_norm = 960.0 / 1000.0
+    assert np.isclose(max_angle, inscribed_norm, atol=1e-6)
 
 
 def test_folding_lens_is_capped_below_its_turning_point() -> None:
-    # A lens whose KB4 folds well inside the frame must be capped below the
-    # turning point so the backward-poly inversion never sees the fold.
+    # A wide lens whose KB4 folds inside the frame must be capped below the
+    # turning point so the backward-poly inversion never sees the fold. A small
+    # focal makes the inscribed circle subtend more than the peak, so the cap
+    # (not the image extent) is what binds.
     image = np.array([1920.0, 1920.0])
     pp = np.array([960.0, 960.0])
-    focal = np.array([1000.0, 1000.0])
+    focal = np.array([350.0, 350.0])
     k = np.array([0.05, 0.0, -0.02, 0.0])
     roots = np.roots([9 * k[3], 7 * k[2], 5 * k[1], 3 * k[0], 1.0])
     peak = min(np.sqrt(r.real) for r in roots if abs(r.imag) < 1e-9 and r.real > 1e-12)
     max_angle = compute_fisheye_max_angle(image, pp, focal, k)
     assert max_angle < peak
     assert np.isclose(max_angle, 0.95 * peak, atol=1e-3)
+
+
+def test_real_x5_resolves_to_a_physical_fov_not_the_corner() -> None:
+    # A 360 fisheye is ~190-205 deg, i.e. a half-FOV of ~95-103 deg. The legacy
+    # corner estimate blew past this (152 deg on the X5); an earlier corner-
+    # based fix regressed the *monotonic* One RS lens to 157 deg. The inscribed-
+    # circle extent must land the X5 in the physical band, not the corner.
+    max_angle_deg = np.rad2deg(
+        compute_fisheye_max_angle(_X5_IMAGE, _X5_PP, _X5_FOCAL, _X5_K)
+    )
+    assert 95.0 < max_angle_deg < 105.0
 
 
 def test_max_angle_radius_round_trips_through_the_kb4_forward() -> None:
