@@ -34,7 +34,7 @@ from threedgrut.utils.logger import logger
 from .colmap_gsplat import normalize_world_space, scene_scale
 from .protocols import Batch, BoundedMultiViewDataset, DatasetVisualization
 from .utils import (
-    compute_max_radius,
+    compute_fisheye_max_angle,
     create_camera_visualization,
     create_pixel_coords,
     get_center_and_diag,
@@ -413,11 +413,18 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             principal_point = params[2:4].astype(np.float32)
             focal_length = params[0:2].astype(np.float32)
             radial_coeffs = params[4:].astype(np.float32)
-            # Estimate max angle for fisheye
-            max_radius_pixels = compute_max_radius(resolution.astype(np.float64), principal_point)
-            fov_angle_x = 2.0 * max_radius_pixels / focal_length[0]
-            fov_angle_y = 2.0 * max_radius_pixels / focal_length[1]
-            max_angle = np.max([fov_angle_x, fov_angle_y]) / 2.0
+            # Largest valid view angle, kept inside the KB4 forward map's
+            # monotonic (invertible) domain. The legacy `max_radius / focal`
+            # estimate inverts the image-corner radius with an equidistant
+            # approximation and lands far past the polynomial's turning point
+            # for wide 360 lenses, poisoning ncore's backward-poly fit and
+            # shrinking/veiling the rendered fisheye periphery.
+            max_angle = compute_fisheye_max_angle(
+                resolution.astype(np.float64),
+                principal_point.astype(np.float64),
+                focal_length.astype(np.float64),
+                radial_coeffs.astype(np.float64),
+            )
 
             params = OpenCVFisheyeCameraModelParameters(
                 principal_point=principal_point,
