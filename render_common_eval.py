@@ -43,6 +43,13 @@ if __name__ == "__main__":
     conf.path = args.eval_bundle
     conf.dataset.holdout_image_list_path = args.holdout_list
     conf.dataset.shutter_type = "GLOBAL"
+    # Eval-only: drop training sidecars tied to the TRAINING bundle. A
+    # fisheye-trained checkpoint carries dataset.sky_mask_folder=sky_masks;
+    # the ERP eval bundle (and any cross-domain bundle) need not have that
+    # dir, and 3DGRUT raises when it is set but absent. cc_psnr is the fair
+    # metric, so sky-opacity supervision is irrelevant at eval time.
+    conf.dataset.sky_mask_folder = None
+    conf.loss.use_sky_opacity = False
 
     model = MixtureOfGaussians(conf)
     model.init_from_checkpoint(checkpoint, setup_optimizer=False)
