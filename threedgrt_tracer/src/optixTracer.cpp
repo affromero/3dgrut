@@ -249,11 +249,11 @@ OptixTracer::OptixTracer(
         options.logCallbackFunction       = &contextLogCB;
         options.logCallbackLevel          = 3;
 
-        // HAX_OPTIX_VALIDATION=1 turns on OptiX's internal device-side checks:
+        // THREEDGRUT_OPTIX_VALIDATION=1 turns on OptiX's internal device-side checks:
         // if the stochastic traversal wedge is a malformed tree / illegal
         // traversal state, validation should surface a named error instead of
         // a silent infinite spin. Diagnostic only (large perf cost).
-        const char* validationEnv = std::getenv("HAX_OPTIX_VALIDATION");
+        const char* validationEnv = std::getenv("THREEDGRUT_OPTIX_VALIDATION");
         if (validationEnv != nullptr && validationEnv[0] == '1') {
             options.validationMode   = OPTIX_DEVICE_CONTEXT_VALIDATION_MODE_ALL;
             options.logCallbackLevel = 4;
@@ -378,7 +378,7 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
         // NOTE: OPTIX_EXCEPTION_FLAG_STACK_OVERFLOW does NOT detect the
         // [INTERNAL_TRAVERSAL_STACK_OVERFLOW] that wedges full-res training
         // (tested: flags compiled in + enabled, the hang stayed silent). Only
-        // validation mode (HAX_OPTIX_VALIDATION=1, ctor above) checks the
+        // validation mode (THREEDGRUT_OPTIX_VALIDATION=1, ctor above) checks the
         // internal traversal stack — use it to diagnose, not in production.
         pipeline_compile_options.exceptionFlags                   = OPTIX_EXCEPTION_FLAG_NONE;
         pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
@@ -812,13 +812,13 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
 
     {
         OptixAccelBuildOptions accel_options = {};
-        // HAX_OPTIX_FAST_BUILD=1 selects PREFER_FAST_BUILD: NOT a fix for the
+        // THREEDGRUT_OPTIX_FAST_BUILD=1 selects PREFER_FAST_BUILD: NOT a fix for the
         // [INTERNAL_TRAVERSAL_STACK_OVERFLOW] wedge, but its shallower trees
         // measurably lower the per-build overflow hazard (~2.3x later wedge in
         // A/B). Used as a throughput multiplier for supervisor-grinding
         // through dense mid-training hot zones; rendering math is identical
         // (same hits, different tree), traversal is ~10-20% slower.
-        const char* fastBuildEnv = std::getenv("HAX_OPTIX_FAST_BUILD");
+        const char* fastBuildEnv = std::getenv("THREEDGRUT_OPTIX_FAST_BUILD");
         accel_options.buildFlags = (fastBuildEnv != nullptr && fastBuildEnv[0] == '1')
                                        ? OPTIX_BUILD_FLAG_PREFER_FAST_BUILD
                                        : OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;

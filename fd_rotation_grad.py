@@ -26,13 +26,6 @@ def _conf():
     cfg_dir = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "configs")
     )
-    if not os.path.isdir(cfg_dir):
-        cfg_dir = os.path.abspath(
-            os.path.join(
-                os.path.expanduser("~"),
-                "Code/Hax-CV-wt-360-splat/dependencies/3dgrut/configs",
-            )
-        )
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):
         return compose(config_name="apps/colmap_3dgut")
 
