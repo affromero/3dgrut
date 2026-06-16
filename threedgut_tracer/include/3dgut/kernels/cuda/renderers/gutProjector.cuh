@@ -134,15 +134,28 @@ struct GUTProjector : Params, UTParams {
         }
 
         const tcnn::vec3& particleMean = particles.position(particleParameters);
-        if ((particleMean.x * sensorMatrix[0][2] + particleMean.y * sensorMatrix[1][2] +
-             particleMean.z * sensorMatrix[2][2] + sensorMatrix[3][2]) < Params::ParticleMinSensorZ) {
+
+        // Camera-to-particle vector (world frame); reused below, so compute
+        // it before the visibility cull.
+        particleSensorRay = particleMean - sensorWorldPosition;
+
+        // Wide-FOV cameras rely on projectPoint() for angular validity.
+        // A forward-hemisphere depth cull would discard valid fisheye rim
+        // samples beyond 90 deg before the KB4 maxAngle check runs.
+        // (Equirectangular joins this branch when that camera model is
+        // ported.)
+        if (sensorModel.modelType == threedgut::TSensorModel::OpenCVFisheyeModel) {
+            if (length(particleSensorRay) < 1e-6f) {
+                return false;
+            }
+        } else if ((particleMean.x * sensorMatrix[0][2] + particleMean.y * sensorMatrix[1][2] +
+                    particleMean.z * sensorMatrix[2][2] + sensorMatrix[3][2]) < Params::ParticleMinSensorZ) {
+            // Perspective / rational / ftheta: forward-hemisphere cull.
             return false;
         }
 
         const tcnn::vec3& particleScale   = particles.scale(particleParameters);
         const tcnn::mat3 particleRotation = particles.rotation(particleParameters);
-
-        particleSensorRay = particleMean - sensorWorldPosition;
 
         int numValidPoints = 0;
         tcnn::vec2 projectedSigmaPoints[2 * UTParams::D + 1];
