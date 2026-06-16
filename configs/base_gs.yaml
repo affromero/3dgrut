@@ -39,6 +39,7 @@ diagnostics:
   snapshot_grad_enabled: false  # Grad panels are sparse; opt in when needed
   snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
   snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
+  validation_metrics_enabled: true  # Compute full validation diagnostics beyond PSNR/loss.
   loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
   loss_volume_voxel_size_m: 0.1
   loss_volume_view_stride: 4
@@ -109,7 +110,7 @@ camera_intrinsics_audit:
   affine_delta: 0.001
   tangential_delta: 0.001
   exit_after: true
-  
+
 export_usd:
   enabled: false
   path: ""

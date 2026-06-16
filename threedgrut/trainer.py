@@ -3012,13 +3012,23 @@ class Trainer3DGRUT:
 
             is_logged_view = iteration in self._validation_log_image_views()
 
-            metrics.update(
-                _diagnostic_metrics(
-                    rgb_gt=rgb_gt,
-                    rgb_pred=rgb_pred,
-                    mask=gpu_batch.mask,
-                )
+            diag_conf = (
+                self.conf.get("diagnostics") if hasattr(self.conf, "get")
+                else None
             )
+            validation_diagnostics_enabled = (
+                bool(diag_conf.get("validation_metrics_enabled", True))
+                if diag_conf is not None
+                else True
+            )
+            if validation_diagnostics_enabled:
+                metrics.update(
+                    _diagnostic_metrics(
+                        rgb_gt=rgb_gt,
+                        rgb_pred=rgb_pred,
+                        mask=gpu_batch.mask,
+                    )
+                )
             metrics.update(
                 _screen_space_footprint_metrics(
                     model=self.model,
@@ -3408,31 +3418,23 @@ class Trainer3DGRUT:
             writer.add_scalar(
                 "val/lpips", np.mean(metrics["lpips"]), global_step
             )
-        writer.add_scalar(
-            "diagnostics/residual/low_freq_l1",
-            np.mean(metrics["low_freq_l1"]),
-            global_step,
+        diagnostic_metric_names = (
+            ("low_freq_l1", "diagnostics/residual/low_freq_l1"),
+            ("high_freq_l1", "diagnostics/residual/high_freq_l1"),
+            ("gradient_l1", "diagnostics/residual/gradient_l1"),
+            ("laplacian_l1", "diagnostics/residual/laplacian_l1"),
+            (
+                "fft_high_energy_ratio",
+                "diagnostics/frequency/ratio_high_legacy",
+            ),
         )
-        writer.add_scalar(
-            "diagnostics/residual/high_freq_l1",
-            np.mean(metrics["high_freq_l1"]),
-            global_step,
-        )
-        writer.add_scalar(
-            "diagnostics/residual/gradient_l1",
-            np.mean(metrics["gradient_l1"]),
-            global_step,
-        )
-        writer.add_scalar(
-            "diagnostics/residual/laplacian_l1",
-            np.mean(metrics["laplacian_l1"]),
-            global_step,
-        )
-        writer.add_scalar(
-            "diagnostics/frequency/ratio_high_legacy",
-            np.mean(metrics["fft_high_energy_ratio"]),
-            global_step,
-        )
+        for metric_name, writer_name in diagnostic_metric_names:
+            if metric_name in metrics:
+                writer.add_scalar(
+                    writer_name,
+                    np.mean(metrics[metric_name]),
+                    global_step,
+                )
         frequency_metric_names = (
             ("fft_energy_ratio_low", "diagnostics/frequency/ratio_low"),
             ("fft_energy_ratio_mid", "diagnostics/frequency/ratio_mid"),
@@ -3440,11 +3442,12 @@ class Trainer3DGRUT:
             ("fft_energy_ratio_ultra", "diagnostics/frequency/ratio_ultra"),
         )
         for metric_name, wandb_name in frequency_metric_names:
-            writer.add_scalar(
-                wandb_name,
-                np.mean(metrics[metric_name]),
-                global_step,
-            )
+            if metric_name in metrics:
+                writer.add_scalar(
+                    wandb_name,
+                    np.mean(metrics[metric_name]),
+                    global_step,
+                )
         frequency_error_names = (
             ("fft_error_ratio_low", "diagnostics/frequency_error/ratio_low"),
             ("fft_error_ratio_mid", "diagnostics/frequency_error/ratio_mid"),
@@ -3455,11 +3458,12 @@ class Trainer3DGRUT:
             ),
         )
         for metric_name, wandb_name in frequency_error_names:
-            writer.add_scalar(
-                wandb_name,
-                np.mean(metrics[metric_name]),
-                global_step,
-            )
+            if metric_name in metrics:
+                writer.add_scalar(
+                    wandb_name,
+                    np.mean(metrics[metric_name]),
+                    global_step,
+                )
         edge_metric_names = (
             ("edge_top15_precision", "diagnostics/edge/precision_top15"),
             ("edge_top15_recall", "diagnostics/edge/recall_top15"),
@@ -3473,11 +3477,12 @@ class Trainer3DGRUT:
             ),
         )
         for metric_name, wandb_name in edge_metric_names:
-            writer.add_scalar(
-                wandb_name,
-                np.mean(metrics[metric_name]),
-                global_step,
-            )
+            if metric_name in metrics:
+                writer.add_scalar(
+                    wandb_name,
+                    np.mean(metrics[metric_name]),
+                    global_step,
+                )
         radial_bands = ("center", "mid", "outer", "rim")
         radial_metric_names = (
             "rgb_l1",
