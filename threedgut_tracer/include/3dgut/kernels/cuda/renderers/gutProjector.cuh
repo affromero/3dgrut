@@ -173,18 +173,19 @@ struct GUTProjector : Params, UTParams {
         // before the visibility cull.
         particleSensorRay = particleMean - sensorWorldPosition;
 
-        if (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel) {
-            // Full-sphere camera: every direction is imaged, so the
-            // forward-hemisphere depth cull must NOT run -- it would discard the
-            // entire rear hemisphere. The only invalid case is a particle
-            // coincident with the camera center (undefined bearing), matching
-            // projectPoint()'s n <= 0 guard.
+        const bool wideFovModel = (
+            sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel ||
+            sensorModel.modelType == threedgut::TSensorModel::OpenCVFisheyeModel);
+        if (wideFovModel) {
+            // Wide-FOV cameras rely on projectPoint() for angular validity.
+            // A forward-hemisphere depth cull would discard valid fisheye rim
+            // samples beyond 90 deg before the KB4 maxAngle check runs.
             if (length(particleSensorRay) < 1e-6f) {
                 return false;
             }
         } else if ((particleMean.x * sensorMatrix[0][2] + particleMean.y * sensorMatrix[1][2] +
                     particleMean.z * sensorMatrix[2][2] + sensorMatrix[3][2]) < Params::ParticleMinSensorZ) {
-            // Perspective / fisheye / rational / ftheta: forward-hemisphere cull.
+            // Perspective / rational / ftheta: forward-hemisphere cull.
             return false;
         }
 
