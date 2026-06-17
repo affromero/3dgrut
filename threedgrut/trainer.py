@@ -88,6 +88,41 @@ SEMANTIC_LABEL_COLORS_RGB = (
 )
 
 
+def _predicted_axial_depth(
+    *,
+    pred_dist: torch.Tensor,
+    rays_dir: torch.Tensor,
+    rays_in_world_space: bool,
+    depth_ray_z: torch.Tensor | None,
+) -> torch.Tensor:
+    """Convert renderer ray distance to axial camera depth when possible."""
+    if pred_dist.ndim == 3:
+        pred_dist = pred_dist.unsqueeze(-1)
+    ray_z = None
+    if depth_ray_z is not None:
+        ray_z = depth_ray_z.to(
+            device=pred_dist.device,
+            dtype=pred_dist.dtype,
+        )
+    elif not rays_in_world_space:
+        ray_z = torch.abs(rays_dir[..., 2:3]).to(
+            device=pred_dist.device,
+            dtype=pred_dist.dtype,
+        )
+    if ray_z is None:
+        return pred_dist
+    if ray_z.shape[1:3] != pred_dist.shape[1:3]:
+        ray_z = F.interpolate(
+            ray_z.permute(0, 3, 1, 2),
+            size=pred_dist.shape[1:3],
+            mode="bilinear",
+            align_corners=False,
+        ).permute(0, 2, 3, 1)
+    if ray_z.shape[0] != pred_dist.shape[0]:
+        ray_z = ray_z.expand(pred_dist.shape[0], -1, -1, -1)
+    return pred_dist * ray_z
+
+
 def _scale_optimizer_learning_rates(
     optimizer: torch.optim.Optimizer, *, scale: float, label: str
 ) -> None:
@@ -3236,22 +3271,14 @@ class Trainer3DGRUT:
                     dtype=rgb_pred.dtype,
                 )
                 pred_dist = outputs["pred_dist"].to(dtype=depth_gt.dtype)
-                if pred_dist.ndim == 3:
-                    pred_dist = pred_dist.unsqueeze(-1)
-                pred_depth = pred_dist
-                if not bool(getattr(gpu_batch, "rays_in_world_space", False)):
-                    ray_z = torch.abs(gpu_batch.rays_dir[..., 2:3]).to(
-                        device=self.device,
-                        dtype=pred_dist.dtype,
-                    )
-                    if ray_z.shape[1:3] != pred_dist.shape[1:3]:
-                        ray_z = F.interpolate(
-                            ray_z.permute(0, 3, 1, 2),
-                            size=pred_dist.shape[1:3],
-                            mode="bilinear",
-                            align_corners=False,
-                        ).permute(0, 2, 3, 1)
-                    pred_depth = pred_dist * ray_z
+                pred_depth = _predicted_axial_depth(
+                    pred_dist=pred_dist,
+                    rays_dir=gpu_batch.rays_dir,
+                    rays_in_world_space=bool(
+                        getattr(gpu_batch, "rays_in_world_space", False)
+                    ),
+                    depth_ray_z=getattr(gpu_batch, "depth_ray_z", None),
+                )
                 if depth_gt.shape[1:3] != pred_depth.shape[1:3]:
                     pred_depth = F.interpolate(
                         pred_depth.permute(0, 3, 1, 2),
