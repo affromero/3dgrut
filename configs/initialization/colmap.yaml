@@ -1,3 +1,4 @@
 method: colmap
 observation_scale_factor: 0.01
 use_observation_points: true
+num_points: 0

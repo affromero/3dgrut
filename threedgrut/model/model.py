@@ -86,6 +86,23 @@ def _estimate_scene_extent_from_points(points: torch.Tensor) -> float:
     return 1.0
 
 
+def _subsample_initial_points(
+    pts: torch.Tensor,
+    rgb: torch.Tensor,
+    *,
+    max_points: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a deterministic subset for bounded point-cloud initialization."""
+    if max_points <= 0 or pts.shape[0] <= max_points:
+        return pts, rgb
+    rng = torch.Generator(device=pts.device).manual_seed(seed)
+    idxs = torch.randperm(
+        pts.shape[0], device=pts.device, generator=rng
+    )[:max_points]
+    return pts[idxs], rgb[idxs]
+
+
 class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     """ """
 
@@ -377,6 +394,19 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         assert file_rgb.dtype == torch.uint8, (
             "Expecting RGB values to be in [0, 255] range"
         )
+        max_points = int(self.conf.initialization.num_points)
+        original_points = file_pts.shape[0]
+        file_pts, file_rgb = _subsample_initial_points(
+            file_pts,
+            file_rgb,
+            max_points=max_points,
+            seed=int(self.conf.seed_initialization),
+        )
+        if file_pts.shape[0] != original_points:
+            logger.info(
+                "Subsampled COLMAP initialization points "
+                f"from {original_points} to {file_pts.shape[0]}"
+            )
         self.default_initialize_from_points(
             file_pts,
             observer_pts,
