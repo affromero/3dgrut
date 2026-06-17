@@ -3223,6 +3223,90 @@ class Trainer3DGRUT:
                 ).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
+        loss_depth = torch.zeros(1, device=self.device)
+        lambda_depth = 0.0
+        if self.conf.loss.get("use_depth", False):
+            if gpu_batch.depth_gt is None:
+                raise RuntimeError(
+                    "loss.use_depth requires dataset.depth_folder."
+                )
+            with torch.cuda.nvtx.range("loss-depth"):
+                depth_gt = gpu_batch.depth_gt.to(
+                    device=self.device,
+                    dtype=rgb_pred.dtype,
+                )
+                pred_dist = outputs["pred_dist"].to(dtype=depth_gt.dtype)
+                if pred_dist.ndim == 3:
+                    pred_dist = pred_dist.unsqueeze(-1)
+                pred_depth = pred_dist
+                if not bool(getattr(gpu_batch, "rays_in_world_space", False)):
+                    ray_z = torch.abs(gpu_batch.rays_dir[..., 2:3]).to(
+                        device=self.device,
+                        dtype=pred_dist.dtype,
+                    )
+                    if ray_z.shape[1:3] != pred_dist.shape[1:3]:
+                        ray_z = F.interpolate(
+                            ray_z.permute(0, 3, 1, 2),
+                            size=pred_dist.shape[1:3],
+                            mode="bilinear",
+                            align_corners=False,
+                        ).permute(0, 2, 3, 1)
+                    pred_depth = pred_dist * ray_z
+                if depth_gt.shape[1:3] != pred_depth.shape[1:3]:
+                    pred_depth = F.interpolate(
+                        pred_depth.permute(0, 3, 1, 2),
+                        size=depth_gt.shape[1:3],
+                        mode="nearest",
+                    ).permute(0, 2, 3, 1)
+                if depth_gt.shape[0] != pred_depth.shape[0]:
+                    depth_gt = depth_gt.expand(pred_depth.shape[0], -1, -1, -1)
+                min_depth = float(self.conf.loss.get("depth_min_m", 0.05))
+                valid_depth = (
+                    torch.isfinite(depth_gt)
+                    & torch.isfinite(pred_depth)
+                    & (depth_gt > min_depth)
+                    & (pred_depth > min_depth)
+                )
+                if mask is not None:
+                    depth_mask = mask
+                    if depth_mask.shape[1:3] != depth_gt.shape[1:3]:
+                        depth_mask = F.interpolate(
+                            depth_mask.permute(0, 3, 1, 2),
+                            size=depth_gt.shape[1:3],
+                            mode="nearest",
+                        ).permute(0, 2, 3, 1)
+                    valid_depth = valid_depth & (depth_mask > 0.5)
+                depth_denominator = torch.clamp(
+                    valid_depth.to(depth_gt.dtype).sum(),
+                    min=1.0,
+                )
+                depth_loss_type = str(
+                    self.conf.loss.get("depth_loss_type", "log_l1")
+                )
+                if depth_loss_type == "log_l1":
+                    depth_error = torch.abs(
+                        torch.log(torch.clamp(pred_depth, min=min_depth))
+                        - torch.log(torch.clamp(depth_gt, min=min_depth))
+                    )
+                elif depth_loss_type == "relative_l1":
+                    depth_error = torch.abs(
+                        pred_depth - depth_gt
+                    ) / torch.clamp(
+                        depth_gt,
+                        min=min_depth,
+                    )
+                else:
+                    msg = (
+                        "Unsupported loss.depth_loss_type "
+                        f"{depth_loss_type!r}. Supported values: "
+                        "log_l1, relative_l1."
+                    )
+                    raise RuntimeError(msg)
+                loss_depth = (
+                    depth_error * valid_depth.to(depth_error.dtype)
+                ).sum() / depth_denominator
+                lambda_depth = float(self.conf.loss.lambda_depth)
+
         # Total loss
         camera_loss_weight = torch.ones(1, device=self.device)
         if self.conf.loss.use_camera_loss_weights:
@@ -3245,6 +3329,7 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
+            + lambda_depth * loss_depth
         )
         loss = loss * camera_loss_weight
         return dict(
@@ -3257,6 +3342,8 @@ class Trainer3DGRUT:
             scale_loss=lambda_scale * loss_scale,
             sky_opacity_loss=lambda_sky_opacity * loss_sky_opacity,
             sky_opacity_loss_raw=loss_sky_opacity,
+            depth_loss=lambda_depth * loss_depth,
+            depth_loss_raw=loss_depth,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -3696,6 +3783,13 @@ class Trainer3DGRUT:
             writer.add_scalar(
                 "val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step
             )
+        if self.conf.loss.get("use_depth", False):
+            depth_loss = np.mean(metrics["losses"]["depth_loss"])
+            depth_loss_raw = np.mean(metrics["losses"]["depth_loss_raw"])
+            writer.add_scalar("val/loss/depth", depth_loss, global_step)
+            writer.add_scalar(
+                "val/loss/depth_raw", depth_loss_raw, global_step
+            )
         table = {
             k: np.mean(v)
             for k, v in metrics.items()
@@ -3982,6 +4076,15 @@ class Trainer3DGRUT:
                     "train/loss/sky_opacity_raw",
                     sky_opacity_loss_raw,
                     global_step,
+                )
+            if self.conf.loss.get("use_depth", False):
+                depth_loss = np.mean(batch_metrics["losses"]["depth_loss"])
+                depth_loss_raw = np.mean(
+                    batch_metrics["losses"]["depth_loss_raw"]
+                )
+                writer.add_scalar("train/loss/depth", depth_loss, global_step)
+                writer.add_scalar(
+                    "train/loss/depth_raw", depth_loss_raw, global_step
                 )
             if (
                 self.post_processing is not None

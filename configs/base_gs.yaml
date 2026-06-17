@@ -214,6 +214,11 @@ loss:
   use_sky_opacity: false
   lambda_sky_opacity: 0.0
 
+  use_depth: false
+  lambda_depth: 0.0
+  depth_loss_type: log_l1
+  depth_min_m: 0.05
+
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp", "luminance_affine"

@@ -82,6 +82,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         ray_jitter=None,
         exif_exposures: Optional[list[Optional[float]]] = None,
         sky_mask_folder: Optional[str] = None,
+        depth_folder: Optional[str] = None,
         train_exclude_image_list_path: Optional[str] = None,
         train_focus_image_list_path: Optional[str] = None,
         train_focus_image_weight: float = 1.0,
@@ -100,6 +101,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             exif_exposures  # Exposure values for all frames (pre-split)
         )
         self.sky_mask_folder = sky_mask_folder
+        self.depth_folder = depth_folder
         self.train_exclude_image_list_path = train_exclude_image_list_path
         self.train_focus_image_list_path = train_focus_image_list_path
         self.holdout_image_list_path = holdout_image_list_path
@@ -196,6 +198,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.mask_paths = self.mask_paths[split_mask]
         if self.sky_mask_paths is not None:
             self.sky_mask_paths = self.sky_mask_paths[split_mask]
+        if self.depth_paths is not None:
+            self.depth_paths = self.depth_paths[split_mask]
 
         self.camera_centers = self.camera_centers[split_mask]
         self.center, self.length_scale, self.scene_bbox = (
@@ -283,6 +287,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.mask_paths = self.mask_paths[keep]
         if self.sky_mask_paths is not None:
             self.sky_mask_paths = self.sky_mask_paths[keep]
+        if self.depth_paths is not None:
+            self.depth_paths = self.depth_paths[keep]
         self.camera_centers = self.camera_centers[keep]
         if self.exif_exposures is not None:
             self.exif_exposures = [
@@ -418,6 +424,28 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
     def resolve_sky_mask_path(self, image_name):
         return os.path.join(self.path, self.get_sky_masks_folder(), image_name)
+
+    def resolve_depth_path(self, image_name):
+        if self.depth_folder is None:
+            return ""
+        depth_stem = os.path.splitext(image_name)[0] + ".npy"
+        direct = os.path.join(self.path, self.depth_folder, depth_stem)
+        if os.path.exists(direct):
+            return direct
+        parts = image_name.replace("\\", "/").split("/")
+        if len(parts) >= 2:
+            camera_name = parts[-2]
+            frame_name = os.path.splitext(parts[-1])[0] + ".npy"
+            candidate = os.path.join(
+                self.path,
+                self.depth_folder,
+                camera_name,
+                "depth_zext",
+                frame_name,
+            )
+            if os.path.exists(candidate):
+                return candidate
+        return direct
 
     def load_b2g_camera_rotations(self):
         metadata_path = os.path.join(self.path, "b2g_camera_models.json")
@@ -833,6 +861,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.image_paths = []
         self.mask_paths = []
         self.sky_mask_paths = [] if self.sky_mask_folder is not None else None
+        self.depth_paths = [] if self.depth_folder is not None else None
         self.poses_end = (
             [] if self._end_pose_by_name is not None else None
         )
@@ -876,6 +905,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 self.sky_mask_paths.append(
                     self.resolve_sky_mask_path(extr.name)
                 )
+            if self.depth_paths is not None:
+                self.depth_paths.append(self.resolve_depth_path(extr.name))
 
         self.camera_centers = np.array(cam_centers)
         _, diagonal = get_center_and_diag(self.camera_centers)
@@ -889,6 +920,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
         if self.sky_mask_paths is not None:
             self.sky_mask_paths = np.stack(self.sky_mask_paths, dtype=str)
+        if self.depth_paths is not None:
+            self.depth_paths = np.stack(self.depth_paths, dtype=str)
 
     def _lazy_worker_intrinsics_cache(self):
         """Create intrinsics cache for a specific worker."""
@@ -1090,6 +1123,30 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             ).reshape(1, actual_h, actual_w, 1)
             output_dict["sky_mask"] = sky_mask
 
+        if self.depth_paths is not None:
+            depth_path = self.depth_paths[idx]
+            if not os.path.exists(depth_path):
+                raise FileNotFoundError(
+                    f"Depth sidecar not found: {depth_path}"
+                )
+            depth = np.asarray(np.load(depth_path), dtype=np.float32)
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            if depth.ndim != 2:
+                raise ValueError(
+                    f"Depth sidecar must be HxW or HxWx1: {depth_path}"
+                )
+            if depth.shape != (actual_h, actual_w):
+                raise ValueError(
+                    "Depth sidecar resolution must match the training image: "
+                    f"{depth_path} has {depth.shape}, expected "
+                    f"{(actual_h, actual_w)} for {self.image_paths[idx]}"
+                )
+            depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+            output_dict["depth_gt"] = torch.from_numpy(depth).reshape(
+                1, depth.shape[0], depth.shape[1], 1
+            )
+
         # Add EXIF exposure if available for this frame
         if (
             self.exif_exposures is not None
@@ -1168,6 +1225,12 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "image_path": batch["image_path"][0],
             "pixel_coords": pixel_coords,
         }
+
+        if "depth_gt" in batch:
+            depth_gt = batch["depth_gt"][0].to(
+                self.device, non_blocking=True
+            )
+            sample["depth_gt"] = depth_gt
 
         if "pose_end" in batch:
             sample["T_to_world_end"] = batch["pose_end"][0].to(

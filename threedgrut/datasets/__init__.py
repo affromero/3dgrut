@@ -95,6 +95,7 @@ def make(name: str, config, ray_jitter):
                 ray_jitter=ray_jitter,
                 exif_exposures=exif_exposures,
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                depth_folder=config.dataset.get("depth_folder", None),
                 train_exclude_image_list_path=config.dataset.get(
                     "train_exclude_image_list_path", None
                 ),
@@ -124,6 +125,7 @@ def make(name: str, config, ray_jitter):
                 test_split_interval=config.dataset.test_split_interval,
                 exif_exposures=exif_exposures,
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                depth_folder=config.dataset.get("depth_folder", None),
                 train_exclude_image_list_path=config.dataset.get(
                     "train_exclude_image_list_path", None
                 ),
@@ -243,6 +245,7 @@ def make_test(name: str, config):
                 test_split_interval=config.dataset.test_split_interval,
                 exif_exposures=exif_exposures,
                 sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                depth_folder=config.dataset.get("depth_folder", None),
                 holdout_image_list_path=config.dataset.get(
                     "holdout_image_list_path", None
                 ),

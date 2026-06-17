@@ -32,6 +32,7 @@ class Batch:
         False  # True if rays are already in world space (no transform needed)
     )
     rgb_gt: Optional[torch.Tensor] = None
+    depth_gt: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
     sky_mask: Optional[torch.Tensor] = None
     intrinsics: Optional[list] = None
@@ -69,6 +70,13 @@ class Batch:
             )
             assert self.rgb_gt.shape[0] == batch_size, (
                 "rgb_gt must have the same batch size"
+            )
+        if self.depth_gt is not None:
+            assert self.depth_gt.ndim == 4, (
+                "depth_gt must be a 4D tensor [B, H, W, 1]"
+            )
+            assert self.depth_gt.shape[0] == batch_size, (
+                "depth_gt must have the same batch size"
             )
         if self.mask is not None:
             assert self.mask.ndim == 4, "mask must be a 3D tensor [B, H, W, 1]"
