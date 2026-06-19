@@ -3350,6 +3350,93 @@ class Trainer3DGRUT:
                 ).sum() / depth_denominator
                 lambda_depth = float(self.conf.loss.lambda_depth)
 
+        # --- rim-gated geometric prior (persistent, ray-distance) ----------
+        # Supervises outputs['pred_dist'] (RAY distance) DIRECTLY against a
+        # ray-distance GT sidecar, gated to the rim (theta > rim_theta_min)
+        # via depth_ray_z = cos(theta). Deliberately avoids
+        # _predicted_axial_depth, whose *cos(theta) factor collapses
+        # supervision exactly at the rim. An optional per-frame centre-anchored
+        # affine calibrates an up-to-scale prior to the strongly-triangulated
+        # centre band, then extrapolates it to the rim.
+        loss_rim = torch.zeros(1, device=self.device)
+        lambda_rim = 0.0
+        if self.conf.loss.get("use_rim_depth", False):
+            if gpu_batch.depth_gt is None:
+                raise RuntimeError(
+                    "loss.use_rim_depth requires dataset.depth_folder "
+                    "(stored as RAY distance, not axial-z)."
+                )
+            depth_ray_z = getattr(gpu_batch, "depth_ray_z", None)
+            if depth_ray_z is None:
+                raise RuntimeError(
+                    "loss.use_rim_depth requires per-pixel depth_ray_z "
+                    "(cos theta) from the fisheye dataset."
+                )
+            with torch.cuda.nvtx.range("loss-rim"):
+                rim_gt = gpu_batch.depth_gt.to(
+                    device=self.device, dtype=rgb_pred.dtype
+                )
+                pred_dist = outputs["pred_dist"].to(dtype=rim_gt.dtype)
+                cos_t = depth_ray_z.to(device=self.device, dtype=rim_gt.dtype)
+                if pred_dist.shape[1:3] != rim_gt.shape[1:3]:
+                    pred_dist = F.interpolate(
+                        pred_dist.permute(0, 3, 1, 2),
+                        size=rim_gt.shape[1:3],
+                        mode="nearest",
+                    ).permute(0, 2, 3, 1)
+                if cos_t.shape[1:3] != rim_gt.shape[1:3]:
+                    cos_t = F.interpolate(
+                        cos_t.permute(0, 3, 1, 2),
+                        size=rim_gt.shape[1:3],
+                        mode="nearest",
+                    ).permute(0, 2, 3, 1)
+                if rim_gt.shape[0] != pred_dist.shape[0]:
+                    rim_gt = rim_gt.expand(pred_dist.shape[0], -1, -1, -1)
+                    cos_t = cos_t.expand(pred_dist.shape[0], -1, -1, -1)
+                min_depth = float(self.conf.loss.get("depth_min_m", 0.05))
+                valid = (
+                    torch.isfinite(rim_gt)
+                    & torch.isfinite(pred_dist)
+                    & (rim_gt > min_depth)
+                    & (pred_dist > min_depth)
+                )
+                cos_rim = float(
+                    np.cos(
+                        np.radians(
+                            float(self.conf.loss.get("rim_theta_min_deg", 60.0))
+                        )
+                    )
+                )
+                cos_ctr = float(
+                    np.cos(
+                        np.radians(
+                            float(
+                                self.conf.loss.get("rim_centre_band_deg", 40.0)
+                            )
+                        )
+                    )
+                )
+                if bool(self.conf.loss.get("rim_centre_anchor", True)):
+                    ctr = valid & (cos_t > cos_ctr)
+                    if bool(ctr.any()):
+                        x = rim_gt[ctr]
+                        y = pred_dist[ctr]
+                        xm = x.mean()
+                        ym = y.mean()
+                        slope = ((x - xm) * (y - ym)).sum() / torch.clamp(
+                            ((x - xm) ** 2).sum(), min=1e-8
+                        )
+                        rim_gt = slope * (rim_gt - xm) + ym
+                rim_mask = valid & (cos_t < cos_rim)
+                rim_denom = torch.clamp(
+                    rim_mask.to(rim_gt.dtype).sum(), min=1.0
+                )
+                rim_err = torch.abs(pred_dist - rim_gt)
+                loss_rim = (
+                    rim_err * rim_mask.to(rim_err.dtype)
+                ).sum() / rim_denom
+                lambda_rim = float(self.conf.loss.lambda_rim)
+
         # Total loss
         camera_loss_weight = torch.ones(1, device=self.device)
         if self.conf.loss.use_camera_loss_weights:
@@ -3373,6 +3460,7 @@ class Trainer3DGRUT:
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
             + lambda_depth * loss_depth
+            + lambda_rim * loss_rim
         )
         loss = loss * camera_loss_weight
         return dict(
@@ -3387,6 +3475,8 @@ class Trainer3DGRUT:
             sky_opacity_loss_raw=loss_sky_opacity,
             depth_loss=lambda_depth * loss_depth,
             depth_loss_raw=loss_depth,
+            rim_loss=lambda_rim * loss_rim,
+            rim_loss_raw=loss_rim,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")

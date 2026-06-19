@@ -222,6 +222,13 @@ loss:
   depth_apply_rgb_mask: true
   depth_min_m: 0.05
 
+  # rim-gated geometric prior (persistent ray-distance constraint at theta>rim)
+  use_rim_depth: false
+  lambda_rim: 0.0
+  rim_theta_min_deg: 60.0
+  rim_centre_band_deg: 40.0
+  rim_centre_anchor: true
+
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp", "luminance_affine"
