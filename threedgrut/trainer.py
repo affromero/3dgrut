@@ -3377,6 +3377,10 @@ class Trainer3DGRUT:
                     device=self.device, dtype=rgb_pred.dtype
                 )
                 pred_dist = outputs["pred_dist"].to(dtype=rim_gt.dtype)
+                if pred_dist.ndim == 3:
+                    # 3DGUT emits pred_dist as [B,H,W] (no channel dim);
+                    # depth_gt/depth_ray_z are [B,H,W,1] -- match them.
+                    pred_dist = pred_dist.unsqueeze(-1)
                 cos_t = depth_ray_z.to(device=self.device, dtype=rim_gt.dtype)
                 if pred_dist.shape[1:3] != rim_gt.shape[1:3]:
                     pred_dist = F.interpolate(
