@@ -398,22 +398,35 @@ def _gradient_tensor_stats(
 
     grad = parameter.grad.detach().abs().float()
     finite_mask = torch.isfinite(grad)
+    finite_count = float(finite_mask.sum().item())
     total_count = max(float(grad.numel()), 1.0)
-    if not finite_mask.any():
+    if finite_count <= 0.0:
         return {
             f"{prefix}/has_grad": 1.0,
             f"{prefix}/finite_fraction": 0.0,
             f"{prefix}/nonzero_fraction": 0.0,
         }
-    values = grad[finite_mask]
+    flat_grad = grad.reshape(-1)
+    if flat_grad.numel() > DIAGNOSTIC_QUANTILE_MAX_SAMPLES:
+        step = (
+            flat_grad.numel() + DIAGNOSTIC_QUANTILE_MAX_SAMPLES - 1
+        ) // DIAGNOSTIC_QUANTILE_MAX_SAMPLES
+        flat_grad = flat_grad[::step]
+    sampled_finite_mask = torch.isfinite(flat_grad)
+    values = flat_grad[sampled_finite_mask]
+    if values.numel() == 0:
+        return {
+            f"{prefix}/has_grad": 1.0,
+            f"{prefix}/finite_fraction": finite_count / total_count,
+            f"{prefix}/nonzero_fraction": 0.0,
+        }
     nonzero_fraction = float((values > 0.0).sum().item()) / max(
         float(values.numel()), 1.0
     )
     quantile_values = _quantile_values(values)
     return {
         f"{prefix}/has_grad": 1.0,
-        f"{prefix}/finite_fraction": float(finite_mask.sum().item())
-        / total_count,
+        f"{prefix}/finite_fraction": finite_count / total_count,
         f"{prefix}/nonzero_fraction": nonzero_fraction,
         f"{prefix}/mean": values.mean().item(),
         f"{prefix}/p50": torch.quantile(quantile_values, 0.50).item(),
@@ -3294,7 +3307,10 @@ class Trainer3DGRUT:
                     & (depth_gt > min_depth)
                     & (pred_depth > min_depth)
                 )
-                if mask is not None:
+                depth_apply_rgb_mask = bool(
+                    self.conf.loss.get("depth_apply_rgb_mask", True)
+                )
+                if depth_apply_rgb_mask and mask is not None:
                     depth_mask = mask
                     if depth_mask.shape[1:3] != depth_gt.shape[1:3]:
                         depth_mask = F.interpolate(
@@ -4546,6 +4562,29 @@ class Trainer3DGRUT:
             gt_rgb = gt0.to(render.device).clamp(0.0, 1.0)
             residual = (render - gt_rgb).abs().mean(dim=-1)
 
+        mask_rgb = None
+        masked_render = None
+        masked_residual = None
+        if gpu_batch.mask is not None:
+            mask0 = (
+                gpu_batch.mask[0]
+                if gpu_batch.mask.ndim == 4
+                else gpu_batch.mask
+            )
+            if mask0.ndim == 3 and mask0.shape[-1] == 1:
+                mask0 = mask0[..., 0]
+            if mask0.shape[:2] != render.shape[:2]:
+                mask0 = torch.nn.functional.interpolate(
+                    mask0.unsqueeze(0).unsqueeze(0).to(render.device),
+                    size=(render.shape[0], render.shape[1]),
+                    mode="nearest",
+                )[0, 0]
+            mask0 = (mask0.to(render.device) > 0.5).to(render.dtype)
+            mask_rgb = mask0[..., None].expand_as(render)
+            masked_render = render * mask_rgb
+            if residual is not None:
+                masked_residual = residual * mask0
+
         # 3) Gradient render
         grad_render = None
         grad_attr = str(diag.get("snapshot_grad_attr", "density"))
@@ -4664,11 +4703,22 @@ class Trainer3DGRUT:
         if gt_rgb is not None:
             gt_arr = _rgb_array(_resize_rgb(gt_rgb))
             panels.append(("GT", gt_arr))
+        if mask_rgb is not None:
+            panels.append(("mask", _rgb_array(_resize_rgb(mask_rgb))))
         render_arr = _rgb_array(_resize_rgb(render))
         panels.append(("render", render_arr))
+        if masked_render is not None:
+            panels.append(
+                ("render_masked", _rgb_array(_resize_rgb(masked_render)))
+            )
         if residual is not None:
             residual_arr = _scalar_hot_array(_resize_scalar(residual))
             panels.append(("residual", residual_arr))
+        if masked_residual is not None:
+            residual_masked_arr = _scalar_hot_array(
+                _resize_scalar(masked_residual)
+            )
+            panels.append(("residual_masked", residual_masked_arr))
         if grad_render is not None:
             grad_arr = _rgb_array(_resize_rgb(grad_render))
             panels.append((f"grad_{grad_attr}", grad_arr))
