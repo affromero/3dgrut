@@ -3937,6 +3937,26 @@ class Trainer3DGRUT:
             raise ValueError(msg)
         return score > self._early_stopping_reference_score + min_delta
 
+    def _violates_early_stopping_score_floor(self, score: float) -> bool:
+        """Return whether validation is below the configured live floor."""
+        early_stopping_conf = self.conf.early_stopping
+        min_score = float(early_stopping_conf.get("min_score", 0.0))
+        if min_score < 0.0:
+            msg = f"early_stopping.min_score must be >= 0, got {min_score}."
+            raise ValueError(msg)
+        if min_score <= 0.0:
+            return False
+        min_score_after_step = int(
+            early_stopping_conf.get("min_score_after_step", 0)
+        )
+        if min_score_after_step < 0:
+            msg = (
+                "early_stopping.min_score_after_step must be >= 0, got "
+                f"{min_score_after_step}."
+            )
+            raise ValueError(msg)
+        return self.global_step >= min_score_after_step and score < min_score
+
     def _handle_validation_checkpointing(
         self, metrics: dict[str, list[float]]
     ) -> None:
@@ -3978,6 +3998,20 @@ class Trainer3DGRUT:
                 self.global_step,
             )
         if not bool(early_stopping_conf.get("enabled", False)):
+            return
+
+        if self._violates_early_stopping_score_floor(score):
+            min_score = float(early_stopping_conf.get("min_score", 0.0))
+            min_score_after_step = int(
+                early_stopping_conf.get("min_score_after_step", 0)
+            )
+            self._should_stop_training = True
+            logger.info(
+                "Early stopping score floor triggered at step "
+                f"{self.global_step}; {metric_name}={score:.6f}, "
+                f"required >= {min_score:.6f} after step "
+                f"{min_score_after_step}."
+            )
             return
 
         if self._is_early_stopping_improvement(score):

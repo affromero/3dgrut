@@ -5,6 +5,23 @@ from omegaconf import OmegaConf
 from threedgrut.trainer import Trainer3DGRUT
 
 
+class _ScalarWriter:
+    """Minimal scalar writer used by checkpointing-only tests."""
+
+    def __init__(self) -> None:
+        self.scalars: list[tuple[str, float, int]] = []
+
+    def add_scalar(self, name: str, value: float, step: int) -> None:
+        self.scalars.append((name, value, step))
+
+
+class _Tracking:
+    """Minimal tracking shell used by checkpointing-only tests."""
+
+    def __init__(self) -> None:
+        self.writer = _ScalarWriter()
+
+
 def _checkpointing_trainer(saved_paths: list[str]) -> Trainer3DGRUT:
     """Create a Trainer3DGRUT shell without initializing CUDA state."""
     trainer = object.__new__(Trainer3DGRUT)
@@ -19,6 +36,8 @@ def _checkpointing_trainer(saved_paths: list[str]) -> Trainer3DGRUT:
                 "metric": "masked_psnr",
                 "patience": 3,
                 "min_delta": 0.03,
+                "min_score": 0.0,
+                "min_score_after_step": 0,
                 "restore_best_on_end": True,
             },
         }
@@ -43,6 +62,7 @@ def _checkpointing_trainer(saved_paths: list[str]) -> Trainer3DGRUT:
         return "/tmp/current_best.pt"
 
     setattr(trainer, "save_checkpoint", save_checkpoint)
+    trainer.tracking = _Tracking()
     return trainer
 
 
@@ -63,3 +83,19 @@ def test_best_checkpoint_tracks_small_positive_validation_gain() -> None:
     )
     assert trainer._early_stopping_reference_step == 20000
     assert trainer._stale_validation_count == 1
+
+
+def test_validation_score_floor_stops_after_probe_step() -> None:
+    """A live quality floor stops runs before long bad continuations."""
+    saved_paths: list[str] = []
+    trainer = _checkpointing_trainer(saved_paths)
+    trainer.conf.early_stopping["min_score"] = 22.0
+    trainer.conf.early_stopping["min_score_after_step"] = 5000
+    trainer.global_step = 5000
+    metrics = {"masked_psnr": [17.0]}
+
+    trainer._handle_validation_checkpointing(metrics)
+
+    assert saved_paths == []
+    assert trainer._should_stop_training is True
+    assert trainer._stale_validation_count == 0
