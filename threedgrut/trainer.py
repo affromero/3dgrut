@@ -3425,6 +3425,15 @@ class Trainer3DGRUT:
                     if bool(ctr.any()):
                         x = rim_gt[ctr]
                         y = pred_dist[ctr]
+                        if bool(
+                            self.conf.loss.get("rim_detach_affine", False)
+                        ):
+                            # Diagnostic: stop gradients flowing through the
+                            # centre-anchor fit so the loss cannot co-adapt the
+                            # evaluation calibration (isolates the metric
+                            # artifact: the calibrated rim collapses for any
+                            # consistently-scaled target while raw is unchanged).
+                            y = y.detach()
                         xm = x.mean()
                         ym = y.mean()
                         slope = ((x - xm) * (y - ym)).sum() / torch.clamp(

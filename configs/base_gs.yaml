@@ -228,6 +228,7 @@ loss:
   rim_theta_min_deg: 60.0
   rim_centre_band_deg: 40.0
   rim_centre_anchor: true
+  rim_detach_affine: false  # diagnostic: detach the centre-anchor fit so the loss cannot co-adapt the eval calibration (isolates the metric artifact)
 
 # Post-processing configuration
 post_processing:
