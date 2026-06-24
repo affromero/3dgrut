@@ -12,6 +12,19 @@ densify:
   relative_size_threshold: 0.01 # Gaussians larger than relative_size_threshold * scene_extent will be split not cloned. Called percent_dense in 3DGS with default value 0.01
   split:
     n_gaussians: 2 # Hardcoded to 2 in 3DGS
+  # Field-angle-aware (solid-angle-weighted) densification. Screen-space
+  # density control is blind to the fisheye projection Jacobian, so the
+  # periphery (few pixels per steradian) is under-densified -> oversized,
+  # over-smoothing rim Gaussians. When enabled, the per-Gaussian
+  # grad-threshold is scaled DOWN and the split/clone size-cap is scaled
+  # DOWN at high field angle theta (the gradient-weighted mean theta the
+  # Gaussian was observed at), so the rim gets MORE, SMALLER Gaussians.
+  # Default disabled -> byte-identical to upstream behaviour.
+  theta_aware:
+    enabled: false
+    theta_power: 1.5 # thresh(theta) = base * cos(theta)^theta_power
+    size_cap_power: 1.0 # size_cap(theta) = base_cap * cos(theta)^size_cap_power
+    min_cos: 0.1 # floor on cos(theta) so the rim threshold/cap cannot collapse to 0
 
 # They use the same values for pruning and densification so check the above values
 prune:

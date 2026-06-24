@@ -43,15 +43,35 @@ class GSStrategy(BaseStrategy):
         )
         self.new_max_density = self.conf.strategy.reset_density.new_max_density
 
+        # Field-angle-aware (solid-angle-weighted) densification config. When
+        # enabled, the rim (high field angle theta) densifies more and keeps
+        # smaller Gaussians, compensating the fisheye projection Jacobian that
+        # screen-space density control is blind to. Defaults keep the upstream
+        # scalar-threshold behaviour byte-identical.
+        theta_cfg = getattr(self.conf.strategy.densify, "theta_aware", None)
+        self.theta_aware = bool(getattr(theta_cfg, "enabled", False))
+        self.theta_power = float(getattr(theta_cfg, "theta_power", 1.5))
+        self.theta_size_cap_power = float(
+            getattr(theta_cfg, "size_cap_power", 1.0)
+        )
+        self.theta_min_cos = float(getattr(theta_cfg, "min_cos", 0.1))
+
         # Accumulation of the norms of the positions gradients
         self.densify_grad_norm_accum = torch.empty([0, 1])
         self.densify_grad_norm_denom = torch.empty([0, 1])
+        # Gradient-weighted accumulation of cos(theta) (and its weight) so the
+        # mean field angle each Gaussian was observed-with can be recovered at
+        # densify time. Only used when theta_aware is enabled.
+        self.densify_cos_accum = torch.empty([0, 1])
+        self.densify_cos_weight = torch.empty([0, 1])
 
     def get_strategy_parameters(self) -> dict:
         params = {}
 
         params["densify_grad_norm_accum"] = (self.densify_grad_norm_accum,)
         params["densify_grad_norm_denom"] = (self.densify_grad_norm_denom,)
+        params["densify_cos_accum"] = (self.densify_cos_accum,)
+        params["densify_cos_weight"] = (self.densify_cos_weight,)
 
         return params
 
@@ -63,6 +83,27 @@ class GSStrategy(BaseStrategy):
             self.densify_grad_norm_denom = checkpoint[
                 "densify_grad_norm_denom"
             ][0].detach()
+            cos_accum = checkpoint.get("densify_cos_accum")
+            cos_weight = checkpoint.get("densify_cos_weight")
+            num_gaussians = self.densify_grad_norm_accum.shape[0]
+            self.densify_cos_accum = (
+                cos_accum[0].detach()
+                if cos_accum is not None
+                else torch.zeros(
+                    (num_gaussians, 1),
+                    dtype=torch.float,
+                    device=self.model.device,
+                )
+            )
+            self.densify_cos_weight = (
+                cos_weight[0].detach()
+                if cos_weight is not None
+                else torch.zeros(
+                    (num_gaussians, 1),
+                    dtype=torch.float,
+                    device=self.model.device,
+                )
+            )
         else:
             num_gaussians = self.model.num_gaussians
             self.densify_grad_norm_accum = torch.zeros(
@@ -70,6 +111,12 @@ class GSStrategy(BaseStrategy):
             )
             self.densify_grad_norm_denom = torch.zeros(
                 (num_gaussians, 1), dtype=torch.int, device=self.model.device
+            )
+            self.densify_cos_accum = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.densify_cos_weight = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
             )
 
     def _post_backward(
@@ -88,7 +135,8 @@ class GSStrategy(BaseStrategy):
         ):
             with torch.cuda.nvtx.range(f"train_{step}_grad_buffer"):
                 self.update_gradient_buffer(
-                    sensor_position=batch.T_to_world[0, :3, 3]
+                    sensor_position=batch.T_to_world[0, :3, 3],
+                    sensor_forward=batch.T_to_world[0, :3, 2],
                 )
 
         # Clamp density
@@ -164,21 +212,62 @@ class GSStrategy(BaseStrategy):
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("update-gradient-buffer")
-    def update_gradient_buffer(self, sensor_position: torch.Tensor) -> None:
+    def update_gradient_buffer(
+        self,
+        sensor_position: torch.Tensor,
+        sensor_forward: torch.Tensor | None = None,
+    ) -> None:
         params_grad = self.model.positions.grad
         mask = (params_grad != 0).max(dim=1)[0]
         assert params_grad is not None
-        distance_to_camera = (
-            self.model.positions[mask] - sensor_position
-        ).norm(dim=1, keepdim=True)
+        to_camera = self.model.positions[mask] - sensor_position
+        distance_to_camera = to_camera.norm(dim=1, keepdim=True)
 
-        self.densify_grad_norm_accum[mask] += (
+        grad_increment = (
             torch.norm(
                 params_grad[mask] * distance_to_camera, dim=-1, keepdim=True
             )
             / 2
         )
+        self.densify_grad_norm_accum[mask] += grad_increment
         self.densify_grad_norm_denom[mask] += 1
+
+        # Field-angle-aware: accumulate the gradient-weighted cos(theta) of
+        # each observed Gaussian relative to this camera's optical axis. The
+        # weight is the gradient increment just added, so at densify time the
+        # ratio (accum / weight) is the gradient-weighted mean cos(theta) --
+        # "the field angle this Gaussian's densification demand came from".
+        if self.theta_aware and sensor_forward is not None:
+            forward = sensor_forward / sensor_forward.norm().clamp_min(1e-8)
+            cos_theta = (
+                to_camera / distance_to_camera.clamp_min(1e-8)
+            ) @ forward
+            cos_theta = cos_theta.unsqueeze(1).clamp(-1.0, 1.0)
+            self.densify_cos_accum[mask] += grad_increment * cos_theta
+            self.densify_cos_weight[mask] += grad_increment
+
+    @torch.no_grad()
+    def _theta_threshold_factors(
+        self,
+    ) -> Optional[torch.Tensor]:
+        """Per-Gaussian field-angle multiplier ``clamp(cos(theta), c)^p``.
+
+        Returns ``None`` when field-angle-aware densification is disabled.
+        Scaling the grad-threshold and the split/clone size-cap by this factor
+        lowers both toward the rim (small ``cos(theta)``), so the periphery
+        gets MORE, SMALLER Gaussians. Gaussians never observed in the window
+        (zero accumulated weight) get factor 1.0 (unchanged behaviour).
+        """
+        if not self.theta_aware:
+            return None
+        weight = self.densify_cos_weight.squeeze()
+        mean_cos = torch.where(
+            weight > 0,
+            (self.densify_cos_accum.squeeze() / weight.clamp_min(1e-12)),
+            torch.ones_like(weight),
+        )
+        mean_cos = mean_cos.clamp(self.theta_min_cos, 1.0)
+        return mean_cos
 
     @torch.cuda.nvtx.range("densify_gaussians")
     def densify_gaussians(self, scene_extent):
@@ -190,15 +279,26 @@ class GSStrategy(BaseStrategy):
         )
         densify_grad_norm[densify_grad_norm.isnan()] = 0.0
 
-        self.log_densify_stats(densify_grad_norm.squeeze(), scene_extent)
-        self.clone_gaussians(densify_grad_norm.squeeze(), scene_extent)
-        self.split_gaussians(densify_grad_norm.squeeze(), scene_extent)
+        mean_cos = self._theta_threshold_factors()
+
+        self.log_densify_stats(
+            densify_grad_norm.squeeze(), scene_extent, mean_cos
+        )
+        self.clone_gaussians(
+            densify_grad_norm.squeeze(), scene_extent, mean_cos
+        )
+        self.split_gaussians(
+            densify_grad_norm.squeeze(), scene_extent, mean_cos
+        )
 
         torch.cuda.empty_cache()
 
     @torch.no_grad()
     def log_densify_stats(
-        self, densify_grad_norm: torch.Tensor, scene_extent: float
+        self,
+        densify_grad_norm: torch.Tensor,
+        scene_extent: float,
+        mean_cos: Optional[torch.Tensor] = None,
     ) -> None:
         if not self.conf.strategy.print_stats:
             return
@@ -212,15 +312,39 @@ class GSStrategy(BaseStrategy):
             stride = max(positive_values.numel() // 200000, 1)
             positive_values = positive_values[::stride][:200000]
         max_scale = torch.max(self.model.get_scale(), dim=1).values
-        size_threshold = self.relative_size_threshold * scene_extent
+        n_points = densify_grad_norm.shape[0]
+        clone_thresh, size_threshold = self._theta_thresholds(
+            self.clone_grad_threshold, scene_extent, mean_cos, n_points
+        )
+        split_thresh, _ = self._theta_thresholds(
+            self.split_grad_threshold, scene_extent, mean_cos, n_points
+        )
         clone_mask = torch.logical_and(
-            densify_grad_norm >= self.clone_grad_threshold,
+            densify_grad_norm >= clone_thresh,
             max_scale <= size_threshold,
         )
         split_mask = torch.logical_and(
-            densify_grad_norm >= self.split_grad_threshold,
+            densify_grad_norm >= split_thresh,
             max_scale > size_threshold,
         )
+        # Field-angle breakdown: prove the rim densifies MORE than the centre.
+        if mean_cos is not None:
+            n = min(mean_cos.shape[0], n_points)
+            cos = mean_cos[:n]
+            cand = torch.logical_or(clone_mask[:n], split_mask[:n])
+            rim = cos <= torch.cos(torch.deg2rad(torch.tensor(60.0)))
+            ctr = cos >= torch.cos(torch.deg2rad(torch.tensor(40.0)))
+            n_rim = int(rim.sum().item())
+            n_ctr = int(ctr.sum().item())
+            rim_rate = float(cand[rim].float().mean().item()) if n_rim else 0.0
+            ctr_rate = float(cand[ctr].float().mean().item()) if n_ctr else 0.0
+            logger.info(
+                "Densify theta-aware: "
+                f"rim(theta>60) n={n_rim} cand_rate={rim_rate:.3f}, "
+                f"center(theta<40) n={n_ctr} cand_rate={ctr_rate:.3f}, "
+                f"power={self.theta_power:g}/{self.theta_size_cap_power:g}, "
+                f"min_cos={self.theta_min_cos:g}"
+            )
         n_total = densify_grad_norm.numel()
         n_finite = int(finite_mask.sum().item())
         n_positive = int((finite_values > 0).sum().item())
@@ -259,9 +383,41 @@ class GSStrategy(BaseStrategy):
             f"{self.split_grad_threshold:g})"
         )
 
+    @torch.no_grad()
+    def _theta_thresholds(
+        self,
+        base_threshold: float,
+        scene_extent: float,
+        mean_cos: Optional[torch.Tensor],
+        n_points: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-Gaussian (grad_threshold, size_cap) for ``n_points`` Gaussians.
+
+        With ``mean_cos=None`` (field-angle-aware off) both are the scalar
+        upstream values broadcast to every Gaussian. Otherwise the rim
+        (small ``cos(theta)``) gets a lower threshold and a smaller size-cap.
+        ``mean_cos`` is padded with 1.0 (no scaling) for any trailing
+        Gaussians added since it was computed (e.g. clones, in the split pass).
+        """
+        device = self.model.positions.device
+        base_cap = self.relative_size_threshold * scene_extent
+        if mean_cos is None:
+            thresh = torch.full((n_points,), base_threshold, device=device)
+            cap = torch.full((n_points,), base_cap, device=device)
+            return thresh, cap
+        cos = torch.ones((n_points,), device=device)
+        n = min(mean_cos.shape[0], n_points)
+        cos[:n] = mean_cos[:n]
+        thresh = base_threshold * cos.pow(self.theta_power)
+        cap = base_cap * cos.pow(self.theta_size_cap_power)
+        return thresh, cap
+
     @torch.cuda.nvtx.range("split_gaussians")
     def split_gaussians(
-        self, densify_grad_norm: torch.Tensor, scene_extent: float
+        self,
+        densify_grad_norm: torch.Tensor,
+        scene_extent: float,
+        mean_cos: Optional[torch.Tensor] = None,
     ):
         n_init_points = self.model.num_gaussians
 
@@ -270,13 +426,13 @@ class GSStrategy(BaseStrategy):
 
         # Here we already have the cloned points in the self.model.positions so only take the points up to size of the initial grad
         padded_grad[: densify_grad_norm.shape[0]] = densify_grad_norm.squeeze()
-        mask = torch.where(
-            padded_grad >= self.split_grad_threshold, True, False
+        split_thresh, size_cap = self._theta_thresholds(
+            self.split_grad_threshold, scene_extent, mean_cos, n_init_points
         )
+        mask = padded_grad >= split_thresh
         mask = torch.logical_and(
             mask,
-            torch.max(self.model.get_scale(), dim=1).values
-            > self.relative_size_threshold * scene_extent,
+            torch.max(self.model.get_scale(), dim=1).values > size_cap,
         )
 
         stds = self.model.get_scale()[mask].repeat(self.split_n_gaussians, 1)
@@ -325,21 +481,28 @@ class GSStrategy(BaseStrategy):
 
     @torch.cuda.nvtx.range("clone_gaussians")
     def clone_gaussians(
-        self, densify_grad_norm: torch.Tensor, scene_extent: float
+        self,
+        densify_grad_norm: torch.Tensor,
+        scene_extent: float,
+        mean_cos: Optional[torch.Tensor] = None,
     ):
         assert densify_grad_norm is not None, (
             "Positional gradients must be available in order to clone the Gaussians"
         )
-        # Extract points that satisfy the gradient condition
-        mask = torch.where(
-            densify_grad_norm >= self.clone_grad_threshold, True, False
+        densify_grad_norm = densify_grad_norm.squeeze()
+        clone_thresh, size_cap = self._theta_thresholds(
+            self.clone_grad_threshold,
+            scene_extent,
+            mean_cos,
+            densify_grad_norm.shape[0],
         )
+        # Extract points that satisfy the gradient condition
+        mask = densify_grad_norm >= clone_thresh
 
         # If the gaussians are larger they shouldn't be cloned, but rather split
         mask = torch.logical_and(
             mask,
-            torch.max(self.model.get_scale(), dim=1).values
-            <= self.relative_size_threshold * scene_extent,
+            torch.max(self.model.get_scale(), dim=1).values <= size_cap,
         )
 
         # stats
@@ -450,22 +613,32 @@ class GSStrategy(BaseStrategy):
         self.prune_densification_buffers(mask)
 
     def reset_densification_buffers(self) -> None:
+        n = self.model.get_positions().shape[0]
         self.densify_grad_norm_accum = torch.zeros(
-            (self.model.get_positions().shape[0], 1),
+            (n, 1),
             device=self.model.device,
             dtype=self.densify_grad_norm_accum.dtype,
         )
 
         self.densify_grad_norm_denom = torch.zeros(
-            (self.model.get_positions().shape[0], 1),
+            (n, 1),
             device=self.model.device,
             dtype=self.densify_grad_norm_denom.dtype,
+        )
+        self.densify_cos_accum = torch.zeros(
+            (n, 1), device=self.model.device, dtype=torch.float
+        )
+        self.densify_cos_weight = torch.zeros(
+            (n, 1), device=self.model.device, dtype=torch.float
         )
 
     def prune_densification_buffers(self, valid_mask: torch.Tensor) -> None:
         # Update non-optimizable buffers
         self.densify_grad_norm_accum = self.densify_grad_norm_accum[valid_mask]
         self.densify_grad_norm_denom = self.densify_grad_norm_denom[valid_mask]
+        if self.densify_cos_accum.shape[0] == valid_mask.shape[0]:
+            self.densify_cos_accum = self.densify_cos_accum[valid_mask]
+            self.densify_cos_weight = self.densify_cos_weight[valid_mask]
 
     def decay_density(self):
         def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
