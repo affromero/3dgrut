@@ -88,6 +88,7 @@ camera_residual:
   optimize_per_camera: false
   optimize_per_image: false
   optimize_rolling_per_camera: false
+  freeze_gaussians: false
   fail_on_zero_grad: true
   fail_after_steps: 5
   min_abs_grad: 1.e-12

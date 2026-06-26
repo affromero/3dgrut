@@ -5164,10 +5164,18 @@ class Trainer3DGRUT:
         metrics: list,
         conf: DictConfig,
     ):
-        # Freeze Gaussians and suspend strategy when distillation starts
+        camera_residual_freeze = (
+            self.camera_residual is not None
+            and bool(conf.camera_residual.get("freeze_gaussians", False))
+        )
+
+        # Freeze Gaussians and suspend strategy for correction-only phases.
         if (
-            self._distillation_start_step >= 0
-            and global_step >= self._distillation_start_step
+            camera_residual_freeze
+            or (
+                self._distillation_start_step >= 0
+                and global_step >= self._distillation_start_step
+            )
         ):
             self.model.freeze_gaussians()
             self.strategy.suspend()

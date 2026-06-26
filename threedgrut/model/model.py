@@ -17,13 +17,13 @@ import os
 from pathlib import Path
 
 import numpy as np
+import threedgrt_tracer
+import threedgut_tracer
 import torch
 from omegaconf import DictConfig
 from plyfile import PlyData
 
-import threedgrt_tracer
 import threedgrut.model.background as background
-import threedgut_tracer
 from threedgrut.datasets.protocols import Batch
 from threedgrut.datasets.utils import (
     read_colmap_points3D_text,
@@ -47,7 +47,6 @@ from threedgrut.utils.misc import (
     to_torch,
 )
 from threedgrut.utils.render import RGB2SH
-
 
 SCENE_EXTENT_MIN = 1e-6
 SCENE_EXTENT_MAX_SAMPLES = 1_000_000
@@ -535,10 +534,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.renderer.build_acc(self, rebuild)
 
     def freeze_gaussians(self) -> None:
-        """Freeze all Gaussian parameters for PPISP controller distillation.
+        """Freeze all Gaussian parameters for non-Gaussian optimization.
 
         This prevents Gaussians from being updated by any loss (including regularization)
-        while the controller learns to predict per-frame corrections.
+        while another module learns corrections.
         """
         if self._gaussians_frozen:
             return
@@ -551,7 +550,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.features_specular.requires_grad = False
 
         self._gaussians_frozen = True
-        logger.info("❄️ [Distillation] Gaussian parameters frozen")
+        logger.info("❄️ Gaussian parameters frozen")
 
     def validate_fields(self):
         num_gaussians = self.num_gaussians
