@@ -16,6 +16,8 @@
 from typing import Optional
 
 import torch
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.strategy.base import BaseStrategy
@@ -55,6 +57,31 @@ class GSStrategy(BaseStrategy):
             getattr(theta_cfg, "size_cap_power", 1.0)
         )
         self.theta_min_cos = float(getattr(theta_cfg, "min_cos", 0.1))
+        feature_cfg = self.conf.strategy.densify.get("feature_grad", {})
+        self.feature_grad_aware = bool(feature_cfg.get("enabled", False))
+        self.feature_grad_power = float(feature_cfg.get("power", 0.5))
+        self.feature_grad_quantile = float(feature_cfg.get("quantile", 0.95))
+        self.feature_grad_max_boost = float(
+            feature_cfg.get("max_boost", 4.0)
+        )
+        if self.feature_grad_power <= 0:
+            msg = (
+                "strategy.densify.feature_grad.power must be positive; "
+                f"got {self.feature_grad_power}."
+            )
+            raise ValueError(msg)
+        if not 0 < self.feature_grad_quantile <= 1:
+            msg = (
+                "strategy.densify.feature_grad.quantile must be in (0, 1]; "
+                f"got {self.feature_grad_quantile}."
+            )
+            raise ValueError(msg)
+        if self.feature_grad_max_boost < 1:
+            msg = (
+                "strategy.densify.feature_grad.max_boost must be >= 1; "
+                f"got {self.feature_grad_max_boost}."
+            )
+            raise ValueError(msg)
 
         # Accumulation of the norms of the positions gradients
         self.densify_grad_norm_accum = torch.empty([0, 1])
@@ -64,6 +91,8 @@ class GSStrategy(BaseStrategy):
         # densify time. Only used when theta_aware is enabled.
         self.densify_cos_accum = torch.empty([0, 1])
         self.densify_cos_weight = torch.empty([0, 1])
+        self.densify_feature_grad_accum = torch.empty([0, 1])
+        self.densify_feature_grad_denom = torch.empty([0, 1])
 
     def get_strategy_parameters(self) -> dict:
         params = {}
@@ -72,6 +101,12 @@ class GSStrategy(BaseStrategy):
         params["densify_grad_norm_denom"] = (self.densify_grad_norm_denom,)
         params["densify_cos_accum"] = (self.densify_cos_accum,)
         params["densify_cos_weight"] = (self.densify_cos_weight,)
+        params["densify_feature_grad_accum"] = (
+            self.densify_feature_grad_accum,
+        )
+        params["densify_feature_grad_denom"] = (
+            self.densify_feature_grad_denom,
+        )
 
         return params
 
@@ -85,6 +120,8 @@ class GSStrategy(BaseStrategy):
             ][0].detach()
             cos_accum = checkpoint.get("densify_cos_accum")
             cos_weight = checkpoint.get("densify_cos_weight")
+            feature_accum = checkpoint.get("densify_feature_grad_accum")
+            feature_denom = checkpoint.get("densify_feature_grad_denom")
             num_gaussians = self.densify_grad_norm_accum.shape[0]
             self.densify_cos_accum = (
                 cos_accum[0].detach()
@@ -104,6 +141,24 @@ class GSStrategy(BaseStrategy):
                     device=self.model.device,
                 )
             )
+            self.densify_feature_grad_accum = (
+                feature_accum[0].detach()
+                if feature_accum is not None
+                else torch.zeros(
+                    (num_gaussians, 1),
+                    dtype=torch.float,
+                    device=self.model.device,
+                )
+            )
+            self.densify_feature_grad_denom = (
+                feature_denom[0].detach()
+                if feature_denom is not None
+                else torch.zeros(
+                    (num_gaussians, 1),
+                    dtype=torch.int,
+                    device=self.model.device,
+                )
+            )
         else:
             num_gaussians = self.model.num_gaussians
             self.densify_grad_norm_accum = torch.zeros(
@@ -117,6 +172,12 @@ class GSStrategy(BaseStrategy):
             )
             self.densify_cos_weight = torch.zeros(
                 (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.densify_feature_grad_accum = torch.zeros(
+                (num_gaussians, 1), dtype=torch.float, device=self.model.device
+            )
+            self.densify_feature_grad_denom = torch.zeros(
+                (num_gaussians, 1), dtype=torch.int, device=self.model.device
             )
 
     def _post_backward(
@@ -246,6 +307,16 @@ class GSStrategy(BaseStrategy):
             self.densify_cos_accum[mask] += grad_increment * cos_theta
             self.densify_cos_weight[mask] += grad_increment
 
+        feature_grad = self.model.features_specular.grad
+        if self.feature_grad_aware and feature_grad is not None:
+            feature_increment = (
+                feature_grad.detach()[mask]
+                .flatten(start_dim=1)
+                .norm(dim=1, keepdim=True)
+            )
+            self.densify_feature_grad_accum[mask] += feature_increment
+            self.densify_feature_grad_denom[mask] += 1
+
     @torch.no_grad()
     def _theta_threshold_factors(
         self,
@@ -269,6 +340,36 @@ class GSStrategy(BaseStrategy):
         mean_cos = mean_cos.clamp(self.theta_min_cos, 1.0)
         return mean_cos
 
+    @torch.no_grad()
+    @jaxtyped(typechecker=beartype)
+    def _feature_grad_boost_factors(
+        self,
+    ) -> Float[torch.Tensor, "gaussian"] | None:
+        """Return bounded boost from accumulated features_specular gradients."""
+        if not self.feature_grad_aware:
+            return None
+        denom = self.densify_feature_grad_denom.squeeze(-1)
+        accum = self.densify_feature_grad_accum.squeeze(-1)
+        mean_grad = torch.where(
+            denom > 0,
+            accum / denom.to(accum.dtype).clamp_min(1),
+            torch.zeros_like(accum),
+        )
+        positive = mean_grad[torch.isfinite(mean_grad) & (mean_grad > 0)]
+        if positive.numel() == 0:
+            return torch.ones_like(mean_grad)
+        reference = torch.quantile(
+            positive,
+            torch.tensor(
+                self.feature_grad_quantile,
+                device=positive.device,
+                dtype=positive.dtype,
+            ),
+        ).clamp_min(1e-12)
+        normalized = mean_grad.clamp_min(0) / reference
+        boost = 1.0 + normalized.pow(self.feature_grad_power)
+        return boost.clamp(1.0, self.feature_grad_max_boost)
+
     @torch.cuda.nvtx.range("densify_gaussians")
     def densify_gaussians(self, scene_extent):
         assert self.model.optimizer is not None, (
@@ -280,25 +381,27 @@ class GSStrategy(BaseStrategy):
         densify_grad_norm[densify_grad_norm.isnan()] = 0.0
 
         mean_cos = self._theta_threshold_factors()
+        feature_boost = self._feature_grad_boost_factors()
+        if feature_boost is not None:
+            densify_grad_norm = densify_grad_norm * feature_boost.unsqueeze(1)
 
+        densify_scores = densify_grad_norm.squeeze(-1)
         self.log_densify_stats(
-            densify_grad_norm.squeeze(), scene_extent, mean_cos
+            densify_scores, scene_extent, mean_cos, feature_boost
         )
-        self.clone_gaussians(
-            densify_grad_norm.squeeze(), scene_extent, mean_cos
-        )
-        self.split_gaussians(
-            densify_grad_norm.squeeze(), scene_extent, mean_cos
-        )
+        self.clone_gaussians(densify_scores, scene_extent, mean_cos)
+        self.split_gaussians(densify_scores, scene_extent, mean_cos)
 
         torch.cuda.empty_cache()
 
     @torch.no_grad()
+    @jaxtyped(typechecker=beartype)
     def log_densify_stats(
         self,
-        densify_grad_norm: torch.Tensor,
+        densify_grad_norm: Float[torch.Tensor, "gaussian"],
         scene_extent: float,
-        mean_cos: Optional[torch.Tensor] = None,
+        mean_cos: Float[torch.Tensor, "gaussian"] | None = None,
+        feature_boost: Float[torch.Tensor, "gaussian"] | None = None,
     ) -> None:
         if not self.conf.strategy.print_stats:
             return
@@ -345,6 +448,32 @@ class GSStrategy(BaseStrategy):
                 f"power={self.theta_power:g}/{self.theta_size_cap_power:g}, "
                 f"min_cos={self.theta_min_cos:g}"
             )
+        if feature_boost is not None:
+            boost_values = feature_boost[torch.isfinite(feature_boost)]
+            if boost_values.numel() > 0:
+                if boost_values.numel() > 200000:
+                    stride = max(boost_values.numel() // 200000, 1)
+                    boost_values = boost_values[::stride][:200000]
+                boost_quantiles = torch.quantile(
+                    boost_values,
+                    torch.tensor(
+                        [0.5, 0.95, 0.99],
+                        device=boost_values.device,
+                        dtype=boost_values.dtype,
+                    ),
+                )
+                boosted = int((feature_boost > 1.0).sum().item())
+                logger.info(
+                    "Densify feature-grad boost: "
+                    f"boosted={boosted}/{feature_boost.numel()}, "
+                    f"mean={boost_values.mean().item():.3f}, "
+                    f"p50={boost_quantiles[0].item():.3f}, "
+                    f"p95={boost_quantiles[1].item():.3f}, "
+                    f"p99={boost_quantiles[2].item():.3f}, "
+                    f"max={boost_values.max().item():.3f}, "
+                    f"power={self.feature_grad_power:g}, "
+                    f"q={self.feature_grad_quantile:g}"
+                )
         n_total = densify_grad_norm.numel()
         n_finite = int(finite_mask.sum().item())
         n_positive = int((finite_values > 0).sum().item())
@@ -631,6 +760,16 @@ class GSStrategy(BaseStrategy):
         self.densify_cos_weight = torch.zeros(
             (n, 1), device=self.model.device, dtype=torch.float
         )
+        self.densify_feature_grad_accum = torch.zeros(
+            (n, 1),
+            device=self.model.device,
+            dtype=self.densify_feature_grad_accum.dtype,
+        )
+        self.densify_feature_grad_denom = torch.zeros(
+            (n, 1),
+            device=self.model.device,
+            dtype=self.densify_feature_grad_denom.dtype,
+        )
 
     def prune_densification_buffers(self, valid_mask: torch.Tensor) -> None:
         # Update non-optimizable buffers
@@ -639,6 +778,13 @@ class GSStrategy(BaseStrategy):
         if self.densify_cos_accum.shape[0] == valid_mask.shape[0]:
             self.densify_cos_accum = self.densify_cos_accum[valid_mask]
             self.densify_cos_weight = self.densify_cos_weight[valid_mask]
+        if self.densify_feature_grad_accum.shape[0] == valid_mask.shape[0]:
+            self.densify_feature_grad_accum = (
+                self.densify_feature_grad_accum[valid_mask]
+            )
+            self.densify_feature_grad_denom = (
+                self.densify_feature_grad_denom[valid_mask]
+            )
 
     def decay_density(self):
         def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:

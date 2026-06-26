@@ -25,6 +25,17 @@ densify:
     theta_power: 1.5 # thresh(theta) = base * cos(theta)^theta_power
     size_cap_power: 1.0 # size_cap(theta) = base_cap * cos(theta)^size_cap_power
     min_cos: 0.1 # floor on cos(theta) so the rim threshold/cap cannot collapse to 0
+  # Feature-gradient-aware densification. Position gradients drive vanilla
+  # 3DGS densification, but high-frequency color residuals in SIREN/Gabor
+  # carrier runs backpropagate strongly through features_specular. When
+  # enabled, the accumulated positional densification score is multiplied by
+  # a bounded boost derived from the per-Gaussian features_specular gradient.
+  # Default disabled -> upstream/theta-aware behavior is unchanged.
+  feature_grad:
+    enabled: false
+    power: 0.5
+    quantile: 0.95
+    max_boost: 4.0
 
 # They use the same values for pruning and densification so check the above values
 prune:
