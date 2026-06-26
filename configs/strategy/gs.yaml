@@ -36,6 +36,7 @@ densify:
     power: 0.5
     quantile: 0.95
     max_boost: 4.0
+    carrier_tail_only: false
 
 # They use the same values for pruning and densification so check the above values
 prune:

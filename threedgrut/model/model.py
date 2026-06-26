@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from omegaconf import DictConfig
 from plyfile import PlyData
 
 import threedgrt_tracer
@@ -99,16 +100,18 @@ def _siren_carrier_hidden_dim(conf) -> int:
     return hidden_dim
 
 
-def _siren_carrier_bias_coeffs(hidden_dim: int) -> int:
+def siren_carrier_bias_coeffs(hidden_dim: int) -> int:
+    """Return the packed first-layer bias coefficient count."""
     return (hidden_dim + 2) // 3
 
 
-def _siren_carrier_coeffs(conf) -> int:
+def siren_carrier_coeffs(conf: DictConfig) -> int:
+    """Return per-channel coefficient count for the SIREN carrier."""
     if not _siren_carrier_enabled(conf):
         return 0
     hidden_dim = _siren_carrier_hidden_dim(conf)
     w1_coeffs = hidden_dim * 2
-    b1_coeffs = _siren_carrier_bias_coeffs(hidden_dim)
+    b1_coeffs = siren_carrier_bias_coeffs(hidden_dim)
     w2_coeffs = hidden_dim
     b2_coeffs = 1
     return w1_coeffs + b1_coeffs + w2_coeffs + b2_coeffs
@@ -116,7 +119,7 @@ def _siren_carrier_coeffs(conf) -> int:
 
 def _carrier_specular_dim(conf) -> int:
     _validate_carrier_config(conf)
-    return 3 * (_gabor_carrier_coeffs(conf) + _siren_carrier_coeffs(conf))
+    return 3 * (_gabor_carrier_coeffs(conf) + siren_carrier_coeffs(conf))
 
 
 def _initial_gabor_carrier_tail(
@@ -144,15 +147,16 @@ def _initial_gabor_carrier_tail(
     return tail
 
 
-def _initial_siren_carrier_tail(
+def initial_siren_carrier_tail(
     *,
     num_gaussians: int,
     device: str | torch.device,
     dtype: torch.dtype,
-    conf,
+    conf: DictConfig,
 ) -> torch.Tensor:
+    """Initialize packed SIREN carrier coefficients."""
     hidden_dim = _siren_carrier_hidden_dim(conf)
-    coeffs = _siren_carrier_coeffs(conf)
+    coeffs = siren_carrier_coeffs(conf)
     tail = torch.zeros(
         (num_gaussians, 3 * coeffs),
         dtype=dtype,
@@ -165,6 +169,16 @@ def _initial_siren_carrier_tail(
     init_scale = float(
         conf.model.get("siren_init_scale", 1.0 / SIREN_CARRIER_INPUT_DIM)
     )
+    if init_scale < 0.0:
+        raise ValueError(
+            f"model.siren_init_scale must be non-negative; got {init_scale}."
+        )
+    output_init_scale = float(conf.model.get("siren_output_init_scale", 0.0))
+    if output_init_scale < 0.0:
+        raise ValueError(
+            "model.siren_output_init_scale must be non-negative; got "
+            f"{output_init_scale}."
+        )
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     w1 = (
@@ -201,6 +215,22 @@ def _initial_siren_carrier_tail(
         flat_idx = (b1_offset + hidden_idx // 3) * 3 + hidden_idx % 3
         tail[:, flat_idx] = b1[:, hidden_idx]
 
+    if output_init_scale > 0.0:
+        w2 = (
+            2.0
+            * torch.rand(
+                (num_gaussians, hidden_dim, 3),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+            - 1.0
+        ) * output_init_scale
+        w2_offset = b1_offset + siren_carrier_bias_coeffs(hidden_dim)
+        for hidden_idx in range(hidden_dim):
+            coeff_idx = (w2_offset + hidden_idx) * 3
+            tail[:, coeff_idx : coeff_idx + 3] = w2[:, hidden_idx, :]
+
     return tail
 
 
@@ -220,7 +250,7 @@ def _initial_carrier_tail(
             conf=conf,
         )
     if _siren_carrier_enabled(conf):
-        return _initial_siren_carrier_tail(
+        return initial_siren_carrier_tail(
             num_gaussians=num_gaussians,
             device=device,
             dtype=dtype,

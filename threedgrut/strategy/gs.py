@@ -22,7 +22,11 @@ from jaxtyping import Float, jaxtyped
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.strategy.base import BaseStrategy
 from threedgrut.utils.logger import logger
-from threedgrut.utils.misc import check_step_condition, quaternion_to_so3
+from threedgrut.utils.misc import (
+    check_step_condition,
+    quaternion_to_so3,
+    sh_degree_to_specular_dim,
+)
 
 
 class GSStrategy(BaseStrategy):
@@ -63,6 +67,9 @@ class GSStrategy(BaseStrategy):
         self.feature_grad_quantile = float(feature_cfg.get("quantile", 0.95))
         self.feature_grad_max_boost = float(
             feature_cfg.get("max_boost", 4.0)
+        )
+        self.feature_grad_carrier_tail_only = bool(
+            feature_cfg.get("carrier_tail_only", False)
         )
         if self.feature_grad_power <= 0:
             msg = (
@@ -309,10 +316,16 @@ class GSStrategy(BaseStrategy):
 
         feature_grad = self.model.features_specular.grad
         if self.feature_grad_aware and feature_grad is not None:
+            feature_grad_values = feature_grad.detach()[mask]
+            if self.feature_grad_carrier_tail_only:
+                sh_dim = sh_degree_to_specular_dim(
+                    self.model.get_max_n_features()
+                )
+                feature_grad_values = feature_grad_values[:, sh_dim:]
             feature_increment = (
-                feature_grad.detach()[mask]
-                .flatten(start_dim=1)
-                .norm(dim=1, keepdim=True)
+                feature_grad_values.flatten(start_dim=1).norm(
+                    dim=1, keepdim=True
+                )
             )
             self.densify_feature_grad_accum[mask] += feature_increment
             self.densify_feature_grad_denom[mask] += 1
@@ -473,7 +486,8 @@ class GSStrategy(BaseStrategy):
                     f"p99={boost_quantiles[2].item():.3f}, "
                     f"max={boost_values.max().item():.3f}, "
                     f"power={self.feature_grad_power:g}, "
-                    f"q={self.feature_grad_quantile:g}"
+                    f"q={self.feature_grad_quantile:g}, "
+                    f"carrier_tail_only={self.feature_grad_carrier_tail_only}"
                 )
         n_total = densify_grad_norm.numel()
         n_finite = int(finite_mask.sum().item())
