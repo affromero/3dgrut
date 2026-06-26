@@ -36,6 +36,7 @@ def _checkpointing_trainer(saved_paths: list[str]) -> Trainer3DGRUT:
                 "metric": "masked_psnr",
                 "patience": 3,
                 "min_delta": 0.03,
+                "min_step": 0,
                 "min_score": 0.0,
                 "min_score_after_step": 0,
                 "restore_best_on_end": True,
@@ -61,7 +62,7 @@ def _checkpointing_trainer(saved_paths: list[str]) -> Trainer3DGRUT:
         saved_paths.append("/tmp/current_best.pt")
         return "/tmp/current_best.pt"
 
-    setattr(trainer, "save_checkpoint", save_checkpoint)
+    trainer.save_checkpoint = save_checkpoint
     trainer.tracking = _Tracking()
     return trainer
 
@@ -98,4 +99,18 @@ def test_validation_score_floor_stops_after_probe_step() -> None:
 
     assert saved_paths == []
     assert trainer._should_stop_training is True
+    assert trainer._stale_validation_count == 0
+
+
+def test_plateau_early_stopping_waits_for_min_step() -> None:
+    """Plateau patience should not accrue before the configured min step."""
+    saved_paths: list[str] = []
+    trainer = _checkpointing_trainer(saved_paths)
+    trainer.conf.early_stopping["min_step"] = 30000
+    metrics = {"masked_psnr": [26.40]}
+
+    trainer._handle_validation_checkpointing(metrics)
+
+    assert saved_paths == []
+    assert trainer._should_stop_training is False
     assert trainer._stale_validation_count == 0

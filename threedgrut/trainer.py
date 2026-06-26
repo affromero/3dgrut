@@ -3957,6 +3957,15 @@ class Trainer3DGRUT:
             raise ValueError(msg)
         return self.global_step >= min_score_after_step and score < min_score
 
+    def _early_stopping_plateau_enabled_for_step(self) -> bool:
+        """Return whether plateau stopping can fire at the current step."""
+        early_stopping_conf = self.conf.early_stopping
+        min_step = int(early_stopping_conf.get("min_step", 0))
+        if min_step < 0:
+            msg = f"early_stopping.min_step must be >= 0, got {min_step}."
+            raise ValueError(msg)
+        return self.global_step >= min_step
+
     def _handle_validation_checkpointing(
         self, metrics: dict[str, list[float]]
     ) -> None:
@@ -4018,6 +4027,15 @@ class Trainer3DGRUT:
             self._early_stopping_reference_score = score
             self._early_stopping_reference_step = self.global_step
             self._stale_validation_count = 0
+            return
+
+        if not self._early_stopping_plateau_enabled_for_step():
+            min_step = int(early_stopping_conf.get("min_step", 0))
+            logger.info(
+                f"Validation {metric_name}={score:.6f} did not clear "
+                "early-stopping min_delta, but plateau stopping is deferred "
+                f"until step {min_step}."
+            )
             return
 
         self._stale_validation_count += 1
