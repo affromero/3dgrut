@@ -52,13 +52,27 @@ SCENE_EXTENT_MIN = 1e-6
 SCENE_EXTENT_MAX_SAMPLES = 1_000_000
 GABOR_CARRIER_NUM_TERMS = 3
 GABOR_CARRIER_EXTRA_COEFFS = GABOR_CARRIER_NUM_TERMS + 3
+SIREN_CARRIER_INPUT_DIM = 5
+SIREN_CARRIER_DEFAULT_HIDDEN_DIM = 6
 
 
 def _gabor_carrier_enabled(conf) -> bool:
     return bool(conf.model.get("use_gabor_carrier", False))
 
 
-def _gabor_carrier_specular_dim(conf) -> int:
+def _siren_carrier_enabled(conf) -> bool:
+    return bool(conf.model.get("use_siren_carrier", False))
+
+
+def _validate_carrier_config(conf) -> None:
+    if _gabor_carrier_enabled(conf) and _siren_carrier_enabled(conf):
+        raise ValueError(
+            "model.use_gabor_carrier and model.use_siren_carrier are "
+            "mutually exclusive."
+        )
+
+
+def _gabor_carrier_coeffs(conf) -> int:
     if not _gabor_carrier_enabled(conf):
         return 0
     num_terms = int(conf.model.get("gabor_num_terms", GABOR_CARRIER_NUM_TERMS))
@@ -67,7 +81,42 @@ def _gabor_carrier_specular_dim(conf) -> int:
             "model.gabor_num_terms currently supports exactly 3 terms; "
             f"got {num_terms}."
         )
-    return 3 * GABOR_CARRIER_EXTRA_COEFFS
+    return GABOR_CARRIER_EXTRA_COEFFS
+
+
+def _siren_carrier_hidden_dim(conf) -> int:
+    hidden_dim = int(
+        conf.model.get(
+            "siren_hidden_dim",
+            SIREN_CARRIER_DEFAULT_HIDDEN_DIM,
+        )
+    )
+    if hidden_dim <= 0:
+        raise ValueError(
+            "model.siren_hidden_dim must be positive; got "
+            f"{hidden_dim}."
+        )
+    return hidden_dim
+
+
+def _siren_carrier_bias_coeffs(hidden_dim: int) -> int:
+    return (hidden_dim + 2) // 3
+
+
+def _siren_carrier_coeffs(conf) -> int:
+    if not _siren_carrier_enabled(conf):
+        return 0
+    hidden_dim = _siren_carrier_hidden_dim(conf)
+    w1_coeffs = hidden_dim * 2
+    b1_coeffs = _siren_carrier_bias_coeffs(hidden_dim)
+    w2_coeffs = hidden_dim
+    b2_coeffs = 1
+    return w1_coeffs + b1_coeffs + w2_coeffs + b2_coeffs
+
+
+def _carrier_specular_dim(conf) -> int:
+    _validate_carrier_config(conf)
+    return 3 * (_gabor_carrier_coeffs(conf) + _siren_carrier_coeffs(conf))
 
 
 def _initial_gabor_carrier_tail(
@@ -78,7 +127,7 @@ def _initial_gabor_carrier_tail(
     conf,
 ) -> torch.Tensor:
     tail = torch.zeros(
-        (num_gaussians, _gabor_carrier_specular_dim(conf)),
+        (num_gaussians, 3 * _gabor_carrier_coeffs(conf)),
         dtype=dtype,
         device=device,
     )
@@ -93,6 +142,91 @@ def _initial_gabor_carrier_tail(
     tail[:, 9:12] = frequency * torch.cos(angles)[None, :]
     tail[:, 12:15] = frequency * torch.sin(angles)[None, :]
     return tail
+
+
+def _initial_siren_carrier_tail(
+    *,
+    num_gaussians: int,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    conf,
+) -> torch.Tensor:
+    hidden_dim = _siren_carrier_hidden_dim(conf)
+    coeffs = _siren_carrier_coeffs(conf)
+    tail = torch.zeros(
+        (num_gaussians, 3 * coeffs),
+        dtype=dtype,
+        device=device,
+    )
+    if tail.shape[1] == 0:
+        return tail
+
+    seed = int(conf.model.get("siren_init_seed", 20260626))
+    init_scale = float(
+        conf.model.get("siren_init_scale", 1.0 / SIREN_CARRIER_INPUT_DIM)
+    )
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    w1 = (
+        2.0
+        * torch.rand(
+            (num_gaussians, hidden_dim, SIREN_CARRIER_INPUT_DIM),
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        - 1.0
+    ) * init_scale
+    b1 = (
+        2.0
+        * torch.rand(
+            (num_gaussians, hidden_dim),
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        - 1.0
+    ) * init_scale
+
+    for hidden_idx in range(hidden_dim):
+        w1_slot = 2 * hidden_idx
+        tail[:, (w1_slot * 3) : (w1_slot * 3 + 3)] = w1[
+            :, hidden_idx, :3
+        ]
+        tail[:, ((w1_slot + 1) * 3)] = w1[:, hidden_idx, 3]
+        tail[:, ((w1_slot + 1) * 3 + 1)] = w1[:, hidden_idx, 4]
+
+    b1_offset = hidden_dim * 2
+    for hidden_idx in range(hidden_dim):
+        flat_idx = (b1_offset + hidden_idx // 3) * 3 + hidden_idx % 3
+        tail[:, flat_idx] = b1[:, hidden_idx]
+
+    return tail
+
+
+def _initial_carrier_tail(
+    *,
+    num_gaussians: int,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    conf,
+) -> torch.Tensor:
+    _validate_carrier_config(conf)
+    if _gabor_carrier_enabled(conf):
+        return _initial_gabor_carrier_tail(
+            num_gaussians=num_gaussians,
+            device=device,
+            dtype=dtype,
+            conf=conf,
+        )
+    if _siren_carrier_enabled(conf):
+        return _initial_siren_carrier_tail(
+            num_gaussians=num_gaussians,
+            device=device,
+            dtype=dtype,
+            conf=conf,
+        )
+    return torch.zeros((num_gaussians, 0), dtype=dtype, device=device)
 
 
 def _sample_point_rows(points: torch.Tensor) -> torch.Tensor:
@@ -183,9 +317,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     def _specular_feature_dim(self) -> int:
         return sh_degree_to_specular_dim(
             self.max_n_features
-        ) + _gabor_carrier_specular_dim(self.conf)
+        ) + _carrier_specular_dim(self.conf)
 
-    def _with_gabor_carrier_tail(
+    def _with_carrier_tail(
         self,
         features_specular: torch.Tensor,
     ) -> torch.Tensor:
@@ -193,11 +327,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         if features_specular.shape[1] == expected_dim:
             return features_specular
         sh_dim = sh_degree_to_specular_dim(self.max_n_features)
-        if (
-            _gabor_carrier_enabled(self.conf)
-            and features_specular.shape[1] == sh_dim
-        ):
-            tail = _initial_gabor_carrier_tail(
+        if features_specular.shape[1] == sh_dim:
+            tail = _initial_carrier_tail(
                 num_gaussians=features_specular.shape[0],
                 device=features_specular.device,
                 dtype=features_specular.dtype,
@@ -289,7 +420,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             sh_degree = render_sph_degree
         specular_dim = sh_degree_to_specular_dim(
             sh_degree
-        ) + _gabor_carrier_specular_dim(conf)
+        ) + _carrier_specular_dim(conf)
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Positions of the 3D Gaussians (x, y, z) [n_gaussians, 3]
@@ -716,9 +847,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 dtype=dtype,
                 device=self.device,
             ).contiguous()
-            if _gabor_carrier_enabled(self.conf):
+            if _carrier_specular_dim(self.conf) > 0:
                 sh_dim = sh_degree_to_specular_dim(self.max_n_features)
-                features_specular[:, sh_dim:] = _initial_gabor_carrier_tail(
+                features_specular[:, sh_dim:] = _initial_carrier_tail(
                     num_gaussians=num_gaussians,
                     device=self.device,
                     dtype=dtype,
@@ -767,7 +898,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = checkpoint["density"]
         self.features_albedo = checkpoint["features_albedo"]
         self.features_specular = torch.nn.Parameter(
-            self._with_gabor_carrier_tail(checkpoint["features_specular"])
+            self._with_carrier_tail(checkpoint["features_specular"])
         )
         if "rotation_activation" not in self.__dict__:
             self.rotation_activation = get_activation_function("normalize")
@@ -880,9 +1011,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         N = positions.shape[0]
         num_specular_dims = self._specular_feature_dim()
         features_specular = torch.zeros((N, num_specular_dims))
-        if _gabor_carrier_enabled(self.conf):
+        if _carrier_specular_dim(self.conf) > 0:
             sh_dim = sh_degree_to_specular_dim(self.max_n_features)
-            features_specular[:, sh_dim:] = _initial_gabor_carrier_tail(
+            features_specular[:, sh_dim:] = _initial_carrier_tail(
                 num_gaussians=N,
                 device=features_specular.device,
                 dtype=features_specular.dtype,
@@ -1189,8 +1320,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
 
         if len(extra_f_names) in {sh_extra_f_count, expected_extra_f_count}:
-            # Full spherical harmonics data available. Gabor-enabled PLYs append
-            # carrier slots after the SH coefficients.
+            # Full spherical harmonics data available. Carrier-enabled PLYs
+            # append learned slots after the SH coefficients.
             mogt_specular = np.zeros((num_gaussians, len(extra_f_names)))
             for idx, attr_name in enumerate(extra_f_names):
                 mogt_specular[:, idx] = np.asarray(
@@ -1220,7 +1351,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             dtype=self.features_specular.dtype,
             device=self.device,
         )
-        mogt_specular_tensor = self._with_gabor_carrier_tail(
+        mogt_specular_tensor = self._with_carrier_tail(
             mogt_specular_tensor
         )
 

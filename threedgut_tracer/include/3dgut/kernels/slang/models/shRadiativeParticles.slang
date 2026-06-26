@@ -108,6 +108,41 @@ vector<float, Dim> radianceFromParameters(float3 incidentDirection,
         }
         radiance = max(radiance, vector<float, Dim>(0));
     }
+    if (SirenEnabled)
+    {
+        const int sirenOffset = RadianceNumSphCoefficients;
+        const int w1Offset = sirenOffset;
+        const int b1Offset = w1Offset + 2 * SirenHiddenDim;
+        const int b1CoeffCount = (SirenHiddenDim + 2) / 3;
+        const int w2Offset = b1Offset + b1CoeffCount;
+        const int b2Offset = w2Offset + SirenHiddenDim;
+        const float uvScale = max(abs(SirenLocalUvScale), 1e-6f);
+        const float uvX = localUv.x / uvScale;
+        const float uvY = localUv.y / uvScale;
+
+        vector<float, Dim> residual = parameters.sphCoefficients[b2Offset];
+        [unroll] for (int i = 0; i < SirenHiddenDim; ++i)
+        {
+            const int rowOffset = w1Offset + 2 * i;
+            const vector<float, Dim> w012 =
+                parameters.sphCoefficients[rowOffset];
+            const vector<float, Dim> w34 =
+                parameters.sphCoefficients[rowOffset + 1];
+            const vector<float, Dim> bias =
+                parameters.sphCoefficients[b1Offset + i / 3];
+            const float hidden =
+                bias[i % 3]
+                + w012.x * uvX
+                + w012.y * uvY
+                + w012.z * incidentDirection.x
+                + w34.x * incidentDirection.y
+                + w34.y * incidentDirection.z;
+            residual += parameters.sphCoefficients[w2Offset + i]
+                * sin(SirenOmega * hidden);
+        }
+        radiance += residual;
+        radiance = max(radiance, vector<float, Dim>(0));
+    }
     return radiance;
 }
 

@@ -137,6 +137,12 @@ model:
   use_gabor_carrier: false
   gabor_num_terms: 3
   gabor_max_frequency: 4.0
+  use_siren_carrier: false
+  siren_hidden_dim: 6
+  siren_omega: 30.0
+  siren_local_uv_scale: 3.0
+  siren_init_seed: 20260626
+  siren_init_scale: 0.2
   bvh_update_frequency: 1
   progressive_training:
     feature_type: "sh" # one of [sh, mlp], currently only sh supported

@@ -47,6 +47,12 @@ def setup_3dgut(conf):
 
     radiance_sh_coeffs = (conf.render.particle_radiance_sph_degree + 1) ** 2
     gabor_enabled = bool(conf.model.get("use_gabor_carrier", False))
+    siren_enabled = bool(conf.model.get("use_siren_carrier", False))
+    if gabor_enabled and siren_enabled:
+        raise ValueError(
+            "model.use_gabor_carrier and model.use_siren_carrier are "
+            "mutually exclusive."
+        )
     gabor_num_terms = int(conf.model.get("gabor_num_terms", 3))
     if gabor_enabled and gabor_num_terms != 3:
         raise ValueError(
@@ -54,8 +60,20 @@ def setup_3dgut(conf):
             f"got {gabor_num_terms}."
         )
     gabor_coeffs = gabor_num_terms + 3 if gabor_enabled else 0
-    radiance_coeffs = radiance_sh_coeffs + gabor_coeffs
-    per_ray_particle_features = gabor_enabled or bool(
+    siren_hidden_dim = int(conf.model.get("siren_hidden_dim", 6))
+    if siren_enabled and siren_hidden_dim <= 0:
+        raise ValueError(
+            "model.siren_hidden_dim must be positive; got "
+            f"{siren_hidden_dim}."
+        )
+    siren_bias_coeffs = (siren_hidden_dim + 2) // 3
+    siren_coeffs = (
+        (2 * siren_hidden_dim) + siren_bias_coeffs + siren_hidden_dim + 1
+        if siren_enabled
+        else 0
+    )
+    radiance_coeffs = radiance_sh_coeffs + gabor_coeffs + siren_coeffs
+    per_ray_particle_features = gabor_enabled or siren_enabled or bool(
         conf.render.splat.get("per_ray_particle_features", False)
     )
 
@@ -65,6 +83,10 @@ def setup_3dgut(conf):
         f"-DPARTICLE_RADIANCE_GABOR_ENABLED={to_cpp_bool(gabor_enabled)}",
         f"-DPARTICLE_RADIANCE_GABOR_NUM_TERMS={gabor_num_terms}",
         f"-DPARTICLE_RADIANCE_GABOR_MAX_FREQUENCY={float(conf.model.get('gabor_max_frequency', 4.0))}",
+        f"-DPARTICLE_RADIANCE_SIREN_ENABLED={to_cpp_bool(siren_enabled)}",
+        f"-DPARTICLE_RADIANCE_SIREN_HIDDEN_DIM={siren_hidden_dim}",
+        f"-DPARTICLE_RADIANCE_SIREN_OMEGA={float(conf.model.get('siren_omega', 30.0))}",
+        f"-DPARTICLE_RADIANCE_SIREN_LOCAL_UV_SCALE={float(conf.model.get('siren_local_uv_scale', 3.0))}",
         f"-DGAUSSIAN_PARTICLE_KERNEL_DEGREE={conf.render.particle_kernel_degree}",
         f"-DGAUSSIAN_PARTICLE_MIN_KERNEL_DENSITY={conf.render.particle_kernel_min_response}",
         f"-DGAUSSIAN_PARTICLE_MIN_ALPHA={conf.render.particle_kernel_min_alpha}",
