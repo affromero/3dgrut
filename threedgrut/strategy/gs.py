@@ -375,6 +375,7 @@ class GSStrategy(BaseStrategy):
         assert self.model.optimizer is not None, (
             "Optimizer need to be initialized before splitting and cloning the Gaussians"
         )
+        scene_extent = float(scene_extent)
         densify_grad_norm = (
             self.densify_grad_norm_accum / self.densify_grad_norm_denom
         )
