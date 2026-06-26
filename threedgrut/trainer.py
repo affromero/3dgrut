@@ -42,12 +42,13 @@ from threedgrut.datasets.utils import (
     MultiEpochsDataLoader,
     PointCloud,
 )
+from threedgrut.model.camera_residual import CameraResidual
 from threedgrut.model.losses import rim_high_frequency_loss, ssim
+from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.model.mvdino_rim_loss import (
     mvdino_feature_rim_loss,
     mvdino_rim_crop_loss,
 )
-from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.post_processing import LuminanceAffine
 from threedgrut.render import Renderer
@@ -62,7 +63,6 @@ from threedgrut.utils.misc import (
 from threedgrut.utils.render import apply_post_processing
 from threedgrut.utils.source_scan import source_scan_id_from_image_path
 from threedgrut.utils.timer import CudaTimer
-
 
 DIAGNOSTIC_QUANTILE_MAX_SAMPLES = 1_000_000
 EVAL_IMAGE_GRID_DIR = "eval_image_grids"
@@ -1424,6 +1424,20 @@ class Trainer3DGRUT:
     post_processing_schedulers: list | None = None
     """ Schedulers for post-processing module optimizers """
 
+    camera_residual: CameraResidual | None = None
+    """Optional bounded ray-space camera residual module."""
+
+    camera_residual_optimizer: torch.optim.Optimizer | None = None
+    """Optimizer for camera residual parameters."""
+
+    camera_residual_scheduler: (
+        torch.optim.lr_scheduler.LRScheduler | None
+    ) = None
+    """Scheduler for the camera residual optimizer."""
+
+    _last_camera_residual_stats: dict[str, float] | None = None
+    """Most recent camera residual stats captured before gradients are zeroed."""
+
     _distillation_start_step: int = -1
     """ Step at which distillation starts (-1 means disabled) """
 
@@ -1481,6 +1495,7 @@ class Trainer3DGRUT:
         logger.log_rule("Setup Model Weights & Training")
         self.init_metrics()
         self.init_post_processing(conf)
+        self.init_camera_residual(conf)
         self.setup_training(conf, self.model, self.train_dataset)
         self.init_experiments_tracking(conf)
         self.init_gui(
@@ -1649,6 +1664,26 @@ class Trainer3DGRUT:
                 logger.info(
                     "📷 Post-processing state restored from checkpoint"
                 )
+            if (
+                "camera_residual" in checkpoint
+                and self.camera_residual is not None
+            ):
+                self.camera_residual.load_state_dict(
+                    checkpoint["camera_residual"]["module"]
+                )
+                if self.camera_residual_optimizer is not None:
+                    _load_optimizer_state(
+                        self.camera_residual_optimizer,
+                        checkpoint["camera_residual"]["optimizer"],
+                        label="camera_residual",
+                    )
+                if self.camera_residual_scheduler is not None:
+                    self.camera_residual_scheduler.load_state_dict(
+                        checkpoint["camera_residual"]["scheduler"]
+                    )
+                logger.info(
+                    "📷 Camera residual state restored from checkpoint"
+                )
         elif conf.import_ply.enabled:
             ply_path = (
                 conf.import_ply.path
@@ -1718,6 +1753,17 @@ class Trainer3DGRUT:
                             )
                         logger.info(
                             "📷 Post-processing module restored from initialization checkpoint"
+                        )
+                    if (
+                        "camera_residual" in checkpoint
+                        and self.camera_residual is not None
+                    ):
+                        self.camera_residual.load_state_dict(
+                            checkpoint["camera_residual"]["module"]
+                        )
+                        logger.info(
+                            "📷 Camera residual module restored from "
+                            "initialization checkpoint"
                         )
                 case "lidar":
                     assert isinstance(train_dataset, datasets.NCoreDataset), (
@@ -4387,6 +4433,27 @@ class Trainer3DGRUT:
                     post_processing_reg_loss,
                     global_step,
                 )
+            if (
+                self.camera_residual is not None
+                and "camera_residual_reg_loss" in batch_metrics["losses"]
+            ):
+                camera_residual_reg_loss = np.mean(
+                    batch_metrics["losses"]["camera_residual_reg_loss"]
+                )
+                writer.add_scalar(
+                    "train/loss/camera_residual_reg",
+                    camera_residual_reg_loss,
+                    global_step,
+                )
+                stats = self._last_camera_residual_stats
+                if stats is None:
+                    stats = self.camera_residual.stats()
+                for metric_name, value in stats.items():
+                    writer.add_scalar(
+                        f"camera_residual/{metric_name}",
+                        value,
+                        global_step,
+                    )
             if "psnr" in batch_metrics:
                 writer.add_scalar(
                     "train/psnr", batch_metrics["psnr"], self.global_step
@@ -4663,6 +4730,16 @@ class Trainer3DGRUT:
                     sched.state_dict()
                     for sched in self.post_processing_schedulers
                 ],
+            }
+        if (
+            self.camera_residual is not None
+            and self.camera_residual_optimizer is not None
+            and self.camera_residual_scheduler is not None
+        ):
+            parameters["camera_residual"] = {
+                "module": self.camera_residual.state_dict(),
+                "optimizer": self.camera_residual_optimizer.state_dict(),
+                "scheduler": self.camera_residual_scheduler.state_dict(),
             }
 
         if best_checkpoint:
@@ -5098,6 +5175,10 @@ class Trainer3DGRUT:
         # Access the GPU-cache batch data
         with torch.cuda.nvtx.range(f"train_iter{global_step}_get_gpu_batch"):
             gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(batch)
+        gpu_batch = self._apply_camera_residual(
+            gpu_batch,
+            global_step=global_step,
+        )
 
         # Perform validation if required
         is_time_to_validate = (global_step > 0 or conf.validate_first) and (
@@ -5137,6 +5218,16 @@ class Trainer3DGRUT:
                 batch_losses["post_processing_reg_loss"] = (
                     post_processing_reg_loss
                 )
+            if self.camera_residual is not None:
+                camera_residual_reg_loss = (
+                    self.camera_residual.get_regularization_loss()
+                )
+                batch_losses["total_loss"] = (
+                    batch_losses["total_loss"] + camera_residual_reg_loss
+                )
+                batch_losses["camera_residual_reg_loss"] = (
+                    camera_residual_reg_loss
+                )
 
         # Backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_pre_bwd"):
@@ -5153,6 +5244,12 @@ class Trainer3DGRUT:
             profilers["backward"].start()
             batch_losses["total_loss"].backward()
             profilers["backward"].end()
+        if self.camera_residual_optimizer is not None:
+            self._validate_camera_residual_gradient(global_step)
+            if self.camera_residual is not None:
+                self._last_camera_residual_stats = (
+                    self.camera_residual.stats()
+                )
         self._compute_per_gaussian_grad_norms()
         self._log_gradient_diagnostics(global_step)
         if self.diagnostics is not None:
@@ -5231,6 +5328,15 @@ class Trainer3DGRUT:
                     opt.zero_grad()
                 for sched in self.post_processing_schedulers:
                     sched.step()
+
+        if self.camera_residual_optimizer is not None:
+            with torch.cuda.nvtx.range(
+                f"train_{global_step}_camera_residual_opt"
+            ):
+                self.camera_residual_optimizer.step()
+                self.camera_residual_optimizer.zero_grad()
+                if self.camera_residual_scheduler is not None:
+                    self.camera_residual_scheduler.step()
 
         # Post backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_post_opt_step"):
@@ -5344,6 +5450,10 @@ class Trainer3DGRUT:
             gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
                 batch_idx
             )
+            gpu_batch = self._apply_camera_residual(
+                gpu_batch,
+                global_step=self.global_step,
+            )
 
             # Compute the outputs of a single batch
             with torch.cuda.nvtx.range(
@@ -5412,6 +5522,14 @@ class Trainer3DGRUT:
         conf = self.conf
 
         logger.log_rule(f"Training {conf.render.method.upper()}")
+        if bool(conf.camera_residual.finite_difference_audit.enabled):
+            self.run_camera_residual_finite_difference_audit()
+            if bool(conf.camera_residual.finite_difference_audit.exit_after):
+                logger.info(
+                    "Camera residual finite-difference audit complete."
+                )
+                return
+
         if bool(conf.camera_intrinsics_audit.enabled):
             self.run_camera_intrinsics_finite_difference_audit()
             if bool(conf.camera_intrinsics_audit.exit_after):
