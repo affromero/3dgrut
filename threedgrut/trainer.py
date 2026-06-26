@@ -42,7 +42,7 @@ from threedgrut.datasets.utils import (
     MultiEpochsDataLoader,
     PointCloud,
 )
-from threedgrut.model.losses import ssim
+from threedgrut.model.losses import rim_high_frequency_loss, ssim
 from threedgrut.model.mvdino_rim_loss import (
     mvdino_feature_rim_loss,
     mvdino_rim_crop_loss,
@@ -3454,6 +3454,46 @@ class Trainer3DGRUT:
                 ).sum() / rim_denom
                 lambda_rim = float(self.conf.loss.lambda_rim)
 
+        loss_rim_hf = torch.zeros(1, device=self.device)
+        lambda_rim_hf = 0.0
+        if self.conf.loss.get("use_rim_hf", False):
+            depth_ray_z = getattr(gpu_batch, "depth_ray_z", None)
+            if depth_ray_z is None:
+                raise RuntimeError(
+                    "loss.use_rim_hf requires per-pixel depth_ray_z "
+                    "(cos theta) from the fisheye dataset."
+                )
+            with torch.cuda.nvtx.range("loss-rim-hf"):
+                loss_rim_hf = rim_high_frequency_loss(
+                    rgb_pred=rgb_pred,
+                    rgb_gt=rgb_gt,
+                    depth_ray_z=depth_ray_z,
+                    mask=mask,
+                    theta_min_deg=float(
+                        self.conf.loss.get("rim_hf_theta_min_deg", 60.0)
+                    ),
+                    theta_max_deg=float(
+                        self.conf.loss.get("rim_hf_theta_max_deg", 80.0)
+                    ),
+                    kernel_size=int(
+                        self.conf.loss.get("rim_hf_kernel_size", 7)
+                    ),
+                    sigma=float(self.conf.loss.get("rim_hf_sigma", 1.5)),
+                    loss_type=str(
+                        self.conf.loss.get(
+                            "rim_hf_loss_type",
+                            "charbonnier",
+                        )
+                    ),
+                    charbonnier_epsilon=float(
+                        self.conf.loss.get(
+                            "rim_hf_charbonnier_epsilon",
+                            0.01,
+                        )
+                    ),
+                )
+                lambda_rim_hf = float(self.conf.loss.get("lambda_rim_hf", 0.0))
+
         # --- MV-DINO feature rim loss -------------------------------------
         loss_mvdino_rim = torch.zeros(1, device=self.device)
         lambda_mvdino_rim = 0.0
@@ -3537,6 +3577,7 @@ class Trainer3DGRUT:
             + lambda_sky_opacity * loss_sky_opacity
             + lambda_depth * loss_depth
             + lambda_rim * loss_rim
+            + lambda_rim_hf * loss_rim_hf
             + lambda_mvdino_rim * loss_mvdino_rim
         )
         loss = loss * camera_loss_weight
@@ -3554,6 +3595,8 @@ class Trainer3DGRUT:
             depth_loss_raw=loss_depth,
             rim_loss=lambda_rim * loss_rim,
             rim_loss_raw=loss_rim,
+            rim_hf_loss=lambda_rim_hf * loss_rim_hf,
+            rim_hf_loss_raw=loss_rim_hf,
             mvdino_rim_loss=lambda_mvdino_rim * loss_mvdino_rim,
             mvdino_rim_loss_raw=loss_mvdino_rim,
         )

@@ -230,6 +230,16 @@ loss:
   rim_centre_anchor: true
   rim_detach_affine: false  # diagnostic: detach the centre-anchor fit so the loss cannot co-adapt the eval calibration (isolates the metric artifact)
 
+  # high-frequency appearance loss on the clean fisheye rim band
+  use_rim_hf: false
+  lambda_rim_hf: 0.0
+  rim_hf_theta_min_deg: 60.0
+  rim_hf_theta_max_deg: 80.0
+  rim_hf_kernel_size: 7
+  rim_hf_sigma: 1.5
+  rim_hf_loss_type: charbonnier
+  rim_hf_charbonnier_epsilon: 0.01
+
   # MV-DINO multi-view-consistent feature rim loss.
   use_mvdino_rim: false
   lambda_mvdino_rim: 0.0
