@@ -228,6 +228,16 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                                     *reinterpret_cast<const float3*>(&sourcePosition));
     }
 
+    __forceinline__ __device__ tcnn::vec2 localUv(uint32_t particleIdx,
+                                                  const tcnn::vec3& rayOrigin,
+                                                  const tcnn::vec3& rayDirection) const {
+        const auto uv = particleDensityLocalUv(*reinterpret_cast<const float3*>(&rayOrigin),
+                                               *reinterpret_cast<const float3*>(&rayDirection),
+                                               particleIdx,
+                                               {{reinterpret_cast<gaussianParticle_RawParameters_0*>(m_densityRawParameters.ptr), nullptr, true}});
+        return *reinterpret_cast<const tcnn::vec2*>(&uv);
+    }
+
     using FeaturesParameters = shRadiativeParticle_Parameters_0;
     using TFeaturesVec       = typename tcnn::vec<ExtParams::FeaturesDim>;
 
@@ -249,6 +259,18 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
         const auto features = particleFeaturesFromBuffer(particleIdx,
                                                          {{m_featureRawParameters.ptr, nullptr, true}, m_featureActiveShDegree},
                                                          *reinterpret_cast<const float3*>(&incidentDirection));
+        return *reinterpret_cast<const TFeaturesVec*>(&features);
+    }
+
+    __forceinline__ __device__ TFeaturesVec featuresFromBuffer(uint32_t particleIdx,
+                                                               const tcnn::vec3& rayOrigin,
+                                                               const tcnn::vec3& rayDirection) const {
+
+        const tcnn::vec2 uv = localUv(particleIdx, rayOrigin, rayDirection);
+        const auto features = particleFeaturesFromBufferAt(particleIdx,
+                                                           {{m_featureRawParameters.ptr, nullptr, true}, m_featureActiveShDegree},
+                                                           *reinterpret_cast<const float3*>(&rayDirection),
+                                                           *reinterpret_cast<const float2*>(&uv));
         return *reinterpret_cast<const TFeaturesVec*>(&features);
     }
 
@@ -295,10 +317,13 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     }
 
     __forceinline__ __device__ void featuresIntegrateFwdFromBuffer(const tcnn::vec3& incidentDirection,
+                                                                   const tcnn::vec2& localUv,
                                                                    float weight,
-                                                                   uint32_t particleIdx, TFeaturesVec integratedFeatures) const {
+                                                                   uint32_t particleIdx,
+                                                                   TFeaturesVec& integratedFeatures) const {
 
         particleFeaturesIntegrateFwdFromBuffer(*reinterpret_cast<const float3*>(&incidentDirection),
+                                               *reinterpret_cast<const float2*>(&localUv),
                                                weight,
                                                particleIdx,
                                                {{m_featureRawParameters.ptr, nullptr, true}, m_featureActiveShDegree},
@@ -323,6 +348,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
 
     template <bool exclusiveGradient>
     __forceinline__ __device__ void featuresIntegrateBwdToBuffer(const tcnn::vec3& incidentDirection,
+                                                                 const tcnn::vec2& localUv,
                                                                  float alpha,
                                                                  float& alphaGrad,
                                                                  uint32_t particleIdx,
@@ -332,6 +358,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
 
         if (TDifferentiable) {
             particleFeaturesIntegrateBwdToBuffer(*reinterpret_cast<const float3*>(&incidentDirection),
+                                                 *reinterpret_cast<const float2*>(&localUv),
                                                  alpha,
                                                  &alphaGrad,
                                                  particleIdx,
@@ -340,6 +367,27 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                                  reinterpret_cast<float3*>(&integratedFeatures),
                                                  reinterpret_cast<float3*>(&integratedFeaturesGrad));
         }
+    }
+
+    template <bool exclusiveGradient>
+    __forceinline__ __device__ void featuresIntegrateBwdToBuffer(const tcnn::vec3& rayOrigin,
+                                                                 const tcnn::vec3& rayDirection,
+                                                                 float alpha,
+                                                                 float& alphaGrad,
+                                                                 uint32_t particleIdx,
+                                                                 const TFeaturesVec& features,
+                                                                 TFeaturesVec& integratedFeatures,
+                                                                 TFeaturesVec& integratedFeaturesGrad) const {
+        const tcnn::vec2 uv = localUv(particleIdx, rayOrigin, rayDirection);
+        featuresIntegrateBwdToBuffer<exclusiveGradient>(
+            rayDirection,
+            uv,
+            alpha,
+            alphaGrad,
+            particleIdx,
+            features,
+            integratedFeatures,
+            integratedFeaturesGrad);
     }
 
     template <bool PerRayRadiance>

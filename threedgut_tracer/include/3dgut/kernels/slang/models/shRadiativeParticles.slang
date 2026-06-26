@@ -68,16 +68,61 @@ void fetchParametersFromBufferBwd(no_diff uint32_t particleIdx,
     }
 }
 
+[BackwardDifferentiable][ForceInline]
+vector<float, Dim> radianceFromParameters(float3 incidentDirection,
+                                          no_diff float2 localUv,
+                                          no_diff uint32_t sphDegree,
+                                          Parameters parameters)
+{
+    vector<float, Dim> radiance =
+        sphericalHarmonics.decode<Dim, RadianceMaxNumSphCoefficients>(
+            sphDegree,
+            parameters.sphCoefficients,
+            incidentDirection);
+    if (GaborEnabled)
+    {
+        static const float TwoPi = 6.283185307179586f;
+        static const float TwoPiSquared = 19.739208802178716f;
+        const int carrierOffset = RadianceNumSphCoefficients;
+        const int freqXOffset = carrierOffset + GaborNumTerms;
+        const int freqYOffset = freqXOffset + 1;
+        const int phaseOffset = freqYOffset + 1;
+        [unroll] for (int i = 0; i < GaborNumTerms; ++i)
+        {
+            const vector<float, Dim> amplitude =
+                parameters.sphCoefficients[carrierOffset + i];
+            const float fx = clamp(
+                parameters.sphCoefficients[freqXOffset][i],
+                -GaborMaxFrequency,
+                GaborMaxFrequency);
+            const float fy = clamp(
+                parameters.sphCoefficients[freqYOffset][i],
+                -GaborMaxFrequency,
+                GaborMaxFrequency);
+            const float phase = parameters.sphCoefficients[phaseOffset][i];
+            const float carrierPhase =
+                TwoPi * (fx * localUv.x + fy * localUv.y) + phase;
+            const float dc =
+                exp(-TwoPiSquared * (fx * fx + fy * fy)) * cos(phase);
+            radiance += amplitude * (cos(carrierPhase) - dc);
+        }
+        radiance = max(radiance, vector<float, Dim>(0));
+    }
+    return radiance;
+}
+
 [BackwardDifferentiable] [ForceInline]
 vector<float, Dim> radianceFromBuffer(no_diff uint32_t particleIdx,
                                       no_diff float3 incidentDirection,
+                                      no_diff float2 localUv,
                                       no_diff uint32_t sphDegree,
                                       no_diff ParametersBuffer parametersBuffer)
 {
-    return sphericalHarmonics.decode<Dim, RadianceMaxNumSphCoefficients>(
-               sphDegree,
-               fetchParametersFromBuffer(particleIdx, parametersBuffer).sphCoefficients,
-               incidentDirection);
+    return radianceFromParameters(
+        incidentDirection,
+        localUv,
+        sphDegree,
+        fetchParametersFromBuffer(particleIdx, parametersBuffer));
 }
 
 [BackwardDifferentiable][ForceInline]
@@ -100,6 +145,7 @@ void integrateRadiance<let backToFront : bool>(float weight,
 
 [BackwardDifferentiable][ForceInline]
 void integrateRadianceFromParameters<let backToFront : bool>(float3 incidentDirection,
+                                                             no_diff float2 localUv,
                                                              no_diff uint32_t sphDegree,
                                                              float weight,
                                                              Parameters parameters,
@@ -109,10 +155,10 @@ void integrateRadianceFromParameters<let backToFront : bool>(float3 incidentDire
     {
         integrateRadiance<backToFront>(
             weight,
-            sphericalHarmonics.decode<Dim, RadianceMaxNumSphCoefficients>(
-                sphDegree,
-                parameters.sphCoefficients,
-                incidentDirection),
+            radianceFromParameters(incidentDirection,
+                                   localUv,
+                                   sphDegree,
+                                   parameters),
             integratedRadiance
         );
     }
@@ -120,6 +166,7 @@ void integrateRadianceFromParameters<let backToFront : bool>(float3 incidentDire
 
 [BackwardDifferentiable][ForceInline]
 void integrateRadianceFromBuffer<let backToFront : bool>(no_diff float3 incidentDirection,
+                                                         no_diff float2 localUv,
                                                          no_diff uint32_t sphDegree,
                                                          float weight,
                                                          no_diff uint32_t particleIdx,
@@ -127,6 +174,7 @@ void integrateRadianceFromBuffer<let backToFront : bool>(no_diff float3 incident
                                                          inout vector<float, Dim> integratedRadiance)
 {
     integrateRadianceFromParameters<backToFront>(incidentDirection,
+                                                 localUv,
                                                  sphDegree,
                                                  weight,
                                                  fetchParametersFromBuffer(particleIdx, parametersBuffer),
@@ -139,14 +187,29 @@ void integrateRadianceFromBuffer<let backToFront : bool>(no_diff float3 incident
 // Entry points
 
 [CudaDeviceExport]
+inline vector<float, shRadiativeParticle.Dim> particleFeaturesFromBufferAt(in uint32_t particleIdx,
+                                         shRadiativeParticle.CommonParameters commonParameters,
+                                         in float3 incidentDirection,
+                                         in float2 localUv)
+{
+    return shRadiativeParticle.radianceFromBuffer(
+        particleIdx,
+        incidentDirection,
+        localUv,
+        commonParameters.sphDegree,
+        commonParameters.parametersBuffer);
+}
+
+[CudaDeviceExport]
 inline vector<float, shRadiativeParticle.Dim> particleFeaturesFromBuffer(in uint32_t particleIdx,
                                          shRadiativeParticle.CommonParameters commonParameters,
                                          in float3 incidentDirection)
 {
-    return sphericalHarmonics.decode<shRadiativeParticle.Dim, shRadiativeParticle.RadianceMaxNumSphCoefficients>(
-        commonParameters.sphDegree,
-        shRadiativeParticle.fetchParametersFromBuffer(particleIdx, commonParameters.parametersBuffer).sphCoefficients,
-        incidentDirection);
+    return particleFeaturesFromBufferAt(
+        particleIdx,
+        commonParameters,
+        incidentDirection,
+        float2(0.0f, 0.0f));
 }
 
 [CudaDeviceExport]
@@ -162,6 +225,7 @@ inline void particleFeaturesIntegrateFwd(in float weight,
 }
 
 [CudaDeviceExport] inline void particleFeaturesIntegrateFwdFromBuffer(in float3 incidentDirection,
+                                                   in float2 localUv,
                                                    in float weight,
                                                    in uint32_t particleIdx,
                                                    shRadiativeParticle.CommonParameters commonParameters,
@@ -169,6 +233,7 @@ inline void particleFeaturesIntegrateFwd(in float weight,
 {
     shRadiativeParticle.integrateRadianceFromBuffer<false>(
         incidentDirection,
+        localUv,
         commonParameters.sphDegree,
         weight,
         particleIdx,
@@ -208,6 +273,7 @@ inline void particleFeaturesIntegrateFwd(in float weight,
 
 [CudaDeviceExport] void particleFeaturesIntegrateBwdToBuffer(
     in float3 incidentDirection,
+    in float2 localUv,
     in float alpha,
     inout float alphaGrad,
     in uint32_t particleIdx,
@@ -227,6 +293,7 @@ inline void particleFeaturesIntegrateFwd(in float weight,
 
         bwd_diff(shRadiativeParticle.integrateRadianceFromBuffer<true>)(
             incidentDirection,
+            localUv,
             commonParameters.sphDegree,
             alphaDiff,
             particleIdx,
@@ -248,6 +315,7 @@ inline void particleFeaturesIntegrateFwd(in float weight,
     bwd_diff(shRadiativeParticle.radianceFromBuffer)(
         particleIdx,
         incidentDirection,
+        float2(0.0f, 0.0f),
         commonParameters.sphDegree,
         commonParameters.parametersBuffer,
         featuresGrad);

@@ -324,6 +324,30 @@ no_diff float3 incidentDirectionFromBuffer(
         sourcePosition
     );
 }
+
+[ForceInline]
+float2 localUvFromParameters(
+    no_diff float3 rayOrigin,
+    no_diff float3 rayDirection,
+    Parameters parameters
+)
+{
+    float3 canonicalRayOrigin;
+    float3 canonicalRayDirection;
+    cannonicalRay(
+        rayOrigin,
+        rayDirection,
+        parameters,
+        canonicalRayOrigin,
+        canonicalRayDirection);
+    const float closestT = Surfel ? (
+        abs(canonicalRayDirection.z) > 1e-06
+            ? -canonicalRayOrigin.z / canonicalRayDirection.z
+            : 0.0f
+    ) : dot(canonicalRayDirection, -canonicalRayOrigin);
+    const float3 closestPoint = canonicalRayOrigin + canonicalRayDirection * closestT;
+    return closestPoint.xy;
+}
 } // namespace gaussianParticle
 
 // ------------------------------------------------------------------------------------------------------------------
@@ -337,6 +361,21 @@ inline gaussianParticle.Parameters particleDensityParameters(
     return gaussianParticle.fetchParameters(
         particleIdx,
         commonParameters.parametersBuffer);
+}
+
+[CudaDeviceExport]
+inline float2 particleDensityLocalUv(
+    float3 rayOrigin,
+    float3 rayDirection,
+    uint32_t particleIdx,
+    gaussianParticle.CommonParameters commonParameters)
+{
+    return gaussianParticle.localUvFromParameters(
+        rayOrigin,
+        rayDirection,
+        gaussianParticle.fetchParameters(
+            particleIdx,
+            commonParameters.parametersBuffer));
 }
 
 [CudaDeviceExport]

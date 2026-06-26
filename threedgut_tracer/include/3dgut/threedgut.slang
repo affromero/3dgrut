@@ -28,6 +28,10 @@ namespace gaussianParticle
 namespace shRadiativeParticle
 {
     static const int RadianceMaxNumSphCoefficients = PARTICLE_RADIANCE_NUM_COEFFS;
+    static const int RadianceNumSphCoefficients = PARTICLE_RADIANCE_NUM_SH_COEFFS;
+    static const bool GaborEnabled = PARTICLE_RADIANCE_GABOR_ENABLED;
+    static const int GaborNumTerms = PARTICLE_RADIANCE_GABOR_NUM_TERMS;
+    static const float GaborMaxFrequency = PARTICLE_RADIANCE_GABOR_MAX_FREQUENCY;
     static const int Dim = 3;
 };
 

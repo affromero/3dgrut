@@ -92,14 +92,30 @@ class PLYImporter(FormatImporter):
         else:
             actual_sh_degree = 0
 
-        specular = np.zeros((num_gaussians, num_speculars * 3), dtype=np.float32)
-        if len(extra_f_names) == expected_extra_f_count:
-            # Full spherical harmonics data available
+        if len(extra_f_names) % 3 != 0:
+            raise ValueError(
+                "PLY f_rest_* properties must be packed as float3 slots; "
+                f"found {len(extra_f_names)} fields."
+            )
+
+        if len(extra_f_names) > expected_extra_f_count:
+            specular_width = len(extra_f_names)
+        else:
+            specular_width = expected_extra_f_count
+
+        specular = np.zeros((num_gaussians, specular_width), dtype=np.float32)
+        if (
+            len(extra_f_names) == expected_extra_f_count
+            or len(extra_f_names) > expected_extra_f_count
+        ):
+            # Full spherical harmonics data available. Extra slots after the
+            # expected SH fields are preserved for carrier-style extensions.
+            actual_speculars = len(extra_f_names) // 3
             for idx, attr_name in enumerate(extra_f_names):
                 specular[:, idx] = np.asarray(plydata.elements[0][attr_name])
             # Convert from channel-major to feature-major layout
-            specular = specular.reshape((num_gaussians, 3, num_speculars))
-            specular = specular.transpose(0, 2, 1).reshape((num_gaussians, num_speculars * 3))
+            specular = specular.reshape((num_gaussians, 3, actual_speculars))
+            specular = specular.transpose(0, 2, 1).reshape((num_gaussians, actual_speculars * 3))
         elif len(extra_f_names) == 0:
             logger.info("PLY file only contains DC components, higher-order SH set to zero")
         elif len(extra_f_names) < expected_extra_f_count:

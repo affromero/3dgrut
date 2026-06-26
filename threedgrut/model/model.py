@@ -50,6 +50,49 @@ from threedgrut.utils.render import RGB2SH
 
 SCENE_EXTENT_MIN = 1e-6
 SCENE_EXTENT_MAX_SAMPLES = 1_000_000
+GABOR_CARRIER_NUM_TERMS = 3
+GABOR_CARRIER_EXTRA_COEFFS = GABOR_CARRIER_NUM_TERMS + 3
+
+
+def _gabor_carrier_enabled(conf) -> bool:
+    return bool(conf.model.get("use_gabor_carrier", False))
+
+
+def _gabor_carrier_specular_dim(conf) -> int:
+    if not _gabor_carrier_enabled(conf):
+        return 0
+    num_terms = int(conf.model.get("gabor_num_terms", GABOR_CARRIER_NUM_TERMS))
+    if num_terms != GABOR_CARRIER_NUM_TERMS:
+        raise ValueError(
+            "model.gabor_num_terms currently supports exactly 3 terms; "
+            f"got {num_terms}."
+        )
+    return 3 * GABOR_CARRIER_EXTRA_COEFFS
+
+
+def _initial_gabor_carrier_tail(
+    *,
+    num_gaussians: int,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    conf,
+) -> torch.Tensor:
+    tail = torch.zeros(
+        (num_gaussians, _gabor_carrier_specular_dim(conf)),
+        dtype=dtype,
+        device=device,
+    )
+    if tail.shape[1] == 0:
+        return tail
+    frequency = 0.5 * float(conf.model.get("gabor_max_frequency", 4.0))
+    angles = torch.tensor(
+        [0.0, np.pi / 3.0, 2.0 * np.pi / 3.0],
+        dtype=dtype,
+        device=device,
+    )
+    tail[:, 9:12] = frequency * torch.cos(angles)[None, :]
+    tail[:, 12:15] = frequency * torch.sin(angles)[None, :]
+    return tail
 
 
 def _sample_point_rows(points: torch.Tensor) -> torch.Tensor:
@@ -137,6 +180,35 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             (self.get_features_albedo(), self.features_specular), dim=1
         )
 
+    def _specular_feature_dim(self) -> int:
+        return sh_degree_to_specular_dim(
+            self.max_n_features
+        ) + _gabor_carrier_specular_dim(self.conf)
+
+    def _with_gabor_carrier_tail(
+        self,
+        features_specular: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_dim = self._specular_feature_dim()
+        if features_specular.shape[1] == expected_dim:
+            return features_specular
+        sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+        if (
+            _gabor_carrier_enabled(self.conf)
+            and features_specular.shape[1] == sh_dim
+        ):
+            tail = _initial_gabor_carrier_tail(
+                num_gaussians=features_specular.shape[0],
+                device=features_specular.device,
+                dtype=features_specular.dtype,
+                conf=self.conf,
+            )
+            return torch.cat((features_specular, tail), dim=1)
+        raise ValueError(
+            "Unexpected features_specular width: "
+            f"got {features_specular.shape[1]}, expected {expected_dim}."
+        )
+
     def get_scale(self, preactivation=False):
         if preactivation:
             return self.scale
@@ -215,7 +287,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 f"Clamping max_n_features to {render_sph_degree}."
             )
             sh_degree = render_sph_degree
-        specular_dim = sh_degree_to_specular_dim(sh_degree)
+        specular_dim = sh_degree_to_specular_dim(
+            sh_degree
+        ) + _gabor_carrier_specular_dim(conf)
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Positions of the 3D Gaussians (x, y, z) [n_gaussians, 3]
@@ -327,10 +401,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         if self.feature_type == "sh":
             assert self.features_albedo.shape == (num_gaussians, 3)
-            specular_sh_dims = sh_degree_to_specular_dim(self.max_n_features)
             assert self.features_specular.shape == (
                 num_gaussians,
-                specular_sh_dims,
+                self._specular_feature_dim(),
             )
         else:
             raise ValueError("Neural features not yet supported.")
@@ -637,13 +710,20 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         features_albedo = features_specular = None
         if self.feature_type == "sh":
             features_albedo = fused_color.contiguous()
-            max_sh_degree = self.max_n_features
-            num_specular_features = sh_degree_to_specular_dim(max_sh_degree)
+            num_specular_features = self._specular_feature_dim()
             features_specular = torch.zeros(
                 (num_gaussians, num_specular_features),
                 dtype=dtype,
                 device=self.device,
             ).contiguous()
+            if _gabor_carrier_enabled(self.conf):
+                sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+                features_specular[:, sh_dim:] = _initial_gabor_carrier_tail(
+                    num_gaussians=num_gaussians,
+                    device=self.device,
+                    dtype=dtype,
+                    conf=self.conf,
+                )
 
         dist = torch.clamp_min(
             nearest_neighbor_dist_cpuKD(fused_point_cloud), 1e-3
@@ -686,7 +766,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.scale = checkpoint["scale"]
         self.density = checkpoint["density"]
         self.features_albedo = checkpoint["features_albedo"]
-        self.features_specular = checkpoint["features_specular"]
+        self.features_specular = torch.nn.Parameter(
+            self._with_gabor_carrier_tail(checkpoint["features_specular"])
+        )
         if "rotation_activation" not in self.__dict__:
             self.rotation_activation = get_activation_function("normalize")
         self.n_active_features = checkpoint["n_active_features"]
@@ -796,8 +878,16 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
         N = positions.shape[0]
-        num_specular_dims = sh_degree_to_specular_dim(self.max_n_features)
+        num_specular_dims = self._specular_feature_dim()
         features_specular = torch.zeros((N, num_specular_dims))
+        if _gabor_carrier_enabled(self.conf):
+            sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+            features_specular[:, sh_dim:] = _initial_gabor_carrier_tail(
+                num_gaussians=N,
+                device=features_specular.device,
+                dtype=features_specular.dtype,
+                conf=self.conf,
+            )
 
         self.positions = torch.nn.Parameter(
             positions.to(dtype=dtype, device=self.device)
@@ -1089,16 +1179,24 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         extra_f_names = sorted(
             extra_f_names, key=lambda x: int(x.split("_")[-1])
         )
-        num_speculars = (self.max_n_features + 1) ** 2 - 1
-        expected_extra_f_count = 3 * num_speculars
+        sh_speculars = (self.max_n_features + 1) ** 2 - 1
+        sh_extra_f_count = 3 * sh_speculars
+        expected_extra_f_count = self._specular_feature_dim()
+        if len(extra_f_names) % 3 != 0:
+            raise ValueError(
+                "PLY f_rest_* properties must be packed as float3 slots; "
+                f"found {len(extra_f_names)} fields."
+            )
 
-        mogt_specular = np.zeros((num_gaussians, expected_extra_f_count))
-        if len(extra_f_names) == expected_extra_f_count:
-            # Full spherical harmonics data available
+        if len(extra_f_names) in {sh_extra_f_count, expected_extra_f_count}:
+            # Full spherical harmonics data available. Gabor-enabled PLYs append
+            # carrier slots after the SH coefficients.
+            mogt_specular = np.zeros((num_gaussians, len(extra_f_names)))
             for idx, attr_name in enumerate(extra_f_names):
                 mogt_specular[:, idx] = np.asarray(
                     plydata.elements[0][attr_name]
                 )
+            num_speculars = len(extra_f_names) // 3
             mogt_specular = mogt_specular.reshape(
                 (num_gaussians, 3, num_speculars)
             )
@@ -1107,14 +1205,24 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
         elif len(extra_f_names) == 0:
             # Only DC components available, create zero-filled higher-order harmonics
+            mogt_specular = np.zeros((num_gaussians, sh_extra_f_count))
             logger.info(
                 "PLY file only contains DC components, initializing higher-order spherical harmonics to zero"
             )
         else:
             # Partial data - this is unexpected
             raise ValueError(
-                f"Unexpected number of f_rest_ properties: found {len(extra_f_names)}, expected {expected_extra_f_count} or 0"
+                f"Unexpected number of f_rest_ properties: found {len(extra_f_names)}, expected {sh_extra_f_count}, {expected_extra_f_count}, or 0"
             )
+
+        mogt_specular_tensor = torch.tensor(
+            mogt_specular,
+            dtype=self.features_specular.dtype,
+            device=self.device,
+        )
+        mogt_specular_tensor = self._with_gabor_carrier_tail(
+            mogt_specular_tensor
+        )
 
         scale_names = [
             p.name
@@ -1149,11 +1257,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
         )
         self.features_specular = torch.nn.Parameter(
-            torch.tensor(
-                mogt_specular,
-                dtype=self.features_specular.dtype,
-                device=self.device,
-            )
+            mogt_specular_tensor
         )
         self.density = torch.nn.Parameter(
             torch.tensor(

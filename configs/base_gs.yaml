@@ -134,6 +134,9 @@ model:
   optimize_position: true
   optimize_rotation: true
   optimize_scale: true
+  use_gabor_carrier: false
+  gabor_num_terms: 3
+  gabor_max_frequency: 4.0
   bvh_update_frequency: 1
   progressive_training:
     feature_type: "sh" # one of [sh, mlp], currently only sh supported

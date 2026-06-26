@@ -52,7 +52,7 @@ struct TGUTProjectorParams {
     static constexpr bool TightOpacityBounding   = GAUSSIAN_TIGHT_OPACITY_BOUNDING;
     static constexpr bool RectBounding           = GAUSSIAN_RECT_BOUNDING;
     static constexpr bool TileCulling            = GAUSSIAN_TILE_BASED_CULLING;
-    static constexpr bool PerRayParticleFeatures = false;
+    static constexpr bool PerRayParticleFeatures = GAUSSIAN_PER_RAY_PARTICLE_FEATURES;
     static constexpr float MaxDepthValue         = 3.4028235e+38;
     static constexpr bool GlobalZOrder           = GAUSSIAN_GLOBAL_Z_ORDER;
     static constexpr bool BackwardProjection     = false; // m_settings.renderMode == Settings::Splat

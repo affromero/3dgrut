@@ -116,11 +116,12 @@ struct GUTKBufferRenderer : Params {
         if constexpr (Backward) {
             float hitAlphaGrad = 0.f;
             if constexpr (Params::PerRayParticleFeatures) {
-                particles.featuresIntegrateBwdToBuffer<false>(ray.direction,
+                particles.featuresIntegrateBwdToBuffer<false>(ray.origin,
+                                                              ray.direction,
                                                               hitParticle.alpha,
                                                               hitAlphaGrad,
                                                               hitParticle.idx,
-                                                              particles.featuresFromBuffer(hitParticle.idx, ray.direction),
+                                                              particles.featuresFromBuffer(hitParticle.idx, ray.origin, ray.direction),
                                                               ray.featuresBackward,
                                                               ray.featuresGradient);
             } else {
@@ -158,7 +159,7 @@ struct GUTKBufferRenderer : Params {
                                               ray.hitT);
 
             particles.featureIntegrateFwd(hitWeight,
-                                          Params::PerRayParticleFeatures ? particles.featuresFromBuffer(hitParticle.idx, ray.direction) : tcnn::max(particleFeatures[hitParticle.idx], 0.f),
+                                          Params::PerRayParticleFeatures ? particles.featuresFromBuffer(hitParticle.idx, ray.origin, ray.direction) : tcnn::max(particleFeatures[hitParticle.idx], 0.f),
                                           ray.features);
 
             if (hitWeight > 0.0f)
@@ -206,7 +207,7 @@ struct GUTKBufferRenderer : Params {
             particles.initializeFeaturesGradient(parametersGradient);
         }
 
-        if constexpr (Backward && (Params::KHitBufferSize == 0)) {
+        if constexpr (Backward && (Params::KHitBufferSize == 0) && !Params::PerRayParticleFeatures) {
             evalBackwardNoKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
                                   sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
         } else {
@@ -374,7 +375,7 @@ struct GUTKBufferRenderer : Params {
 
                         // Get Gaussian features
                         if constexpr (Params::PerRayParticleFeatures) {
-                            hitFeatures = particles.featuresFromBuffer(particleIdx, ray.direction);
+                            hitFeatures = particles.featuresFromBuffer(particleIdx, ray.origin, ray.direction);
                         } else {
                             hitFeatures = tcnn::max(particleFeaturesBuffer[particleIdx], 0.f);
                         }

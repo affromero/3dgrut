@@ -72,11 +72,21 @@ class PLYExporter(ModelExporter):
         # Create normal vectors (placeholder, pointing up)
         mogt_nrm = np.repeat(np.array([[0, 0, 1]], dtype=np.float32), repeats=num_gaussians, axis=0)
 
-        # Reshape specular coefficients for PLY format (channel-major layout)
-        # From [N, M*3] to [N, M, 3] to [N, 3, M] to [N, M*3] (channel-major)
-        num_speculars = (accessor.get_max_sh_degree() + 1) ** 2 - 1
-        mogt_specular = attrs.specular.reshape((num_gaussians, num_speculars, 3))
-        mogt_specular = mogt_specular.transpose(0, 2, 1).reshape((num_gaussians, num_speculars * 3))
+        # Reshape specular coefficients for PLY format (channel-major layout).
+        # Extra carrier slots are stored after the SH slots and use the same
+        # float3 coefficient packing.
+        if attrs.specular.shape[1] % 3 != 0:
+            raise ValueError(
+                "PLY export requires specular features packed as float3 slots; "
+                f"got width {attrs.specular.shape[1]}."
+            )
+        num_speculars = attrs.specular.shape[1] // 3
+        mogt_specular = attrs.specular.reshape(
+            (num_gaussians, num_speculars, 3)
+        )
+        mogt_specular = mogt_specular.transpose(0, 2, 1).reshape(
+            (num_gaussians, num_speculars * 3)
+        )
 
         # Build PLY dtype
         dtype_full = [

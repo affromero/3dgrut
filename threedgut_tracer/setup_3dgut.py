@@ -45,8 +45,26 @@ def setup_3dgut(conf):
     ut_kappa = conf.render.splat.ut_kappa
     ut_delta = math.sqrt(ut_alpha * ut_alpha * (ut_d + ut_kappa))
 
+    radiance_sh_coeffs = (conf.render.particle_radiance_sph_degree + 1) ** 2
+    gabor_enabled = bool(conf.model.get("use_gabor_carrier", False))
+    gabor_num_terms = int(conf.model.get("gabor_num_terms", 3))
+    if gabor_enabled and gabor_num_terms != 3:
+        raise ValueError(
+            "model.gabor_num_terms currently supports exactly 3 terms; "
+            f"got {gabor_num_terms}."
+        )
+    gabor_coeffs = gabor_num_terms + 3 if gabor_enabled else 0
+    radiance_coeffs = radiance_sh_coeffs + gabor_coeffs
+    per_ray_particle_features = gabor_enabled or bool(
+        conf.render.splat.get("per_ray_particle_features", False)
+    )
+
     defines = [
-        f"-DPARTICLE_RADIANCE_NUM_COEFFS={(conf.render.particle_radiance_sph_degree + 1) ** 2}",
+        f"-DPARTICLE_RADIANCE_NUM_COEFFS={radiance_coeffs}",
+        f"-DPARTICLE_RADIANCE_NUM_SH_COEFFS={radiance_sh_coeffs}",
+        f"-DPARTICLE_RADIANCE_GABOR_ENABLED={to_cpp_bool(gabor_enabled)}",
+        f"-DPARTICLE_RADIANCE_GABOR_NUM_TERMS={gabor_num_terms}",
+        f"-DPARTICLE_RADIANCE_GABOR_MAX_FREQUENCY={float(conf.model.get('gabor_max_frequency', 4.0))}",
         f"-DGAUSSIAN_PARTICLE_KERNEL_DEGREE={conf.render.particle_kernel_degree}",
         f"-DGAUSSIAN_PARTICLE_MIN_KERNEL_DENSITY={conf.render.particle_kernel_min_response}",
         f"-DGAUSSIAN_PARTICLE_MIN_ALPHA={conf.render.particle_kernel_min_alpha}",
@@ -59,6 +77,7 @@ def setup_3dgut(conf):
         f"-DGAUSSIAN_N_ROLLING_SHUTTER_ITERATIONS={conf.render.splat.n_rolling_shutter_iterations}",
         f"-DGAUSSIAN_K_BUFFER_SIZE={conf.render.splat.k_buffer_size}",
         f"-DGAUSSIAN_GLOBAL_Z_ORDER={to_cpp_bool(conf.render.splat.global_z_order)}",
+        f"-DGAUSSIAN_PER_RAY_PARTICLE_FEATURES={to_cpp_bool(per_ray_particle_features)}",
         f"-DFINE_GRAINED_LOAD_BALANCING={to_cpp_bool(getattr(conf.render.splat, 'fine_grained_load_balancing', False))}",
         # -- Unscented Transform --
         f"-DGAUSSIAN_UT_ALPHA={ut_alpha}",
