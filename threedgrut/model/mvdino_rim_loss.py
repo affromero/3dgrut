@@ -1,6 +1,5 @@
 """MV-DINO feature losses for native fisheye rim supervision."""
 
-import argparse
 import importlib
 import math
 import os
@@ -19,8 +18,19 @@ _IMAGENET_STD = (0.229, 0.224, 0.225)
 _DINO_INPUT_SIZE = 518
 
 
+class _SafeConfig:
+    """Attribute config object for MVFM model construction."""
+
+    def __init__(self, **kwargs: object) -> None:
+        self.__dict__.update(kwargs)
+
+    def __getattr__(self, name: str) -> object:
+        """MVFM configs probe optional flags through namespace attributes."""
+        return False
+
+
 class _ModelFactory(Protocol):
-    def __call__(self, args: argparse.Namespace) -> torch.nn.Module:
+    def __call__(self, args: _SafeConfig) -> torch.nn.Module:
         """Build the MV-DINO model."""
 
 
@@ -37,12 +47,6 @@ class _CheckpointLoader(Protocol):
 class _CheckpointFactory(Protocol):
     def __call__(self, checkpoint_dir: str) -> _CheckpointLoader:
         """Build the MV-DINO checkpoint loader."""
-
-
-class _SafeNamespace(argparse.Namespace):
-    def __getattr__(self, name: str) -> bool:
-        """MVFM configs probe optional flags through namespace attributes."""
-        return False
 
 
 def _resolve_exp_dir(exp_dir: str | None) -> str:
@@ -91,6 +95,15 @@ def _load_mvdino(
     if not isinstance(raw_args, dict):
         msg = f"MV-DINO args file at {args_path} must contain a mapping."
         raise TypeError(msg)
+    config_kwargs: dict[str, object] = {}
+    for key, value in raw_args.items():
+        if not isinstance(key, str):
+            msg = (
+                "MV-DINO args file keys must be strings; "
+                f"found {type(key).__name__} at {args_path}."
+            )
+            raise TypeError(msg)
+        config_kwargs[key] = value
 
     model_factory = cast(
         _ModelFactory,
@@ -100,7 +113,7 @@ def _load_mvdino(
         _CheckpointFactory,
         checkpointing.CheckPoint,
     )
-    model = model_factory(_SafeNamespace(**raw_args)).to(device)
+    model = model_factory(_SafeConfig(**config_kwargs)).to(device)
     checkpoint_dir = path_join(model_root, "checkpoints")
     model = checkpoint_factory(checkpoint_dir).load_model(model, latest=False)
     model.eval()
