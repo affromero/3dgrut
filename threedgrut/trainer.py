@@ -43,6 +43,10 @@ from threedgrut.datasets.utils import (
     PointCloud,
 )
 from threedgrut.model.losses import ssim
+from threedgrut.model.mvdino_rim_loss import (
+    mvdino_feature_rim_loss,
+    mvdino_rim_crop_loss,
+)
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.post_processing import LuminanceAffine
@@ -3450,6 +3454,65 @@ class Trainer3DGRUT:
                 ).sum() / rim_denom
                 lambda_rim = float(self.conf.loss.lambda_rim)
 
+        # --- MV-DINO feature rim loss -------------------------------------
+        loss_mvdino_rim = torch.zeros(1, device=self.device)
+        lambda_mvdino_rim = 0.0
+        if self.conf.loss.get("use_mvdino_rim", False):
+            with torch.cuda.nvtx.range("loss-mvdino-rim"):
+                use_rim_crops = bool(
+                    self.conf.loss.get("mvdino_use_rim_crops", False)
+                )
+                exp_dir = self.conf.loss.get("mvdino_exp_dir")
+                exp_dir = str(exp_dir) if exp_dir else None
+                model_name = str(
+                    self.conf.loss.get("mvdino_model_name", "dinov2_reg")
+                )
+                shared_kwargs = {
+                    "rgb_pred": rgb_pred,
+                    "rgb_gt": rgb_gt,
+                    "rays_dir": gpu_batch.rays_dir,
+                    "t_to_world": gpu_batch.T_to_world,
+                    "depth_ray_z": getattr(gpu_batch, "depth_ray_z", None),
+                    "mask": mask,
+                    "theta_min_deg": float(
+                        self.conf.loss.get(
+                            "mvdino_rim_theta_min_deg", 60.0
+                        )
+                    ),
+                    "theta_max_deg": float(
+                        self.conf.loss.get(
+                            "mvdino_rim_theta_max_deg", 80.0
+                        )
+                    ),
+                    "exp_dir": exp_dir,
+                    "name": model_name,
+                }
+                if use_rim_crops:
+                    loss_mvdino_rim = mvdino_rim_crop_loss(
+                        **shared_kwargs,
+                        n_crops=int(self.conf.loss.get("mvdino_n_crops", 8)),
+                        crop=int(self.conf.loss.get("mvdino_crop_px", 518)),
+                    )
+                else:
+                    loss_mvdino_rim = mvdino_feature_rim_loss(
+                        **shared_kwargs,
+                        use_feature_upsampler=bool(
+                            self.conf.loss.get("mvdino_use_anyup", False)
+                        ),
+                        upsampled_feature_size=int(
+                            self.conf.loss.get("mvdino_anyup_res", 512)
+                        ),
+                    )
+                lambda_mvdino_rim = float(
+                    self.conf.loss.get("lambda_mvdino_rim", 0.0)
+                )
+                warmup_iters = int(
+                    self.conf.loss.get("mvdino_warmup_iters", 3000)
+                )
+                if warmup_iters > 0:
+                    warmup_scale = min(1.0, self.global_step / warmup_iters)
+                    lambda_mvdino_rim *= warmup_scale
+
         # Total loss
         camera_loss_weight = torch.ones(1, device=self.device)
         if self.conf.loss.use_camera_loss_weights:
@@ -3474,6 +3537,7 @@ class Trainer3DGRUT:
             + lambda_sky_opacity * loss_sky_opacity
             + lambda_depth * loss_depth
             + lambda_rim * loss_rim
+            + lambda_mvdino_rim * loss_mvdino_rim
         )
         loss = loss * camera_loss_weight
         return dict(
@@ -3490,6 +3554,8 @@ class Trainer3DGRUT:
             depth_loss_raw=loss_depth,
             rim_loss=lambda_rim * loss_rim,
             rim_loss_raw=loss_rim,
+            mvdino_rim_loss=lambda_mvdino_rim * loss_mvdino_rim,
+            mvdino_rim_loss_raw=loss_mvdino_rim,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")

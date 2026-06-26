@@ -230,6 +230,20 @@ loss:
   rim_centre_anchor: true
   rim_detach_affine: false  # diagnostic: detach the centre-anchor fit so the loss cannot co-adapt the eval calibration (isolates the metric artifact)
 
+  # MV-DINO multi-view-consistent feature rim loss.
+  use_mvdino_rim: false
+  lambda_mvdino_rim: 0.0
+  mvdino_model_name: dinov2_reg
+  mvdino_rim_theta_min_deg: 60.0
+  mvdino_rim_theta_max_deg: 80.0
+  mvdino_exp_dir: null
+  mvdino_warmup_iters: 3000
+  mvdino_use_rim_crops: false
+  mvdino_n_crops: 8
+  mvdino_crop_px: 518
+  mvdino_use_anyup: false
+  mvdino_anyup_res: 512
+
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp", "luminance_affine"
