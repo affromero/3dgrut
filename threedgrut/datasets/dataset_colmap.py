@@ -1226,12 +1226,13 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "pixel_coords": pixel_coords,
         }
 
+        sample["depth_ray_z"] = torch.abs(rays_dir[..., 2:3])
+
         if "depth_gt" in batch:
             depth_gt = batch["depth_gt"][0].to(
                 self.device, non_blocking=True
             )
             sample["depth_gt"] = depth_gt
-            sample["depth_ray_z"] = torch.abs(rays_dir[..., 2:3])
 
         if "pose_end" in batch:
             sample["T_to_world_end"] = batch["pose_end"][0].to(
