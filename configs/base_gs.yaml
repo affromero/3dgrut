@@ -51,6 +51,7 @@ early_stopping:
   metric: masked_psnr_if_available
   patience: 3
   min_delta: 0.0
+  min_step: 0
   min_score: 0.0
   min_score_after_step: 0
   restore_best_on_end: true
