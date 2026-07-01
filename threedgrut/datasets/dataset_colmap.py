@@ -143,6 +143,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self._camera_id_to_idx = {
             cam_id: idx for idx, cam_id in enumerate(sorted_camera_ids)
         }
+        physical_camera_keys = sorted(
+            {
+                self._post_processing_camera_key(extr)
+                for extr in self.cam_extrinsics
+            }
+        )
+        self._post_processing_camera_key_to_idx = {
+            key: idx for idx, key in enumerate(physical_camera_keys)
+        }
 
         self.n_frames = len(self.cam_extrinsics)
         self.load_camera_data()
@@ -1011,6 +1020,25 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         colmap_camera_id = self.cam_extrinsics[frame_idx].camera_id
         return self._camera_id_to_idx[colmap_camera_id]
 
+    @staticmethod
+    def _post_processing_camera_key(extrinsic) -> str:
+        """Return the physical camera key for appearance post-processing."""
+        parent = os.path.dirname(extrinsic.name.replace("\\", "/"))
+        return parent if parent else "camera_0"
+
+    def get_post_processing_camera_idx(self, frame_idx: int) -> int:
+        """Return the physical-camera index for PPISP-style corrections."""
+        key = self._post_processing_camera_key(self.cam_extrinsics[frame_idx])
+        return self._post_processing_camera_key_to_idx[key]
+
+    def get_post_processing_frames_per_camera(self) -> list[int]:
+        """Return split frame counts grouped by physical camera."""
+        counts = [0] * len(self._post_processing_camera_key_to_idx)
+        for extr in self.cam_extrinsics:
+            key = self._post_processing_camera_key(extr)
+            counts[self._post_processing_camera_key_to_idx[key]] += 1
+        return counts
+
     def get_frames_per_camera(self) -> list[int]:
         """Return list of frame counts per camera.
 
@@ -1093,6 +1121,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "pose": torch.tensor(self.poses[idx]).unsqueeze(0),
             "intr": self.get_intrinsics_idx(idx),
             "camera_idx": self.get_camera_idx(idx),
+            "post_processing_camera_idx": self.get_post_processing_camera_idx(
+                idx
+            ),
             "frame_idx": idx,
             "sequence_idx": self._sequence_idx_from_path(
                 self.image_paths[idx]
@@ -1220,6 +1251,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "T_to_world": pose,
             f"intrinsics_{camera_name}": camera_params_dict,
             "camera_idx": int(self._first_scalar(batch["camera_idx"])),
+            "post_processing_camera_idx": int(
+                self._first_scalar(batch["post_processing_camera_idx"])
+            ),
             "frame_idx": int(self._first_scalar(batch["frame_idx"])),
             "sequence_idx": int(self._first_scalar(batch["sequence_idx"])),
             "image_path": batch["image_path"][0],

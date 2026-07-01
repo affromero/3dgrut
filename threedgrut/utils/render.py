@@ -114,7 +114,9 @@ def apply_post_processing(
     )
 
     pred_rgb = outputs["pred_rgb"]
-    camera_idx = gpu_batch.camera_idx
+    camera_idx = getattr(
+        gpu_batch, "post_processing_camera_idx", gpu_batch.camera_idx
+    )
     frame_idx = gpu_batch.frame_idx if training else -1
     sequence_idx = getattr(gpu_batch, "sequence_idx", -1)
     H, W = pred_rgb.shape[1], pred_rgb.shape[2]
@@ -130,15 +132,20 @@ def apply_post_processing(
         residual_grid_gate = _residual_grid_edge_gate(outputs)
         if residual_grid_gate is not None:
             residual_grid_gate = residual_grid_gate.contiguous().view(-1)
+    post_processing_kwargs = {
+        "resolution": (W, H),
+        "camera_idx": camera_idx,
+        "frame_idx": frame_idx,
+        "exposure_prior": gpu_batch.exposure,
+    }
+    if hasattr(post_processing, "use_temporal_affine"):
+        post_processing_kwargs["sequence_idx"] = sequence_idx
+    if getattr(post_processing, "use_residual_grid_edge_gate", False):
+        post_processing_kwargs["residual_grid_gate"] = residual_grid_gate
     pred_rgb_pp = post_processing(
         pred_rgb_flat,
         pixel_coords_flat,
-        resolution=(W, H),
-        camera_idx=camera_idx,
-        frame_idx=frame_idx,
-        sequence_idx=sequence_idx,
-        exposure_prior=gpu_batch.exposure,
-        residual_grid_gate=residual_grid_gate,
+        **post_processing_kwargs,
     )
 
     # Reshape back: [H*W, 3] -> [1, H, W, 3]

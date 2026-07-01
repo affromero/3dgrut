@@ -1441,6 +1441,51 @@ class Trainer3DGRUT:
     _distillation_start_step: int = -1
     """ Step at which distillation starts (-1 means disabled) """
 
+    _latest_training_psnr: float | None = None
+    """Most recent training-batch PSNR."""
+
+    _latest_training_masked_psnr: float | None = None
+    """Most recent training-batch masked PSNR."""
+
+    _latest_training_metric_step: int | None = None
+    """Step for the most recent training-batch PSNR metrics."""
+
+    _training_psnr_window_sum: float = 0.0
+    """Sum of training-batch PSNR values since the previous validation."""
+
+    _training_masked_psnr_window_sum: float = 0.0
+    """Sum of training-batch masked PSNR values since validation."""
+
+    _training_psnr_window_count: int = 0
+    """Count of training-batch PSNR values since validation."""
+
+    _training_masked_psnr_window_count: int = 0
+    """Count of training-batch masked PSNR values since validation."""
+
+    _training_metric_window_start_step: int | None = None
+    """First training step included in the active PSNR window."""
+
+    _validation_training_psnr: float | None = None
+    """Training-window PSNR snapshot for the current validation."""
+
+    _validation_training_masked_psnr: float | None = None
+    """Training-window masked PSNR snapshot for the current validation."""
+
+    _validation_train_probe_psnr: float | None = None
+    """Current-model train-probe PSNR for the current validation."""
+
+    _validation_train_probe_masked_psnr: float | None = None
+    """Current-model train-probe masked PSNR for the current validation."""
+
+    _validation_train_probe_count: int = 0
+    """Number of train views used for the current validation probe."""
+
+    _validation_training_window_start_step: int | None = None
+    """First training step included in the current validation snapshot."""
+
+    _validation_training_window_end_step: int | None = None
+    """Last training step included in the current validation snapshot."""
+
     @staticmethod
     def create_from_checkpoint(resume: str, conf: DictConfig):
         """Create a new trainer from a checkpoint file"""
@@ -1893,7 +1938,12 @@ class Trainer3DGRUT:
         if method == "ppisp":
             from ppisp import PPISP, PPISPConfig
 
-            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            frames_per_camera_fn = getattr(
+                self.train_dataset,
+                "get_post_processing_frames_per_camera",
+                self.train_dataset.get_frames_per_camera,
+            )
+            frames_per_camera = frames_per_camera_fn()
             num_cameras = len(frames_per_camera)
             num_frames = sum(frames_per_camera)
 
@@ -3073,13 +3123,7 @@ class Trainer3DGRUT:
                 metrics["valid_hit_coverage"] = hit_mask.mean().item()
                 metrics["valid_opacity_coverage"] = opacity_mask.mean().item()
 
-        if is_compute_validation_metrics:
-            metrics["camera_idx"] = int(gpu_batch.camera_idx)
-            source_scan_id = source_scan_id_from_image_path(
-                image_path=str(gpu_batch.image_path),
-                camera_idx=int(gpu_batch.camera_idx),
-            )
-            metrics["source_scan_id"] = source_scan_id or ""
+        if split in ("training", "validation"):
             with torch.cuda.nvtx.range("criterions_psnr"):
                 metrics["psnr"] = psnr(rgb_pred, rgb_gt).item()
                 if gpu_batch.mask is not None:
@@ -3094,6 +3138,14 @@ class Trainer3DGRUT:
                         -10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))
                     ).item()
                     metrics["mask_coverage"] = mask.mean().item()
+
+        if is_compute_validation_metrics:
+            metrics["camera_idx"] = int(gpu_batch.camera_idx)
+            source_scan_id = source_scan_id_from_image_path(
+                image_path=str(gpu_batch.image_path),
+                camera_idx=int(gpu_batch.camera_idx),
+            )
+            metrics["source_scan_id"] = source_scan_id or ""
 
             rgb_gt_full = rgb_gt.permute(0, 3, 1, 2)
             pred_rgb_full = rgb_pred.permute(0, 3, 1, 2)
@@ -3682,6 +3734,7 @@ class Trainer3DGRUT:
         """
         writer = self.tracking.writer
         global_step = self.global_step
+        self._snapshot_training_metric_window()
 
         if "img_eval_tiles" in metrics and "eval_image_path" in metrics:
             jpg_dir = os.path.join(
@@ -3775,12 +3828,46 @@ class Trainer3DGRUT:
                 f"worst={psnr_values[worst_idx]:.2f} "
                 f"({os.path.basename(eval_paths[worst_idx])})"
             )
+        train_psnr = self._validation_training_metric("psnr")
+        if train_psnr is not None:
+            train_val_gap = train_psnr - mean_psnr
+            writer.add_scalar(
+                "generalization/train_psnr",
+                train_psnr,
+                global_step,
+            )
+            writer.add_scalar(
+                "generalization/psnr_gap_train_minus_val",
+                train_val_gap,
+                global_step,
+            )
+            if self._validation_train_probe_count > 0:
+                source = f"train-probe n={self._validation_train_probe_count}"
+            else:
+                source = (
+                    "train-window steps "
+                    f"{self._validation_training_window_start_step}-"
+                    f"{self._validation_training_window_end_step}"
+                )
+            logger.info(
+                f"val PSNR mean={mean_psnr:.2f}; {source} "
+                f"PSNR={train_psnr:.2f}; "
+                f"train-val gap={train_val_gap:.2f}"
+            )
+        train_window_psnr = self._validation_training_psnr
+        if train_window_psnr is not None:
+            writer.add_scalar(
+                "generalization/train_window_psnr",
+                train_window_psnr,
+                global_step,
+            )
         if "masked_psnr" in metrics:
             masked_values = np.asarray(
                 metrics["masked_psnr"], dtype=np.float64
             )
+            mean_masked_psnr = float(masked_values.mean())
             writer.add_scalar(
-                "val/masked_psnr", float(masked_values.mean()), global_step
+                "val/masked_psnr", mean_masked_psnr, global_step
             )
             writer.add_scalar(
                 "val/masked_psnr_best_view",
@@ -3792,6 +3879,30 @@ class Trainer3DGRUT:
                 float(masked_values.min()),
                 global_step,
             )
+            train_masked_psnr = self._validation_training_metric(
+                "masked_psnr"
+            )
+            if train_masked_psnr is not None:
+                masked_gap = train_masked_psnr - mean_masked_psnr
+                writer.add_scalar(
+                    "generalization/train_masked_psnr",
+                    train_masked_psnr,
+                    global_step,
+                )
+                writer.add_scalar(
+                    "generalization/masked_psnr_gap_train_minus_val",
+                    masked_gap,
+                    global_step,
+                )
+            train_window_masked_psnr = (
+                self._validation_training_masked_psnr
+            )
+            if train_window_masked_psnr is not None:
+                writer.add_scalar(
+                    "generalization/train_window_masked_psnr",
+                    train_window_masked_psnr,
+                    global_step,
+                )
         if "mask_coverage" in metrics:
             writer.add_scalar(
                 "val/mask_coverage",
@@ -4131,6 +4242,42 @@ class Trainer3DGRUT:
                 "radial_rim_edge_energy_ratio",
             )
         }
+        train_psnr = self._validation_training_metric("psnr")
+        if train_psnr is not None:
+            table["train_psnr"] = train_psnr
+            table["psnr_gap_train_minus_val"] = train_psnr - mean_psnr
+        if self._validation_train_probe_psnr is not None:
+            table["train_probe_psnr"] = self._validation_train_probe_psnr
+            table["train_probe_count"] = float(
+                self._validation_train_probe_count
+            )
+        train_window_psnr = self._validation_training_psnr
+        if train_window_psnr is not None:
+            table["train_window_psnr"] = train_window_psnr
+            table["train_window_steps"] = (
+                f"{self._validation_training_window_start_step}-"
+                f"{self._validation_training_window_end_step}"
+            )
+        if "masked_psnr" in table:
+            train_masked_psnr = self._validation_training_metric(
+                "masked_psnr"
+            )
+            if train_masked_psnr is not None:
+                table["train_masked_psnr"] = train_masked_psnr
+                table["masked_psnr_gap_train_minus_val"] = (
+                    train_masked_psnr - float(table["masked_psnr"])
+                )
+            if self._validation_train_probe_masked_psnr is not None:
+                table["train_probe_masked_psnr"] = (
+                    self._validation_train_probe_masked_psnr
+                )
+            train_window_masked_psnr = (
+                self._validation_training_masked_psnr
+            )
+            if train_window_masked_psnr is not None:
+                table["train_window_masked_psnr"] = (
+                    train_window_masked_psnr
+                )
         for time_key in mean_timings:
             table[time_key] = f"{f'{mean_timings[time_key]:.2f}'}" + " ms/it"
         summary_path = os.path.join(
@@ -4215,6 +4362,80 @@ class Trainer3DGRUT:
             raise ValueError(msg)
         return self.global_step >= min_score_after_step and score < min_score
 
+    def _is_waiting_for_ppisp_distillation(self) -> bool:
+        """Return whether PPISP is before controller distillation."""
+        return (
+            self.post_processing is not None
+            and self._distillation_start_step >= 0
+            and self.global_step < self._distillation_start_step
+        )
+
+    def _snapshot_training_metric_window(self) -> None:
+        """Capture train-window PSNR values for the current validation."""
+        self._validation_training_window_start_step = (
+            self._training_metric_window_start_step
+        )
+        self._validation_training_window_end_step = (
+            self._latest_training_metric_step
+        )
+        if self._training_psnr_window_count > 0:
+            self._validation_training_psnr = (
+                self._training_psnr_window_sum
+                / self._training_psnr_window_count
+            )
+        else:
+            self._validation_training_psnr = None
+        if self._training_masked_psnr_window_count > 0:
+            self._validation_training_masked_psnr = (
+                self._training_masked_psnr_window_sum
+                / self._training_masked_psnr_window_count
+            )
+        else:
+            self._validation_training_masked_psnr = None
+
+    def _reset_training_metric_window(self) -> None:
+        """Reset train-window PSNR accumulation after validation."""
+        self._training_psnr_window_sum = 0.0
+        self._training_masked_psnr_window_sum = 0.0
+        self._training_psnr_window_count = 0
+        self._training_masked_psnr_window_count = 0
+        self._training_metric_window_start_step = None
+
+    def _validation_training_metric(self, metric_name: str) -> float | None:
+        """Return the current-model training metric for validation logs."""
+        if metric_name == "masked_psnr":
+            if self._validation_train_probe_masked_psnr is not None:
+                return self._validation_train_probe_masked_psnr
+            return self._validation_training_masked_psnr
+        if metric_name == "psnr":
+            if self._validation_train_probe_psnr is not None:
+                return self._validation_train_probe_psnr
+            return self._validation_training_psnr
+        return None
+
+    def _training_metric_suffix(
+        self,
+        metric_name: str,
+        validation_score: float,
+    ) -> str:
+        """Format train-window metric context for validation logs."""
+        training_score = self._validation_training_metric(metric_name)
+        if training_score is None:
+            return ""
+        gap = training_score - validation_score
+        if self._validation_train_probe_count > 0:
+            source = f"train-probe n={self._validation_train_probe_count}"
+        else:
+            source = (
+                "train-window steps "
+                f"{self._validation_training_window_start_step}-"
+                f"{self._validation_training_window_end_step}"
+            )
+        return (
+            f"; {source} {metric_name}={training_score:.6f}; "
+            f"train-val gap={gap:.6f}"
+        )
+
     def _handle_validation_checkpointing(
         self, metrics: dict[str, list[float]]
     ) -> None:
@@ -4233,11 +4454,19 @@ class Trainer3DGRUT:
             early_stopping_conf.get("enabled", False)
         ):
             return
+        if self._is_waiting_for_ppisp_distillation():
+            logger.info(
+                "Deferring PPISP best-checkpoint and early-stopping update "
+                f"at step {self.global_step}; controller distillation starts "
+                f"at step {self._distillation_start_step}."
+            )
+            return
 
         score = self._validation_checkpoint_score(metrics)
         metric_name = str(early_stopping_conf.get("metric", "masked_psnr"))
         if metric_name == EARLY_STOPPING_AUTO_PSNR_METRIC:
             metric_name = "masked_psnr" if "masked_psnr" in metrics else "psnr"
+        training_suffix = self._training_metric_suffix(metric_name, score)
         if self._is_best_validation_score(score):
             self._best_validation_score = score
             self._best_validation_step = self.global_step
@@ -4247,7 +4476,7 @@ class Trainer3DGRUT:
                 )
             logger.info(
                 f"Best validation {metric_name}={score:.6f} "
-                f"at step {self.global_step}"
+                f"at step {self.global_step}{training_suffix}"
             )
         if self._best_validation_score is not None:
             self.tracking.writer.add_scalar(
@@ -4268,7 +4497,7 @@ class Trainer3DGRUT:
                 "Early stopping score floor triggered at step "
                 f"{self.global_step}; {metric_name}={score:.6f}, "
                 f"required >= {min_score:.6f} after step "
-                f"{min_score_after_step}."
+                f"{min_score_after_step}{training_suffix}."
             )
             return
 
@@ -4293,6 +4522,7 @@ class Trainer3DGRUT:
             f"Validation {metric_name}={score:.6f} did not clear "
             f"early-stopping min_delta from {reference_score:.6f}; "
             f"stale validations: {self._stale_validation_count}/{patience}"
+            f"{training_suffix}"
         )
         if (
             bool(early_stopping_conf.get("enabled", False))
@@ -4363,6 +4593,19 @@ class Trainer3DGRUT:
         """
         writer = self.tracking.writer
         global_step = self.global_step
+        if "psnr" in batch_metrics:
+            training_psnr = float(batch_metrics["psnr"])
+            self._latest_training_psnr = training_psnr
+            self._latest_training_metric_step = global_step
+            if self._training_metric_window_start_step is None:
+                self._training_metric_window_start_step = global_step
+            self._training_psnr_window_sum += training_psnr
+            self._training_psnr_window_count += 1
+        if "masked_psnr" in batch_metrics:
+            training_masked_psnr = float(batch_metrics["masked_psnr"])
+            self._latest_training_masked_psnr = training_masked_psnr
+            self._training_masked_psnr_window_sum += training_masked_psnr
+            self._training_masked_psnr_window_count += 1
 
         if (
             self.conf.enable_writer
@@ -4457,6 +4700,12 @@ class Trainer3DGRUT:
             if "psnr" in batch_metrics:
                 writer.add_scalar(
                     "train/psnr", batch_metrics["psnr"], self.global_step
+                )
+            if "masked_psnr" in batch_metrics:
+                writer.add_scalar(
+                    "train/masked_psnr",
+                    batch_metrics["masked_psnr"],
+                    self.global_step,
                 )
             if "ssim" in batch_metrics:
                 writer.add_scalar(
@@ -4655,20 +4904,34 @@ class Trainer3DGRUT:
             logger.info("📊 Exporting PPISP report...")
 
             ppisp_report_dir = Path(out_dir) / "ppisp_report"
-            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            frames_per_camera_fn = getattr(
+                self.train_dataset,
+                "get_post_processing_frames_per_camera",
+                self.train_dataset.get_frames_per_camera,
+            )
+            frames_per_camera = frames_per_camera_fn()
 
             # Get camera names if available
             camera_names = None
             if hasattr(self.train_dataset, "get_camera_names"):
-                camera_names = self.train_dataset.get_camera_names()
+                dataset_camera_names = self.train_dataset.get_camera_names()
+                if len(dataset_camera_names) == len(frames_per_camera):
+                    camera_names = dataset_camera_names
 
-            export_ppisp_report(
-                self.post_processing,
-                frames_per_camera=frames_per_camera,
-                output_dir=ppisp_report_dir,
-                camera_names=camera_names,
-            )
-            logger.info(f"📊 PPISP report saved to: {ppisp_report_dir}")
+            try:
+                export_ppisp_report(
+                    self.post_processing,
+                    frames_per_camera=frames_per_camera,
+                    output_dir=ppisp_report_dir,
+                    camera_names=camera_names,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PPISP report export failed; checkpoints and exported "
+                    f"model artifacts are still valid: {exc}"
+                )
+            else:
+                logger.info(f"📊 PPISP report saved to: {ppisp_report_dir}")
 
         self._compute_loss_volume_if_enabled()
         self.teardown_dataloaders()
@@ -5433,6 +5696,73 @@ class Trainer3DGRUT:
 
         self.log_training_pass(metrics)
 
+    @torch.cuda.nvtx.range("run_training_probe_pass")
+    def run_training_probe_pass(self, conf: DictConfig) -> None:
+        """Evaluate current-model PSNR on a deterministic train subset."""
+        view_count = int(
+            conf.writer.get("train_eval_count", len(self.val_dataloader))
+        )
+        if view_count <= 0:
+            self._validation_train_probe_psnr = None
+            self._validation_train_probe_masked_psnr = None
+            self._validation_train_probe_count = 0
+            return
+        view_count = min(view_count, len(self.train_dataset))
+        psnr_values: list[float] = []
+        masked_psnr_values: list[float] = []
+        logger.info(
+            f"Step {self.global_step} -- Running train probe on "
+            f"{view_count} views.."
+        )
+        for train_iteration in range(view_count):
+            sample = self.train_dataset[train_iteration]
+            batch = torch.utils.data.default_collate([sample])
+            gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(
+                batch
+            )
+            gpu_batch = self._apply_camera_residual(
+                gpu_batch,
+                global_step=self.global_step,
+            )
+            outputs = self.model(gpu_batch, train=False)
+            if self.post_processing is not None:
+                outputs = apply_post_processing(
+                    self.post_processing,
+                    outputs,
+                    gpu_batch,
+                    training=True,
+                )
+            rgb_pred = outputs["pred_rgb"]
+            rgb_gt = gpu_batch.rgb_gt
+            psnr_values.append(
+                self.criterions["psnr"](rgb_pred, rgb_gt).item()
+            )
+            if gpu_batch.mask is not None:
+                mask = gpu_batch.mask
+                masked_error = torch.square(rgb_pred - rgb_gt) * mask
+                masked_denominator = torch.clamp_min(
+                    mask.sum() * rgb_gt.shape[-1],
+                    1.0,
+                )
+                masked_mse = masked_error.sum() / masked_denominator
+                masked_psnr_values.append(
+                    (
+                        -10.0
+                        * torch.log10(torch.clamp_min(masked_mse, 1e-12))
+                    ).item()
+                )
+        self._validation_train_probe_count = len(psnr_values)
+        if psnr_values:
+            self._validation_train_probe_psnr = float(np.mean(psnr_values))
+        else:
+            self._validation_train_probe_psnr = None
+        if masked_psnr_values:
+            self._validation_train_probe_masked_psnr = float(
+                np.mean(masked_psnr_values)
+            )
+        else:
+            self._validation_train_probe_masked_psnr = None
+
     @torch.cuda.nvtx.range("run_validation_pass")
     @torch.no_grad()
     def run_validation_pass(self, conf: DictConfig) -> dict[str, Any]:
@@ -5496,8 +5826,10 @@ class Trainer3DGRUT:
 
         logger.end_progress(task_name="Validation")
 
+        self.run_training_probe_pass(conf)
         metrics = self._flatten_list_of_dicts(metrics)
         self.log_validation_pass(metrics)
+        self._reset_training_metric_window()
         return metrics
 
     @staticmethod
