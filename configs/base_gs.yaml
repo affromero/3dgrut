@@ -40,6 +40,8 @@ diagnostics:
   snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
   snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
   validation_metrics_enabled: true  # Compute full validation diagnostics beyond PSNR/loss.
+  training_metrics_enabled: true  # Compute comparable train-split diagnostics at validation checkpoints.
+  training_metrics_max_views: 64  # Cap train-split eval views; 0 evaluates every train view.
   loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
   loss_volume_voxel_size_m: 0.1
   loss_volume_view_stride: 4
@@ -51,6 +53,7 @@ early_stopping:
   metric: masked_psnr_if_available
   patience: 3
   min_delta: 0.0
+  min_step: 0
   min_score: 0.0
   min_score_after_step: 0
   restore_best_on_end: true
@@ -268,6 +271,10 @@ loss:
 # Post-processing configuration
 post_processing:
   method: null # Possible values: null, "ppisp", "luminance_affine"
+  # Mapping used only by post-processing modules. Rendering still uses
+  # dataset intrinsics. Use "single_physical_camera" for monocular video
+  # COLMAP bundles whose frame-specific intrinsics create many camera_id rows.
+  camera_index_mode: dataset
   resume_lr_scale: 1.0
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.
