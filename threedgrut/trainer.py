@@ -60,7 +60,14 @@ from threedgrut.utils.misc import (
     jet_map,
     seed_everything,
 )
-from threedgrut.utils.render import apply_post_processing
+from threedgrut.utils.render import (
+    POST_PROCESSING_CAMERA_INDEX_DATASET,
+    POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL,
+    apply_post_processing,
+    post_processing_camera_idx,
+    post_processing_camera_index_mode,
+    post_processing_frames_per_camera,
+)
 from threedgrut.utils.source_scan import source_scan_id_from_image_path
 from threedgrut.utils.timer import CudaTimer
 
@@ -1441,6 +1448,11 @@ class Trainer3DGRUT:
     _distillation_start_step: int = -1
     """ Step at which distillation starts (-1 means disabled) """
 
+    _post_processing_camera_index_mode: str = (
+        POST_PROCESSING_CAMERA_INDEX_DATASET
+    )
+    """Post-processing-only camera index mapping mode."""
+
     @staticmethod
     def create_from_checkpoint(resume: str, conf: DictConfig):
         """Create a new trainer from a checkpoint file"""
@@ -1484,6 +1496,9 @@ class Trainer3DGRUT:
         self._early_stopping_reference_step: int | None = None
         self._stale_validation_count = 0
         self._best_checkpoint_path: str | None = None
+        self._post_processing_camera_index_mode = (
+            post_processing_camera_index_mode(conf)
+        )
 
         # Setup the trainer and components
         logger.log_rule("Load Datasets")
@@ -1505,6 +1520,36 @@ class Trainer3DGRUT:
             self.val_dataset,
             self.scene_bbox,
         )
+
+    def _post_processing_frames_per_camera(self) -> list[int]:
+        dataset_frames_per_camera = self.train_dataset.get_frames_per_camera()
+        frames_per_camera = post_processing_frames_per_camera(
+            dataset_frames_per_camera,
+            self._post_processing_camera_index_mode,
+        )
+        if frames_per_camera != dataset_frames_per_camera:
+            logger.info(
+                "📷 Post-processing camera index mode "
+                f"{self._post_processing_camera_index_mode}: "
+                f"{len(dataset_frames_per_camera)} dataset camera buckets -> "
+                f"{len(frames_per_camera)} post-processing camera bucket."
+            )
+        return frames_per_camera
+
+    def _post_processing_camera_idx(self, camera_idx: int) -> int:
+        return post_processing_camera_idx(
+            camera_idx,
+            self._post_processing_camera_index_mode,
+        )
+
+    def _post_processing_camera_names(self) -> list[str] | None:
+        if self._post_processing_camera_index_mode == (
+            POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL
+        ):
+            return ["physical_camera"]
+        if not hasattr(self.train_dataset, "get_camera_names"):
+            return None
+        return self.train_dataset.get_camera_names()
 
     def init_dataloaders(self, conf: DictConfig):
         from threedgrut.datasets.utils import configure_dataloader_for_platform
@@ -1893,7 +1938,7 @@ class Trainer3DGRUT:
         if method == "ppisp":
             from ppisp import PPISP, PPISPConfig
 
-            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            frames_per_camera = self._post_processing_frames_per_camera()
             num_cameras = len(frames_per_camera)
             num_frames = sum(frames_per_camera)
 
@@ -1949,7 +1994,7 @@ class Trainer3DGRUT:
                 f"📷 {method.upper()} initialized: {num_cameras} cameras, {num_frames} frames"
             )
         elif method == "luminance_affine":
-            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            frames_per_camera = self._post_processing_frames_per_camera()
             num_cameras = len(frames_per_camera)
             num_frames = sum(frames_per_camera)
 
@@ -2297,6 +2342,9 @@ class Trainer3DGRUT:
                 outputs,
                 residual_batch,
                 training=False,
+                camera_idx_override=self._post_processing_camera_idx(
+                    residual_batch.camera_idx
+                ),
             )
         rgb_error = torch.square(outputs["pred_rgb"] - residual_batch.rgb_gt)
         psnr_value = (
@@ -2797,6 +2845,9 @@ class Trainer3DGRUT:
                     outputs,
                     audited_batch,
                     training=False,
+                    camera_idx_override=self._post_processing_camera_idx(
+                        audited_batch.camera_idx
+                    ),
                 )
             rgb_gt = audited_batch.rgb_gt
             rgb_pred = outputs["pred_rgb"]
@@ -3037,8 +3088,12 @@ class Trainer3DGRUT:
             step % self.conf.writer.hit_stat_frequency == 0
         )
         is_compute_validation_metrics = split == "validation"
+        is_compute_training_eval_metrics = split == "train_eval"
+        is_compute_eval_metrics = (
+            is_compute_validation_metrics or is_compute_training_eval_metrics
+        )
 
-        if is_compute_train_hit_metrics or is_compute_validation_metrics:
+        if is_compute_train_hit_metrics or is_compute_eval_metrics:
             metrics["hits_mean"] = outputs["hits_count"].mean().item()
             metrics["hits_std"] = outputs["hits_count"].std().item()
             metrics["hits_min"] = outputs["hits_count"].min().item()
@@ -3073,7 +3128,7 @@ class Trainer3DGRUT:
                 metrics["valid_hit_coverage"] = hit_mask.mean().item()
                 metrics["valid_opacity_coverage"] = opacity_mask.mean().item()
 
-        if is_compute_validation_metrics:
+        if is_compute_eval_metrics:
             metrics["camera_idx"] = int(gpu_batch.camera_idx)
             source_scan_id = source_scan_id_from_image_path(
                 image_path=str(gpu_batch.image_path),
@@ -3108,18 +3163,26 @@ class Trainer3DGRUT:
                         pred_rgb_full_clipped, rgb_gt_full
                     ).item()
 
-            is_logged_view = iteration in self._validation_log_image_views()
+            is_logged_view = (
+                is_compute_validation_metrics
+                and iteration in self._validation_log_image_views()
+            )
 
             diag_conf = (
                 self.conf.get("diagnostics") if hasattr(self.conf, "get")
                 else None
             )
-            validation_diagnostics_enabled = (
-                bool(diag_conf.get("validation_metrics_enabled", True))
+            diagnostics_key = (
+                "validation_metrics_enabled"
+                if is_compute_validation_metrics
+                else "training_metrics_enabled"
+            )
+            eval_diagnostics_enabled = (
+                bool(diag_conf.get(diagnostics_key, True))
                 if diag_conf is not None
                 else True
             )
-            if validation_diagnostics_enabled:
+            if eval_diagnostics_enabled:
                 metrics.update(
                     _diagnostic_metrics(
                         rgb_gt=rgb_gt,
@@ -4179,6 +4242,14 @@ class Trainer3DGRUT:
             raise ValueError(msg)
         return float(np.mean(values))
 
+    def _validation_checkpoint_min_step(self) -> int:
+        """Return the first step allowed to update best/stop state."""
+        min_step = int(self.conf.early_stopping.get("min_step", 0))
+        if min_step < 0:
+            msg = f"early_stopping.min_step must be >= 0, got {min_step}."
+            raise ValueError(msg)
+        return min_step
+
     def _is_best_validation_score(self, score: float) -> bool:
         """Return whether ``score`` is the numerically best validation score."""
         if self._best_validation_score is None:
@@ -4232,6 +4303,14 @@ class Trainer3DGRUT:
         if not save_best and not bool(
             early_stopping_conf.get("enabled", False)
         ):
+            return
+
+        min_step = self._validation_checkpoint_min_step()
+        if self.global_step < min_step:
+            logger.info(
+                "Validation checkpointing deferred until step "
+                f"{min_step}; current step={self.global_step}."
+            )
             return
 
         score = self._validation_checkpoint_score(metrics)
@@ -4587,6 +4666,139 @@ class Trainer3DGRUT:
 
         """
 
+    @staticmethod
+    def _selected_training_metric_indices(
+        total_views: int,
+        max_views: int,
+    ) -> list[int]:
+        """Return deterministic train-view indices for metric evaluation."""
+        if total_views <= 0:
+            return []
+        if max_views <= 0 or max_views >= total_views:
+            return list(range(total_views))
+        indices = np.linspace(
+            0,
+            total_views - 1,
+            num=max_views,
+            dtype=np.int64,
+        )
+        return [int(index) for index in indices]
+
+    @torch.cuda.nvtx.range("log_training_metrics_iter")
+    def log_training_metrics_iter(
+        self,
+        batch_metrics: dict[str, Any],
+        iteration: int,
+    ) -> None:
+        """Log progress after a single train-split metrics iteration."""
+        logger.log_progress(
+            task_name="Training metrics",
+            advance=1,
+            iteration=f"{iteration!s}",
+            psnr=batch_metrics["psnr"],
+            loss=batch_metrics["losses"]["total_loss"],
+        )
+
+    @torch.cuda.nvtx.range("log_training_metrics_pass")
+    def log_training_metrics_pass(self, metrics: dict[str, Any]) -> None:
+        """Log aggregated train-split metrics for comparison with val."""
+        if not metrics:
+            return
+
+        writer = self.tracking.writer
+        global_step = self.global_step
+        table: dict[str, float] = {}
+        metric_names = (
+            "psnr",
+            "masked_psnr",
+            "ssim",
+            "lpips",
+            "mask_coverage",
+            "low_freq_l1",
+            "high_freq_l1",
+            "gradient_l1",
+            "laplacian_l1",
+            "fft_energy_ratio_low",
+            "fft_energy_ratio_mid",
+            "fft_energy_ratio_high",
+            "fft_energy_ratio_ultra",
+            "fft_error_ratio_low",
+            "fft_error_ratio_mid",
+            "fft_error_ratio_high",
+            "fft_error_ratio_ultra",
+            "edge_top15_precision",
+            "edge_top15_recall",
+            "edge_top15_f1",
+            "edge_rgb_l1",
+            "nonedge_rgb_l1",
+            "edge_high_freq_l1",
+            "nonedge_high_freq_l1",
+            "valid_hit_coverage",
+            "valid_opacity_coverage",
+            "footprint_front_fraction",
+            "footprint_radius_px_mean",
+            "footprint_radius_px_p95",
+            "footprint_radius_px_max",
+        )
+        for metric_name in metric_names:
+            if metric_name in metrics:
+                table[metric_name] = float(np.mean(metrics[metric_name]))
+
+        losses = metrics.get("losses", {})
+        if "total_loss" in losses:
+            table["loss_total"] = float(np.mean(losses["total_loss"]))
+
+        scalar_names = {
+            "psnr": "train_eval/psnr",
+            "masked_psnr": "train_eval/masked_psnr",
+            "ssim": "train_eval/ssim",
+            "lpips": "train_eval/lpips",
+            "mask_coverage": "train_eval/mask_coverage",
+            "loss_total": "train_eval/loss/total",
+            "valid_hit_coverage": "train_eval/coverage/valid_hit_fraction",
+            "valid_opacity_coverage": (
+                "train_eval/coverage/valid_opacity_fraction"
+            ),
+        }
+        for metric_name, writer_name in scalar_names.items():
+            if metric_name in table:
+                writer.add_scalar(writer_name, table[metric_name], global_step)
+
+        source_scan_summary = _group_metric_summary(
+            metrics=metrics,
+            group_key="source_scan_id",
+            metric_names=SOURCE_SCAN_METRIC_NAMES,
+        )
+        source_scan_camera_summary = _group_metric_summary_by_keys(
+            metrics=metrics,
+            group_keys=("source_scan_id", "camera_idx"),
+            metric_names=SOURCE_SCAN_METRIC_NAMES,
+        )
+        summary_path = os.path.join(
+            self.tracking.output_dir,
+            f"training_metrics_step_{global_step:06d}.json",
+        )
+        evaluated_views = 0
+        if "psnr" in metrics:
+            evaluated_views = len(metrics["psnr"])
+        training_summary: dict[str, Any] = {
+            "global_step": float(global_step),
+            "num_gaussians": float(self.model.num_gaussians),
+            "evaluated_views": float(evaluated_views),
+        }
+        training_summary.update(table)
+        if source_scan_summary:
+            training_summary["source_scan_metrics"] = source_scan_summary
+        if source_scan_camera_summary:
+            training_summary["source_scan_camera_metrics"] = (
+                source_scan_camera_summary
+            )
+        with open(summary_path, "w", encoding="utf-8") as file:
+            json.dump(training_summary, file, indent=2, sort_keys=True)
+        logger.log_table(
+            f"📊 Training Metrics - Step {global_step}", record=table
+        )
+
     @torch.cuda.nvtx.range("on_training_end")
     def on_training_end(self):
         """Callback that prompts at the end of training."""
@@ -4655,18 +4867,13 @@ class Trainer3DGRUT:
             logger.info("📊 Exporting PPISP report...")
 
             ppisp_report_dir = Path(out_dir) / "ppisp_report"
-            frames_per_camera = self.train_dataset.get_frames_per_camera()
-
-            # Get camera names if available
-            camera_names = None
-            if hasattr(self.train_dataset, "get_camera_names"):
-                camera_names = self.train_dataset.get_camera_names()
+            frames_per_camera = self._post_processing_frames_per_camera()
 
             export_ppisp_report(
                 self.post_processing,
                 frames_per_camera=frames_per_camera,
                 output_dir=ppisp_report_dir,
-                camera_names=camera_names,
+                camera_names=self._post_processing_camera_names(),
             )
             logger.info(f"📊 PPISP report saved to: {ppisp_report_dir}")
 
@@ -5195,6 +5402,7 @@ class Trainer3DGRUT:
         if is_time_to_validate:
             validation_metrics = self.run_validation_pass(conf)
             self._handle_validation_checkpointing(validation_metrics)
+            self.run_training_metrics_pass(conf)
             if self._should_stop_training:
                 return
 
@@ -5209,7 +5417,13 @@ class Trainer3DGRUT:
         if self.post_processing is not None:
             with torch.cuda.nvtx.range(f"train_{global_step}_post_processing"):
                 outputs = apply_post_processing(
-                    self.post_processing, outputs, gpu_batch, training=True
+                    self.post_processing,
+                    outputs,
+                    gpu_batch,
+                    training=True,
+                    camera_idx_override=self._post_processing_camera_idx(
+                        gpu_batch.camera_idx
+                    ),
                 )
 
         # Compute the losses of a single batch
@@ -5433,6 +5647,102 @@ class Trainer3DGRUT:
 
         self.log_training_pass(metrics)
 
+    @torch.cuda.nvtx.range("run_training_metrics_pass")
+    @torch.no_grad()
+    def run_training_metrics_pass(self, conf: DictConfig) -> dict[str, Any]:
+        """Evaluate a deterministic subset of training views."""
+        diag_conf = (
+            conf.get("diagnostics") if hasattr(conf, "get") else None
+        )
+        enabled = (
+            bool(diag_conf.get("training_metrics_enabled", True))
+            if diag_conf is not None
+            else True
+        )
+        if not enabled:
+            return {}
+
+        max_views = (
+            int(diag_conf.get("training_metrics_max_views", 64))
+            if diag_conf is not None
+            else 64
+        )
+        selected_indices = self._selected_training_metric_indices(
+            len(self.train_dataset),
+            max_views,
+        )
+        if not selected_indices:
+            return {}
+
+        eval_subset = torch.utils.data.Subset(
+            self.train_dataset,
+            selected_indices,
+        )
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_subset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+        profilers = {
+            "inference": CudaTimer(),
+        }
+        metrics = []
+        logger.info(f"Step {self.global_step} -- Running training metrics..")
+        logger.start_progress(
+            task_name="Training metrics",
+            total_steps=len(selected_indices),
+            color="dark_sea_green3",
+        )
+
+        for eval_iteration, batch in enumerate(eval_dataloader):
+            train_iteration = selected_indices[eval_iteration]
+            gpu_batch = self.train_dataset.get_gpu_batch_with_intrinsics(batch)
+            gpu_batch = self._apply_camera_residual(
+                gpu_batch,
+                global_step=self.global_step,
+            )
+
+            with torch.cuda.nvtx.range(
+                f"train.metrics_step_{self.global_step}"
+            ):
+                profilers["inference"].start()
+                outputs = self.model(gpu_batch, train=False)
+                outputs = collapse_blur_samples(outputs, gpu_batch)
+                if self.post_processing is not None:
+                    outputs = apply_post_processing(
+                        self.post_processing,
+                        outputs,
+                        gpu_batch,
+                        training=False,
+                        camera_idx_override=self._post_processing_camera_idx(
+                            gpu_batch.camera_idx
+                        ),
+                    )
+                profilers["inference"].end()
+
+                batch_losses = self.get_losses(gpu_batch, outputs)
+                batch_metrics = self.get_metrics(
+                    gpu_batch,
+                    outputs,
+                    batch_losses,
+                    profilers,
+                    split="train_eval",
+                    iteration=train_iteration,
+                )
+                self.log_training_metrics_iter(
+                    batch_metrics,
+                    iteration=train_iteration,
+                )
+                metrics.append(batch_metrics)
+
+        logger.end_progress(task_name="Training metrics")
+
+        flattened_metrics = self._flatten_list_of_dicts(metrics)
+        self.log_training_metrics_pass(flattened_metrics)
+        return flattened_metrics
+
     @torch.cuda.nvtx.range("run_validation_pass")
     @torch.no_grad()
     def run_validation_pass(self, conf: DictConfig) -> dict[str, Any]:
@@ -5476,6 +5786,9 @@ class Trainer3DGRUT:
                         outputs,
                         gpu_batch,
                         training=False,
+                        camera_idx_override=self._post_processing_camera_idx(
+                            gpu_batch.camera_idx
+                        ),
                     )
                 profilers["inference"].end()
 
@@ -5583,6 +5896,7 @@ class Trainer3DGRUT:
             logger.log_rule("Final Validation")
             validation_metrics = self.run_validation_pass(conf)
             self._handle_validation_checkpointing(validation_metrics)
+            self.run_training_metrics_pass(conf)
 
         # Perform testing
         self.on_training_end()

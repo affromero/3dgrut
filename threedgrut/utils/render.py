@@ -15,6 +15,7 @@
 
 
 import torch
+from omegaconf import DictConfig
 
 ## NOTE: SPH code from gaussian-splatting, from plenoctree, from ???
 C0 = 0.28209479177387814
@@ -47,6 +48,15 @@ C4 = [
     0.6258357354491761,
 ]
 
+POST_PROCESSING_CAMERA_INDEX_DATASET = "dataset"
+POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL = "single_physical_camera"
+POST_PROCESSING_CAMERA_INDEX_MODES = frozenset(
+    (
+        POST_PROCESSING_CAMERA_INDEX_DATASET,
+        POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL,
+    )
+)
+
 
 def RGB2SH(rgb):
     return (rgb - 0.5) / C0
@@ -54,6 +64,48 @@ def RGB2SH(rgb):
 
 def SH2RGB(sh):
     return sh * C0 + 0.5
+
+
+def post_processing_camera_index_mode(conf: DictConfig) -> str:
+    mode = conf.post_processing.get(
+        "camera_index_mode",
+        POST_PROCESSING_CAMERA_INDEX_DATASET,
+    )
+    if mode not in POST_PROCESSING_CAMERA_INDEX_MODES:
+        raise ValueError(
+            "Unsupported post_processing.camera_index_mode="
+            f"{mode!r}. Expected one of "
+            f"{sorted(POST_PROCESSING_CAMERA_INDEX_MODES)}."
+        )
+    return mode
+
+
+def post_processing_frames_per_camera(
+    frames_per_camera: list[int],
+    camera_index_mode: str,
+) -> list[int]:
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_DATASET:
+        return frames_per_camera
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL:
+        return [sum(frames_per_camera)]
+    raise ValueError(
+        "Unsupported post-processing camera index mode: "
+        f"{camera_index_mode!r}."
+    )
+
+
+def post_processing_camera_idx(
+    camera_idx: int,
+    camera_index_mode: str,
+) -> int:
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_DATASET:
+        return camera_idx
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL:
+        return 0
+    raise ValueError(
+        "Unsupported post-processing camera index mode: "
+        f"{camera_index_mode!r}."
+    )
 
 
 def _edge_gate(image_bhwc: torch.Tensor) -> torch.Tensor:
@@ -96,6 +148,7 @@ def apply_post_processing(
     outputs: dict,
     gpu_batch,
     training: bool = False,
+    camera_idx_override: int | None = None,
 ) -> dict:
     """Apply post-processing to rendered output.
 
@@ -105,6 +158,7 @@ def apply_post_processing(
         gpu_batch: Batch containing camera_idx, frame_idx, sequence_idx,
             pixel_coords, exposure
         training: If True, use actual frame_idx; if False, use -1 for novel view mode
+        camera_idx_override: Optional post-processing-only camera index.
 
     Returns:
         Updated outputs dict with post-processed pred_rgb
@@ -114,7 +168,11 @@ def apply_post_processing(
     )
 
     pred_rgb = outputs["pred_rgb"]
-    camera_idx = gpu_batch.camera_idx
+    camera_idx = (
+        gpu_batch.camera_idx
+        if camera_idx_override is None
+        else camera_idx_override
+    )
     frame_idx = gpu_batch.frame_idx if training else -1
     sequence_idx = getattr(gpu_batch, "sequence_idx", -1)
     H, W = pred_rgb.shape[1], pred_rgb.shape[2]
@@ -130,15 +188,20 @@ def apply_post_processing(
         residual_grid_gate = _residual_grid_edge_gate(outputs)
         if residual_grid_gate is not None:
             residual_grid_gate = residual_grid_gate.contiguous().view(-1)
+    kwargs = {
+        "resolution": (W, H),
+        "camera_idx": camera_idx,
+        "frame_idx": frame_idx,
+        "exposure_prior": gpu_batch.exposure,
+    }
+    if hasattr(post_processing, "use_temporal_affine"):
+        kwargs["sequence_idx"] = sequence_idx
+    if hasattr(post_processing, "use_residual_grid"):
+        kwargs["residual_grid_gate"] = residual_grid_gate
     pred_rgb_pp = post_processing(
         pred_rgb_flat,
         pixel_coords_flat,
-        resolution=(W, H),
-        camera_idx=camera_idx,
-        frame_idx=frame_idx,
-        sequence_idx=sequence_idx,
-        exposure_prior=gpu_batch.exposure,
-        residual_grid_gate=residual_grid_gate,
+        **kwargs,
     )
 
     # Reshape back: [H*W, 3] -> [1, H, W, 3]
