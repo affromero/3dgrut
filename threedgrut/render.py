@@ -566,12 +566,6 @@ class Renderer:
                 "image_path": gpu_batch.image_path,
                 "psnr": float(psnr_single_img),
             }
-            if masked_psnr:
-                frame_metrics["masked_psnr"] = float(masked_psnr[-1])
-            if mask_coverage:
-                frame_metrics["mask_coverage"] = float(mask_coverage[-1])
-            per_frame_metrics.append(frame_metrics)
-
             if psnr_single_img > best_psnr:
                 best_psnr = psnr_single_img
                 best_psnr_img = pred_img_to_write
@@ -596,6 +590,14 @@ class Renderer:
                         rgb_gt_full.permute(0, 3, 1, 2),
                     ).item()
                 )
+                frame_metrics["ssim"] = float(ssim[-1])
+                frame_metrics["lpips"] = float(lpips[-1])
+
+            if masked_psnr:
+                frame_metrics["masked_psnr"] = float(masked_psnr[-1])
+            if mask_coverage:
+                frame_metrics["mask_coverage"] = float(mask_coverage[-1])
+            per_frame_metrics.append(frame_metrics)
 
             # Color-corrected metrics
             pred_rgb_cc = color_correct_affine(pred_rgb_full, rgb_gt_full)
