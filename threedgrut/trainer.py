@@ -3806,7 +3806,12 @@ class Trainer3DGRUT:
         )
 
     @torch.cuda.nvtx.range("log_validation_pass")
-    def log_validation_pass(self, metrics: dict[str, Any]) -> None:
+    def log_validation_pass(
+        self,
+        metrics: dict[str, Any],
+        *,
+        training_metrics: dict[str, Any] | None = None,
+    ) -> None:
         """Log information after a single validation pass.
 
         Args:
@@ -4324,9 +4329,17 @@ class Trainer3DGRUT:
             )
         }
         train_psnr = self._validation_training_metric("psnr")
+        if train_psnr is None:
+            train_psnr = self._mean_metric(training_metrics, "psnr")
         if train_psnr is not None:
             table["train_psnr"] = train_psnr
             table["psnr_gap_train_minus_val"] = train_psnr - mean_psnr
+        train_ssim = self._mean_metric(training_metrics, "ssim")
+        if train_ssim is not None:
+            table["train_ssim"] = train_ssim
+        train_lpips = self._mean_metric(training_metrics, "lpips")
+        if train_lpips is not None:
+            table["train_lpips"] = train_lpips
         if self._validation_train_probe_psnr is not None:
             table["train_probe_psnr"] = self._validation_train_probe_psnr
             table["train_probe_count"] = float(
@@ -4582,6 +4595,21 @@ class Trainer3DGRUT:
         self._training_psnr_window_count = 0
         self._training_masked_psnr_window_count = 0
         self._training_metric_window_start_step = None
+
+    @staticmethod
+    def _mean_metric(
+        metrics: dict[str, Any] | None,
+        metric_name: str,
+    ) -> float | None:
+        """Return the finite mean of one flattened metrics vector."""
+        values = metrics.get(metric_name) if metrics is not None else None
+        if values is None:
+            return None
+        array = np.asarray(values, dtype=np.float64)
+        if array.size == 0:
+            return None
+        mean = float(array.mean())
+        return mean if np.isfinite(mean) else None
 
     def _validation_training_metric(self, metric_name: str) -> float | None:
         """Return the current-model training metric for validation logs."""
@@ -5781,9 +5809,12 @@ class Trainer3DGRUT:
             global_step % self.val_frequency == 0
         )
         if is_time_to_validate:
-            validation_metrics = self.run_validation_pass(conf)
+            training_metrics = self.run_training_metrics_pass(conf)
+            validation_metrics = self.run_validation_pass(
+                conf,
+                training_metrics=training_metrics,
+            )
             self._handle_validation_checkpointing(validation_metrics)
-            self.run_training_metrics_pass(conf)
             if self._should_stop_training:
                 return
 
@@ -6126,7 +6157,11 @@ class Trainer3DGRUT:
 
     @torch.cuda.nvtx.range("run_validation_pass")
     @torch.no_grad()
-    def run_validation_pass(self, conf: DictConfig) -> dict[str, Any]:
+    def run_validation_pass(
+        self,
+        conf: DictConfig,
+        training_metrics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Runs a single validation epoch over the dataset.
 
         Returns:
@@ -6191,7 +6226,7 @@ class Trainer3DGRUT:
         logger.end_progress(task_name="Validation")
 
         metrics = self._flatten_list_of_dicts(metrics)
-        self.log_validation_pass(metrics)
+        self.log_validation_pass(metrics, training_metrics=training_metrics)
         self._reset_training_metric_window()
         return metrics
 
@@ -6276,9 +6311,12 @@ class Trainer3DGRUT:
             and not self._should_stop_training
         ):
             logger.log_rule("Final Validation")
-            validation_metrics = self.run_validation_pass(conf)
+            training_metrics = self.run_training_metrics_pass(conf)
+            validation_metrics = self.run_validation_pass(
+                conf,
+                training_metrics=training_metrics,
+            )
             self._handle_validation_checkpointing(validation_metrics)
-            self.run_training_metrics_pass(conf)
 
         # Perform testing
         self.on_training_end()
