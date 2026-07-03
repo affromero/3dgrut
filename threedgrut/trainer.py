@@ -4459,6 +4459,99 @@ class Trainer3DGRUT:
             and self.global_step < self._distillation_start_step
         )
 
+    def _activate_ppisp_distillation_after_plateau(
+        self,
+        *,
+        metric_name: str,
+        score: float,
+        reference_score: float,
+        training_suffix: str,
+    ) -> None:
+        """Start PPISP controller distillation after geometry plateaus."""
+        if self.post_processing is None:
+            return
+
+        previous_start_step = self._distillation_start_step
+        self._distillation_start_step = self.global_step
+        scheduler = getattr(self.post_processing, "_ppisp_scheduler", None)
+        activation_step = self.global_step
+        if scheduler is not None:
+            activation_step = int(
+                getattr(scheduler, "last_epoch", self.global_step)
+            )
+        if hasattr(self.post_processing, "_controller_activation_step"):
+            self.post_processing._controller_activation_step = activation_step
+
+        self._early_stopping_reference_score = None
+        self._early_stopping_reference_step = None
+        self._stale_validation_count = 0
+        self._best_validation_score = None
+        self._best_validation_step = None
+        self._best_checkpoint_path = None
+        logger.info(
+            "PPISP controller distillation activated early at step "
+            f"{self.global_step}; scheduled start was "
+            f"{previous_start_step}. Geometry validation "
+            f"{metric_name}={score:.6f} did not clear min_delta from "
+            f"{reference_score:.6f}{training_suffix}."
+        )
+
+    def _reset_ppisp_checkpoint_state_for_distillation(self) -> None:
+        """Discard pre-PPISP geometry plateau state at distillation start."""
+        if self._early_stopping_reference_score is None:
+            return
+        self._early_stopping_reference_score = None
+        self._early_stopping_reference_step = None
+        self._stale_validation_count = 0
+        logger.info(
+            "Reset PPISP geometry plateau state at controller distillation "
+            f"step {self.global_step}."
+        )
+
+    def _handle_ppisp_pre_distillation_validation(
+        self,
+        *,
+        metric_name: str,
+        score: float,
+        training_suffix: str,
+    ) -> None:
+        """Track geometry plateau before PPISP controller distillation."""
+        if self._is_early_stopping_improvement(score):
+            self._early_stopping_reference_score = score
+            self._early_stopping_reference_step = self.global_step
+            self._stale_validation_count = 0
+            logger.info(
+                "PPISP geometry validation reference "
+                f"{metric_name}={score:.6f} at step {self.global_step}"
+                f"{training_suffix}."
+            )
+            return
+
+        self._stale_validation_count += 1
+        reference_score = self._early_stopping_reference_score
+        if reference_score is None:
+            msg = (
+                "No early-stopping reference was recorded before stale update."
+            )
+            raise RuntimeError(msg)
+        patience = int(self.conf.early_stopping.get("patience", 3))
+        if patience < 1:
+            msg = f"early_stopping.patience must be >= 1, got {patience}."
+            raise ValueError(msg)
+        logger.info(
+            "PPISP geometry validation "
+            f"{metric_name}={score:.6f} did not clear min_delta from "
+            f"{reference_score:.6f}; stale validations: "
+            f"{self._stale_validation_count}/{patience}{training_suffix}"
+        )
+        if self._stale_validation_count >= patience:
+            self._activate_ppisp_distillation_after_plateau(
+                metric_name=metric_name,
+                score=score,
+                reference_score=reference_score,
+                training_suffix=training_suffix,
+            )
+
     def _snapshot_training_metric_window(self) -> None:
         """Capture train-window PSNR values for the current validation."""
         self._validation_training_window_start_step = (
@@ -4543,13 +4636,6 @@ class Trainer3DGRUT:
             early_stopping_conf.get("enabled", False)
         ):
             return
-        if self._is_waiting_for_ppisp_distillation():
-            logger.info(
-                "Deferring PPISP best-checkpoint and early-stopping update "
-                f"at step {self.global_step}; controller distillation starts "
-                f"at step {self._distillation_start_step}."
-            )
-            return
 
         min_step = self._validation_checkpoint_min_step()
         if self.global_step < min_step:
@@ -4564,6 +4650,27 @@ class Trainer3DGRUT:
         if metric_name == EARLY_STOPPING_AUTO_PSNR_METRIC:
             metric_name = "masked_psnr" if "masked_psnr" in metrics else "psnr"
         training_suffix = self._training_metric_suffix(metric_name, score)
+        if self._is_waiting_for_ppisp_distillation():
+            if not bool(early_stopping_conf.get("enabled", False)):
+                logger.info(
+                    "Deferring PPISP best-checkpoint update at step "
+                    f"{self.global_step}; controller distillation starts at "
+                    f"step {self._distillation_start_step}."
+                )
+                return
+            self._handle_ppisp_pre_distillation_validation(
+                metric_name=metric_name,
+                score=score,
+                training_suffix=training_suffix,
+            )
+            return
+        if (
+            self.post_processing is not None
+            and self._distillation_start_step >= 0
+            and self._best_validation_score is None
+        ):
+            self._reset_ppisp_checkpoint_state_for_distillation()
+
         if self._is_best_validation_score(score):
             self._best_validation_score = score
             self._best_validation_step = self.global_step
