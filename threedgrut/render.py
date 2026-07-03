@@ -35,7 +35,11 @@ from threedgrut.post_processing import LuminanceAffine
 from threedgrut.utils.color_correct import color_correct_affine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import create_summary_writer
-from threedgrut.utils.render import apply_post_processing
+from threedgrut.utils.render import (
+    apply_post_processing,
+    post_processing_camera_idx,
+    post_processing_camera_index_mode,
+)
 
 
 def _load_luminance_affine_state_compat(
@@ -137,6 +141,9 @@ class Renderer:
         self.writer = writer
         self.compute_extra_metrics = compute_extra_metrics
         self.post_processing = post_processing
+        self._post_processing_camera_index_mode = (
+            post_processing_camera_index_mode(conf)
+        )
 
         if conf.model.background.color == "black":
             self.bg_color = torch.zeros(
@@ -481,7 +488,20 @@ class Renderer:
             # Apply post-processing
             if self.post_processing is not None:
                 outputs = apply_post_processing(
-                    self.post_processing, outputs, gpu_batch, training=False
+                    self.post_processing,
+                    outputs,
+                    gpu_batch,
+                    training=False,
+                    camera_idx_override=post_processing_camera_idx(
+                        int(
+                            getattr(
+                                gpu_batch,
+                                "post_processing_camera_idx",
+                                gpu_batch.camera_idx,
+                            )
+                        ),
+                        self._post_processing_camera_index_mode,
+                    ),
                 )
 
             pred_rgb_full = outputs["pred_rgb"]

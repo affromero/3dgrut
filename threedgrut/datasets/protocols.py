@@ -44,6 +44,7 @@ class Batch:
     intrinsics_EquirectCameraModelParameters: Optional[dict] = None
     # Camera/frame indices for post-processing
     camera_idx: int = -1  # 0-based camera index
+    post_processing_camera_idx: int = -1  # physical-camera index
     frame_idx: int = -1  # 0-based frame index (global across split)
     sequence_idx: int = -1  # Parsed scanner sequence index from image name
     image_path: str = ""  # Source image path for logging and diagnostics
