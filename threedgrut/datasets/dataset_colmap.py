@@ -50,6 +50,14 @@ from .utils import (
 )
 
 
+def _read_rgb_image_array(image_path: str) -> np.ndarray:
+    """Read an image as uint8 RGB, dropping alpha channels if present."""
+    with Image.open(image_path) as image:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        return np.array(image, copy=True)
+
+
 def _get_relative_paths(path_dir: str) -> list[str]:
     paths = []
     for dirpath, _, filenames in os.walk(path_dir):
@@ -708,7 +716,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     @torch.cuda.nvtx.range("colmap_dataset::_getitem")
     def __getitem__(self, idx) -> dict:
         # Load image and get its actual dimensions
-        image_data = np.asarray(Image.open(self.image_paths[idx]))
+        image_data = _read_rgb_image_array(self.image_paths[idx])
         actual_h, actual_w = image_data.shape[:2]
 
         assert image_data.dtype == np.uint8, "Image data must be of type uint8"
@@ -794,7 +802,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             intr, _, _, _, _ = self.intrinsics[camera_id]
 
             # Load actual image to get dimensions
-            image_data = np.asarray(Image.open(self.image_paths[i_cam]))
+            image_data = _read_rgb_image_array(self.image_paths[i_cam])
             h, w = image_data.shape[:2]
 
             f_w = intr["focal_length"][0]
