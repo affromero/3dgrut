@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import os
-import random
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -26,45 +25,6 @@ from torch.utils.tensorboard.writer import SummaryWriter
 
 OmegaConf.register_new_resolver("div", lambda a, b: a / b)
 OmegaConf.register_new_resolver("eq", lambda a, b: a == b)
-
-
-def ensure_wandb_api_key_env() -> None:
-    """Require W&B credentials before starting a tracked training run."""
-
-    if os.environ.get("WANDB_API_KEY"):
-        return
-
-    raise RuntimeError(
-        "W&B logging is enabled, but WANDB_API_KEY is not set. "
-        "Export WANDB_API_KEY before starting a tracked training run."
-    )
-
-
-def seed_everything(seed: int) -> torch.Generator:
-    """Seed all RNGs for a reproducible run and return a seeded generator.
-
-    Seeds python ``random``, numpy, and torch (CPU + every visible CUDA
-    device), and enables cheap determinism flags. The returned
-    ``torch.Generator`` is meant to be handed to the training DataLoader so
-    its ``shuffle=True`` sampler and per-worker base seeds are reproducible.
-
-    Args:
-        seed: Base run seed (e.g. ``conf.seed_initialization``).
-
-    Returns:
-        A CPU ``torch.Generator`` already seeded with ``seed``.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    # Cheap, non-perf-destroying determinism knobs. Do NOT enable
-    # torch.use_deterministic_algorithms(True) here: several CUDA kernels in
-    # the splat path have no deterministic implementation and it would raise.
-    generator = torch.Generator()
-    generator.manual_seed(seed)
-    return generator
 
 
 def to_torch(data: npt.NDArray, device: str, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
@@ -128,47 +88,37 @@ def quaternion_to_so3(r):
     return R
 
 
-def exponential_scheduler(
-    lr_init: float,
-    lr_final: float,
-    max_steps: int = 1000000,
-    type: str = "",
-) -> Callable[[int], float]:
-    lr_init = float(lr_init)
-    lr_final = float(lr_final)
-    max_steps = max(int(max_steps), 1)
-    if not np.isfinite(lr_init) or not np.isfinite(lr_final):
-        raise ValueError(
-            f"Invalid exponential scheduler LR endpoints: {lr_init}, {lr_final}"
-        )
-    if lr_init < 0.0 or lr_final < 0.0:
-        raise ValueError(
-            "Exponential scheduler requires non-negative LR endpoints: "
-            f"{lr_init}, {lr_final}"
-        )
-
-    def helper(step: int) -> float:
+def exponential_scheduler(lr_init, lr_final, max_steps=1000000, type=""):
+    def helper(step):
         t = np.clip(step / max_steps, 0, 1)
-        if lr_init == 0.0 and lr_final == 0.0:
-            return 0.0
-        if lr_init == 0.0:
-            return lr_final * t
-        if lr_final == 0.0:
-            return lr_init * (1.0 - t)
         log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
         return log_lerp
 
     return helper
 
 
-def skip_scheduler(type=""):
+def cosine_scheduler(lr_init, lr_final, max_steps=1000000, type=""):
+    """Cosine annealing: lr = lr_final + 0.5 * (lr_init - lr_final) * (1 + cos(pi * step / max_steps))."""
+
+    def helper(step):
+        t = np.clip(step / max_steps, 0, 1)
+        return float(lr_final + 0.5 * (lr_init - lr_final) * (1 + np.cos(np.pi * t)))
+
+    return helper
+
+
+def skip_scheduler(type="", **kwargs):
     def helper(step):
         return None
 
     return helper
 
 
-SCHEDULER_DICT: dict[str, Callable] = {"exp": exponential_scheduler, "skip": skip_scheduler}
+SCHEDULER_DICT: dict[str, Callable] = {
+    "exp": exponential_scheduler,
+    "cosine": cosine_scheduler,
+    "skip": skip_scheduler,
+}
 
 
 def get_scheduler(scheduler: str) -> Callable:
@@ -200,38 +150,22 @@ def jet_map(map: torch.Tensor, max_val: float) -> torch.Tensor:
 
 def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb):
     timestamp = datetime.now().strftime("%d%m_%H%M%S")
-    name_prefix = (
-        f"{experiment_name}-{object_name}" if experiment_name else object_name
-    )
-    run_name = f"{name_prefix}-{timestamp}"
+    run_name = f"{object_name}-" + timestamp
 
     assert out_dir is not None, "Output directory must be specified"
     out_dir = os.path.join(out_dir, experiment_name) if experiment_name else out_dir
     out_dir = os.path.join(out_dir, run_name)
 
     if use_wandb:
-        ensure_wandb_api_key_env()
-
         import wandb
 
         wandb.login()
-        wandb_run_id = getattr(conf, "wandb_run_id", "")
-        wandb_resume = getattr(conf, "wandb_resume", "allow")
-        wandb_resume_kwargs = (
-            {"id": wandb_run_id, "resume": wandb_resume}
-            if wandb_run_id
-            else {}
-        )
-        wandb_group = getattr(conf, "wandb_group", "") or experiment_name
-        wandb_run = wandb.init(
+        wandb.init(
             config=OmegaConf.to_container(DictConfig(conf)),
             project=conf.wandb_project,
-            group=wandb_group,
+            group=experiment_name,
             name=run_name,
-            **wandb_resume_kwargs,
         )
-        wandb_run.define_metric("train/iteration")
-        wandb_run.define_metric("*", step_metric="train/iteration")
         wandb.tensorboard.patch(root_logdir=out_dir, save=False)
 
     writer = SummaryWriter(log_dir=out_dir)

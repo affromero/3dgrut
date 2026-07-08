@@ -176,7 +176,7 @@ class Tracer:
             particle_density = torch.concat(
                 [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
             ).contiguous()
-            particle_radiance = mog_sph.contiguous()
+            particle_features = mog_sph.contiguous()
 
             ray_time = (
                 torch.ones(
@@ -186,7 +186,7 @@ class Tracer:
             )
 
             (
-                ray_radiance_density,
+                ray_features_density,
                 ray_hit_distance,
                 ray_hit_count,
                 mog_visibility,
@@ -197,7 +197,7 @@ class Tracer:
                 frame_id,
                 n_active_features,
                 particle_density,
-                particle_radiance,
+                particle_features,
                 ray_ori.contiguous(),
                 ray_dir.contiguous(),
                 ray_time.contiguous(),
@@ -212,10 +212,10 @@ class Tracer:
                 ray_ori,
                 ray_dir,
                 ray_time,
-                ray_radiance_density,
+                ray_features_density,
                 ray_hit_distance,
                 particle_density,
-                particle_radiance,
+                particle_features,
             )
 
             ctx.frame_id = frame_id
@@ -225,7 +225,7 @@ class Tracer:
             ctx.tracer_wrapper = tracer_wrapper
 
             return (
-                ray_radiance_density,
+                ray_features_density.float(),  # always fp32 to caller; fp16 saved in ctx for trace_bwd
                 ray_hit_distance,
                 ray_hit_count,
                 mog_visibility,
@@ -237,7 +237,7 @@ class Tracer:
         @staticmethod
         def backward(
             ctx,
-            ray_radiance_density_grd,
+            ray_features_density_grd,  # always fp32 (gradient buffer is never fp16)
             ray_hit_distance_grd,
             ray_hit_count_grd_UNUSED,
             mog_visibility_grd_UNUSED,
@@ -249,10 +249,10 @@ class Tracer:
                 ray_ori,
                 ray_dir,
                 ray_time,
-                ray_radiance_density,
+                ray_features_density,
                 ray_hit_distance,
                 particle_density,
-                particle_radiance,
+                particle_features,
             ) = ctx.saved_variables
 
             frame_id = ctx.frame_id
@@ -260,11 +260,16 @@ class Tracer:
             sensor_params = ctx.sensor_params
             sensor_poses = ctx.sensor_poses
 
-            particle_density_grd, particle_radiance_grd, ray_ori_grd, ray_dir_grd = ctx.tracer_wrapper.trace_bwd(
+            (
+                particle_density_grd,
+                particle_features_grd,
+                ray_ori_grd,
+                ray_dir_grd,
+            ) = ctx.tracer_wrapper.trace_bwd(
                 frame_id,
                 n_active_features,
                 particle_density,
-                particle_radiance,
+                particle_features,
                 ray_ori,
                 ray_dir,
                 ray_time,
@@ -273,8 +278,8 @@ class Tracer:
                 sensor_poses.timestamps_us[1],
                 sensor_poses.T_world_sensors[0],
                 sensor_poses.T_world_sensors[1],
-                ray_radiance_density,
-                ray_radiance_density_grd,
+                ray_features_density,
+                ray_features_density_grd,
                 ray_hit_distance,
                 ray_hit_distance_grd,
             )
@@ -282,14 +287,14 @@ class Tracer:
             mog_pos_grd, mog_dns_grd, mog_rot_grd, mog_scl_grd, _ = torch.split(
                 particle_density_grd, [3, 1, 4, 3, 1], dim=1
             )
-            mog_sph_grd = particle_radiance_grd
+            mog_sph_grd = particle_features_grd
 
             return (
                 None,  # tracer_wrapper
                 None,  # frame_id
                 None,  # n_active_features
-                -ray_ori_grd,  # ray_ori — CUDA backward uses inverted convention
-                -ray_dir_grd,  # ray_dir — CUDA backward uses inverted convention
+                ray_ori_grd,
+                ray_dir_grd,
                 mog_pos_grd.contiguous(),
                 mog_rot_grd.contiguous(),
                 mog_scl_grd.contiguous(),
@@ -358,7 +363,7 @@ class Tracer:
                 frame_id,
             )
             (
-                pred_rgba,
+                pred_features_alpha,
                 pred_dist,
                 hits_count,
                 mog_visibility,
@@ -380,120 +385,26 @@ class Tracer:
                 poses,
             )
 
-            pred_rgb = pred_rgba[..., :3].unsqueeze(0).contiguous()
-            pred_opacity = pred_rgba[..., 3:].unsqueeze(0).contiguous()
+            # pred_features_alpha is [..., RAY_FEATURE_DIM + 1]: features (fp32) + density
+            ray_feature_dim = gaussians.ray_feature_dim
+            pred_features = pred_features_alpha[..., :ray_feature_dim].unsqueeze(0).contiguous()
+            pred_opacity = pred_features_alpha[..., ray_feature_dim:].unsqueeze(0).contiguous()
             pred_dist = pred_dist.unsqueeze(0).contiguous()
             hits_count = hits_count.unsqueeze(0).contiguous()
-
-            pred_rgb, pred_opacity = gaussians.background(
-                gpu_batch.T_to_world.contiguous(), rays_d, pred_rgb, pred_opacity, train
-            )
 
             timings = self.tracer_wrapper.collect_times()
 
         return {
-            "pred_rgb": pred_rgb,
+            "pred_features": pred_features,
             "pred_opacity": pred_opacity,
             "pred_dist": pred_dist,
-            "pred_normals": torch.nn.functional.normalize(torch.ones_like(pred_rgb), dim=3),
+            "pred_normals": torch.nn.functional.normalize(torch.ones_like(pred_features), dim=3),
             "hits_count": hits_count,
             "frame_time_ms": timings["forward_render"] if "forward_render" in timings else 0.0,
             "mog_visibility": mog_visibility,
             "mog_projected_position": mog_projected_position,
             "mog_projected_extent": mog_projected_extent,
             "mog_tiles_count": mog_tiles_count,
-        }
-
-    @torch.no_grad()
-    def render_diagnostic(
-        self,
-        gaussians,
-        gpu_batch: Batch,
-        frame_id: int = 0,
-        features_override=None,
-        sph_degree_override=None,
-    ):
-        """No-grad diagnostic render bypassing _Autograd, accepting overrides.
-
-        Used by the live GUI for gradient render modes: substitutes a
-        per-particle scalar-derived feature tensor and (optionally) forces
-        `n_active_features=0` (3DGUT band-0 only). Does not affect training.
-        """
-        rays_o = gpu_batch.rays_ori
-        rays_d = gpu_batch.rays_dir
-
-        sensor, poses = Tracer.__create_camera_parameters(gpu_batch)
-
-        n_active_features = (
-            sph_degree_override
-            if sph_degree_override is not None
-            else gaussians.n_active_features
-        )
-
-        mog_pos = gaussians.positions.contiguous()
-        mog_rot = gaussians.get_rotation().contiguous()
-        mog_scl = gaussians.get_scale().contiguous()
-        mog_dns = gaussians.get_density().contiguous()
-        particle_density = torch.concat(
-            [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
-        ).contiguous()
-        particle_radiance = (
-            features_override.contiguous()
-            if features_override is not None
-            else gaussians.get_features().contiguous()
-        )
-
-        ray_time = (
-            torch.ones(
-                (rays_o.shape[0], rays_o.shape[1], rays_o.shape[2], 1),
-                device=rays_o.device,
-                dtype=torch.long,
-            )
-            * poses.timestamps_us[0]
-        )
-
-        (
-            ray_radiance_density,
-            ray_hit_distance,
-            ray_hit_count,
-            _mog_visibility,
-            _mog_projected_position,
-            _mog_projected_extent,
-            _mog_tiles_count,
-        ) = self.tracer_wrapper.trace(
-            frame_id,
-            n_active_features,
-            particle_density,
-            particle_radiance,
-            rays_o.contiguous(),
-            rays_d.contiguous(),
-            ray_time.contiguous(),
-            sensor,
-            poses.timestamps_us[0],
-            poses.timestamps_us[1],
-            poses.T_world_sensors[0],
-            poses.T_world_sensors[1],
-        )
-
-        pred_rgb = ray_radiance_density[..., :3].unsqueeze(0).contiguous()
-        pred_opacity = ray_radiance_density[..., 3:].unsqueeze(0).contiguous()
-        pred_dist = ray_hit_distance.unsqueeze(0).contiguous()
-        hits_count = ray_hit_count.unsqueeze(0).contiguous()
-
-        pred_rgb, pred_opacity = gaussians.background(
-            gpu_batch.T_to_world.contiguous(),
-            rays_d,
-            pred_rgb,
-            pred_opacity,
-            False,
-        )
-
-        return {
-            "pred_rgb": pred_rgb,
-            "pred_opacity": pred_opacity,
-            "pred_dist": pred_dist,
-            "pred_normals": torch.nn.functional.normalize(torch.ones_like(pred_rgb), dim=3),
-            "hits_count": hits_count,
         }
 
     def get_bvh_stats(self) -> dict:

@@ -125,20 +125,7 @@ extern "C" __global__ void __raygen__rg() {
     float rayLastHitDistance = fmaxf(0.0f, minMaxT.x - epsT);
     RayPayload rayPayload;
 
-    // Hard backstop against a non-terminating march. Under concurrent multi-process
-    // OptiX traversal the driver scheduler can hand back degenerate/incomplete
-    // payloads that fail to advance rayLastHitDistance, spinning this loop forever
-    // (GPU pinned at 100% with zero step progress -- the observed concurrency wedge).
-    // Cap the iteration count AND force monotonic forward progress so the raygen
-    // kernel always terminates regardless of what trace() returns.
-    constexpr int kMaxMarchIters = 4096;
-    int marchIters               = 0;
-
     while ((rayLastHitDistance <= minMaxT.y) && (rayTransmittance > params.minTransmittance)) {
-        if (++marchIters > kMaxMarchIters) {
-            break;
-        }
-        const float prevLastHitDistance = rayLastHitDistance;
         trace(rayPayload, rayOrigin, rayDirection, rayLastHitDistance + epsT, minMaxT.y + epsT);
         if (rayPayload[0].particleId == RayHit::InvalidParticleId) {
             break;
@@ -154,7 +141,7 @@ extern "C" __global__ void __raygen__rg() {
                     rayDirection,
                     rayHit.particleId,
                     params.particleDensity,
-                    params.particleRadiance,
+                    params.particleFeatures,
                     params.hitMinGaussianResponse,
                     params.alphaMinThreshold,
                     params.sphDegree,
@@ -180,17 +167,11 @@ extern "C" __global__ void __raygen__rg() {
 #endif
             }
         }
-
-        // Force forward progress when no accepted hit advanced rayLastHitDistance
-        // (float ULP at large t, or a degenerate payload), preventing an infinite march.
-        if (rayLastHitDistance <= prevLastHitDistance) {
-            rayLastHitDistance = nextafterf(prevLastHitDistance + epsT, RayHit::InfiniteDistance);
-        }
     }
 
-    params.rayRadiance[idx.z][idx.y][idx.x][0]    = rayRadiance.x;
-    params.rayRadiance[idx.z][idx.y][idx.x][1]    = rayRadiance.y;
-    params.rayRadiance[idx.z][idx.y][idx.x][2]    = rayRadiance.z;
+    params.rayFeatures[idx.z][idx.y][idx.x][0]    = rayRadiance.x;
+    params.rayFeatures[idx.z][idx.y][idx.x][1]    = rayRadiance.y;
+    params.rayFeatures[idx.z][idx.y][idx.x][2]    = rayRadiance.z;
     params.rayDensity[idx.z][idx.y][idx.x][0]     = 1 - rayTransmittance;
     params.rayHitDistance[idx.z][idx.y][idx.x][0] = rayHitDistance;
     params.rayHitDistance[idx.z][idx.y][idx.x][1] = rayLastHitDistance;

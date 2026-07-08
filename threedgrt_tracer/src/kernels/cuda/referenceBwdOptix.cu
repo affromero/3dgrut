@@ -109,12 +109,12 @@ extern "C" __global__ void __raygen__rg() {
     const float3 rayOrigin    = params.rayWorldOrigin(idx);
     const float3 rayDirection = params.rayWorldDirection(idx);
 
-    float3 rayIntegratedRadiance     = make_float3(params.rayRadiance[idx.z][idx.y][idx.x][0], params.rayRadiance[idx.z][idx.y][idx.x][1], params.rayRadiance[idx.z][idx.y][idx.x][2]);
+    float3 rayIntegratedRadiance     = make_float3(params.rayFeatures[idx.z][idx.y][idx.x][0], params.rayFeatures[idx.z][idx.y][idx.x][1], params.rayFeatures[idx.z][idx.y][idx.x][2]);
     float rayIntegratedTransmittance = 1.0f - params.rayDensity[idx.z][idx.y][idx.x][0];
     float rayIntegratedHitDistance   = params.rayHitDistance[idx.z][idx.y][idx.x][0];
     float rayMaxHitDistance          = params.rayHitDistance[idx.z][idx.y][idx.x][1];
 
-    float3 rayRadianceGrad     = make_float3(params.rayRadianceGrad[idx.z][idx.y][idx.x][0], params.rayRadianceGrad[idx.z][idx.y][idx.x][1], params.rayRadianceGrad[idx.z][idx.y][idx.x][2]);
+    float3 rayRadianceGrad     = make_float3(params.rayFeaturesGrad[idx.z][idx.y][idx.x][0], params.rayFeaturesGrad[idx.z][idx.y][idx.x][1], params.rayFeaturesGrad[idx.z][idx.y][idx.x][2]);
     float rayTransmittanceGrad = -1.0f * params.rayDensityGrad[idx.z][idx.y][idx.x][0];
     float rayHitDistanceGrad   = params.rayHitDistanceGrad[idx.z][idx.y][idx.x][0];
 
@@ -132,17 +132,7 @@ extern "C" __global__ void __raygen__rg() {
 
     RayPayload rayPayload;
 
-    // Hard backstop mirroring the forward kernel: guarantee the backward march always
-    // terminates (iteration cap + forced monotonic progress) regardless of what trace()
-    // returns. Diagnostic hardening; does NOT fix the concurrent multi-process wedge.
-    constexpr int kMaxMarchIters = 4096;
-    int marchIters               = 0;
-
     while (startT < endT) {
-        if (++marchIters > kMaxMarchIters) {
-            break;
-        }
-        const float prevStartT = startT;
         trace(rayPayload, rayOrigin, rayDirection, startT + epsT, endT);
         if (rayPayload[0].particleId == RayHit::InvalidParticleId) {
             break;
@@ -159,8 +149,8 @@ extern "C" __global__ void __raygen__rg() {
                     rayHit.particleId,
                     params.particleDensity,
                     params.particleDensityGrad,
-                    params.particleRadiance,
-                    params.particleRadianceGrad,
+                    params.particleFeatures,
+                    params.particleFeaturesGrad,
                     params.hitMinGaussianResponse,
                     params.alphaMinThreshold,
                     params.minTransmittance,
@@ -179,12 +169,6 @@ extern "C" __global__ void __raygen__rg() {
 
                 startT = fmaxf(startT, rayHit.distance);
             }
-        }
-
-        // Force forward progress when no hit advanced startT (float ULP at large t, or a
-        // degenerate payload), preventing an infinite march.
-        if (startT <= prevStartT) {
-            startT = nextafterf(prevStartT + epsT, RayHit::InfiniteDistance);
         }
     }
 

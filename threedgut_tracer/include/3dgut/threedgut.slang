@@ -24,19 +24,4 @@ namespace gaussianParticle
 };
 
 #include <3dgut/kernels/slang/models/gaussianParticles.slang>
-
-namespace shRadiativeParticle
-{
-    static const int RadianceMaxNumSphCoefficients = PARTICLE_RADIANCE_NUM_COEFFS;
-    static const int RadianceNumSphCoefficients = PARTICLE_RADIANCE_NUM_SH_COEFFS;
-    static const bool GaborEnabled = PARTICLE_RADIANCE_GABOR_ENABLED;
-    static const int GaborNumTerms = PARTICLE_RADIANCE_GABOR_NUM_TERMS;
-    static const float GaborMaxFrequency = PARTICLE_RADIANCE_GABOR_MAX_FREQUENCY;
-    static const bool SirenEnabled = PARTICLE_RADIANCE_SIREN_ENABLED;
-    static const int SirenHiddenDim = PARTICLE_RADIANCE_SIREN_HIDDEN_DIM;
-    static const float SirenOmega = PARTICLE_RADIANCE_SIREN_OMEGA;
-    static const float SirenLocalUvScale = PARTICLE_RADIANCE_SIREN_LOCAL_UV_SCALE;
-    static const int Dim = 3;
-};
-
-#include <3dgut/kernels/slang/models/shRadiativeParticles.slang>
+#include <3dgut/kernels/slang/models/radiativeParticles.slang>

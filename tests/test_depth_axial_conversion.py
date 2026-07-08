@@ -23,9 +23,7 @@ def test_world_ray_depth_uses_preserved_camera_space_z() -> None:
 
 def test_camera_space_depth_uses_ray_z_fallback() -> None:
     pred_dist = torch.full((1, 2, 2, 1), 8.0)
-    rays_dir = torch.tensor(
-        [[[[0.0, 0.0, 1.0], [0.0, 0.6, 0.8]], [[0.0, 0.8, 0.6], [1.0, 0.0, 0.0]]]]
-    )
+    rays_dir = torch.tensor([[[[0.0, 0.0, 1.0], [0.0, 0.6, 0.8]], [[0.0, 0.8, 0.6], [1.0, 0.0, 0.0]]]])
 
     pred_depth = _predicted_axial_depth(
         pred_dist=pred_dist,

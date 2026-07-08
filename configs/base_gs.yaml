@@ -12,51 +12,15 @@ out_dir: "./runs"
 n_iterations: 30000
 with_gui: false
 with_viser_gui: false
-viser_port: 8080
 gui_update_from_device: true
 val_frequency: 5000
 num_workers: 24
 use_wandb: false
 wandb_project: "3dgrt"
-wandb_group: ""
-wandb_run_id: ""
-wandb_resume: "allow"
 test_last: true
 validate_first: false
-validate_final: true
-validate_only: false
 log_frequency: 1
-
-# Diagnostic substrate (AI-readable Parquet sidecar + future PNG snapshots).
-diagnostics:
-  parquet_enabled: true     # Write per-step metrics to {output_dir}/diagnostics.parquet
-  parquet_flush_steps: 100  # Flush row groups every N steps
-  snapshot_frequency: 500   # Save render/residual/grad_positions PNGs every N steps (0 disables)
-  snapshot_camera_index: 0  # Which train camera to render snapshots from
-  snapshot_resolution: 256  # Thumbnail edge length
-  snapshot_include_gt: true  # Include GT RGB when the train batch exposes it
-  snapshot_contact_sheet_enabled: true  # Log GT/render/residual/grad in one PNG
-  snapshot_grad_enabled: false  # Grad panels are sparse; opt in when needed
-  snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
-  snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
-  validation_metrics_enabled: true  # Compute full validation diagnostics beyond PSNR/loss.
-  training_metrics_enabled: true  # Compute comparable train-split diagnostics at validation checkpoints.
-  training_metrics_max_views: 64  # Cap train-split eval views; 0 evaluates every train view.
-  loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
-  loss_volume_voxel_size_m: 0.1
-  loss_volume_view_stride: 4
-  loss_volume_pixel_stride: 8
 compute_extra_metrics: true
-
-early_stopping:
-  enabled: false
-  metric: masked_psnr_if_available
-  patience: 3
-  min_delta: 0.0
-  min_step: 0
-  min_score: 0.0
-  min_score_after_step: 0
-  restore_best_on_end: true
 
 enable_frame_timings: false
 
@@ -65,9 +29,6 @@ writer:
   hit_stat_frequency: 999999
   max_num_hits: 128
   log_image_views: ${int_list:[ 0, 13, 27, 43, 78 ]}
-  eval_image_count: 5
-  eval_image_group_size: 5
-  footprint_sample_count: 200000
 
 export_ply:
   enabled: false
@@ -76,56 +37,41 @@ import_ply:
   enabled: false
   path: ""
   init_global_step: 0
-
-camera_residual:
-  enabled: false
-  lr: 0.0001
-  lr_end_fraction: 0.01
-  warmup_steps: 0
-  reg_lambda: 1.0
-  max_rotation_rad: 0.0174533
-  max_translation_m: 0.02
-  max_rolling_rotation_rad: 0.004
-  max_rolling_translation_m: 0.005
-  optimize_global: true
-  optimize_per_camera: false
-  optimize_per_image: false
-  optimize_rolling_per_camera: false
-  freeze_gaussians: false
-  fail_on_zero_grad: true
-  fail_after_steps: 5
-  min_abs_grad: 1.e-12
-  finite_difference_audit:
-    enabled: false
-    max_views: 12
-    rotation_step_rad: 0.001
-    translation_step_m: 0.002
-    per_view: false
-    target_image_names: ""
-    exit_after: true
-
-camera_intrinsics_audit:
-  enabled: false
-  camera_indices: [0, 2]
-  max_views_per_camera: 8
-  focal_delta_fraction: 0.002
-  principal_delta_px: 2.0
-  skew_delta_px: 0.5
-  numerator_delta: 0.005
-  denominator_delta: 0.005
-  affine_delta: 0.001
-  tangential_delta: 0.001
-  exit_after: true
-
+  
 export_usd:
   enabled: false
   path: ""
   apply_normalizing_transform: true
-  format: standard  # "nurec" for Omniverse USDVol internal format, "standard" for USDVol ParticleField3DGaussianSplat
+  format: standard  # "nurec" for internal USDVol format, "standard" for USDVol ParticleField3DGaussianSplat
   half_precision: false
   export_cameras: true
   export_background: true
+  # zDepth | cameraDistance | rayHitDistance
   sorting_mode_hint: cameraDistance
+  # Enable post-processing export when the checkpoint contains a supported module.
+  # Defaults to true; ppisp-integration-mode controls how PPISP is exported.
+  export_post_processing: true
+  # spg-runtime authors PPISP as Omniverse SPG shaders applied at render time.
+  # sh-optimized folds one fixed PPISP transform into Gaussian SH coefficients.
+  # spg-runtime | sh-optimized
+  ppisp-integration-mode: spg-runtime
+  # Optional fixed PPISP camera/frame. sh-optimized defaults unset values to 0;
+  # spg-runtime keeps dynamic per-camera/per-frame behavior when unset.
+  ppisp-reference-camera-id: null
+  ppisp-reference-frame-id: null
+  # Achromatic PPISP responsivity default authored on spg-runtime SPG shaders.
+  # To rescale asset radiance by k while preserving the PPISP input magnitude,
+  # set scene-radiance-scale: k and ppisp-responsivity: 1/k.
+  ppisp-responsivity: 1.0
+  # null = auto-export controllers when the PPISP checkpoint has them.
+  # true = require controller export; false = force static/time-sampled fallback.
+  enable-ppisp-controller-export: null
+  # Number of optimizer steps for sh-optimized export. null uses the default (3000).
+  sh-optimization-num-iterations: null
+  # Multiplicative scale applied to exported SH radiance.
+  scene-radiance-scale: 1.0
+  # USD timeCodesPerSecond; time codes are bare frame indices so this sets playback speed
+  frames_per_second: 1.0
 
 model:
   density_activation: sigmoid
@@ -135,9 +81,13 @@ model:
   optimize_density: true
   optimize_features_albedo: true
   optimize_features_specular: true
+  optimize_features: true
   optimize_position: true
   optimize_rotation: true
   optimize_scale: true
+  bvh_update_frequency: 1
+  feature_type: "sh" # one of [sh, nht] # sh: spherical harmonics radiance, nht: neural harmonics texture
+  # Positional carrier residuals (sh mode only; 3dgut renderer only).
   use_gabor_carrier: false
   gabor_num_terms: 3
   gabor_max_frequency: 4.0
@@ -148,13 +98,40 @@ model:
   siren_init_seed: 20260626
   siren_init_scale: 0.2
   siren_output_init_scale: 0.0
-  bvh_update_frequency: 1
   progressive_training:
-    feature_type: "sh" # one of [sh, mlp], currently only sh supported
     init_n_features: 0 # sh: initial sh deg | mlp: num of dims initially unmasked
     max_n_features: 3 # sh: maximum sh deg | mlp: total num of dims finally unmasked
     increase_frequency: 1000 # unmask more feature dimensions every N global steps
     increase_step: 1 # sh: how many degrees unmasked per step | mlp: how many dims unmasked per step
+
+  nht_features:
+    dim: 48
+    init_min: -1.5707963267948966
+    init_max: 1.5707963267948966
+    activation:
+      type: "sincos"
+      num_frequencies: 1
+    interpolation_type: "barycentric"
+
+  nht_decoder:
+    enabled: true
+    hidden_dim: 128
+    num_layers: 3
+    dir_encoding: "SphericalHarmonics"
+    dir_encoding_degree: 3
+    sh_scale: 3.0
+    center_ray_encoding: false
+    output_activation: "Sigmoid"
+    unpremultiply_alpha: false
+    learning_rate: 0.00068
+    reg_weight: 0.0
+    scheduler:
+      type: "cosine"
+      decay_final: 0.1
+      max_steps: 30000
+    ema_decay: 0.95
+    ema_start_step: 0
+    color_refine_steps: 3000
 
   background:
     name: background-color # one of [skip-background, background-color]
@@ -164,15 +141,11 @@ model:
 
 checkpoint:
   iterations: ${int_list:[ 7000, 30000 ]}
-  keep_step_checkpoints: true
-  save_last_on_validation: false
-  save_best_on_validation: false
 
 optimizer:
   type: adam # We only support adam and selective_adam for now
   lr: 0.0
   eps: 1.e-15
-  resume_lr_scale: 1.0
   params:
     positions:
       lr: 0.00016 # 3DGS value: 0.00016 initial and decayed to 0.0000016
@@ -182,6 +155,8 @@ optimizer:
       lr: 0.0025 # 3DGS value: 0.0025
     features_specular:
       lr: ${div:${optimizer.params.features_albedo.lr},20} # 3DGS value 20x smaller than lr of features_albedo
+    features:
+      lr: 0.015
     rotation:
       lr: 0.001 # 3DGS value: 0.001
     scale:
@@ -199,27 +174,20 @@ scheduler:
   density:
     type: skip
 
+  features:
+    type: cosine
+    decay_final: 0.1
+    max_steps: 30000
+
 loss:
   use_l1: true
   lambda_l1: 0.8
-  l1_loss_type: absolute
-  charbonnier_epsilon: 0.01
-
-  # ErpGS-style distortion-aware latitude weighting of the RGB L1 term.
-  # When true AND the frame is equirectangular, the per-pixel L1 residual is
-  # weighted by a mean-1-normalized cos(latitude) map so the loss respects
-  # the true spherical sampling (poles are over-sampled in ERP). No-op on
-  # perspective/fisheye frames; SSIM is left unweighted.
-  erp_latitude_weighting: false
-
+  
   use_l2: false
   lambda_l2: 1.0
 
   use_ssim: true
   lambda_ssim: 0.2
-
-  use_camera_loss_weights: false
-  camera_loss_weights: []
 
   use_opacity: false
   lambda_opacity: 0.0
@@ -227,55 +195,20 @@ loss:
   use_scale: false
   lambda_scale: 0.0
 
-  use_sky_opacity: false
-  lambda_sky_opacity: 0.0
-
+  # Metric-depth supervision from COLMAP-aligned sidecars (anchors sparse
+  # geometry to cure floater/leakage in weakly-constrained regions).
   use_depth: false
   lambda_depth: 0.0
-  depth_loss_type: log_l1
-  depth_apply_rgb_mask: true
-  depth_min_m: 0.05
-
-  # rim-gated geometric prior (persistent ray-distance constraint at theta>rim)
-  use_rim_depth: false
-  lambda_rim: 0.0
-  rim_theta_min_deg: 60.0
-  rim_centre_band_deg: 40.0
-  rim_centre_anchor: true
-  rim_detach_affine: false  # diagnostic: detach the centre-anchor fit so the loss cannot co-adapt the eval calibration (isolates the metric artifact)
-
-  # high-frequency appearance loss on the clean fisheye rim band
-  use_rim_hf: false
-  lambda_rim_hf: 0.0
-  rim_hf_theta_min_deg: 60.0
-  rim_hf_theta_max_deg: 80.0
-  rim_hf_kernel_size: 7
-  rim_hf_sigma: 1.5
-  rim_hf_loss_type: charbonnier
-  rim_hf_charbonnier_epsilon: 0.01
-
-  # MV-DINO multi-view-consistent feature rim loss.
-  use_mvdino_rim: false
-  lambda_mvdino_rim: 0.0
-  mvdino_model_name: dinov2_reg
-  mvdino_rim_theta_min_deg: 60.0
-  mvdino_rim_theta_max_deg: 80.0
-  mvdino_exp_dir: null
-  mvdino_warmup_iters: 3000
-  mvdino_use_rim_crops: false
-  mvdino_n_crops: 8
-  mvdino_crop_px: 518
-  mvdino_use_anyup: false
-  mvdino_anyup_res: 512
+  depth_loss_type: log_l1  # log_l1 | relative_l1
+  depth_min_m: 0.05  # ignore depths below this (metres) on both pred and GT
 
 # Post-processing configuration
 post_processing:
-  method: null # Possible values: null, "ppisp", "luminance_affine"
-  # Mapping used only by post-processing modules. Rendering still uses
-  # dataset intrinsics. Use "single_physical_camera" for monocular video
-  # COLMAP bundles whose frame-specific intrinsics create many camera_id rows.
+  # null | "ppisp" | "linear-to-srgb" | "luminance_affine"
+  method: null
+  # "dataset": one bucket per dataset camera; "single_physical_camera":
+  # fold all frames into one bucket (dataset splits one physical camera).
   camera_index_mode: dataset
-  resume_lr_scale: 1.0
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.
   use_controller: true
@@ -317,3 +250,30 @@ hydra:
     chdir: false
   run:
     dir: .
+
+camera_residual:
+  enabled: false
+  lr: 0.0001
+  lr_end_fraction: 0.01
+  warmup_steps: 0
+  reg_lambda: 1.0
+  max_rotation_rad: 0.0174533
+  max_translation_m: 0.02
+  max_rolling_rotation_rad: 0.004
+  max_rolling_translation_m: 0.005
+  optimize_global: true
+  optimize_per_camera: false
+  optimize_per_image: false
+  optimize_rolling_per_camera: false
+  freeze_gaussians: false
+  fail_on_zero_grad: true
+  fail_after_steps: 5
+  min_abs_grad: 1.e-12
+  finite_difference_audit:
+    enabled: false
+    max_views: 12
+    rotation_step_rad: 0.001
+    translation_step_m: 0.002
+    per_view: false
+    target_image_names: ""
+    exit_after: true

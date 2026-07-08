@@ -2,7 +2,7 @@
 
 import torch
 from omegaconf import OmegaConf
-from threedgrut.model.model import (
+from threedgrut.model.carriers import (
     initial_siren_carrier_tail,
     siren_carrier_bias_coeffs,
     siren_carrier_coeffs,

@@ -25,9 +25,14 @@ For projects that require a fast, modular, and production-ready Gaussian Splatti
 > _CVPR 2025 (Oral)_
 > __[Project page](https://research.nvidia.com/labs/toronto-ai/3DGUT)&nbsp;/ [Paper](https://research.nvidia.com/labs/toronto-ai/3DGUT/res/3DGUT_ready_main.pdf)&nbsp;/ [Video](https://research.nvidia.com/labs/toronto-ai/3DGUT/#supp_video)&nbsp;/ [BibTeX](assets/3dgut2025.bib)__
 
+> __Neural Harmonic Textures for High-Quality Primitive Based Neural Reconstruction__
+> Jorge Condor, Nicolas Moenne-Loccoz, Merlin Nimier-David, Piotr Didyk, Zan Gojcic, Qi Wu
+> _arXiv 2026_
+> __[Project page](https://research.nvidia.com/labs/sil/projects/neural-harmonic-textures/)&nbsp;/ [Paper](https://research.nvidia.com/labs/sil/projects/neural-harmonic-textures/assets/neural_harmonic_textures.pdf)&nbsp;/ [Video](https://research.nvidia.com/labs/sil/projects/neural-harmonic-textures/videos/video_nht_titleless.mp4)&nbsp;/ [BibTeX](assets/nht2026.bib)__
 
 ## 🔥 News
-- ✅[2026/03] **NCore v4:** Support for training from NCore v4 datasets ([NCore](https://github.com/NVIDIA/ncore), [commands](#training-on-ncore-v4-datasets)).
+- ✅[2026/06] 3DGRUT v2.0.0: Neural Harmonic Textures support.
+- ✅[2026/03] NCore v4: Support for training from NCore v4 datasets ([NCore](https://github.com/NVIDIA/ncore), [commands](#training-on-ncore-v4-datasets)).
 - ✅[2026/01] Physically-Plausible ISP support.
 - ✅[2025/08] Support for the 3DGRT and 3DGS/3DGRT pipelines is now available with the Vulkan API as part of the [Vulkan Gaussian Splatting Project](https://github.com/nvpro-samples/vk_gaussian_splatting). 3DGUT will also be available soon.
 - ✅[2025/07] Support for datasets with multiple sensors (only for COLMAP-style datasets).
@@ -49,23 +54,25 @@ For projects that require a fast, modular, and production-ready Gaussian Splatti
   - [Running with Docker](#running-with-docker)
 - [💻 2. Train 3DGRT or 3DGUT scenes](#-2-train-3dgrt-or-3dgut-scenes)
   - [Training on NCore v4 datasets](#training-on-ncore-v4-datasets)
+  - [Training with Neural Harmonic Textures (NHT)](#training-with-neural-harmonic-textures-nht)
   - [Using image masks](#using-image-masks)
-  - [Exporting USDZ for use in Omniverse and Isaac Sim](#exporting-usdz-for-use-in-omniverse-and-isaac-sim)
+  - [Exporting trained scenes (USD, PLY, NuRec)](#exporting-trained-scenes-usd-ply-nurec)
 - [🎥 3. Rendering from Checkpoints](#-3-rendering-from-checkpoints)
   - [To visualize training progress interactively](#to-visualize-training-progress-interactively)
   - [To visualize a pre-trained checkpoint](#to-visualize-a-pre-trained-checkpoint)
 - [📋 4. Evaluations](#-4-evaluations)
 - [🛝 5. Interactive Playground GUI](#-5-interactive-playground-gui)
-- [📄 6. Contributing](#-6-contributing)
-- [🎓 7. Citations](#-7-citations)
-- [🙏 8. Acknowledgements](#-8-acknowledgements)
+- [📦 6. Asset Preparation and Re-export](threedgrut/export/README.md#transcoding-between-formats)
+- [📄 7. Contributing](#-7-contributing)
+- [🎓 8. Citations](#-8-citations)
+- [🙏 9. Acknowledgements](#-9-acknowledgements)
 
 ## 🔧 1 Dependencies and Installation
 - Supported CUDA versions: 11.8, 12.4, 12.6, 12.8 (default), 13.0 (experimental)
 - For good performance with 3DGRT, we recommend using an NVIDIA GPU with Ray Tracing (RT) cores.
 - Both Linux and Windows are supported via UV install scripts.
 
-### Option A: Using UV (Recommended)
+### Using UV
 
 (Kindly contributed by [@MasahiroOgawa](https://github.com/MasahiroOgawa))
 
@@ -76,6 +83,7 @@ git clone --recursive https://github.com/nv-tlabs/3dgrut.git
 cd 3dgrut
 ```
 
+<br/>
 <details open>
 <summary><strong>Linux</strong></summary>
 
@@ -120,6 +128,7 @@ source .venv/bin/activate
 
 </details>
 
+<br/>
 <details>
 <summary><strong>Windows</strong></summary>
 
@@ -154,32 +163,6 @@ This also sets the build environment variables (`TORCH_CUDA_ARCH_LIST`, `CUDA_HO
 
 </details>
 
-### Option B: Using Legacy Conda Script
-
-<details>
-<summary>Legacy Conda Installation via <code>install_env.sh</code> (CUDA 11.8.0 / 12.8.1 only)</summary>
-</br>
-
-> [!NOTE]
-> `install_env.sh` is a legacy script that only supports CUDA 11.8.0 and 12.8.1 and requires
-> manual GCC management. For new setups, prefer **Sub-option A1** above, which supports more
-> CUDA versions and handles GCC compatibility automatically.
-
-```bash
-git clone --recursive https://github.com/nv-tlabs/3dgrut.git
-cd 3dgrut
-chmod +x install_env.sh
-./install_env.sh 3dgrut
-conda activate 3dgrut
-```
-
-If your system GCC is newer than 11, install `gcc-11` first and pass the `WITH_GCC11` flag:
-```sh
-sudo apt-get install gcc-11 g++-11
-./install_env.sh 3dgrut WITH_GCC11
-```
-</details>
-
 ### Blackwell / RTX 50 series Support
 
 We support CUDA 12.8 (Blackwell / RTX 50 series) — kindly contributed by <a href="https://www.github.com/johnnynunez">@johnnynunez</a>:
@@ -198,16 +181,11 @@ source .venv/bin/activate
 
 ### Building and Running with Docker
 
-To build the Docker image:
-```sh
-docker build --build-arg CUDA_VERSION=12.8.1 -t 3dgrut:cuda128 .
-```
-
 Build the Docker image:
-```bash
-git clone --recursive https://github.com/nv-tlabs/3dgrut.git
-cd 3dgrut
-docker build . -t 3dgrut
+```sh
+docker build --build-arg CUDA_VERSION=12.8.1 -t 3dgrut:cuda12 .
+docker build --build-arg CUDA_VERSION=11.8.0 --build-arg UBUNTU_VERSION=22.04 -t 3dgrut:cuda11 .
+docker buildx build --platform linux/amd64,linux/arm64 --build-arg CUDA_VERSION=13.0.2 -t 3dgrut:cuda13 .
 ```
 
 Run it:
@@ -259,11 +237,29 @@ python train.py --config-name apps/colmap_3dgrt_mcmc.yaml path=data/mipnerf360/b
 python train.py --config-name apps/colmap_3dgut_mcmc.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgut dataset.downsample_factor=2
 ```
 
+### Training with Neural Harmonic Textures (NHT)
+
+To enable Neural Harmonic Textures (NHT), use:
+```bash
+python train.py --config-name apps/colmap_3dgrt_mcmc_nht.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgrt_nht dataset.downsample_factor=2
+python train.py --config-name apps/colmap_3dgut_mcmc_nht.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgut_nht dataset.downsample_factor=2
+```
+
 To enable selective Adam, use:
 ```bash
 python train.py --config-name apps/colmap_3dgrt.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgrt dataset.downsample_factor=2 optimizer.type=selective_adam
 python train.py --config-name apps/colmap_3dgut.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgut dataset.downsample_factor=2 optimizer.type=selective_adam
 ```
+
+### Post-processing (linear-to-sRGB and PPISP)
+
+Hydra key: ``post_processing.method``. Values:
+
+- **null** (default): no change to rendered RGB before the loss.
+- **linear-to-srgb**: **IEC 61966-2-1** piecewise linear-to-sRGB encoding on ``pred_rgb``.
+- **ppisp**: physically plausible image signal processing; requires the ``ppisp`` package. PPISP
+  learns exposure, color, vignetting, and camera response corrections. When configured with a
+  controller, it can also predict exposure and color latents from each rendered view.
 
 If you use MCMC and Selective Adam in your research, please cite [3dgs-mcmc](https://github.com/ubc-vision/3dgs-mcmc), [taming-3dgs](https://github.com/humansensinglab/taming-3dgs),
 and the [gSplat](https://github.com/nerfstudio-project/gsplat/tree/main) library from which the code was adopted (links to the code are provided in the source files).
@@ -282,42 +278,24 @@ The provided masks should have the same resolution as their corresponding images
 
 **NOTE**: The masks are only used for loss computation and not for computing the metrics.
 
-### Exporting USDZ for use in Omniverse and Isaac Sim
+### Exporting trained scenes (USD, PLY, NuRec)
 
-As a beta feature, Omniverse Kit 107.3 and Isaac Sim 5.0 are able to support rendering 3D Gaussians in a specific custom USDZ-based format that uses an extension of the UsdVolVolume Schema.
-
-The 3DGRUT repository can output trained scenes to this format by enabling the `export_usd` flag:
+Trained scenes can be exported to USD ([`ParticleField`](https://openusd.org/release/user_guides/schemas/usdVol/ParticleField.html)), NuRec USDZ for Omniverse,
+or PLY, and transcoded between these formats. The simplest path is to enable export at the end of
+training:
 
 ```bash
 python train.py --config-name apps/colmap_3dgut.yaml path=data/mipnerf360/garden/ out_dir=runs experiment_name=garden_3dgut dataset.downsample_factor=2 export_usd.enabled=true
 ```
 
 > [!NOTE]
-> The USD output schema is currently compatible with Isaac Sim 5.0, but how USD and reconstruction workflows work together is highly likely to change in future versions. This is a beta feature.
+> While Isaac Sim 6.0 supports both the `ParticleField` (standard USD) schema and the custom NuRec USDZ
+> output, custom NuRec USDZ is going to be deprecated and replaced by `ParticleField`. Prefer `ParticleField`
+> for new assets.
 
-#### Converting PLY files to USDZ
-
-If you have existing Gaussian data in PLY format, for example, from 3DGS, you can convert it to the USDZ format using the `ply_to_usd.py` script:
-
-```bash
-python -m threedgrut.export.scripts.ply_to_usd path/to/your/model.ply --output_file path/to/output.usdz
-```
-
-This is useful for converting 3DGS models from other sources to the USDZ format. Note that the resulting USDZ does not include a mesh. If you need a mesh inside the USDZ (e.g. for collision geometry), follow the next step.
-
-#### Adding a Mesh to a USDZ File
-
-You can add a mesh (PLY or USD) into an existing USDZ file using the `add_mesh_to_usdz.py` script. This is useful for producing USDZ assets with physics properties such as collision geometry.
-
-
-```bash
-python -m threedgrut.export.scripts.add_mesh_to_usdz --input_usdz path/to/input.usdz --output_usdz path/to/output.usdz --mesh_ply path/to/mesh.ply --set_collision
-```
-
-Optional flags:
-- `--set_collision` — enable collision on mesh prims.
-- `--set_invisible` — make mesh prims invisible.
-- `--referencing_usd` — specify which USD file in the package to modify (default: auto-detect the one with a Volume prim).
+For the full set of export workflows — standalone USD export, PLY ⇄ USD ⇄ NuRec transcoding,
+PLY→USDZ conversion, adding meshes to USDZ, and PPISP post-processing export — see the export
+documentation: [`threedgrut/export/README.md`](threedgrut/export/README.md).
 
 ## 🎥 3. Rendering from Checkpoints
 Evaluate a checkpoint with splatting, the OptiX tracer, or PyTorch:
@@ -513,6 +491,64 @@ bash ./benchmark/scannetpp_render.sh results/scannetpp
 
 </details>
 
+<details>
+<summary><strong><a name="gut-nht-benchmark">3DGUT / NHT Results Produced on L40</a></strong></summary>
+<br/>
+
+**MipNeRF360 Dataset**
+
+```bash
+RESULT_DIR=results/mipnerf360_3dgut_nht \
+    bash ./benchmark/mipnerf360.sh apps/colmap_3dgut_mcmc_nht.yaml
+bash ./benchmark/mipnerf360_render.sh results/mipnerf360_3dgut_nht
+```
+
+Current validation uses 1M primitives, 30k iterations, MCMC, and 48 NHT features.
+
+|           | PSNR  | SSIM  | Train (s) | FPS   |
+|-----------|-------|-------|-----------|-------|
+| Bicycle   | 25.32 | 0.767 | 3177.5    | 230.9 |
+| Bonsai    | 33.65 | 0.951 | 5583.5    | 141.4 |
+| Counter   | 29.99 | 0.919 | 7229.4    | 120.5 |
+| Flowers   | 21.52 | 0.606 | 3916.8    | 179.3 |
+| Garden    | 27.52 | 0.859 | 3054.4    | 311.2 |
+| Kitchen   | 32.44 | 0.934 | 5852.5    | 162.3 |
+| Room      | 32.61 | 0.931 | 5827.3    | 139.6 |
+| Stump     | 26.68 | 0.779 | 3155.7    | 213.6 |
+| Treehill  | 23.02 | 0.653 | 3225.3    | 219.2 |
+| *Average* | 28.08 | 0.822 | 4558.0    | 190.9 |
+
+</details>
+
+<details>
+<summary><strong><a name="grt-nht-benchmark">3DGRT / NHT Results Produced on L40</a></strong></summary>
+<br/>
+
+**MipNeRF360 Dataset**
+
+```bash
+RESULT_DIR=results/mipnerf360_3dgrt_nht \
+    bash ./benchmark/mipnerf360.sh apps/colmap_3dgrt_mcmc_nht.yaml
+bash ./benchmark/mipnerf360_render.sh results/mipnerf360_3dgrt_nht
+```
+
+Current validation uses 1M primitives, 30k iterations, MCMC, and 48 NHT features.
+
+|           | PSNR  | SSIM  | Train (s) | FPS  |
+|-----------|-------|-------|-----------|------|
+| Bicycle   | 25.21 | 0.762 | 3187.1    | 58.1 |
+| Bonsai    | 33.11 | 0.949 | 6470.9    | 27.4 |
+| Counter   | 29.41 | 0.915 | 9095.5    | 18.6 |
+| Flowers   | 21.42 | 0.604 | 3676.9    | 50.9 |
+| Garden    | 27.12 | 0.850 | 2864.2    | 67.4 |
+| Kitchen   | 31.47 | 0.930 | 6025.1    | 26.6 |
+| Room      | 31.61 | 0.929 | 7548.5    | 30.5 |
+| Stump     | 25.61 | 0.744 | 2751.5    | 49.1 |
+| Treehill  | 23.05 | 0.653 | 3405.5    | 55.9 |
+| *Average* | 27.56 | 0.815 | 5002.8    | 42.7 |
+
+</details>
+
 ## 🛝 5. Interactive Playground GUI
 
 The playground allows interactive exploration of pretrained scenes, with ray-tracing effects such as inserted objects,
@@ -527,7 +563,13 @@ See [Playground README](threedgrut_playground/README.md) for details.
 
 *Update (2025/04): The playground engine is now exposed, and remote rendering is supported; see README for details.*
 
-## 📄 6. Contributing
+## 📦 6. Asset Preparation and Re-export
+
+This repository includes tools for converting, combining, partitioning, and
+re-exporting Gaussian assets between PLY, ParticleField USD, and NuRec.
+See the [asset transcoding and re-export documentation](threedgrut/export/README.md#transcoding-between-formats).
+
+## 📄 7. Contributing
 
 Contributions are welcome! Please feel free to submit a pull request.
 
@@ -535,7 +577,7 @@ Formatting uses `black` and `isort`. Please run
 `black . --target-version=py311 --line-length=120 --exclude=thirdparty/tiny-cuda-nn` and
 `isort . --skip=thirdparty/tiny-cuda-nn --profile=black` before submitting a pull request.
 
-## 🎓 7. Citations
+## 🎓 8. Citations
 
 ```
 @article{loccoz20243dgrt,
@@ -555,7 +597,16 @@ Formatting uses `black` and `isort`. Please run
 }
 ```
 
-## 🙏 8. Acknowledgements
+```
+@article{condor2026nht,
+    title={Neural Harmonic Textures for High-Quality Primitive Based Neural Reconstruction},
+    author={Condor, Jorge and Moenne-Loccoz, Nicolas and Nimier-David, Merlin and Didyk, Piotr and Gojcic, Zan and Wu, Qi},
+    journal = {arXiv preprint arXiv:2604.01204},
+    year={2026}
+}
+```
+
+## 🙏 9. Acknowledgements
 
 We sincerely thank our colleagues for their valuable contributions to this project.
 

@@ -444,11 +444,6 @@ constexpr uint32_t icosaHedronNumTri = 20;
 constexpr float goldenRatio   = 1.618033988749895;
 constexpr float icosaEdge     = 1.323169076499215;
 constexpr float icosaVrtScale = 0.5 * icosaEdge;
-__device__ inline bool finiteSane(const float3& v) {
-    return isfinite(v.x) && isfinite(v.y) && isfinite(v.z) &&
-           (fabsf(v.x) <= 1e12f) && (fabsf(v.y) <= 1e12f) && (fabsf(v.z) <= 1e12f);
-}
-
 __global__ void computeGaussianEnclosingIcosaHedronKernel(
     const uint32_t gNum,
     const float3* __restrict__ gPos,
@@ -459,8 +454,7 @@ __global__ void computeGaussianEnclosingIcosaHedronKernel(
     const uint32_t opts,
     const float degree,
     float3* __restrict__ gPrimVrt,
-    int3* __restrict__ gPrimTri,
-    unsigned int* __restrict__ badPrimCounter) {
+    int3* __restrict__ gPrimTri) {
     const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < gNum) {
         const uint32_t sVertIdx = icosaHedronNumVrt * idx;
@@ -478,31 +472,10 @@ __global__ void computeGaussianEnclosingIcosaHedronKernel(
             make_float3(0, -1, -goldenRatio), make_float3(goldenRatio, 0, -1), make_float3(1, -goldenRatio, 0)};
 
         const float3 kscl = kernelScale(gDns[idx], kernelMinResponse, opts, degree) * scl * icosaVrtScale;
-        // Non-finite (or absurd-magnitude) vertices fed to optixAccelBuild are
-        // undefined behavior in OptiX traversal (observed: a few warps wedge
-        // forever inside optixTrace, pinning the GPU with ~0% SM occupancy).
-        // Collapse any such particle to a degenerate point (zero-area triangles
-        // are legally discarded by the builder) and count it for the host log.
-        float3 vrts[icosaHedronNumVrt];
-        bool bad = false;
 #pragma unroll
         for (int i = 0; i < icosaHedronNumVrt; ++i) {
-            vrts[i] = (icosaHedronVrt[i] * kscl) * rot + trans;
-            bad     = bad || !finiteSane(vrts[i]);
-        }
-        if (bad) {
-            const float3 safe = finiteSane(trans) ? trans : make_float3(0.f, 0.f, 0.f);
-#pragma unroll
-            for (int i = 0; i < icosaHedronNumVrt; ++i) {
-                vrts[i] = safe;
-            }
-            if (badPrimCounter != nullptr) {
-                atomicAdd(badPrimCounter, 1u);
-            }
-        }
-#pragma unroll
-        for (int i = 0; i < icosaHedronNumVrt; ++i) {
-            gPrimVrt[sVertIdx + i] = vrts[i];
+            float3& vrt = gPrimVrt[sVertIdx + i];
+            vrt         = (icosaHedronVrt[i] * kscl) * rot + trans;
         }
 
         const int3 icosaHedronTri[icosaHedronNumTri] = {
@@ -723,7 +696,6 @@ void computeGaussianEnclosingIcosaHedron(uint32_t gNum,
                                          const float degree,
                                          float3* gPrimVrt,
                                          int3* gPrimTri,
-                                         unsigned int* badPrimCounter,
                                          cudaStream_t stream) {
     const uint32_t threads = 1024;
     const uint32_t blocks  = div_round_up(static_cast<uint32_t>(gNum), threads);
@@ -733,8 +705,7 @@ void computeGaussianEnclosingIcosaHedron(uint32_t gNum,
                                                                               gRot,
                                                                               gScl,
                                                                               gDns,
-                                                                              kernelMinResponse, opts, degree, gPrimVrt, gPrimTri,
-                                                                              badPrimCounter);
+                                                                              kernelMinResponse, opts, degree, gPrimVrt, gPrimTri);
 }
 
 void computeGaussianEnclosingTetraHedron(uint32_t gNum,

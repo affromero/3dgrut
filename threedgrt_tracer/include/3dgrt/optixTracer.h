@@ -54,18 +54,6 @@ enum CreatePipelineFlags {
     PipelineFlag_SpherePrim = 1 << 5
 };
 
-// Public POD exposed via pybind11 — diagnostic stats captured at the most
-// recent `buildBVH(...)` call. Used by the live GUIs and the per-step
-// Parquet sidecar to attribute densification cost.
-struct BVHStats {
-    float lastBuildTimeMs;          // host-side wall-clock of last buildBVH()
-    uint32_t primitiveCount;        // gNum at last build
-    size_t gasBufferBytes;          // OptiX GAS output buffer bytes
-    size_t gasBufferTmpBytes;       // OptiX GAS temp scratch bytes
-    size_t gPrimAABBBytes;          // primitive AABB / instance buffer bytes
-    bool lastBuildWasFullRebuild;   // true = full rebuild, false = refit/update
-};
-
 class OptixTracer {
 
 protected:
@@ -84,6 +72,7 @@ protected:
 
         float particleKernelDegree;
         float particleKernelMinResponse;
+        float particleKernelMaxAlpha;
         bool particleKernelDensityClamping;
         int particleRadianceSphDegree;
 
@@ -101,7 +90,6 @@ protected:
         size_t iasBufferSz;
         CUdeviceptr gPipelineParticleData; ///< buffer containing pipeline specific particle data
         size_t gPipelineParticleDataSz;
-        CUdeviceptr badPrimCounter; ///< device counter of sanitized non-finite primitives (diagnostic)
 
         OptixPipeline pipelineTracingFwd;
         OptixShaderBindingTable sbtTracingFwd;
@@ -145,6 +133,7 @@ public:
         const std::string& primitive,
         float particleKernelDegree,
         float particleKernelMinResponse,
+        float particleKernelMaxAlpha,
         bool particleKernelDensityClamping,
         int particleRadianceSphDegree,
         bool enableNormals,
@@ -157,7 +146,7 @@ public:
                                                                                                                        torch::Tensor rayOri,
                                                                                                                        torch::Tensor rayDir,
                                                                                                                        torch::Tensor particleDensity,
-                                                                                                                       torch::Tensor particleRadiance,
+                                                                                                                       torch::Tensor particleFeatures,
                                                                                                                        uint32_t renderOpts,
                                                                                                                        int sphDegree,
                                                                                                                        float minTransmittance);
@@ -166,13 +155,13 @@ public:
                                                                                             torch::Tensor rayToWorld,
                                                                                             torch::Tensor rayOri,
                                                                                             torch::Tensor rayDir,
-                                                                                            torch::Tensor rayRad,
+                                                                                            torch::Tensor rayFeat,
                                                                                             torch::Tensor rayDns,
                                                                                             torch::Tensor rayHit,
                                                                                             torch::Tensor rayNrm,
                                                                                             torch::Tensor particleDensity,
-                                                                                            torch::Tensor particleRadiance,
-                                                                                            torch::Tensor rayRadGrd,
+                                                                                            torch::Tensor particleFeatures,
+                                                                                            torch::Tensor rayFeatGrd,
                                                                                             torch::Tensor rayDnsGrd,
                                                                                             torch::Tensor rayHitGrd,
                                                                                             torch::Tensor rayNrmGrd,
@@ -186,11 +175,4 @@ public:
                           torch::Tensor mogDns,
                           unsigned int rebuild,
                           bool allow_update);
-
-    // Diagnostic accessor for the most recent buildBVH() call. Populated
-    // inside buildBVH(); zero-initialized until first build.
-    BVHStats getBVHStats() const { return _lastBVHStats; }
-
-protected:
-    BVHStats _lastBVHStats{0.f, 0, 0, 0, 0, false};
 };

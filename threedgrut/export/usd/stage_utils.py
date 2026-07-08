@@ -22,6 +22,7 @@ coordinate transforms, and USDZ packaging.
 
 import logging
 import os
+import struct
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -31,13 +32,42 @@ from typing import List, Optional, Union
 import numpy as np
 from pxr import Gf, Usd, UsdGeom
 
-from threedgrut.export.transforms import column_vector_4x4_to_usd_matrix
+from threedgrut.export.transforms import (
+    USDTransformSamples,
+    apply_usd_transform_samples,
+    column_vector_4x4_to_usd_matrix,
+)
 
 logger = logging.getLogger(__name__)
 
 # Constants
 DEFAULT_FRAME_RATE = 24.0
 USD_WORLD_PATH = "/World"
+_USDZ_ALIGNMENT = 64
+_USDZ_PADDING_EXTRA_ID = 0x1986
+
+
+def _write_usdz_entry(zip_file: zipfile.ZipFile, filename: str, data: Union[str, bytes]) -> None:
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+
+    header_offset = zip_file.fp.tell()
+    filename_size = len(filename.encode("utf-8"))
+    unpadded_data_offset = header_offset + 30 + filename_size
+    padding_size = (-unpadded_data_offset) % _USDZ_ALIGNMENT
+
+    # ZIP extra fields need a 4-byte header. If the needed padding is smaller,
+    # add one full alignment period and keep the same modulo.
+    if 0 < padding_size < 4:
+        padding_size += _USDZ_ALIGNMENT
+
+    zip_info = zipfile.ZipInfo(filename)
+    zip_info.compress_type = zipfile.ZIP_STORED
+    if padding_size:
+        zip_info.extra = struct.pack("<HH", _USDZ_PADDING_EXTRA_ID, padding_size - 4)
+        zip_info.extra += b"\0" * (padding_size - 4)
+
+    zip_file.writestr(zip_info, data)
 
 
 @dataclass(kw_only=True)
@@ -59,7 +89,7 @@ class NamedUSDStage:
         self.stage.GetRootLayer().Export(temp_file_path)
         with open(temp_file_path, "rb") as file:
             usd_data = file.read()
-        zip_file.writestr(self.filename, usd_data)
+        _write_usdz_entry(zip_file, self.filename, usd_data)
         os.unlink(temp_file_path)
 
 
@@ -79,7 +109,7 @@ class NamedSerialized:
 
     def save_to_zip(self, zip_file: zipfile.ZipFile):
         """Save the serialized data to a zip file."""
-        zip_file.writestr(self.filename, self.serialized)
+        _write_usdz_entry(zip_file, self.filename, self.serialized)
 
 
 def initialize_usd_stage(up_axis: str = "Y") -> Usd.Stage:
@@ -112,6 +142,7 @@ def create_gaussian_model_root(
     root_path: str = "/World/Gaussians",
     normalizing_transform: np.ndarray = None,
     coordinate_transform: np.ndarray = None,
+    source_transform_samples: Optional[USDTransformSamples] = None,
 ) -> str:
     """
     Create the root Xform for Gaussian content with optional coordinate transforms.
@@ -124,11 +155,14 @@ def create_gaussian_model_root(
         root_path: USD path for the root prim
         normalizing_transform: Optional 4x4 normalizing transform matrix
         coordinate_transform: Optional 4x4 (e.g. 3DGRUT-to-USDZ). Applied after normalizing and scale.
+        source_transform_samples: Optional source Gaussian local-to-world transform samples,
+            authored before normalization / coordinate transform to match the NuRec exporter.
 
     Returns:
         The root path string
     """
     root_xform = UsdGeom.Xform.Define(stage, root_path)
+    apply_usd_transform_samples(root_xform, source_transform_samples)
 
     # Build scale matrix for axis flipping
     scale_x = -1.0 if flip_x_axis else 1.0

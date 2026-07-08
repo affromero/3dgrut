@@ -27,6 +27,7 @@ from .utils import read_colmap_extrinsics_binary, read_colmap_extrinsics_text
 def _load_colmap_exif_exposures(
     dataset_path: str,
     downsample_factor: int,
+    original_images: bool = False,
 ) -> list[Optional[float]]:
     """Load EXIF exposure data for all COLMAP images.
 
@@ -37,6 +38,7 @@ def _load_colmap_exif_exposures(
     Args:
         dataset_path: Path to COLMAP dataset root
         downsample_factor: Downsample factor for images folder suffix
+        original_images: Read EXIF from the original images folder instead of a downsampled image folder
 
     Returns:
         List of mean-normalized log2 exposure values for all images.
@@ -52,7 +54,7 @@ def _load_colmap_exif_exposures(
         cam_extrinsics = read_colmap_extrinsics_text(cameras_extrinsic_file)
 
     # Build image paths
-    downsample_suffix = "" if downsample_factor == 1 else f"_{downsample_factor}"
+    downsample_suffix = "" if original_images or downsample_factor == 1 else f"_{downsample_factor}"
     images_folder = f"images{downsample_suffix}"
 
     image_paths: list[Path] = []
@@ -78,11 +80,13 @@ def make(name: str, config, ray_jitter):
                 bg_color=config.model.background.color,
             )
         case "colmap":
+            gsplat_image_downscale = config.dataset.get("gsplat_image_downscale", False)
             # Load EXIF exposure data if enabled (shared between train and val)
             if config.dataset.get("load_exif", True):
                 exif_exposures = _load_colmap_exif_exposures(
                     config.path,
                     config.dataset.downsample_factor,
+                    original_images=gsplat_image_downscale,
                 )
             else:
                 exif_exposures = None
@@ -94,29 +98,13 @@ def make(name: str, config, ray_jitter):
                 test_split_interval=config.dataset.test_split_interval,
                 ray_jitter=ray_jitter,
                 exif_exposures=exif_exposures,
-                sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                camera_names=config.dataset.get("camera_names", None),
+                camera_ids=config.dataset.get("camera_ids", None),
+                normalize_world_space=config.dataset.get("normalize_world_space", False),
+                gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
-                train_exclude_image_list_path=config.dataset.get(
-                    "train_exclude_image_list_path", None
-                ),
-                train_focus_image_list_path=config.dataset.get(
-                    "train_focus_image_list_path", None
-                ),
-                train_focus_image_weight=config.dataset.get(
-                    "train_focus_image_weight", 1.0
-                ),
-                holdout_image_list_path=config.dataset.get(
-                    "holdout_image_list_path", None
-                ),
-                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
-                rs_ray_injection=(
-                    config.render.get("method", "3dgut") == "3dgrt"
-                    and config.dataset.get("rs_ray_injection", True)
-                ),
-                # Exposure-time sampling is a TRAIN-only forward model; the
-                # val dataset stays single-instant so metrics and snapshots
-                # evaluate the sharp underlying scene.
-                blur_samples=int(config.dataset.get("blur_samples", 1)),
+                train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
+                holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -124,19 +112,13 @@ def make(name: str, config, ray_jitter):
                 downsample_factor=config.dataset.downsample_factor,
                 test_split_interval=config.dataset.test_split_interval,
                 exif_exposures=exif_exposures,
-                sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                camera_names=config.dataset.get("camera_names", None),
+                camera_ids=config.dataset.get("camera_ids", None),
+                normalize_world_space=config.dataset.get("normalize_world_space", False),
+                gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
-                train_exclude_image_list_path=config.dataset.get(
-                    "train_exclude_image_list_path", None
-                ),
-                holdout_image_list_path=config.dataset.get(
-                    "holdout_image_list_path", None
-                ),
-                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
-                rs_ray_injection=(
-                    config.render.get("method", "3dgut") == "3dgrt"
-                    and config.dataset.get("rs_ray_injection", True)
-                ),
+                train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
+                holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
             )
         case "scannetpp":
             train_dataset = ScannetppDataset(
@@ -145,12 +127,16 @@ def make(name: str, config, ray_jitter):
                 ray_jitter=ray_jitter,
                 downsample_factor=config.dataset.downsample_factor,
                 test_split_interval=config.dataset.test_split_interval,
+                camera_names=config.dataset.get("camera_names", None),
+                camera_ids=config.dataset.get("camera_ids", None),
             )
             val_dataset = ScannetppDataset(
                 config.path,
                 split="val",
                 downsample_factor=config.dataset.downsample_factor,
                 test_split_interval=config.dataset.test_split_interval,
+                camera_names=config.dataset.get("camera_names", None),
+                camera_ids=config.dataset.get("camera_ids", None),
             )
         case "ncore":
             train_dataset = NCoreDataset(
@@ -229,11 +215,13 @@ def make_test(name: str, config):
                 bg_color=config.model.background.color,
             )
         case "colmap":
+            gsplat_image_downscale = config.dataset.get("gsplat_image_downscale", False)
             # Load EXIF exposure data if enabled
             if config.dataset.get("load_exif", True):
                 exif_exposures = _load_colmap_exif_exposures(
                     config.path,
                     config.dataset.downsample_factor,
+                    original_images=gsplat_image_downscale,
                 )
             else:
                 exif_exposures = None
@@ -244,16 +232,13 @@ def make_test(name: str, config):
                 downsample_factor=config.dataset.downsample_factor,
                 test_split_interval=config.dataset.test_split_interval,
                 exif_exposures=exif_exposures,
-                sky_mask_folder=config.dataset.get("sky_mask_folder", None),
+                camera_names=config.dataset.get("camera_names", None),
+                camera_ids=config.dataset.get("camera_ids", None),
+                normalize_world_space=config.dataset.get("normalize_world_space", False),
+                gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
-                holdout_image_list_path=config.dataset.get(
-                    "holdout_image_list_path", None
-                ),
-                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
-                rs_ray_injection=(
-                    config.render.get("method", "3dgut") == "3dgrt"
-                    and config.dataset.get("rs_ray_injection", True)
-                ),
+                train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
+                holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
             )
         case "scannetpp":
             dataset = ScannetppDataset(
@@ -261,6 +246,8 @@ def make_test(name: str, config):
                 split="val",
                 downsample_factor=config.dataset.downsample_factor,
                 test_split_interval=config.dataset.test_split_interval,
+                camera_names=config.dataset.get("camera_names", None),
+                camera_ids=config.dataset.get("camera_ids", None),
             )
         case "ncore":
             # Inherit temporal window from training by default

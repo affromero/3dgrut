@@ -14,7 +14,6 @@ eval/
 extra_info/
 
 debug_**
-tea_debug.log
 
 utils/ngc/grid_search_configs
 
@@ -25,6 +24,7 @@ thirdparty/kaolin/
 
 threedgrt_tracer/.ninja_log
 threedgrt_tracer/include/3dgrt/kernels/slang/*.cuh*
+threedgut_tracer/include/threedgutSlang.cuh
 *.egg-info
 .idea
 
@@ -40,3 +40,8 @@ assets/nvidia-hq.gif
 assets/playground_glass.gif
 
 uv.lock
+
+tools/**/.pytest_cache/
+
+# Standalone validation skill repo (lives in-tree during the transition).
+/threedgrut_usd_validation/

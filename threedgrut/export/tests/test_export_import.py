@@ -19,14 +19,20 @@ Export/Import tests with mock ExportableModel.
 Tests the full export pipeline: ExportableModel -> Exporter -> File -> Importer -> verify data.
 """
 
+import sys
 import tempfile
+import types
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from pxr import Usd, UsdValidation
+
+pytest.importorskip("pxr", reason="usd-core (pxr) is only available on linux x86_64")
+
+from pxr import Sdf, Usd
 
 from threedgrut.export.base import ExportableModel
 from threedgrut.export.formats import PLYExporter
@@ -34,16 +40,25 @@ from threedgrut.export.importers import PLYImporter, USDImporter
 from threedgrut.export.usd.exporter import USDExporter
 
 
-def _validate_stage(stage: Usd.Stage) -> list:
-    """Run usd-core stage validators (StageMetadataChecker, CompositionErrorTest). Returns list of ValidationError."""
-    validators = UsdValidation.ValidationRegistry().GetOrLoadValidatorsByName(
-        ["usdValidation:StageMetadataChecker", "usdValidation:CompositionErrorTest"]
-    )
-    if not validators:
-        return []
-    ctx = UsdValidation.ValidationContext(validators)
-    result = ctx.Validate(stage)
-    return list(result) if result else []
+def _assert_default_camera_render_product(
+    stage: Usd.Stage,
+    camera_name: str = "camera_0000",
+    resolution: tuple[int, int] = (640, 480),
+) -> None:
+    product_path = f"/Render/{camera_name}"
+    render_var_path = f"{product_path}/LdrColor"
+    product = stage.GetPrimAtPath(product_path)
+    assert product.IsValid()
+    assert product.GetTypeName() == "RenderProduct"
+    assert product.GetRelationship("camera").GetTargets() == [Sdf.Path(f"/World/Cameras/{camera_name}")]
+    assert product.GetRelationship("orderedVars").GetTargets() == [Sdf.Path(render_var_path)]
+    assert tuple(product.GetAttribute("resolution").Get()) == resolution
+
+    render_var = stage.GetPrimAtPath(render_var_path)
+    assert render_var.IsValid()
+    assert render_var.GetTypeName() == "RenderVar"
+    assert render_var.GetAttribute("sourceName").Get() == "LdrColor"
+    assert not stage.GetPrimAtPath(f"{product_path}/HdrColor").IsValid()
 
 
 class MockGaussianModel(ExportableModel):
@@ -91,6 +106,8 @@ class MockGaussianModel(ExportableModel):
         # Specular (higher-order SH): zeros for simplicity
         num_specular_coeffs = (sh_degree + 1) ** 2 - 1
         self._specular = torch.zeros((num_gaussians, num_specular_coeffs * 3), dtype=torch.float32, device=device)
+        self.features_albedo = self._albedo
+        self.features_specular = self._specular
 
     def get_positions(self) -> torch.Tensor:
         return self._positions
@@ -121,6 +138,72 @@ class MockGaussianModel(ExportableModel):
 
     def get_features_specular(self) -> torch.Tensor:
         return self._specular
+
+
+class MockCameraDataset:
+    """Minimal dataset exposing camera poses for USD camera export tests."""
+
+    image_w = 640
+    image_h = 480
+    intrinsics = [500.0, 500.0, 320.0, 240.0]
+
+    def __len__(self) -> int:
+        return 2
+
+    def get_poses(self) -> np.ndarray:
+        poses = np.repeat(np.eye(4, dtype=np.float64)[None, :, :], len(self), axis=0)
+        poses[1, 0, 3] = 1.0
+        return poses
+
+    def get_camera_names(self):
+        return ["camera_0000"]
+
+    def get_camera_idx(self, frame_idx: int) -> int:
+        return 0
+
+
+class MockMultiCameraDataset(MockCameraDataset):
+    """Minimal multi-camera dataset with interleaved physical camera frames."""
+
+    def __len__(self) -> int:
+        return 6
+
+    def get_poses(self) -> np.ndarray:
+        poses = np.repeat(np.eye(4, dtype=np.float64)[None, :, :], len(self), axis=0)
+        poses[:, 0, 3] = np.arange(len(self), dtype=np.float64)
+        return poses
+
+    def get_camera_names(self):
+        return ["camera_left", "camera_right"]
+
+    def get_camera_idx(self, frame_idx: int) -> int:
+        return frame_idx % 2
+
+
+class MockCameraDatasetNoIntrinsics(MockCameraDataset):
+    """Camera dataset with poses but no native image resolution metadata."""
+
+    intrinsics = None
+
+
+def _install_fake_ppisp_module(monkeypatch):
+    class PPISP(torch.nn.Module):
+        __module__ = "ppisp"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.num_cameras = 1
+            self.config = SimpleNamespace(use_controller=False)
+            self.controllers = torch.nn.ModuleList()
+            self.exposure_params = torch.tensor([0.1, -0.2], dtype=torch.float32)
+            self.color_params = torch.zeros((2, 8), dtype=torch.float32)
+            self.vignetting_params = torch.zeros((1, 3, 5), dtype=torch.float32)
+            self.crf_params = torch.zeros((1, 3, 4), dtype=torch.float32)
+
+    ppisp_module = types.ModuleType("ppisp")
+    ppisp_module.PPISP = PPISP
+    monkeypatch.setitem(sys.modules, "ppisp", ppisp_module)
+    return PPISP
 
 
 class TestPLYExportImport:
@@ -430,7 +513,7 @@ class TestExportImportConsistency:
             )
 
     def test_usd_export_passes_usd_validation(self):
-        """Exported USD stage passes usd-core schema/stage validators."""
+        """Exported USD stage passes OpenUSD stage validators (run inside USDExporter.export)."""
         model = MockGaussianModel(num_gaussians=5, sh_degree=0)
         with tempfile.TemporaryDirectory() as tmpdir:
             usd_path = Path(tmpdir) / "test.usdz"
@@ -440,10 +523,6 @@ class TestExportImportConsistency:
                 export_background=False,
                 apply_normalizing_transform=False,
             ).export(model, usd_path)
-            stage = Usd.Stage.Open(str(usd_path))
-            assert stage, "Failed to open exported stage"
-            errors = _validate_stage(stage)
-            assert not errors, "USD validation failed:\n" + "\n".join(e.GetMessage() for e in errors)
 
 
 def _find_prim_with_color_space_api(stage: Usd.Stage):
@@ -454,11 +533,92 @@ def _find_prim_with_color_space_api(stage: Usd.Stage):
     return None
 
 
+def _find_prim_with_attribute(stage: Usd.Stage, attr_name: str):
+    for prim in Usd.PrimRange(stage.GetPseudoRoot()):
+        if prim.GetAttribute(attr_name).IsValid():
+            return prim
+    return None
+
+
+class TestPPISPRuntimeMode:
+    """Pin the mapping from PPISP integration mode to runtime color handling."""
+
+    def test_compute_runtime_post_processing(self):
+        from threedgrut.export.usd.exporter import (
+            PPISP_INTEGRATION_MODE_SH_OPTIMIZED,
+            PPISP_INTEGRATION_MODE_SPG_RUNTIME,
+            compute_runtime_post_processing,
+        )
+
+        ppisp = object()
+        assert compute_runtime_post_processing(False, None, PPISP_INTEGRATION_MODE_SPG_RUNTIME) is False
+        assert compute_runtime_post_processing(True, None, PPISP_INTEGRATION_MODE_SPG_RUNTIME) is False
+        assert compute_runtime_post_processing(True, ppisp, PPISP_INTEGRATION_MODE_SH_OPTIMIZED) is False
+        assert compute_runtime_post_processing(True, ppisp, PPISP_INTEGRATION_MODE_SPG_RUNTIME) is True
+
+    def test_usd_exporter_accepts_borel_setting_names_from_config(self):
+        conf = SimpleNamespace(
+            export_usd={
+                "ppisp-integration-mode": "spg-runtime",
+                "ppisp-reference-camera-id": 1,
+                "ppisp-reference-frame-id": 2,
+                "enable-ppisp-controller-export": False,
+                "sh-optimization-num-iterations": 11,
+                "scene-radiance-scale": 1.25,
+                "export_cameras": False,
+            }
+        )
+
+        exporter = USDExporter.from_config(conf)
+
+        assert exporter.ppisp_integration_mode == "spg-runtime"
+        assert exporter.ppisp_reference_camera_id == 1
+        assert exporter.ppisp_reference_frame_id == 2
+        assert exporter.enable_ppisp_controller_export is False
+        assert exporter.sh_optimization_num_iterations == 11
+        assert exporter.scene_radiance_scale == pytest.approx(1.25)
+
+    def test_usd_exporter_rejects_branch_local_mode_aliases(self):
+        with pytest.raises(ValueError, match="Unsupported PPISP integration mode"):
+            USDExporter(ppisp_integration_mode="baked-sh")
+        with pytest.raises(ValueError, match="Unsupported PPISP integration mode"):
+            USDExporter(ppisp_integration_mode="omni-native")
+
+    def test_usd_exporter_ignores_branch_local_config_aliases(self):
+        conf = SimpleNamespace(
+            export_usd={
+                "post-processing-camera-id": 3,
+                "post-processing-frame-id": 4,
+                "ignore-ppisp-controller": True,
+                "post-processing-bake-epochs": 2,
+                "radiance-scale": 1.5,
+                "export_cameras": False,
+            }
+        )
+
+        exporter = USDExporter.from_config(conf)
+
+        assert exporter.ppisp_reference_camera_id is None
+        assert exporter.ppisp_reference_frame_id is None
+        assert exporter.enable_ppisp_controller_export is None
+        assert exporter.sh_optimization_num_iterations == 3000
+        assert exporter.scene_radiance_scale == pytest.approx(1.0)
+
+    def test_controller_export_is_rejected_for_sh_optimized(self):
+        from threedgrut.export.usd.exporter import PPISP_INTEGRATION_MODE_SH_OPTIMIZED
+
+        with pytest.raises(ValueError, match="enable_ppisp_controller_export"):
+            USDExporter(
+                ppisp_integration_mode=PPISP_INTEGRATION_MODE_SH_OPTIMIZED,
+                enable_ppisp_controller_export=True,
+            )
+
+
 class TestUSDExportColorSpace:
     """Test that USD export applies ColorSpaceAPI with correct color space name."""
 
     def test_usd_export_color_space_default_srgb(self):
-        """Export with linear_srgb=False (default) sets color space to srgb_rec709_display."""
+        """Standard export sets color space to srgb_rec709_display."""
         model = MockGaussianModel(num_gaussians=5, sh_degree=3)
         with tempfile.TemporaryDirectory() as tmpdir:
             usd_path = Path(tmpdir) / "test.usdz"
@@ -467,7 +627,6 @@ class TestUSDExportColorSpace:
                 export_cameras=False,
                 export_background=False,
                 apply_normalizing_transform=False,
-                linear_srgb=False,
             ).export(model, usd_path)
             stage = Usd.Stage.Open(str(usd_path))
             assert stage
@@ -478,8 +637,211 @@ class TestUSDExportColorSpace:
             assert attr, "ColorSpaceName attribute missing"
             assert attr.Get() == "srgb_rec709_display"
 
-    def test_usd_export_color_space_linear_srgb(self):
-        """Export with linear_srgb=True sets color space to lin_rec709_scene."""
+    def test_usdz_export_camera_is_composed_from_root_stage(self):
+        """USDZ camera prims are authored where the package root composes them."""
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        dataset = MockCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usdz"
+            USDExporter(
+                half_precision=False,
+                export_cameras=True,
+                export_background=False,
+                apply_normalizing_transform=False,
+            ).export(model, usd_path, dataset=dataset, validation_dataset=MockCameraDataset())
+            stage = Usd.Stage.Open(str(usd_path))
+            assert stage
+            assert stage.GetPrimAtPath("/World/Cameras/camera_0000").IsValid()
+            assert stage.GetPrimAtPath("/World/Cameras/camera_0000_val").IsValid()
+            assert not stage.GetPrimAtPath("/World/gaussians/Cameras/camera_0000").IsValid()
+            assert stage.GetStartTimeCode() == 0.0
+            assert stage.GetEndTimeCode() == 1.0
+            _assert_default_camera_render_product(stage)
+            _assert_default_camera_render_product(stage, "camera_0000_val")
+            render_settings = stage.GetRootLayer().customLayerData["renderSettings"]
+            assert render_settings == {"rtx:post:tonemap:op": 2}
+
+    @pytest.mark.parametrize("suffix", [".usda", ".usdz"])
+    def test_usd_export_authors_default_render_settings_without_runtime_ppisp(self, suffix: str):
+        """ParticleField exports author the default render settings without PPISP."""
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        dataset = MockCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / f"test{suffix}"
+            USDExporter(
+                half_precision=False,
+                export_cameras=True,
+                export_background=False,
+                apply_normalizing_transform=False,
+            ).export(model, usd_path, dataset=dataset, validate_usd=False)
+
+            stage = Usd.Stage.Open(str(usd_path))
+            assert stage
+            render_settings = stage.GetRootLayer().customLayerData["renderSettings"]
+            assert render_settings == {"rtx:post:tonemap:op": 2}
+
+    def test_usd_export_with_native_ppisp_disables_gaussian_skip_tonemapping(self, monkeypatch):
+        """Runtime PPISP consumes HDR Gaussian output, so Kit must not skip tonemapping."""
+        from threedgrut.export.usd.exporter import PPISP_INTEGRATION_MODE_SPG_RUNTIME
+
+        PPISP = _install_fake_ppisp_module(monkeypatch)
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        dataset = MockCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usdz"
+            USDExporter(
+                half_precision=False,
+                export_cameras=True,
+                export_background=False,
+                apply_normalizing_transform=False,
+                ppisp_integration_mode=PPISP_INTEGRATION_MODE_SPG_RUNTIME,
+            ).export(model, usd_path, dataset=dataset, post_processing=PPISP(), validate_usd=False)
+
+            stage = Usd.Stage.Open(str(usd_path))
+            assert stage
+            prim = _find_prim_with_color_space_api(stage)
+            assert prim is not None
+            assert Usd.ColorSpaceAPI(prim).GetColorSpaceNameAttr().Get() == "lin_rec709_scene"
+            shader_prim = _find_prim_with_attribute(stage, "inputs:apply_srgb_linear")
+            assert shader_prim is not None
+            assert shader_prim.GetAttribute("inputs:apply_srgb_linear").Get() is False
+            assert shader_prim.GetAttribute("inputs:apply_inverse_tonemap").Get() is False
+            render_settings = stage.GetRootLayer().customLayerData["renderSettings"]
+            assert render_settings["rtx:post:tonemap:op"] == 2
+            assert render_settings["rtx:rtpt:gaussian:skipTonemapping:enabled"] is False
+
+    def test_runtime_ppisp_rejects_frame_reference_without_camera_reference(self, monkeypatch):
+        """spg-runtime: frame-only static PPISP export is ambiguous."""
+        from threedgrut.export.usd.exporter import PPISP_INTEGRATION_MODE_SPG_RUNTIME
+
+        PPISP = _install_fake_ppisp_module(monkeypatch)
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        dataset = MockCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usdz"
+            with pytest.raises(ValueError, match="ppisp_reference_frame_id was set without ppisp_reference_camera_id"):
+                USDExporter(
+                    half_precision=False,
+                    export_cameras=True,
+                    export_background=False,
+                    apply_normalizing_transform=False,
+                    ppisp_integration_mode=PPISP_INTEGRATION_MODE_SPG_RUNTIME,
+                    ppisp_reference_frame_id=1,
+                ).export(model, usd_path, dataset=dataset, post_processing=PPISP(), validate_usd=False)
+
+    def test_enabling_controller_export_requires_trained_controller(self, monkeypatch):
+        from threedgrut.export.usd.exporter import PPISP_INTEGRATION_MODE_SPG_RUNTIME
+
+        PPISP = _install_fake_ppisp_module(monkeypatch)
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        dataset = MockCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usdz"
+            with pytest.raises(ValueError, match="trained controllers"):
+                USDExporter(
+                    half_precision=False,
+                    export_cameras=True,
+                    export_background=False,
+                    apply_normalizing_transform=False,
+                    ppisp_integration_mode=PPISP_INTEGRATION_MODE_SPG_RUNTIME,
+                    enable_ppisp_controller_export=True,
+                ).export(model, usd_path, dataset=dataset, post_processing=PPISP(), validate_usd=False)
+
+    def test_usd_export_requires_dataset_when_cameras_enabled(self):
+        """Camera-enabled exports must not silently produce camera-less USD."""
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usda"
+            with pytest.raises(ValueError, match="export_cameras=True requires a dataset"):
+                USDExporter(
+                    half_precision=False,
+                    export_cameras=True,
+                    export_background=False,
+                    apply_normalizing_transform=False,
+                ).export(model, usd_path, validate_usd=False)
+
+    def test_usd_export_requires_render_product_resolution(self):
+        """Camera-enabled exports must author RenderProducts, not only cameras."""
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usda"
+            with pytest.raises(ValueError, match="no RenderProducts"):
+                USDExporter(
+                    half_precision=False,
+                    export_cameras=True,
+                    export_background=False,
+                    apply_normalizing_transform=False,
+                ).export(
+                    model,
+                    usd_path,
+                    dataset=MockCameraDatasetNoIntrinsics(),
+                    validate_usd=False,
+                )
+
+    def test_multi_camera_time_codes_are_global_dataset_indices(self):
+        """Multi-camera exports use GLOBAL dataset frame indices as USD time codes.
+
+        ``MockMultiCameraDataset`` interleaves left/right via ``frame_idx % 2``
+        across 6 frames, so left owns global indices ``[0, 2, 4]`` and right
+        owns ``[1, 3, 5]``. Authoring those exact indices as time samples
+        keeps the OVRTX-vs-PyTorch comparator's basename match working without
+        any sidecar.
+        """
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        dataset = MockMultiCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usda"
+            USDExporter(
+                half_precision=False,
+                export_cameras=True,
+                export_background=False,
+                apply_normalizing_transform=False,
+            ).export(model, usd_path, dataset=dataset, validate_usd=False)
+
+            stage = Usd.Stage.Open(str(usd_path))
+            assert stage
+            assert stage.GetStartTimeCode() == 0.0
+            assert stage.GetEndTimeCode() == 5.0
+
+            left_transform = stage.GetPrimAtPath("/World/Cameras/camera_left").GetAttribute("xformOp:transform")
+            right_transform = stage.GetPrimAtPath("/World/Cameras/camera_right").GetAttribute("xformOp:transform")
+            assert left_transform.GetTimeSamples() == [0.0, 2.0, 4.0]
+            assert right_transform.GetTimeSamples() == [1.0, 3.0, 5.0]
+
+
+class TestUSDSampleExports:
+    """Sample USD exports that exercise representative exporter options."""
+
+    @pytest.mark.parametrize("suffix", [".usda", ".usdz"])
+    def test_sample_standard_export_with_cameras_and_timing(self, suffix: str):
+        """Standard export writes openable stages for both layer and package outputs."""
+        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
+        dataset = MockCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / f"sample{suffix}"
+            USDExporter(
+                half_precision=False,
+                export_cameras=True,
+                export_background=False,
+                apply_normalizing_transform=False,
+                frames_per_second=24.0,
+                scene_radiance_scale=1.25,
+            ).export(model, usd_path, dataset=dataset, validate_usd=False)
+
+            assert usd_path.exists()
+            stage = Usd.Stage.Open(str(usd_path))
+            assert stage
+            assert stage.GetTimeCodesPerSecond() == 24.0
+            assert stage.GetPrimAtPath("/World/Cameras/camera_0000").IsValid()
+            _assert_default_camera_render_product(stage)
+            assert _find_prim_with_color_space_api(stage) is not None
+
+
+class TestUSDExportSortingModeHint:
+    """Test ParticleField sortingModeHint authoring."""
+
+    def test_usd_export_sorting_mode_hint_ray_hit_distance(self):
+        """Export can author the usd-core 26.5 rayHitDistance sorting hint."""
         model = MockGaussianModel(num_gaussians=5, sh_degree=3)
         with tempfile.TemporaryDirectory() as tmpdir:
             usd_path = Path(tmpdir) / "test.usdz"
@@ -488,31 +850,180 @@ class TestUSDExportColorSpace:
                 export_cameras=False,
                 export_background=False,
                 apply_normalizing_transform=False,
-                linear_srgb=True,
+                sorting_mode_hint="rayHitDistance",
             ).export(model, usd_path)
             stage = Usd.Stage.Open(str(usd_path))
             assert stage
             prim = _find_prim_with_color_space_api(stage)
-            assert prim is not None, "No prim with ColorSpaceAPI found"
-            api = Usd.ColorSpaceAPI(prim)
-            attr = api.GetColorSpaceNameAttr()
-            assert attr, "ColorSpaceName attribute missing"
-            assert attr.Get() == "lin_rec709_scene"
+            assert prim is not None, "No Gaussian particle prim found"
+            assert prim.GetAttribute("sortingModeHint").Get() == "rayHitDistance"
 
-    def test_usd_export_color_space_from_config(self):
-        """Export via from_config with linear_srgb in config sets correct color space."""
-        model = MockGaussianModel(num_gaussians=5, sh_degree=3)
-        conf = SimpleNamespace(export_usd=SimpleNamespace(linear_srgb=True))
+    def test_usd_export_sorting_mode_hint_rejects_unknown_token(self):
+        """Unsupported sorting hints fail before authoring invalid USD."""
+        with pytest.raises(ValueError, match="Unsupported ParticleField sortingModeHint"):
+            USDExporter(sorting_mode_hint="frontToBack")
+
+
+class TestNuRecExport:
+    """Smoke tests for the NuRec exporter's camera and RenderProduct authoring.
+
+    NuRec USDZs are composed of ``default.usda`` (the package root) which
+    references ``gauss.usda`` at ``/World/gauss``. Cameras authored on
+    ``gauss.usda`` therefore appear under ``/World/gauss/Cameras/...`` in
+    the composed view, while the ``/Render`` scope sits outside ``/World``
+    and is only reachable by opening the gauss layer directly.
+    """
+
+    @staticmethod
+    def _open_gauss_layer(usdz_path: Path, tmp_path: Path) -> Usd.Stage:
+        """Extract gauss.usda from a NuRec USDZ and open it as a standalone stage."""
+        import zipfile
+
+        with zipfile.ZipFile(usdz_path) as zf:
+            zf.extract("gauss.usda", path=tmp_path)
+        stage = Usd.Stage.Open(str(tmp_path / "gauss.usda"))
+        assert stage, f"Failed to open gauss.usda inside {usdz_path}"
+        return stage
+
+    def test_nurec_export_writes_camera_and_default_render_product(self):
+        """Without PPISP, NuRec USDZ ships per-camera xform + /Render LdrColor product."""
+        from threedgrut.export.usd.nurec.exporter import NuRecExporter
+
+        model = MockGaussianModel(num_gaussians=8, sh_degree=3)
+        dataset = MockCameraDataset()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            usd_path = tmp_path / "test.usdz"
+            NuRecExporter(
+                export_cameras=True,
+                export_post_processing=False,
+            ).export(model, usd_path, dataset=dataset)
+
+            assert usd_path.exists()
+
+            composed = Usd.Stage.Open(str(usd_path))
+            assert composed.GetPrimAtPath("/World/gauss/Cameras/camera_0000").IsValid()
+            assert "renderSettings" in composed.GetRootLayer().customLayerData
+            render_settings = composed.GetRootLayer().customLayerData["renderSettings"]
+            assert render_settings["rtx:post:registeredCompositing:invertToneMap"] is True
+            assert render_settings["rtx:post:registeredCompositing:invertColorCorrection"] is True
+            assert "rtx:rtpt:gaussian:skipTonemapping:enabled" not in render_settings
+
+            gauss = self._open_gauss_layer(usd_path, tmp_path)
+            assert gauss.GetPrimAtPath("/World/Cameras/camera_0000").IsValid()
+            _assert_default_camera_render_product(gauss)
+
+    def test_nurec_export_with_native_ppisp_authors_root_spg_and_ppisp_render_settings(self, monkeypatch):
+        """Native NuRec PPISP export exposes the SPG graph and disables registered-compositing inversions."""
+        from threedgrut.export.usd.exporter import PPISP_INTEGRATION_MODE_SPG_RUNTIME
+        from threedgrut.export.usd.nurec.exporter import NuRecExporter
+
+        PPISP = _install_fake_ppisp_module(monkeypatch)
+        model = MockGaussianModel(num_gaussians=8, sh_degree=3)
+        dataset = MockCameraDataset()
         with tempfile.TemporaryDirectory() as tmpdir:
             usd_path = Path(tmpdir) / "test.usdz"
-            exporter = USDExporter.from_config(conf)
-            exporter.export(model, usd_path)
-            stage = Usd.Stage.Open(str(usd_path))
-            assert stage
-            prim = _find_prim_with_color_space_api(stage)
-            assert prim is not None, "No prim with ColorSpaceAPI found"
-            api = Usd.ColorSpaceAPI(prim)
-            assert api.GetColorSpaceNameAttr().Get() == "lin_rec709_scene"
+            NuRecExporter(
+                export_cameras=True,
+                export_post_processing=True,
+                ppisp_integration_mode=PPISP_INTEGRATION_MODE_SPG_RUNTIME,
+            ).export(model, usd_path, dataset=dataset, post_processing=PPISP())
+
+            composed = Usd.Stage.Open(str(usd_path))
+            assert composed.GetPrimAtPath("/World/gauss/Cameras/camera_0000").IsValid()
+            ppisp_camera = composed.GetPrimAtPath("/World/gauss/Cameras/camera_0000_ppisp")
+            assert ppisp_camera.IsValid()
+            assert ppisp_camera.GetAttribute("ppisp:responsivity").IsValid()
+            assert composed.GetPrimAtPath("/Render/camera_0000/PPISP").IsValid()
+            render_settings = composed.GetRootLayer().customLayerData["renderSettings"]
+            assert render_settings["rtx:post:registeredCompositing:invertToneMap"] is False
+            assert render_settings["rtx:post:registeredCompositing:invertColorCorrection"] is False
+            assert render_settings["rtx:rtpt:gaussian:skipTonemapping:enabled"] is False
+
+            product = composed.GetPrimAtPath("/Render/camera_0000")
+            assert product.GetRelationship("camera").GetTargets() == [
+                Sdf.Path("/World/gauss/Cameras/camera_0000_ppisp")
+            ]
+            ldr = composed.GetPrimAtPath("/Render/camera_0000/LdrColor")
+            assert ldr.GetAttribute("omni:rtx:aov").GetConnections() == [
+                Sdf.Path("/Render/camera_0000/PPISP.outputs:PPISPColor")
+            ]
+            with zipfile.ZipFile(usd_path) as zf:
+                names = set(zf.namelist())
+            assert {"ppisp_usd_spg.usda", "ppisp_usd_spg.cu", "ppisp_usd_spg.cu.lua"} <= names
+
+    def test_nurec_export_writes_validation_camera_with_val_suffix(self):
+        """validation_dataset surfaces a separate ``<name>_val`` camera and product."""
+        from threedgrut.export.usd.nurec.exporter import NuRecExporter
+
+        model = MockGaussianModel(num_gaussians=8, sh_degree=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            usd_path = tmp_path / "test.usdz"
+            NuRecExporter(
+                export_cameras=True,
+                export_post_processing=False,
+            ).export(
+                model,
+                usd_path,
+                dataset=MockCameraDataset(),
+                validation_dataset=MockCameraDataset(),
+            )
+
+            composed = Usd.Stage.Open(str(usd_path))
+            assert composed.GetPrimAtPath("/World/gauss/Cameras/camera_0000").IsValid()
+            assert composed.GetPrimAtPath("/World/gauss/Cameras/camera_0000_val").IsValid()
+
+            gauss = self._open_gauss_layer(usd_path, tmp_path)
+            _assert_default_camera_render_product(gauss)
+            _assert_default_camera_render_product(gauss, "camera_0000_val")
+
+    def test_nurec_export_requires_dataset_when_cameras_enabled(self):
+        """NuRec camera-enabled exports must not silently omit camera data."""
+        from threedgrut.export.usd.nurec.exporter import NuRecExporter
+
+        model = MockGaussianModel(num_gaussians=8, sh_degree=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usdz"
+            with pytest.raises(ValueError, match="export_cameras=True requires a dataset"):
+                NuRecExporter(
+                    export_cameras=True,
+                    export_post_processing=False,
+                ).export(model, usd_path)
+
+    def test_nurec_export_multi_camera_uses_global_dataset_indices_as_time_codes(self):
+        """Multi-camera NuRec exports keep the OVRTX-vs-PyTorch basename match."""
+        from threedgrut.export.usd.nurec.exporter import NuRecExporter
+
+        model = MockGaussianModel(num_gaussians=8, sh_degree=3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            usd_path = tmp_path / "test.usdz"
+            NuRecExporter(
+                export_cameras=True,
+                export_post_processing=False,
+            ).export(model, usd_path, dataset=MockMultiCameraDataset())
+
+            gauss = self._open_gauss_layer(usd_path, tmp_path)
+            left_transform = gauss.GetPrimAtPath("/World/Cameras/camera_left").GetAttribute("xformOp:transform")
+            right_transform = gauss.GetPrimAtPath("/World/Cameras/camera_right").GetAttribute("xformOp:transform")
+            assert left_transform.GetTimeSamples() == [0.0, 2.0, 4.0]
+            assert right_transform.GetTimeSamples() == [1.0, 3.0, 5.0]
+
+    def test_nurec_export_rejects_unsupported_render_method(self):
+        """The exporter refuses anything other than 3dgut / 3dgrt up front."""
+        from threedgrut.export.usd.nurec.exporter import (
+            NuRecExporter,
+            _get_default_nurec_conf,
+        )
+
+        model = MockGaussianModel(num_gaussians=4, sh_degree=3)
+        conf = _get_default_nurec_conf()
+        conf.render.method = "inria"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            usd_path = Path(tmpdir) / "test.usdz"
+            with pytest.raises(ValueError, match="render.method to be '3dgut' or '3dgrt'"):
+                NuRecExporter().export(model, usd_path, conf=conf)
 
 
 if __name__ == "__main__":

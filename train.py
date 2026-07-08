@@ -38,7 +38,6 @@ def get_git_revision_hash() -> str:
 @hydra.main(config_path="configs", version_base=None)
 def main(conf: DictConfig) -> None:
     logger.info(f"Git hash: {get_git_revision_hash()}")
-
     logger.info(f"Compiling native code..")
     from threedgrut.trainer import Trainer3DGRUT
 

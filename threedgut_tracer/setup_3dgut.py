@@ -18,6 +18,14 @@ import os
 
 import torch
 
+from threedgrut.model.carriers import (
+    GABOR_CARRIER_NUM_TERMS,
+    carrier_specular_dim,
+    gabor_carrier_enabled,
+    siren_carrier_enabled,
+    siren_carrier_hidden_dim,
+)
+from threedgrut.model.features import Features
 from threedgrut.utils import jit
 
 
@@ -32,9 +40,6 @@ def setup_3dgut(conf):
     include_paths.append(os.path.join(prefix, "..", "thirdparty", "tiny-cuda-nn", "include"))
     include_paths.append(os.path.join(prefix, "..", "thirdparty", "tiny-cuda-nn", "dependencies"))
     include_paths.append(os.path.join(prefix, "..", "thirdparty", "tiny-cuda-nn", "dependencies", "fmt", "include"))
-    include_paths.append(build_dir)
-
-    # Compiler options.
 
     def to_cpp_bool(value):
         return "true" if value else "false"
@@ -45,48 +50,37 @@ def setup_3dgut(conf):
     ut_kappa = conf.render.splat.ut_kappa
     ut_delta = math.sqrt(ut_alpha * ut_alpha * (ut_d + ut_kappa))
 
+    feat = Features(conf)
     radiance_sh_coeffs = (conf.render.particle_radiance_sph_degree + 1) ** 2
-    gabor_enabled = bool(conf.model.get("use_gabor_carrier", False))
-    siren_enabled = bool(conf.model.get("use_siren_carrier", False))
-    if gabor_enabled and siren_enabled:
-        raise ValueError(
-            "model.use_gabor_carrier and model.use_siren_carrier are "
-            "mutually exclusive."
-        )
-    gabor_num_terms = int(conf.model.get("gabor_num_terms", 3))
-    if gabor_enabled and gabor_num_terms != 3:
-        raise ValueError(
-            "model.gabor_num_terms currently supports exactly 3 terms; "
-            f"got {gabor_num_terms}."
-        )
-    gabor_coeffs = gabor_num_terms + 3 if gabor_enabled else 0
-    siren_hidden_dim = int(conf.model.get("siren_hidden_dim", 6))
-    if siren_enabled and siren_hidden_dim <= 0:
-        raise ValueError(
-            "model.siren_hidden_dim must be positive; got "
-            f"{siren_hidden_dim}."
-        )
-    siren_bias_coeffs = (siren_hidden_dim + 2) // 3
-    siren_coeffs = (
-        (2 * siren_hidden_dim) + siren_bias_coeffs + siren_hidden_dim + 1
-        if siren_enabled
-        else 0
-    )
-    radiance_coeffs = radiance_sh_coeffs + gabor_coeffs + siren_coeffs
-    per_ray_particle_features = gabor_enabled or siren_enabled or bool(
-        conf.render.splat.get("per_ray_particle_features", False)
-    )
-
-    defines = [
-        f"-DPARTICLE_RADIANCE_NUM_COEFFS={radiance_coeffs}",
+    carrier_defines = [
         f"-DPARTICLE_RADIANCE_NUM_SH_COEFFS={radiance_sh_coeffs}",
-        f"-DPARTICLE_RADIANCE_GABOR_ENABLED={to_cpp_bool(gabor_enabled)}",
-        f"-DPARTICLE_RADIANCE_GABOR_NUM_TERMS={gabor_num_terms}",
+        f"-DPARTICLE_RADIANCE_GABOR_ENABLED={to_cpp_bool(gabor_carrier_enabled(conf))}",
+        f"-DPARTICLE_RADIANCE_GABOR_NUM_TERMS={GABOR_CARRIER_NUM_TERMS}",
         f"-DPARTICLE_RADIANCE_GABOR_MAX_FREQUENCY={float(conf.model.get('gabor_max_frequency', 4.0))}",
-        f"-DPARTICLE_RADIANCE_SIREN_ENABLED={to_cpp_bool(siren_enabled)}",
-        f"-DPARTICLE_RADIANCE_SIREN_HIDDEN_DIM={siren_hidden_dim}",
+        f"-DPARTICLE_RADIANCE_SIREN_ENABLED={to_cpp_bool(siren_carrier_enabled(conf))}",
+        f"-DPARTICLE_RADIANCE_SIREN_HIDDEN_DIM={siren_carrier_hidden_dim(conf)}",
         f"-DPARTICLE_RADIANCE_SIREN_OMEGA={float(conf.model.get('siren_omega', 30.0))}",
         f"-DPARTICLE_RADIANCE_SIREN_LOCAL_UV_SCALE={float(conf.model.get('siren_local_uv_scale', 3.0))}",
+    ]
+    transform_defines = [
+        f"-DPARTICLE_FEATURE_DIM={feat.particle_feature_dim}",
+        f"-DRAY_FEATURE_DIM={feat.ray_feature_dim}",
+        f"-DFEATURE_TRANSFORM_TYPE={feat.transform_type}",
+    ]
+    nht_defines = [
+        f"-DFEATURE_INTERPOLATION_TYPE={feat.interpolation_type}",
+        f"-DFEATURE_INTERPOLATION_SUPPORT={feat.interpolation_support}",
+        f"-DFEATURE_ACTIVATION_TYPE={feat.activation_type}",
+        f"-DFEATURE_ACTIVATION_NUM_FREQUENCIES={feat.activation_num_frequencies}",
+        f"-DINTERP_POINT_FEATURE_DIM={feat.interp_point_feature_dim}",
+    ]
+    half_defines = [
+        f"-DPARTICLE_FEATURE_HALF={1 if conf.render.particle_feature_half else 0}",
+        f"-DFEATURE_OUTPUT_HALF={1 if conf.render.feature_output_half else 0}",
+    ]
+
+    defines = [
+        f"-DPARTICLE_RADIANCE_NUM_COEFFS={radiance_sh_coeffs + carrier_specular_dim(conf) // 3}",
         f"-DGAUSSIAN_PARTICLE_KERNEL_DEGREE={conf.render.particle_kernel_degree}",
         f"-DGAUSSIAN_PARTICLE_MIN_KERNEL_DENSITY={conf.render.particle_kernel_min_response}",
         f"-DGAUSSIAN_PARTICLE_MIN_ALPHA={conf.render.particle_kernel_min_alpha}",
@@ -95,11 +89,16 @@ def setup_3dgut(conf):
         f"-DGAUSSIAN_PARTICLE_SURFEL={to_cpp_bool(conf.render.primitive_type=='trisurfel')}",
         f"-DGAUSSIAN_MIN_TRANSMITTANCE_THRESHOLD={conf.render.min_transmittance}",
         f"-DGAUSSIAN_ENABLE_HIT_COUNT={to_cpp_bool(conf.render.enable_hitcounts)}",
+        # Feature-based radiance dimensions
+        *transform_defines,
+        *nht_defines,
+        *carrier_defines,
+        # Feature buffer memory layout
+        *half_defines,
         # Specific to the 3DGUT renderer
         f"-DGAUSSIAN_N_ROLLING_SHUTTER_ITERATIONS={conf.render.splat.n_rolling_shutter_iterations}",
         f"-DGAUSSIAN_K_BUFFER_SIZE={conf.render.splat.k_buffer_size}",
         f"-DGAUSSIAN_GLOBAL_Z_ORDER={to_cpp_bool(conf.render.splat.global_z_order)}",
-        f"-DGAUSSIAN_PER_RAY_PARTICLE_FEATURES={to_cpp_bool(per_ray_particle_features)}",
         f"-DFINE_GRAINED_LOAD_BALANCING={to_cpp_bool(getattr(conf.render.splat, 'fine_grained_load_balancing', False))}",
         # -- Unscented Transform --
         f"-DGAUSSIAN_UT_ALPHA={ut_alpha}",
@@ -129,6 +128,18 @@ def setup_3dgut(conf):
         "-O3",
         *defines,
     ]
+    # Diagnostic: dump ptxas register / smem / spill stats per kernel.
+    # Enable with `export NHT_PTXAS_VERBOSE=1` before launching training.
+    if os.environ.get("NHT_PTXAS_VERBOSE", "0") == "1":
+        cuda_cflags += [
+            "-Xptxas=-v",
+            "--resource-usage",
+        ]
+    # When PARTICLE_FEATURE_HALF=1 the Slang-generated header uses __half types;
+    # the Slang prelude only pulls in <cuda_fp16.h> and defines __half when
+    # SLANG_CUDA_ENABLE_HALF is set.
+    if conf.render.particle_feature_half or conf.render.feature_output_half:
+        cuda_cflags.append("-DSLANG_CUDA_ENABLE_HALF=1")
 
     # List of sources.
     source_files = [
@@ -140,9 +151,11 @@ def setup_3dgut(conf):
 
     # Compile slang kernels
     slang_build_inc_dir = os.path.join(os.path.dirname(__file__), "include", "3dgut")
+    slang_output_file = os.path.join(os.path.dirname(__file__), "include", "threedgutSlang.cuh")
+
     jit.compile_slang_kernel(
         kernel_files=[f"{os.path.join(slang_build_inc_dir, 'threedgut.slang')}"],
-        output_file=f"{os.path.join(build_dir, 'threedgutSlang.cuh')}",
+        output_file=slang_output_file,
         include_paths=[
             os.path.join(os.path.dirname(__file__), "include"),
             os.path.join(os.path.dirname(__file__), "..", "threedgrt_tracer", "include"),

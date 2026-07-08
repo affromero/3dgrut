@@ -24,7 +24,11 @@ from pathlib import Path
 import numpy as np
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdUtils, UsdVol
 
-from threedgrut.export.transforms import get_3dgrut_to_usdz_coordinate_transform
+from threedgrut.export.transforms import (
+    USDTransformSamples,
+    apply_usd_transform_samples,
+    get_3dgrut_to_usdz_coordinate_transform,
+)
 from threedgrut.export.usd.nurec.templates import NamedSerialized
 from threedgrut.export.usd.stage_utils import NamedUSDStage
 from threedgrut.export.usd.stage_utils import (
@@ -37,14 +41,14 @@ logger = logging.getLogger(__name__)
 NUREC_UP_AXIS = "Z"
 
 
-def initialize_usd_stage() -> Usd.Stage:
+def initialize_usd_stage(up_axis: str = NUREC_UP_AXIS) -> Usd.Stage:
     """
-    Initialize a new USD stage with NuRec/Omniverse settings (Z-up).
+    Initialize a new USD stage with NuRec/Omniverse settings (Z-up by default).
 
     Returns:
-        Usd.Stage: A new USD stage with Z-up axis
+        Usd.Stage: A new USD stage
     """
-    return _initialize_usd_stage(up_axis=NUREC_UP_AXIS)
+    return _initialize_usd_stage(up_axis=up_axis)
 
 
 def serialize_usd_stage_to_bytes(stage: Usd.Stage) -> bytes:
@@ -69,30 +73,43 @@ def serialize_usd_stage_to_bytes(stage: Usd.Stage) -> bytes:
     return content
 
 
-def serialize_nurec_usd(
+def _author_render_settings(
+    stage: Usd.Stage,
+    *,
+    invert_registered_compositing: bool,
+    skip_gaussian_tonemapping: bool,
+) -> None:
+    """Author the NuRec default renderer settings on a stage."""
+    render_settings = {
+        "rtx:rendermode": "RaytracedLighting",
+        "rtx:directLighting:sampledLighting:samplesPerPixel": 8,
+        "rtx:post:histogram:enabled": False,
+        "rtx:post:registeredCompositing:invertToneMap": invert_registered_compositing,
+        "rtx:post:registeredCompositing:invertColorCorrection": invert_registered_compositing,
+        "rtx:material:enableRefraction": False,
+        "rtx:post:tonemap:op": 2,
+        "rtx:raytracing:fractionalCutoutOpacity": False,
+        "rtx:matteObject:visibility:secondaryRays": True,
+    }
+    if skip_gaussian_tonemapping:
+        render_settings["rtx:rtpt:gaussian:skipTonemapping:enabled"] = False
+    stage.SetMetadataByDictKey("customLayerData", "renderSettings", render_settings)
+
+
+def _author_nurec_volume(
+    stage: Usd.Stage,
     model_file: NamedSerialized,
     positions: np.ndarray,
-    normalizing_transform: np.ndarray = np.eye(4),
-    apply_coordinate_transform: bool = False,
-) -> NamedUSDStage:
-    """
-    Create a USD file for the 3DGS model.
-
-    Args:
-        model_file: NamedSerialized object containing the compressed msgpack data
-        positions: Positions extracted from PLY file for AABB calculation
-        normalizing_transform: 4x4 transformation matrix to normalize the scene (defaults to identity)
-        apply_coordinate_transform: If True, apply 3DGRUT-to-USDZ coordinate transform (Omniverse convention)
-
-    Returns:
-        NamedUSDStage object containing the USD stage
-    """
-    logger.info("Creating USD file containing NuRec model")
-
+    *,
+    volume_path: str,
+    normalizing_transform: np.ndarray,
+    apply_coordinate_transform: bool,
+    source_gaussian_transform: USDTransformSamples | None,
+) -> None:
+    """Author a single NuRec ``UsdVol.Volume`` (referencing ``model_file``) into ``stage``."""
     # Calculate AABB from positions
     min_coord = np.min(positions, axis=0)
     max_coord = np.max(positions, axis=0)
-    logger.info(f"Model bounding box: min={min_coord}, max={max_coord}")
 
     # Convert numpy values to Python floats
     min_x, min_y, min_z = float(min_coord[0]), float(min_coord[1]), float(min_coord[2])
@@ -101,27 +118,13 @@ def serialize_nurec_usd(
     min_list = [min_x, min_y, min_z]
     max_list = [max_x, max_y, max_z]
 
-    # Initialize the USD stage with standard settings
-    stage = initialize_usd_stage()
-
-    # Set up render settings
-    render_settings = {
-        "rtx:rendermode": "RaytracedLighting",
-        "rtx:directLighting:sampledLighting:samplesPerPixel": 8,
-        "rtx:post:histogram:enabled": False,
-        "rtx:post:registeredCompositing:invertToneMap": True,
-        "rtx:post:registeredCompositing:invertColorCorrection": True,
-        "rtx:material:enableRefraction": False,
-        "rtx:post:tonemap:op": 2,
-        "rtx:raytracing:fractionalCutoutOpacity": False,
-        "rtx:matteObject:visibility:secondaryRays": True,
-    }
-    stage.SetMetadataByDictKey("customLayerData", "renderSettings", render_settings)
-
-    # Define UsdVol::Volume
-    gauss_path = "/World/gauss"
+    gauss_path = volume_path
     gauss_volume = UsdVol.Volume.Define(stage, gauss_path)
     gauss_prim = gauss_volume.GetPrim()
+    logger.info(
+        f"  {gauss_path}: {len(positions)} gaussians, extent "
+        f"min=[{min_x:.4g}, {min_y:.4g}, {min_z:.4g}] max=[{max_x:.4g}, {max_y:.4g}, {max_z:.4g}]"
+    )
 
     # Apply normalizing transform (identity by default). Optionally apply 3DGRUT-to-USDZ coordinate transform.
     normalizing_inverse = np.linalg.inv(normalizing_transform)
@@ -132,6 +135,7 @@ def serialize_nurec_usd(
         corrected_matrix = normalizing_inverse
 
     # Apply transform directly to the gauss volume
+    apply_usd_transform_samples(gauss_volume, source_gaussian_transform)
     matrix_op = gauss_volume.AddTransformOp()
     matrix_op.Set(Gf.Matrix4d(*corrected_matrix.flatten()))
 
@@ -189,6 +193,75 @@ def serialize_nurec_usd(
     # Create empty proxy mesh relationship for forward compatibility
     gauss_prim.CreateRelationship("proxy")
 
+
+def serialize_nurec_usd(
+    model_file: NamedSerialized,
+    positions: np.ndarray,
+    normalizing_transform: np.ndarray = np.eye(4),
+    apply_coordinate_transform: bool = False,
+    source_gaussian_transform: USDTransformSamples | None = None,
+    author_render_settings: bool = True,
+    invert_registered_compositing: bool = True,
+    skip_gaussian_tonemapping: bool = False,
+) -> NamedUSDStage:
+    """Create a USD stage with a single NuRec ``UsdVol.Volume`` at ``/World/gauss``.
+
+    See :func:`serialize_nurec_usd_partitions` for the multi-volume variant.
+    """
+    logger.info("Creating USD file containing NuRec model")
+    stage = initialize_usd_stage()
+    if author_render_settings:
+        _author_render_settings(
+            stage,
+            invert_registered_compositing=invert_registered_compositing,
+            skip_gaussian_tonemapping=skip_gaussian_tonemapping,
+        )
+    _author_nurec_volume(
+        stage,
+        model_file,
+        positions,
+        volume_path="/World/gauss",
+        normalizing_transform=normalizing_transform,
+        apply_coordinate_transform=apply_coordinate_transform,
+        source_gaussian_transform=source_gaussian_transform,
+    )
+    return NamedUSDStage(filename="gauss.usda", stage=stage)
+
+
+def serialize_nurec_usd_partitions(
+    volume_specs: list,
+    normalizing_transform: np.ndarray = np.eye(4),
+    apply_coordinate_transform: bool = False,
+    source_gaussian_transform: USDTransformSamples | None = None,
+    author_render_settings: bool = True,
+    invert_registered_compositing: bool = True,
+    skip_gaussian_tonemapping: bool = False,
+) -> NamedUSDStage:
+    """Create a USD stage with one NuRec ``UsdVol.Volume`` per partition.
+
+    ``volume_specs`` is a list of ``(model_file, positions)`` — each becomes a Volume at
+    ``/World/Partition_NNN/gauss`` referencing its own ``.nurec`` payload. Volumes are never
+    fused; each carries its own field assets and crop bounds.
+    """
+    logger.info("Creating USD file containing %d NuRec volumes", len(volume_specs))
+    stage = initialize_usd_stage()
+    if author_render_settings:
+        _author_render_settings(
+            stage,
+            invert_registered_compositing=invert_registered_compositing,
+            skip_gaussian_tonemapping=skip_gaussian_tonemapping,
+        )
+    width = max(3, len(str(max(len(volume_specs) - 1, 0))))
+    for i, (model_file, positions) in enumerate(volume_specs):
+        _author_nurec_volume(
+            stage,
+            model_file,
+            positions,
+            volume_path=f"/World/Partition_{i:0{width}d}/gauss",
+            normalizing_transform=normalizing_transform,
+            apply_coordinate_transform=apply_coordinate_transform,
+            source_gaussian_transform=source_gaussian_transform,
+        )
     return NamedUSDStage(filename="gauss.usda", stage=stage)
 
 
@@ -223,6 +296,10 @@ def serialize_usd_default_layer(gauss_stage: NamedUSDStage) -> NamedUSDStage:
         NamedUSDStage: The default USD stage with the gauss reference
     """
     stage = initialize_usd_stage()
+    if getattr(gauss_stage.stage, "HasAuthoredTimeCodeRange", None) and gauss_stage.stage.HasAuthoredTimeCodeRange():
+        stage.SetStartTimeCode(gauss_stage.stage.GetStartTimeCode())
+        stage.SetEndTimeCode(gauss_stage.stage.GetEndTimeCode())
+    stage.SetTimeCodesPerSecond(gauss_stage.stage.GetTimeCodesPerSecond())
 
     # The delegate captures all errors about dangling references, effectively silencing them.
     delegate = UsdUtils.CoalescingDiagnosticDelegate()
@@ -242,17 +319,24 @@ def serialize_usd_default_layer(gauss_stage: NamedUSDStage) -> NamedUSDStage:
 
 
 def write_to_usdz(
-    file_path: Path, model_file: NamedSerialized, gauss_usd: NamedUSDStage, default_usd: NamedUSDStage
+    file_path: Path,
+    model_file,
+    gauss_usd: NamedUSDStage,
+    default_usd: NamedUSDStage,
+    extra_files: list[NamedSerialized] | None = None,
 ) -> None:
     """
     Write the USDZ file containing the model data and USD stages.
 
     Args:
         file_path: Path to write the USDZ file to
-        model_file: The compressed model data
+        model_file: The compressed model data — a single NamedSerialized or a list (one
+            ``.nurec`` payload per volume for multi-volume exports)
         gauss_usd: The gauss USD stage
         default_usd: The default USD stage
     """
+    model_files = model_file if isinstance(model_file, (list, tuple)) else [model_file]
+
     # Make sure path to usdz-file exists
     file_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -260,8 +344,11 @@ def write_to_usdz(
         # Save default.usda first (required by USDZ spec)
         default_usd.save_to_zip(zip_file)
 
-        # Save the model file and gauss USD stage
-        model_file.save_to_zip(zip_file)
+        # Save the model file(s), gauss USD stage, and optional shader sidecars.
+        for mf in model_files:
+            mf.save_to_zip(zip_file)
         gauss_usd.save_to_zip(zip_file)
+        for extra_file in extra_files or []:
+            extra_file.save_to_zip(zip_file)
 
     logger.info(f"USDZ file created successfully at {file_path}")

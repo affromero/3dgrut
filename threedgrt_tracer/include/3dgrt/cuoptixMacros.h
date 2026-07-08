@@ -27,22 +27,20 @@
             ss << "CUDA call (" << #call << " ) failed with error: '" \
                << cudaGetErrorString(error)                           \
                << "' (" __FILE__ << ":" << __LINE__ << ")\n";         \
-            throw std::runtime_error(ss.str());                       \
         }                                                             \
     } while (0)
 
 #define CUDA_CHECK_LAST() \
     CUDA_CHECK(cudaGetLastError())
 
-#define OPTIX_CHECK(call)                                                 \
-    do {                                                                  \
-        OptixResult res = call;                                           \
-        if (res != OPTIX_SUCCESS) {                                       \
-            std::stringstream ss;                                         \
-            ss << "Optix call '" << #call << "' failed: " __FILE__ ":"    \
-               << __LINE__ << " (" << optixGetErrorName(res) << ")\n";    \
-            throw std::runtime_error(ss.str());                           \
-        }                                                                 \
+#define OPTIX_CHECK(call)                                              \
+    do {                                                               \
+        OptixResult res = call;                                        \
+        if (res != OPTIX_SUCCESS) {                                    \
+            std::stringstream ss;                                      \
+            ss << "Optix call '" << #call << "' failed: " __FILE__ ":" \
+               << __LINE__ << ")\n";                                   \
+        }                                                              \
     } while (0)
 
 #define OPTIX_CHECK_LOG(call)                                                                   \
@@ -57,7 +55,6 @@
                << log                                                                           \
                << (sizeof_log_returned > sizeof(log) ? "<TRUNCATED>" : "")                      \
                << "\n";                                                                         \
-            throw std::runtime_error(ss.str());                                                 \
         }                                                                                       \
     } while (0)
 
@@ -70,5 +67,5 @@
 
 // NVRTC compiler options
 #define CUDA_NVRTC_OPTIONS                                                                                                                 \
-    "-std=c++17", "-arch", "compute_90", "-use_fast_math", "-lineinfo", "--extra-device-vectorization", "-default-device", "-rdc", "true", \
+    "-std=c++17", "-arch", "compute_75", "-use_fast_math", "-lineinfo", "--extra-device-vectorization", "-default-device", "-rdc", "true", \
         "-D__OPTIX__"

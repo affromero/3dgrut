@@ -8,16 +8,11 @@ particle_kernel_min_response: 0.0113
 particle_kernel_min_alpha: ${div:1.0,255.0}
 particle_kernel_max_alpha: 0.99
 particle_radiance_sph_degree: 3
-primitive_type: icosahedron  # NOT instances: the instances IAS/GAS path needs 2-level traversal (ALLOW_SINGLE_LEVEL_INSTANCING + depth 2) but the pipeline is compiled ALLOW_SINGLE_GAS/depth-1 -> broken traversal -> zero hits. icosahedron is the paper/reference default.
+primitive_type: instances
 min_transmittance: 0.001
 max_consecutive_bvh_update: 15
 enable_normals: false
 enable_hitcounts: true
 enable_kernel_timings: false
-
-gaussian_dropout:
-  enabled: false
-  probability: 0.0
-  compensate_density: true
-  start_iteration: 0
-  end_iteration: -1
+particle_feature_half: false
+feature_output_half: false
