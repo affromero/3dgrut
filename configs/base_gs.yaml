@@ -199,6 +199,9 @@ loss:
 post_processing:
   # null | "ppisp" | "linear-to-srgb" | "luminance_affine"
   method: null
+  # "dataset": one bucket per dataset camera; "single_physical_camera":
+  # fold all frames into one bucket (dataset splits one physical camera).
+  camera_index_mode: dataset
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.
   use_controller: true

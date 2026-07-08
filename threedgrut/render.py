@@ -30,6 +30,7 @@ from threedgrut.utils.color_correct import color_correct_affine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import create_summary_writer
 from threedgrut.post_processing import LuminanceAffine
+from threedgrut.utils.render import post_processing_camera_index_mode
 from threedgrut.utils.render import (
     apply_background,
     apply_feature_decoder,
@@ -101,6 +102,8 @@ class Renderer:
         self.writer = writer
         self.compute_extra_metrics = compute_extra_metrics
         self.post_processing = post_processing
+        if self.post_processing is not None:
+            self.post_processing.camera_index_mode = post_processing_camera_index_mode(conf)
         self.feature_decoder = feature_decoder
 
         if conf.model.background.color == "black":

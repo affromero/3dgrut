@@ -51,6 +51,63 @@ def SH2RGB(sh):
     return sh * C0 + 0.5
 
 
+POST_PROCESSING_CAMERA_INDEX_DATASET = "dataset"
+POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL = "single_physical_camera"
+POST_PROCESSING_CAMERA_INDEX_MODES = frozenset(
+    (
+        POST_PROCESSING_CAMERA_INDEX_DATASET,
+        POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL,
+    )
+)
+
+
+def post_processing_camera_index_mode(conf) -> str:
+    """Selected camera bucketing mode for per-camera post-processing.
+
+    "dataset" keeps the dataset's camera indices (one post-processing bucket
+    per dataset camera); "single_physical_camera" folds every frame into one
+    bucket, for captures where the dataset splits one physical camera into
+    many logical ones.
+    """
+    mode = conf.post_processing.get(
+        "camera_index_mode",
+        POST_PROCESSING_CAMERA_INDEX_DATASET,
+    )
+    if mode not in POST_PROCESSING_CAMERA_INDEX_MODES:
+        raise ValueError(
+            "Unsupported post_processing.camera_index_mode="
+            f"{mode!r}. Expected one of "
+            f"{sorted(POST_PROCESSING_CAMERA_INDEX_MODES)}."
+        )
+    return mode
+
+
+def post_processing_frames_per_camera(
+    frames_per_camera: list[int],
+    camera_index_mode: str,
+) -> list[int]:
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_DATASET:
+        return frames_per_camera
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL:
+        return [sum(frames_per_camera)]
+    raise ValueError(
+        f"Unsupported post-processing camera index mode: {camera_index_mode!r}."
+    )
+
+
+def post_processing_camera_idx(
+    camera_idx: int,
+    camera_index_mode: str,
+) -> int:
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_DATASET:
+        return camera_idx
+    if camera_index_mode == POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL:
+        return 0
+    raise ValueError(
+        f"Unsupported post-processing camera index mode: {camera_index_mode!r}."
+    )
+
+
 def apply_feature_decoder(
     feature_decoder,
     outputs: dict,
@@ -125,7 +182,14 @@ def apply_post_processing(
     assert outputs["pred_features"].shape[0] == 1, "Post-processing requires batch_size=1"
 
     pred_features = outputs["pred_features"]
-    camera_idx = gpu_batch.camera_idx
+    camera_idx = post_processing_camera_idx(
+        gpu_batch.camera_idx,
+        getattr(
+            post_processing,
+            "camera_index_mode",
+            POST_PROCESSING_CAMERA_INDEX_DATASET,
+        ),
+    )
     frame_idx = gpu_batch.frame_idx if training else -1
     H, W = pred_features.shape[1], pred_features.shape[2]
 

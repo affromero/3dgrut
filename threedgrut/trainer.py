@@ -45,6 +45,10 @@ from threedgrut.post_processing import LuminanceAffine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import check_step_condition, create_summary_writer, jet_map
 from threedgrut.utils.render import (
+    post_processing_camera_index_mode,
+    post_processing_frames_per_camera,
+)
+from threedgrut.utils.render import (
     apply_background,
     apply_feature_decoder,
     apply_post_processing,
@@ -154,6 +158,8 @@ class Trainer3DGRUT:
         # Feature decoder and post-processing must exist before setup_training so resume can load their state.
         self.init_feature_decoder(conf)
         self.init_post_processing(conf)
+        if getattr(self, "post_processing", None) is not None:
+            self.post_processing.camera_index_mode = post_processing_camera_index_mode(conf)
         self.init_camera_residual(conf)
         self.setup_training(conf, self.model, self.train_dataset)
         self.init_experiments_tracking(conf)
@@ -487,10 +493,14 @@ class Trainer3DGRUT:
         if method is None:
             return
 
+        camera_index_mode = post_processing_camera_index_mode(conf)
+
         if method == "ppisp":
             from ppisp import PPISP, PPISPConfig
 
-            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            frames_per_camera = post_processing_frames_per_camera(
+                self.train_dataset.get_frames_per_camera(), camera_index_mode
+            )
             num_cameras = len(frames_per_camera)
             num_frames = sum(frames_per_camera)
 
@@ -543,7 +553,9 @@ class Trainer3DGRUT:
             self.post_processing_schedulers = []
             logger.info("Post-processing: linear-to-sRGB (no trainable parameters)")
         elif method == "luminance_affine":
-            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            frames_per_camera = post_processing_frames_per_camera(
+                self.train_dataset.get_frames_per_camera(), camera_index_mode
+            )
             num_cameras = len(frames_per_camera)
             num_frames = sum(frames_per_camera)
 
