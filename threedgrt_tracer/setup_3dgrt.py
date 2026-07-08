@@ -15,6 +15,7 @@
 
 import os
 
+from threedgrut.model.carriers import gabor_carrier_enabled, siren_carrier_enabled
 from threedgrut.model.features import Features
 from threedgrut.utils import jit
 
@@ -22,6 +23,12 @@ from threedgrut.utils import jit
 # ----------------------------------------------------------------------------
 #
 def setup_3dgrt(conf):
+    if gabor_carrier_enabled(conf) or siren_carrier_enabled(conf):
+        raise ValueError(
+            "Gabor/SIREN carriers are only supported by the 3dgut renderer "
+            "(render.method '3dgut'); the 3dgrt tracer has no carrier "
+            "feature head."
+        )
     def to_cpp_bool(value):
         return "true" if value else "false"
 

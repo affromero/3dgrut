@@ -63,11 +63,17 @@ class PLYExporter(ModelExporter):
         # Create normal vectors (placeholder, pointing up)
         mogt_nrm = np.repeat(np.array([[0, 0, 1]], dtype=np.float32), repeats=num_gaussians, axis=0)
 
-        # Reshape specular coefficients for PLY format (channel-major layout)
+# Reshape specular coefficients for PLY format (channel-major layout)
         # From [N, M*3] to [N, M, 3] to [N, 3, M] to [N, M*3] (channel-major).
         # Derive M from the actual array width: importers pad specular to a fixed (degree-3)
         # width while reporting the true SH degree in caps, so deriving M from a degree value
-        # would mismatch the stored width for sources below the padding degree.
+        # would mismatch the stored width for sources below the padding degree. Carrier
+        # slots (if any) are stored after the SH slots with the same float3 packing.
+        if attrs.specular.shape[1] % 3 != 0:
+            raise ValueError(
+                "PLY export requires specular features packed as float3 slots; "
+                f"got width {attrs.specular.shape[1]}."
+            )
         num_speculars = attrs.specular.shape[1] // 3
         mogt_specular = attrs.specular.reshape((num_gaussians, num_speculars, 3))
         mogt_specular = mogt_specular.transpose(0, 2, 1).reshape((num_gaussians, num_speculars * 3))

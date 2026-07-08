@@ -315,6 +315,32 @@ class TestPLYExportImport:
                 attrs.albedo, expected_albedo, rtol=1e-5, atol=1e-6, err_msg="Albedo mismatch after PLY export/import"
             )
 
+    def test_ply_export_import_extra_specular_slots(self):
+        """Test that non-SH specular slots are preserved."""
+        model = MockGaussianModel(num_gaussians=10, sh_degree=3)
+        extra_slots = torch.arange(
+            60, dtype=torch.float32, device=model.device
+        ).reshape(10, 6)
+        model._specular = torch.cat((model._specular, extra_slots), dim=1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ply_path = Path(tmpdir) / "test.ply"
+
+            exporter = PLYExporter()
+            exporter.export(model, ply_path)
+
+            importer = PLYImporter(max_sh_degree=3)
+            attrs, caps = importer.load(ply_path)
+
+            expected_specular = model.get_features_specular().cpu().numpy()
+            np.testing.assert_allclose(
+                attrs.specular,
+                expected_specular,
+                rtol=1e-5,
+                atol=1e-6,
+                err_msg="Specular extension slots mismatch after PLY export/import",
+            )
+
 
 class TestUSDExportImport:
     """Test USD LightField export from ExportableModel and import back."""

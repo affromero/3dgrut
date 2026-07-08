@@ -22,6 +22,9 @@
 #elif FEATURE_TRANSFORM_TYPE == 1
     // Post-MLP radiance mode
     #include <3dgut/kernels/slang/models/neuralHarmonicFeaturesParticle.slang>
+#elif FEATURE_TRANSFORM_TYPE == 2
+    // Spherical harmonics + positional carrier residual (Gabor / SIREN)
+    #include <3dgut/kernels/slang/models/carrierRadiativeParticles.slang>
 #else
-    #error "Unknown FEATURE_TRANSFORM_TYPE. Must be 0 (SH) or 1 (neural_harmonic_features)"
+    #error "Unknown FEATURE_TRANSFORM_TYPE. Must be 0 (SH), 1 (neural_harmonic_features), or 2 (sh + carrier)"
 #endif

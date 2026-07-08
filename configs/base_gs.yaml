@@ -87,6 +87,17 @@ model:
   optimize_scale: true
   bvh_update_frequency: 1
   feature_type: "sh" # one of [sh, nht] # sh: spherical harmonics radiance, nht: neural harmonics texture
+  # Positional carrier residuals (sh mode only; 3dgut renderer only).
+  use_gabor_carrier: false
+  gabor_num_terms: 3
+  gabor_max_frequency: 4.0
+  use_siren_carrier: false
+  siren_hidden_dim: 6
+  siren_omega: 30.0
+  siren_local_uv_scale: 3.0
+  siren_init_seed: 20260626
+  siren_init_scale: 0.2
+  siren_output_init_scale: 0.0
   progressive_training:
     init_n_features: 0 # sh: initial sh deg | mlp: num of dims initially unmasked
     max_n_features: 3 # sh: maximum sh deg | mlp: total num of dims finally unmasked

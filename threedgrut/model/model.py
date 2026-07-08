@@ -27,6 +27,7 @@ from threedgrut.datasets.protocols import Batch
 from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
 from threedgrut.export import PLYExporter
 from threedgrut.export.base import ExportableModel
+from threedgrut.model.carriers import carrier_specular_dim, initial_carrier_tail
 from threedgrut.model.features import Features
 from threedgrut.model.geometry import (
     apply_points_transform,
@@ -98,6 +99,27 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             return self.features  # [N, K]
         else:
             raise ValueError(f"Unknown feature_type: {self.feature_type}")
+
+    def _specular_feature_dim(self) -> int:
+        return sh_degree_to_specular_dim(self.max_n_features) + carrier_specular_dim(self.conf)
+
+    def _with_carrier_tail(self, features_specular: torch.Tensor) -> torch.Tensor:
+        """Widen SH-only specular features with freshly initialized carrier slots."""
+        expected_dim = self._specular_feature_dim()
+        if features_specular.shape[1] == expected_dim:
+            return features_specular
+        sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+        if carrier_specular_dim(self.conf) > 0 and features_specular.shape[1] == sh_dim:
+            tail = initial_carrier_tail(
+                num_gaussians=features_specular.shape[0],
+                device=features_specular.device,
+                dtype=features_specular.dtype,
+                conf=self.conf,
+            )
+            return torch.cat((features_specular, tail), dim=1)
+        raise ValueError(
+            f"Unexpected features_specular width: got {features_specular.shape[1]}, expected {expected_dim}."
+        )
 
     def get_scale(self, preactivation=False):
         if preactivation:
@@ -180,7 +202,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 f"Clamping max_n_features to {render_sph_degree}."
             )
             sh_degree = render_sph_degree
-        specular_dim = sh_degree_to_specular_dim(sh_degree)
+        specular_dim = sh_degree_to_specular_dim(sh_degree) + carrier_specular_dim(conf)
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Positions of the 3D Gaussians (x, y, z) [n_gaussians, 3]
@@ -305,8 +327,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         if self.feature_type == Features.Type.SH:
             assert self.features_albedo.shape == (num_gaussians, 3)
-            specular_sh_dims = sh_degree_to_specular_dim(self.max_n_features)
-            assert self.features_specular.shape == (num_gaussians, specular_sh_dims)
+            assert self.features_specular.shape == (num_gaussians, self._specular_feature_dim())
         elif self.feature_type == Features.Type.NHT:
             assert self.features.shape == (num_gaussians, self.particle_feature_dim)
         else:
@@ -571,11 +592,15 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # Initialize features based on feature_type
         if self.feature_type == Features.Type.SH:
             features_albedo = fused_color.contiguous()
-            max_sh_degree = self.max_n_features
-            num_specular_features = sh_degree_to_specular_dim(max_sh_degree)
+            num_specular_features = self._specular_feature_dim()
             features_specular = torch.zeros(
                 (num_gaussians, num_specular_features), dtype=dtype, device=self.device
             ).contiguous()
+            if carrier_specular_dim(self.conf) > 0:
+                sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+                features_specular[:, sh_dim:] = initial_carrier_tail(
+                    num_gaussians=num_gaussians, device=self.device, dtype=dtype, conf=self.conf
+                )
         elif self.feature_type == Features.Type.NHT:
             init_min = float(getattr(self.conf.model.nht_features, "init_min", -5.0))
             init_max = float(getattr(self.conf.model.nht_features, "init_max", 5.0))
@@ -670,7 +695,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         if checkpoint_feature_type == Features.Type.SH:
             self.features_albedo = checkpoint["features_albedo"]
-            self.features_specular = checkpoint["features_specular"]
+            self.features_specular = torch.nn.Parameter(
+                self._with_carrier_tail(checkpoint["features_specular"])
+            )
         elif checkpoint_feature_type == Features.Type.NHT:
             self.features = checkpoint["features"]
             self.nht_num_interpolation_points = Features(self.conf).num_interpolation_points
@@ -753,8 +780,16 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # Initialize features based on feature_type
         if self.feature_type == Features.Type.SH:
             features_albedo = to_torch(RGB2SH(to_np(colors.float() / 255.0)), device=self.device)
-            num_specular_dims = sh_degree_to_specular_dim(self.max_n_features)
+            num_specular_dims = self._specular_feature_dim()
             features_specular = torch.zeros((N, num_specular_dims))
+            if carrier_specular_dim(self.conf) > 0:
+                sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+                features_specular[:, sh_dim:] = initial_carrier_tail(
+                    num_gaussians=N,
+                    device=features_specular.device,
+                    dtype=features_specular.dtype,
+                    conf=self.conf,
+                )
         elif self.feature_type == Features.Type.NHT:
             init_min = float(getattr(self.conf.model.nht_features, "init_min", -5.0))
             init_max = float(getattr(self.conf.model.nht_features, "init_max", 5.0))
@@ -959,23 +994,32 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
-        num_speculars = (self.max_n_features + 1) ** 2 - 1
-        expected_extra_f_count = 3 * num_speculars
+        sh_speculars = (self.max_n_features + 1) ** 2 - 1
+        sh_extra_f_count = 3 * sh_speculars
+        expected_extra_f_count = self._specular_feature_dim()
+        if len(extra_f_names) % 3 != 0:
+            raise ValueError(
+                f"PLY f_rest_* properties must be packed as float3 slots; found {len(extra_f_names)} fields."
+            )
 
-        mogt_specular = np.zeros((num_gaussians, expected_extra_f_count))
-        if len(extra_f_names) == expected_extra_f_count:
-            # Full spherical harmonics data available
+        if len(extra_f_names) in {sh_extra_f_count, expected_extra_f_count}:
+            # Full spherical harmonics data available. Carrier-enabled PLYs
+            # append carrier slots after the SH coefficients.
+            mogt_specular = np.zeros((num_gaussians, len(extra_f_names)))
             for idx, attr_name in enumerate(extra_f_names):
                 mogt_specular[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            num_speculars = len(extra_f_names) // 3
             mogt_specular = mogt_specular.reshape((num_gaussians, 3, num_speculars))
             mogt_specular = mogt_specular.transpose(0, 2, 1).reshape((num_gaussians, num_speculars * 3))
         elif len(extra_f_names) == 0:
             # Only DC components available, create zero-filled higher-order harmonics
+            mogt_specular = np.zeros((num_gaussians, sh_extra_f_count))
             logger.info(f"PLY file only contains DC components, initializing higher-order spherical harmonics to zero")
         else:
             # Partial data - this is unexpected
             raise ValueError(
-                f"Unexpected number of f_rest_ properties: found {len(extra_f_names)}, expected {expected_extra_f_count} or 0"
+                f"Unexpected number of f_rest_ properties: found {len(extra_f_names)}, "
+                f"expected {sh_extra_f_count}, {expected_extra_f_count}, or 0"
             )
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
@@ -995,7 +1039,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             torch.tensor(mogt_albedo, dtype=self.features_albedo.dtype, device=self.device)
         )
         self.features_specular = torch.nn.Parameter(
-            torch.tensor(mogt_specular, dtype=self.features_specular.dtype, device=self.device)
+            self._with_carrier_tail(torch.tensor(mogt_specular, dtype=self.features_specular.dtype, device=self.device))
         )
         self.density = torch.nn.Parameter(torch.tensor(mogt_densities, dtype=self.density.dtype, device=self.device))
         self.scale = torch.nn.Parameter(torch.tensor(mogt_scales, dtype=self.scale.dtype, device=self.device))

@@ -15,6 +15,12 @@
 
 from enum import IntEnum
 
+from threedgrut.model.carriers import (
+    carrier_specular_dim,
+    gabor_carrier_enabled,
+    siren_carrier_enabled,
+)
+
 
 class Features:
     """Enums and conf-driven getters for feature type, activation, and interpolation."""
@@ -24,6 +30,7 @@ class Features:
 
         SH = 0  # Spherical harmonics
         NHT = 1  # Neural harmonic texture
+        SH_CARRIER = 2  # Spherical harmonics + positional carrier residual
 
         @classmethod
         def from_string(cls, value: str) -> "Features.Type":
@@ -52,9 +59,23 @@ class Features:
         self._conf = conf
 
     @property
+    def carriers_enabled(self):
+        """True when a Gabor or SIREN carrier extends the SH radiance."""
+        return gabor_carrier_enabled(self._conf) or siren_carrier_enabled(self._conf)
+
+    @property
     def transform_type(self):
-        """SH or NHT — integer value used directly in C preprocessor defines."""
-        return Features.Type.from_string(self._conf.model.feature_type)
+        """SH, NHT, or SH_CARRIER — integer value used directly in C preprocessor defines.
+
+        feature_type stays "sh" in the config when carriers are enabled (they
+        are an SH-mode extension); only the compiled feature head differs.
+        """
+        base = Features.Type.from_string(self._conf.model.feature_type)
+        if base == Features.Type.SH and self.carriers_enabled:
+            return Features.Type.SH_CARRIER
+        if base != Features.Type.SH and self.carriers_enabled:
+            raise ValueError("Carriers require model.feature_type 'sh'.")
+        return base
 
     @property
     def activation_type(self):
@@ -135,7 +156,7 @@ class Features:
         feature_type = self._conf.model.feature_type.lower()
         if feature_type == "sh":
             sh_degree = self._conf.model.progressive_training.max_n_features
-            return 3 * ((sh_degree + 1) ** 2)
+            return 3 * ((sh_degree + 1) ** 2) + carrier_specular_dim(self._conf)
         elif feature_type == "nht":
             return self._conf.model.nht_features.dim
         raise ValueError(f"Unknown feature_type: {feature_type}")

@@ -18,6 +18,13 @@ import os
 
 import torch
 
+from threedgrut.model.carriers import (
+    GABOR_CARRIER_NUM_TERMS,
+    carrier_specular_dim,
+    gabor_carrier_enabled,
+    siren_carrier_enabled,
+    siren_carrier_hidden_dim,
+)
 from threedgrut.model.features import Features
 from threedgrut.utils import jit
 
@@ -44,6 +51,17 @@ def setup_3dgut(conf):
     ut_delta = math.sqrt(ut_alpha * ut_alpha * (ut_d + ut_kappa))
 
     feat = Features(conf)
+    radiance_sh_coeffs = (conf.render.particle_radiance_sph_degree + 1) ** 2
+    carrier_defines = [
+        f"-DPARTICLE_RADIANCE_NUM_SH_COEFFS={radiance_sh_coeffs}",
+        f"-DPARTICLE_RADIANCE_GABOR_ENABLED={to_cpp_bool(gabor_carrier_enabled(conf))}",
+        f"-DPARTICLE_RADIANCE_GABOR_NUM_TERMS={GABOR_CARRIER_NUM_TERMS}",
+        f"-DPARTICLE_RADIANCE_GABOR_MAX_FREQUENCY={float(conf.model.get('gabor_max_frequency', 4.0))}",
+        f"-DPARTICLE_RADIANCE_SIREN_ENABLED={to_cpp_bool(siren_carrier_enabled(conf))}",
+        f"-DPARTICLE_RADIANCE_SIREN_HIDDEN_DIM={siren_carrier_hidden_dim(conf)}",
+        f"-DPARTICLE_RADIANCE_SIREN_OMEGA={float(conf.model.get('siren_omega', 30.0))}",
+        f"-DPARTICLE_RADIANCE_SIREN_LOCAL_UV_SCALE={float(conf.model.get('siren_local_uv_scale', 3.0))}",
+    ]
     transform_defines = [
         f"-DPARTICLE_FEATURE_DIM={feat.particle_feature_dim}",
         f"-DRAY_FEATURE_DIM={feat.ray_feature_dim}",
@@ -62,7 +80,7 @@ def setup_3dgut(conf):
     ]
 
     defines = [
-        f"-DPARTICLE_RADIANCE_NUM_COEFFS={(conf.render.particle_radiance_sph_degree + 1) ** 2}",
+        f"-DPARTICLE_RADIANCE_NUM_COEFFS={radiance_sh_coeffs + carrier_specular_dim(conf) // 3}",
         f"-DGAUSSIAN_PARTICLE_KERNEL_DEGREE={conf.render.particle_kernel_degree}",
         f"-DGAUSSIAN_PARTICLE_MIN_KERNEL_DENSITY={conf.render.particle_kernel_min_response}",
         f"-DGAUSSIAN_PARTICLE_MIN_ALPHA={conf.render.particle_kernel_min_alpha}",
@@ -74,6 +92,7 @@ def setup_3dgut(conf):
         # Feature-based radiance dimensions
         *transform_defines,
         *nht_defines,
+        *carrier_defines,
         # Feature buffer memory layout
         *half_defines,
         # Specific to the 3DGUT renderer

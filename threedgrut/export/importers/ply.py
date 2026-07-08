@@ -91,9 +91,12 @@ class PLYImporter(FormatImporter):
             specular = np.zeros((num_gaussians, 0), dtype=np.float32)
             logger.info("PLY file only contains DC components; no higher-order SH")
         else:
-            # Smallest full SH degree whose band count holds all present coefficients.
+            # Smallest full SH degree whose band count holds all present coefficients,
+            # capped at max_sh_degree: slots beyond the capped band count are carrier
+            # extensions and are preserved verbatim (no padding) after the SH slots.
             actual_sh_degree = int(np.ceil(np.sqrt(actual_speculars + 1))) - 1
-            full_speculars = (actual_sh_degree + 1) ** 2 - 1
+            actual_sh_degree = min(actual_sh_degree, self.max_sh_degree)
+            full_speculars = max((actual_sh_degree + 1) ** 2 - 1, actual_speculars)
             specular = np.zeros((num_gaussians, full_speculars * 3), dtype=np.float32)
             temp_specular = np.zeros((num_gaussians, actual_speculars * 3), dtype=np.float32)
             for idx, attr_name in enumerate(extra_f_names):
@@ -102,8 +105,14 @@ class PLYImporter(FormatImporter):
             temp_specular = temp_specular.reshape((num_gaussians, 3, actual_speculars))
             temp_specular = temp_specular.transpose(0, 2, 1).reshape((num_gaussians, actual_speculars * 3))
             specular[:, : actual_speculars * 3] = temp_specular
-            if full_speculars != actual_speculars:
+            if full_speculars > actual_speculars:
                 logger.info(f"PLY has partial SH ({actual_speculars} coeffs); padded to degree {actual_sh_degree}")
+            max_full_speculars = (self.max_sh_degree + 1) ** 2 - 1
+            if actual_speculars > max_full_speculars:
+                logger.info(
+                    f"PLY carries {actual_speculars - max_full_speculars} specular extension "
+                    f"slots beyond SH degree {actual_sh_degree}; preserved verbatim"
+                )
 
         # Extract scales
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
