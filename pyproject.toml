@@ -33,6 +33,8 @@ dependencies = [
     "setuptools==78.1.1",
     "pillow",
     "ninja",
+    "beartype",
+    "jaxtyping",
     "plyfile",
     "torchmetrics",
     "addict",
