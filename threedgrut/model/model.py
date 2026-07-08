@@ -48,6 +48,21 @@ from threedgrut.utils.misc import (
 from threedgrut.utils.render import RGB2SH
 
 
+def _subsample_initial_points(
+    pts: torch.Tensor,
+    rgb: torch.Tensor,
+    *,
+    max_points: int,
+    seed: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a deterministic subset for bounded point-cloud initialization."""
+    if max_points <= 0 or pts.shape[0] <= max_points:
+        return pts, rgb
+    rng = torch.Generator(device=pts.device).manual_seed(seed)
+    idxs = torch.randperm(pts.shape[0], device=pts.device, generator=rng)[:max_points]
+    return pts[idxs], rgb[idxs]
+
+
 class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     """ """
 
@@ -379,6 +394,16 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         file_pts = apply_points_transform(file_pts, points_transform)
 
         assert file_rgb.dtype == torch.uint8, "Expecting RGB values to be in [0, 255] range"
+        max_points = int(self.conf.initialization.get("num_points", 0))
+        original_points = file_pts.shape[0]
+        file_pts, file_rgb = _subsample_initial_points(
+            file_pts,
+            file_rgb,
+            max_points=max_points,
+            seed=int(self.conf.seed_initialization),
+        )
+        if file_pts.shape[0] != original_points:
+            logger.info(f"Subsampled COLMAP initialization points from {original_points} to {file_pts.shape[0]}")
         self.default_initialize_from_points(
             file_pts,
             observer_pts,
@@ -695,9 +720,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         if checkpoint_feature_type == Features.Type.SH:
             self.features_albedo = checkpoint["features_albedo"]
-            self.features_specular = torch.nn.Parameter(
-                self._with_carrier_tail(checkpoint["features_specular"])
-            )
+            self.features_specular = torch.nn.Parameter(self._with_carrier_tail(checkpoint["features_specular"]))
         elif checkpoint_feature_type == Features.Type.NHT:
             self.features = checkpoint["features"]
             self.nht_num_interpolation_points = Features(self.conf).num_interpolation_points
