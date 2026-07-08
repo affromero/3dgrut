@@ -42,6 +42,39 @@ struct GUTProjector : Params, UTParams {
         };
     }
 
+    // Equirectangular-only: half-open X tile range [min, max) that is allowed to
+    // run negative or past gridX so a footprint straddling the +-180 deg azimuth
+    // seam is binned to BOTH panorama edges. Y is NOT computed here (poles do not
+    // wrap) -- callers take Y from computeTileSpaceBBox. The span is capped at one
+    // full ring (gridX tiles) so a particle can never emit duplicate wrapped keys.
+    // Used IDENTICALLY by the count (eval) and emit (expand) loops; both passes
+    // pass the same inputs, so they get the same bounds and tile_count == tiles_emitted.
+    struct EquirectXTileRange {
+        int min;
+        int max;
+    };
+
+    static inline __device__ EquirectXTileRange computeEquirectXTileRange(const tcnn::uvec2& tileGrid, const tcnn::vec2& position, const tcnn::vec2& extent) {
+        constexpr int blockX = static_cast<int>(threedgut::GUTParameters::Tiling::BlockX);
+        const int gridX      = static_cast<int>(tileGrid.x);
+        int xMin             = static_cast<int>(floorf((position.x - 0.5f - extent.x) / blockX));
+        int xMax             = static_cast<int>(ceilf((position.x - 0.5f + extent.x) / blockX));
+        if (xMax <= xMin) {
+            xMax = xMin + 1;
+        }
+        // Cap at one full ring so wrapped keys cannot duplicate.
+        if ((xMax - xMin) > gridX) {
+            xMax = xMin + gridX;
+        }
+        return EquirectXTileRange{xMin, xMax};
+    }
+
+    // Wrap an (possibly negative / >= gridX) tile column into [0, gridX) for key emission.
+    static inline __device__ uint32_t wrapTileX(int x, int gridX) {
+        const int m = x % gridX;
+        return static_cast<uint32_t>(m < 0 ? m + gridX : m);
+    }
+
     static inline __device__ uint64_t concatTileDepthKeys(uint32_t tileKey, uint32_t depthKey) {
         return (static_cast<uint64_t>(tileKey) << 32) | depthKey;
     }
@@ -135,16 +168,18 @@ struct GUTProjector : Params, UTParams {
 
         const tcnn::vec3& particleMean = particles.position(particleParameters);
 
-        // Camera-to-particle vector (world frame); reused below, so compute
-        // it before the visibility cull.
+        // Camera-to-particle vector (world frame); its norm is the equirect
+        // projectPoint() radial distance and is reused below, so compute it
+        // before the visibility cull.
         particleSensorRay = particleMean - sensorWorldPosition;
 
-        // Wide-FOV cameras rely on projectPoint() for angular validity.
-        // A forward-hemisphere depth cull would discard valid fisheye rim
-        // samples beyond 90 deg before the KB4 maxAngle check runs.
-        // (Equirectangular joins this branch when that camera model is
-        // ported.)
-        if (sensorModel.modelType == threedgut::TSensorModel::OpenCVFisheyeModel) {
+        const bool wideFovModel = (
+            sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel ||
+            sensorModel.modelType == threedgut::TSensorModel::OpenCVFisheyeModel);
+        if (wideFovModel) {
+            // Wide-FOV cameras rely on projectPoint() for angular validity.
+            // A forward-hemisphere depth cull would discard valid fisheye rim
+            // samples beyond 90 deg before the KB4 maxAngle check runs.
             if (length(particleSensorRay) < 1e-6f) {
                 return false;
             }
@@ -209,6 +244,28 @@ struct GUTProjector : Params, UTParams {
             return false;
         }
 
+        // Equirectangular seam handling: sigma points straddling the +-180 deg
+        // azimuth seam wrap (u ~ 0 vs ~ width), which corrupts the averaged
+        // center and covariance below. Unwrap each sigma point's u onto the
+        // branch nearest the first point and recompute the mean; the center is
+        // wrapped back into [0, width) after the covariance is built.
+        const bool equirectModel =
+            (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel);
+        if (equirectModel) {
+            const float width = static_cast<float>(resolution.x);
+            const float refX  = projectedSigmaPoints[0].x;
+#pragma unroll
+            for (int i = 1; i < 2 * UTParams::D + 1; ++i) {
+                projectedSigmaPoints[i].x -= width * roundf((projectedSigmaPoints[i].x - refX) / width);
+            }
+            tcnn::vec2 unwrappedCenter = projectedSigmaPoints[0] * (Lambda / (UTParams::D + Lambda));
+#pragma unroll
+            for (int i = 1; i < 2 * UTParams::D + 1; ++i) {
+                unwrappedCenter += weightI * projectedSigmaPoints[i];
+            }
+            particleProjCenter = unwrappedCenter;
+        }
+
         {
             const tcnn::vec2 centeredPoint = projectedSigmaPoints[0] - particleProjCenter;
             constexpr float weight0        = Lambda / (UTParams::D + Lambda) + (1.f - UTParams::Alpha * UTParams::Alpha + UTParams::Beta);
@@ -222,6 +279,11 @@ struct GUTProjector : Params, UTParams {
             particleProjCovariance += weightI * tcnn::vec3(centeredPoint.x * centeredPoint.x,
                                                            centeredPoint.x * centeredPoint.y,
                                                            centeredPoint.y * centeredPoint.y);
+        }
+
+        if (equirectModel) {
+            const float width    = static_cast<float>(resolution.x);
+            particleProjCenter.x = particleProjCenter.x - width * floorf(particleProjCenter.x / width);
         }
 
         return true;
@@ -285,14 +347,33 @@ struct GUTProjector : Params, UTParams {
                                                                       particleMaxConicOpacityPower);
         }
 
-        particlesVisibilityCudaPtr[particleIdx] = validConicEstimation ? 1 : 0;
-
         validProjection = validProjection && validConicEstimation;
+
+        // Visibility feeds SelectiveAdam and must match the exact render gate
+        // below: a particle whose unscented projection failed is NOT visible,
+        // even if its conic estimation succeeded.
+        particlesVisibilityCudaPtr[particleIdx] = validProjection ? 1 : 0;
 
         uint32_t numValidTiles = 0;
         if (validProjection) {
             const BoundingBox2D tileBBox = computeTileSpaceBBox(tileGrid, particleProjCenter, particleProjExtent);
-            if constexpr (Params::TileCulling) {
+            if (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel) {
+                // Azimuthally-wrapping X range; Y still clamps (poles do not wrap).
+                // Iterate the unwrapped X span and power-test at the true (unwrapped)
+                // footprint column -- identical to the emit loop in expand().
+                const EquirectXTileRange xRange = computeEquirectXTileRange(tileGrid, particleProjCenter, particleProjExtent);
+                if constexpr (Params::TileCulling) {
+                    for (int y = tileBBox.min.y; y < tileBBox.max.y; ++y) {
+                        for (int x = xRange.min; x < xRange.max; ++x) {
+                            if (tileMinParticlePowerResponse(tcnn::vec2(x, y), particleProjConicOpacity, particleProjCenter) < particleMaxConicOpacityPower) {
+                                numValidTiles++;
+                            }
+                        }
+                    }
+                } else {
+                    numValidTiles = static_cast<uint32_t>((xRange.max - xRange.min) * (static_cast<int>(tileBBox.max.y) - static_cast<int>(tileBBox.min.y)));
+                }
+            } else if constexpr (Params::TileCulling) {
                 for (int y = tileBBox.min.y; y < tileBBox.max.y; ++y) {
                     for (int x = tileBBox.min.x; x < tileBBox.max.x; ++x) {
                         if (tileMinParticlePowerResponse(tcnn::vec2(x, y), particleProjConicOpacity, particleProjCenter) < particleMaxConicOpacityPower) {
@@ -326,9 +407,18 @@ struct GUTProjector : Params, UTParams {
         particlesProjectedConicOpacityPtr[particleIdx] = particleProjConicOpacity;
         particlesProjectedExtentPtr[particleIdx]       = particleProjExtent;
         if constexpr (Params::GlobalZOrder) {
-            const tcnn::vec3& particleMean       = particles.position(particleParameters);
-            particlesGlobalDepthPtr[particleIdx] = (particleMean.x * sensorViewMatrix[0][2] + particleMean.y * sensorViewMatrix[1][2] +
-                                                    particleMean.z * sensorViewMatrix[2][2] + sensorViewMatrix[3][2]);
+            if (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel) {
+                // Full-sphere camera: signed sensor-frame Z would corrupt the
+                // ascending unsigned-float-bits radix sort for the rear
+                // hemisphere (negative Z sorts as larger and reversed). Radial
+                // distance is non-negative and is the correct front-to-back
+                // ordering when there is no single forward axis.
+                particlesGlobalDepthPtr[particleIdx] = particleSensorDistance;
+            } else {
+                const tcnn::vec3& particleMean       = particles.position(particleParameters);
+                particlesGlobalDepthPtr[particleIdx] = (particleMean.x * sensorViewMatrix[0][2] + particleMean.y * sensorViewMatrix[1][2] +
+                                                        particleMean.z * sensorViewMatrix[2][2] + sensorViewMatrix[3][2]);
+            }
         } else {
             particlesGlobalDepthPtr[particleIdx] = particleSensorDistance;
         }
@@ -337,7 +427,7 @@ struct GUTProjector : Params, UTParams {
     static inline __device__ void expand(tcnn::uvec2 tileGrid,
                                          int numParticles,
                                          tcnn::ivec2 /*resolution*/,
-                                         threedgut::TSensorModel /*sensorModel*/,
+                                         threedgut::TSensorModel sensorModel,
                                          threedgut::TSensorState /*sensorState*/,
                                          const uint32_t* __restrict__ particlesTilesOffsetPtr,
                                          const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,
@@ -365,6 +455,12 @@ struct GUTProjector : Params, UTParams {
         uint32_t tileOffset                 = (particleIdx == 0) ? 0 : particlesTilesOffsetPtr[particleIdx - 1];
         const tcnn::vec2 particleProjCenter = particlesProjectedPositionPtr[particleIdx];
         const BoundingBox2D tileBBox        = computeTileSpaceBBox(tileGrid, particleProjCenter, particleProjExtent);
+        const bool equirectModel            = (sensorModel.modelType == threedgut::TSensorModel::EquirectangularModel);
+        // Same unwrapped X range the count loop in eval() used; the iteration count
+        // is identical, only the emitted KEY column is wrapped modulo gridX below.
+        const EquirectXTileRange xRange     = equirectModel ? computeEquirectXTileRange(tileGrid, particleProjCenter, particleProjExtent)
+                                                            : EquirectXTileRange{static_cast<int>(tileBBox.min.x), static_cast<int>(tileBBox.max.x)};
+        const int gridX                     = static_cast<int>(tileGrid.x);
 
         if constexpr (Params::TileCulling) {
 
@@ -373,12 +469,25 @@ struct GUTProjector : Params, UTParams {
             const tcnn::vec4 conicOpacity    = particlesProjectedConicOpacityPtr[particleIdx];
             const float maxConicOpacityPower = logf(conicOpacity.w / Params::AlphaThreshold);
 
-            for (int y = tileBBox.min.y; (y < tileBBox.max.y) && (tileOffset < maxTileOffset); ++y) {
-                for (int x = tileBBox.min.x; (x < tileBBox.max.x) && (tileOffset < maxTileOffset); ++x) {
-                    if (tileMinParticlePowerResponse(tcnn::vec2(x, y), conicOpacity, particleProjCenter) < maxConicOpacityPower) {
-                        unsortedTileDepthKeysPtr[tileOffset]   = concatTileDepthKeys(y * tileGrid.x + x, depthKey);
-                        unsortedTileParticleIdxPtr[tileOffset] = particleIdx;
-                        tileOffset++;
+            if (equirectModel) {
+                for (int y = tileBBox.min.y; (y < tileBBox.max.y) && (tileOffset < maxTileOffset); ++y) {
+                    for (int x = xRange.min; (x < xRange.max) && (tileOffset < maxTileOffset); ++x) {
+                        if (tileMinParticlePowerResponse(tcnn::vec2(x, y), conicOpacity, particleProjCenter) < maxConicOpacityPower) {
+                            const uint32_t keyX                    = wrapTileX(x, gridX);
+                            unsortedTileDepthKeysPtr[tileOffset]   = concatTileDepthKeys(y * tileGrid.x + keyX, depthKey);
+                            unsortedTileParticleIdxPtr[tileOffset] = particleIdx;
+                            tileOffset++;
+                        }
+                    }
+                }
+            } else {
+                for (int y = tileBBox.min.y; (y < tileBBox.max.y) && (tileOffset < maxTileOffset); ++y) {
+                    for (int x = tileBBox.min.x; (x < tileBBox.max.x) && (tileOffset < maxTileOffset); ++x) {
+                        if (tileMinParticlePowerResponse(tcnn::vec2(x, y), conicOpacity, particleProjCenter) < maxConicOpacityPower) {
+                            unsortedTileDepthKeysPtr[tileOffset]   = concatTileDepthKeys(y * tileGrid.x + x, depthKey);
+                            unsortedTileParticleIdxPtr[tileOffset] = particleIdx;
+                            tileOffset++;
+                        }
                     }
                 }
             }
@@ -390,11 +499,22 @@ struct GUTProjector : Params, UTParams {
 
         } else {
 
-            for (int y = tileBBox.min.y; y < tileBBox.max.y; ++y) {
-                for (int x = tileBBox.min.x; x < tileBBox.max.x; ++x) {
-                    unsortedTileDepthKeysPtr[tileOffset]   = concatTileDepthKeys(y * tileGrid.x + x, depthKey);
-                    unsortedTileParticleIdxPtr[tileOffset] = particleIdx;
-                    tileOffset++;
+            if (equirectModel) {
+                for (int y = tileBBox.min.y; y < tileBBox.max.y; ++y) {
+                    for (int x = xRange.min; x < xRange.max; ++x) {
+                        const uint32_t keyX                    = wrapTileX(x, gridX);
+                        unsortedTileDepthKeysPtr[tileOffset]   = concatTileDepthKeys(y * tileGrid.x + keyX, depthKey);
+                        unsortedTileParticleIdxPtr[tileOffset] = particleIdx;
+                        tileOffset++;
+                    }
+                }
+            } else {
+                for (int y = tileBBox.min.y; y < tileBBox.max.y; ++y) {
+                    for (int x = tileBBox.min.x; x < tileBBox.max.x; ++x) {
+                        unsortedTileDepthKeysPtr[tileOffset]   = concatTileDepthKeys(y * tileGrid.x + x, depthKey);
+                        unsortedTileParticleIdxPtr[tileOffset] = particleIdx;
+                        tileOffset++;
+                    }
                 }
             }
         }

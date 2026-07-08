@@ -320,6 +320,35 @@ class Tracer:
     def build_acc(self, gaussians, rebuild=True):
         pass  # no-op for 3DGUT
 
+    def _apply_gaussian_dropout(self, densities, train, frame_id):
+        if not train:
+            return densities
+        dropout_conf = self.conf.render.get("gaussian_dropout", None)
+        if dropout_conf is None or not dropout_conf.get("enabled", False):
+            return densities
+        probability = float(dropout_conf.get("probability", 0.0))
+        if probability <= 0.0:
+            return densities
+        if probability >= 1.0:
+            raise ValueError(
+                "render.gaussian_dropout.probability must be in [0, 1), "
+                f"got {probability}."
+            )
+        step = int(frame_id)
+        start_iteration = int(dropout_conf.get("start_iteration", 0))
+        end_iteration = int(dropout_conf.get("end_iteration", -1))
+        if step < start_iteration:
+            return densities
+        if end_iteration >= 0 and step > end_iteration:
+            return densities
+
+        keep_probability = 1.0 - probability
+        keep_mask = torch.rand_like(densities) < keep_probability
+        dropped = densities * keep_mask.to(dtype=densities.dtype)
+        if dropout_conf.get("compensate_density", True):
+            dropped = dropped / keep_probability
+        return dropped
+
     def render(self, gaussians, gpu_batch: Batch, train=False, frame_id=0):
         rays_o = gpu_batch.rays_ori
         rays_d = gpu_batch.rays_dir
@@ -328,6 +357,11 @@ class Tracer:
 
         num_gaussians = gaussians.num_gaussians
         with torch.cuda.nvtx.range(f"model.forward({num_gaussians} gaussians)"):
+            densities = self._apply_gaussian_dropout(
+                gaussians.get_density(),
+                train,
+                frame_id,
+            )
             (
                 pred_features_alpha,
                 pred_dist,
@@ -345,7 +379,7 @@ class Tracer:
                 gaussians.positions.contiguous(),
                 gaussians.get_rotation().contiguous(),
                 gaussians.get_scale().contiguous(),
-                gaussians.get_density().contiguous(),
+                densities.contiguous(),
                 gaussians.get_features().contiguous(),
                 sensor,
                 poses,
@@ -372,6 +406,10 @@ class Tracer:
             "mog_projected_extent": mog_projected_extent,
             "mog_tiles_count": mog_tiles_count,
         }
+
+    def get_bvh_stats(self) -> dict:
+        """3DGUT uses SplatRaster (no OptiX BVH) — return empty stats."""
+        return {}
 
     @staticmethod
     def __fov2focal(fov_radians: float, pixels: int):
@@ -505,6 +543,29 @@ class Tracer:
                 angle_to_pixeldist_poly=K["angle_to_pixeldist_poly"],
                 max_angle=K["max_angle"],
                 linear_cde=K["linear_cde"],
+            )
+            return camera_model_parameters, Tracer.__create_sensor_pose_from_R_T(R_start, T_start, R_end, T_end)
+
+        elif (K := gpu_batch.intrinsics_RationalCameraModelParameters) is not None:
+            camera_model_parameters = _3dgut_plugin.fromRationalCameraModelParameters(
+                resolution=K["resolution"],
+                shutter_type=SHUTTER_TYPE_MAP[K["shutter_type"]],
+                native_resolution=K["native_resolution"],
+                image_rotation_quadrants_cw=K["image_rotation_quadrants_cw"],
+                principal_point=K["principal_point"],
+                focal_length=K["focal_length"],
+                numerator_coeffs=K["numerator_coeffs"],
+                denominator_coeffs=K["denominator_coeffs"],
+                affine_coeffs=K["affine_coeffs"],
+                tangential_coeffs=K["tangential_coeffs"],
+                skew=K["skew"],
+            )
+            return camera_model_parameters, Tracer.__create_sensor_pose_from_R_T(R_start, T_start, R_end, T_end)
+
+        elif (K := gpu_batch.intrinsics_EquirectCameraModelParameters) is not None:
+            camera_model_parameters = _3dgut_plugin.fromEquirectCameraModelParameters(
+                resolution=K["resolution"],
+                shutter_type=SHUTTER_TYPE_MAP[K["shutter_type"]],
             )
             return camera_model_parameters, Tracer.__create_sensor_pose_from_R_T(R_start, T_start, R_end, T_end)
 
