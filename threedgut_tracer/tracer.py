@@ -246,7 +246,12 @@ class Tracer:
             sensor_params = ctx.sensor_params
             sensor_poses = ctx.sensor_poses
 
-            particle_density_grd, particle_features_grd = ctx.tracer_wrapper.trace_bwd(
+            (
+                particle_density_grd,
+                particle_features_grd,
+                ray_ori_grd,
+                ray_dir_grd,
+            ) = ctx.tracer_wrapper.trace_bwd(
                 frame_id,
                 n_active_features,
                 particle_density,
@@ -274,8 +279,8 @@ class Tracer:
                 None,  # tracer_wrapper
                 None,  # frame_id
                 None,  # n_active_features
-                None,  # ray_ori
-                None,  # ray_dir
+                ray_ori_grd,
+                ray_dir_grd,
                 mog_pos_grd.contiguous(),
                 mog_rot_grd.contiguous(),
                 mog_scl_grd.contiguous(),

@@ -261,7 +261,7 @@ struct GUTKBufferRenderer : Params {
             particles.initializeFeaturesGradient(parametersGradient);
         }
 
-        if constexpr (Backward && (Params::KHitBufferSize == 0)) {
+        if constexpr (Backward && (Params::KHitBufferSize == 0) && !Params::PerRayParticleFeatures) {
             evalBackwardNoKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
                                   sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
         } else {
@@ -687,6 +687,8 @@ struct GUTKBufferRenderer : Params {
                     TFeaturesVec featuresGrad = TFeaturesVec::zero();
 
                     if (ray.isAlive()) {
+                        float3 hitRayOriGrd = make_float3(0.f, 0.f, 0.f);
+                        float3 hitRayDirGrd = make_float3(0.f, 0.f, 0.f);
                         particles.processHitBwd<false>(
                             ray.origin,
                             ray.direction,
@@ -703,7 +705,11 @@ struct GUTKBufferRenderer : Params {
                             ray.featuresGradient,
                             ray.hitT,
                             ray.hitTBackward,
-                            ray.hitTGradient);
+                            ray.hitTGradient,
+                            hitRayOriGrd,
+                            hitRayDirGrd);
+                        ray.originGradient    = ray.originGradient + tcnn::vec3{hitRayOriGrd.x, hitRayOriGrd.y, hitRayOriGrd.z};
+                        ray.directionGradient = ray.directionGradient + tcnn::vec3{hitRayDirGrd.x, hitRayDirGrd.y, hitRayDirGrd.z};
                         if (ray.transmittance < Particles::MinTransmittanceThreshold) {
                             ray.kill();
                         }

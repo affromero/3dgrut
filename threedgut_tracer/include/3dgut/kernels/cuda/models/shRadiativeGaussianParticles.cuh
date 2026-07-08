@@ -271,6 +271,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
         return result;
     }
 
+
     template <bool Clamped = true>
     __forceinline__ __device__ TFeaturesVec featuresCustomFromBuffer(uint32_t particleIdx,
                                                                      const tcnn::vec3& incidentDirection) const {
@@ -326,6 +327,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     }
 
     __forceinline__ __device__ void featuresIntegrateFwdFromBuffer(const tcnn::vec3& incidentDirection,
+                                                                   const tcnn::vec2& localUv,
                                                                    float weight,
                                                                    uint32_t particleIdx, TFeaturesVec& integratedFeatures) const {
         particleFeaturesIntegrateFwdFromBuffer(*reinterpret_cast<const float3*>(&incidentDirection),
@@ -438,6 +440,7 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
         }
     }
 
+
     template <bool PerRayRadiance>
     __forceinline__ __device__ bool processHitFwd(const tcnn::vec3& rayOrigin,
                                                   const tcnn::vec3& rayDirection,
@@ -478,7 +481,9 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                                   const TFeaturesVec& featuresGradient,
                                                   float& hitT,
                                                   float hitTBackward,
-                                                  float hitTGradient) const {
+                                                  float hitTGradient,
+                                                  float3& rayOriginGrad,
+                                                  float3& rayDirectionGrad) const {
 
         threedgut::processHitBwd<ExtParams::KernelDegree, false, PerRayRadiance>(
             reinterpret_cast<const float3&>(rayOrigin),
@@ -489,6 +494,13 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
             PerRayRadiance ? reinterpret_cast<const float*>(reinterpret_cast<TFeatureRawParamPtr*>(m_featureRawParameters.ptr))
                            : reinterpret_cast<const float*>(particleFeatures.data()),
             PerRayRadiance ? m_featureRawParameters.gradPtr : reinterpret_cast<float*>(particleFeaturesGradPtr),
+#if PARTICLE_FEATURE_HALF
+            // fp16 feature storage cannot alias float3 SH coefficients;
+            // skip the global-SH direction gradient (per-ray path unaffected).
+            nullptr,
+#else
+            PerRayRadiance ? nullptr : reinterpret_cast<const float3*>(m_featureRawParameters.ptr),
+#endif
             ExtParams::MinParticleKernelDensity,
             ExtParams::AlphaThreshold,
             ExtParams::MinTransmittanceThreshold,
@@ -496,6 +508,8 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
             transmittanceBackward,
             transmittance,
             transmittanceGradient,
+            rayOriginGrad,
+            rayDirectionGrad,
             reinterpret_cast<const float3&>(featuresBackward),
             reinterpret_cast<float3&>(features),
             reinterpret_cast<const float3&>(featuresGradient),

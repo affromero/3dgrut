@@ -237,8 +237,8 @@ __global__ NHT_BWD_LB void renderBackward(threedgut::RenderParameters params,
                                           const float* __restrict__ worldHitDistanceGradientPtr,
                                           const TFeatureDensityElem* __restrict__ featureDensityPtr,
                                           const float* __restrict__ featureDensityGradientPtr,
-                                          tcnn::vec3* __restrict__ /*worldRayOriginGradientPtr*/,
-                                          tcnn::vec3* __restrict__ /*worldRayDirectionGradientPtr*/,
+                                          tcnn::vec3* __restrict__ worldRayOriginGradientPtr,
+                                          tcnn::vec3* __restrict__ worldRayDirectionGradientPtr,
                                           const tcnn::vec2* __restrict__ particlesProjectedPositionPtr,
                                           const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
                                           const float* __restrict__ particlesGlobalDepthPtr,
@@ -275,6 +275,22 @@ __global__ NHT_BWD_LB void renderBackward(threedgut::RenderParameters params,
                                particlesGlobalDepthGradPtr,
                                particlesPrecomputedFeaturesGradPtr,
                                {parameterGradientMemoryHandles});
+
+    if (worldRayOriginGradientPtr && ray.idx != ~0u) {
+        // The forward transforms sensor (camera-space) rays to world via
+        // `sensorToWorldTransform` (rayPayload.cuh: origin = M*o, dir =
+        // mat3(M)*d), and origin/direction gradients accumulate in that WORLD
+        // basis. The input ray tensors are sensor-space, so the gradient must
+        // be pulled back to the sensor basis: dL/d(sensor) = R^T * dL/d(world),
+        // R = mat3(sensorToWorldTransform). Without this the camera-pose /
+        // rolling-shutter residual receives wrong-axis gradients (a local-Y
+        // correction lands on whatever world axis R maps it to). For the
+        // world-space ray path `sensorToWorldTransform` is identity, so this
+        // is a no-op there.
+        const tcnn::mat3 worldToSensor = tcnn::transpose(tcnn::mat3(sensorToWorldTransform));
+        worldRayOriginGradientPtr[ray.idx]    = worldToSensor * ray.originGradient;
+        worldRayDirectionGradientPtr[ray.idx] = worldToSensor * ray.directionGradient;
+    }
 }
 
 __global__ void projectBackward(tcnn::uvec2 tileGrid,

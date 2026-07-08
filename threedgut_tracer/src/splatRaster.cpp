@@ -260,7 +260,7 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
     return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(rayRadianceDensity, rayHitDistance, rayHitCount, particleVisibility);
 }
 
-std::tuple<torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
                       torch::Tensor particleDensity,
                       torch::Tensor particleRadiance,
@@ -292,7 +292,7 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
     torch::Tensor particleRadianceGradient = torch::zeros({particleRadiance.size(0), particleRadiance.size(1)}, opts);
     torch::Tensor particleRadianceKernel   = particleRadianceKernelTensor(particleRadiance);
 
-    const bool rayBackpropagation = false;
+    const bool rayBackpropagation = true;
 
     torch::Tensor rayOriginGradient;
     torch::Tensor rayDirectionGradient;
@@ -346,7 +346,8 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
         timer->stop();
     }
 
-    return std::tuple<torch::Tensor, torch::Tensor>(particleDensityGradient, particleRadianceGradient);
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+        particleDensityGradient, particleRadianceGradient, rayOriginGradient, rayDirectionGradient);
 }
 
 std::map<std::string, float>
