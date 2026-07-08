@@ -65,8 +65,16 @@ class BaseStrategy:
     def _post_optimizer_step(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
         return False
 
-    def update_gradient_buffer(self, sensor_position: torch.Tensor) -> None:
-        """Callback function to update the gradient buffer."""
+    def update_gradient_buffer(
+        self,
+        sensor_position: torch.Tensor,
+        sensor_forward: torch.Tensor | None = None,
+    ) -> None:
+        """Callback function to update the gradient buffer.
+
+        ``sensor_forward`` is the camera optical (+Z "front") axis in world
+        space; only field-angle-aware densification consumes it.
+        """
         pass
 
     def get_strategy_parameters(self) -> dict:
