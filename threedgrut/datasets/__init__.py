@@ -102,6 +102,12 @@ def make(name: str, config, ray_jitter):
                 camera_ids=config.dataset.get("camera_ids", None),
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -113,6 +119,12 @@ def make(name: str, config, ray_jitter):
                 camera_ids=config.dataset.get("camera_ids", None),
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
             )
         case "scannetpp":
             train_dataset = ScannetppDataset(
@@ -230,6 +242,12 @@ def make_test(name: str, config):
                 camera_ids=config.dataset.get("camera_ids", None),
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
             )
         case "scannetpp":
             dataset = ScannetppDataset(

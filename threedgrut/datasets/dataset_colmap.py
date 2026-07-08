@@ -133,6 +133,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         camera_ids: Optional[list[int]] = None,
         normalize_world_space: bool = False,
         gsplat_image_downscale: bool = False,
+        train_exclude_image_list_path=None,
+        holdout_image_list_path=None,
     ):
         self.path = path
         self.device = device
@@ -146,6 +148,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.normalize_world_space = bool(normalize_world_space)
         self.gsplat_image_downscale = gsplat_image_downscale
         self.world_normalization_transform = np.eye(4, dtype=np.float32)
+        self.train_exclude_image_list_path = train_exclude_image_list_path
+        self.holdout_image_list_path = holdout_image_list_path
 
         # Worker-based GPU cache for multiprocessing compatibility
         self._worker_gpu_cache = {}
@@ -173,9 +177,37 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             self._apply_world_space_normalization()
         indices = np.arange(self.n_frames)
 
+        # A name-based holdout list takes precedence over the positional
+        # test_split_interval. The COLMAP reader sorts frames by name, so a
+        # positional (index % interval) split cannot reproduce a designated
+        # train.txt/test.txt holdout; matching by name is order-independent.
+        # val == exactly the held-out frames, train == everything else.
+        holdout_names = self.load_holdout_image_names()
+        if holdout_names:
+            in_holdout = np.array(
+                [extr.name in holdout_names for extr in self.cam_extrinsics],
+                dtype=bool,
+            )
+            n_held = int(in_holdout.sum())
+            # Fail loud on a silent leak: the holdout must match EXACTLY (every
+            # listed name present in the model). A partial match (e.g. a
+            # .png-suffix / basename mismatch on some frames) would otherwise
+            # silently leak one side into the other and shrink the eval set.
+            if n_held != len(holdout_names):
+                raise ValueError(
+                    f"holdout list has {len(holdout_names)} names but matched "
+                    f"{n_held} of {len(self.cam_extrinsics)} COLMAP frames -- "
+                    "a name mismatch would silently leak/shrink the eval "
+                    "(check the .png suffix / basename)."
+                )
+            logger.info(
+                f"[holdout] split={self.split}: {n_held}/"
+                f"{len(self.cam_extrinsics)} frames held out by name"
+            )
+            indices = in_holdout if self.split != "train" else ~in_holdout
         # If test_split_interval is set, every test_split_interval frame will be excluded from the training set
         # If test_split_interval is non-positive, all images will be used for training and testing
-        if self.test_split_interval > 0:
+        elif self.test_split_interval > 0:
             if self.split == "train":
                 indices = np.mod(indices, self.test_split_interval) != 0
             else:
@@ -200,11 +232,80 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         else:
             self.exif_exposures = None
 
+        if self.split == "train":
+            self.apply_train_exclude_image_list()
+
         # Update the number of frames to only include the samples from the split
         self.n_frames = self.poses.shape[0]
 
         # Clear existing worker caches to force recreation with new intrinsics
         self._worker_gpu_cache.clear()
+
+    def load_holdout_image_names(self):
+        if not self.holdout_image_list_path:
+            return set()
+        if not os.path.exists(self.holdout_image_list_path):
+            raise FileNotFoundError(
+                f"Holdout image list not found: {self.holdout_image_list_path}"
+            )
+        holdout = set()
+        with open(self.holdout_image_list_path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    holdout.add(stripped)
+        return holdout
+
+    def load_train_exclude_image_names(self):
+        if not self.train_exclude_image_list_path:
+            return set()
+        if not os.path.exists(self.train_exclude_image_list_path):
+            raise FileNotFoundError(
+                f"Train exclude image list not found: {self.train_exclude_image_list_path}"
+            )
+        excluded = set()
+        with open(self.train_exclude_image_list_path, "r", encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    excluded.add(stripped)
+        return excluded
+
+    def apply_train_exclude_image_list(self):
+        excluded = self.load_train_exclude_image_names()
+        if not excluded:
+            return
+        image_names = np.array(
+            [os.path.basename(path) for path in self.image_paths],
+            dtype=object,
+        )
+        keep = np.array(
+            [name not in excluded for name in image_names], dtype=bool
+        )
+        if np.all(keep):
+            logger.warning(
+                f"Train exclude image list matched no images: {self.train_exclude_image_list_path}"
+            )
+            return
+        dropped = int(np.count_nonzero(~keep))
+        logger.info(
+            f"Excluded {dropped} train images from {self.train_exclude_image_list_path}"
+        )
+        self.cam_extrinsics = [
+            extrinsic
+            for extrinsic, keep_item in zip(self.cam_extrinsics, keep)
+            if keep_item
+        ]
+        self.poses = self.poses[keep].astype(np.float32)
+        self.image_paths = self.image_paths[keep]
+        self.mask_paths = self.mask_paths[keep]
+        self.camera_centers = self.camera_centers[keep]
+        if self.exif_exposures is not None:
+            self.exif_exposures = [
+                exposure
+                for exposure, keep_item in zip(self.exif_exposures, keep)
+                if keep_item
+            ]
 
     def _load_points_for_world_normalization(self) -> np.ndarray:
         points_candidates = [
