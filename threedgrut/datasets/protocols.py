@@ -28,6 +28,8 @@ class Batch:
     T_to_world_end: Optional[torch.Tensor] = None  # [B, 4, 4] END pose for rolling shutter
     rays_in_world_space: bool = False  # True if rays are already in world space (no transform needed)
     rgb_gt: Optional[torch.Tensor] = None
+    depth_gt: Optional[torch.Tensor] = None  # [B, H, W, 1] metric axial depth (m)
+    depth_ray_z: Optional[torch.Tensor] = None  # [B, H, W, 1] |ray_z| in camera space
     mask: Optional[torch.Tensor] = None
     intrinsics: Optional[list] = None
     intrinsics_OpenCVPinholeCameraModelParameters: Optional[dict] = None
@@ -50,6 +52,12 @@ class Batch:
         if self.rgb_gt is not None:
             assert self.rgb_gt.ndim == 4, "rgb_gt must be a 4D tensor [B, H, W, 3]"
             assert self.rgb_gt.shape[0] == batch_size, "rgb_gt must have the same batch size"
+        if self.depth_gt is not None:
+            assert self.depth_gt.ndim == 4, "depth_gt must be a 4D tensor [B, H, W, 1]"
+            assert self.depth_gt.shape[0] == batch_size, "depth_gt must have the same batch size"
+        if self.depth_ray_z is not None:
+            assert self.depth_ray_z.ndim == 4, "depth_ray_z must be a 4D tensor [B, H, W, 1]"
+            assert self.depth_ray_z.shape[0] == batch_size, "depth_ray_z must have the same batch size"
         if self.mask is not None:
             assert self.mask.ndim == 4, "mask must be a 3D tensor [B, H, W, 1]"
             assert self.mask.shape[0] == batch_size, "mask must have the same batch size"

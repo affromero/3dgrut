@@ -22,6 +22,7 @@ from typing import Any, Optional, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
 from addict import Dict
 from omegaconf import DictConfig, OmegaConf
@@ -39,21 +40,54 @@ from threedgrut.model.camera_residual import CameraResidual
 from threedgrut.model.losses import ssim
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
+from threedgrut.post_processing import LuminanceAffine
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
-from threedgrut.post_processing import LuminanceAffine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import check_step_condition, create_summary_writer, jet_map
-from threedgrut.utils.render import (
-    post_processing_camera_index_mode,
-    post_processing_frames_per_camera,
-)
 from threedgrut.utils.render import (
     apply_background,
     apply_feature_decoder,
     apply_post_processing,
+    post_processing_camera_index_mode,
+    post_processing_frames_per_camera,
 )
 from threedgrut.utils.timer import CudaTimer
+
+
+def _predicted_axial_depth(
+    *,
+    pred_dist: torch.Tensor,
+    rays_dir: torch.Tensor,
+    rays_in_world_space: bool,
+    depth_ray_z: torch.Tensor | None,
+) -> torch.Tensor:
+    """Convert renderer ray distance to axial camera depth when possible.
+
+    The renderer returns distance along each ray. Metric-depth GT is axial
+    (z in camera space), so multiply by |ray_z|. For world-space ray batches
+    (3dgrt path) the batch carries the preserved camera-space ``depth_ray_z``;
+    otherwise fall back to the camera-space ray directions.
+    """
+    if pred_dist.ndim == 3:
+        pred_dist = pred_dist.unsqueeze(-1)
+    ray_z = None
+    if depth_ray_z is not None:
+        ray_z = depth_ray_z.to(device=pred_dist.device, dtype=pred_dist.dtype)
+    elif not rays_in_world_space:
+        ray_z = torch.abs(rays_dir[..., 2:3]).to(device=pred_dist.device, dtype=pred_dist.dtype)
+    if ray_z is None:
+        return pred_dist
+    if ray_z.shape[1:3] != pred_dist.shape[1:3]:
+        ray_z = F.interpolate(
+            ray_z.permute(0, 3, 1, 2),
+            size=pred_dist.shape[1:3],
+            mode="bilinear",
+            align_corners=False,
+        ).permute(0, 2, 3, 1)
+    if ray_z.shape[0] != pred_dist.shape[0]:
+        ray_z = ray_z.expand(pred_dist.shape[0], -1, -1, -1)
+    return pred_dist * ray_z
 
 
 class Trainer3DGRUT:
@@ -140,9 +174,7 @@ class Trainer3DGRUT:
         self._in_color_refine = False
         self.camera_residual: CameraResidual | None = None
         self.camera_residual_optimizer: torch.optim.Optimizer | None = None
-        self.camera_residual_scheduler: (
-            torch.optim.lr_scheduler.LRScheduler | None
-        ) = None
+        self.camera_residual_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
         self._last_camera_residual_stats: dict[str, float] | None = None
         """ Whether NHT color refinement is active """
 
@@ -317,10 +349,7 @@ class Trainer3DGRUT:
                 cr_ckpt = checkpoint["camera_residual"]
                 self.camera_residual.load_state_dict(cr_ckpt["module"])
                 self.camera_residual_optimizer.load_state_dict(cr_ckpt["optimizer"])
-                if (
-                    self.camera_residual_scheduler is not None
-                    and cr_ckpt.get("scheduler") is not None
-                ):
+                if self.camera_residual_scheduler is not None and cr_ckpt.get("scheduler") is not None:
                     self.camera_residual_scheduler.load_state_dict(cr_ckpt["scheduler"])
                 logger.info("📷 Camera residual state restored from checkpoint")
 
@@ -652,20 +681,13 @@ class Trainer3DGRUT:
                 ),
             ).to(self.device)
 
-            self.post_processing_optimizers = (
-                self.post_processing.create_optimizers()
-            )
-            self.post_processing_schedulers = (
-                self.post_processing.create_schedulers(
-                    self.post_processing_optimizers,
-                    max_optimization_iters=conf.n_iterations,
-                )
+            self.post_processing_optimizers = self.post_processing.create_optimizers()
+            self.post_processing_schedulers = self.post_processing.create_schedulers(
+                self.post_processing_optimizers,
+                max_optimization_iters=conf.n_iterations,
             )
 
-            logger.info(
-                f"📷 LUMINANCE_AFFINE initialized: {num_cameras} cameras, "
-                f"{num_frames} frames"
-            )
+            logger.info(f"📷 LUMINANCE_AFFINE initialized: {num_cameras} cameras, " f"{num_frames} frames")
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
 
@@ -880,8 +902,70 @@ class Trainer3DGRUT:
                 loss_scale = torch.abs(self.model.get_scale()).mean()
                 lambda_scale = self.conf.loss.lambda_scale
 
+        # Metric-depth supervision
+        loss_depth = torch.zeros(1, device=self.device)
+        lambda_depth = 0.0
+        if self.conf.loss.get("use_depth", False):
+            if gpu_batch.depth_gt is None:
+                raise RuntimeError("loss.use_depth requires dataset.depth_folder.")
+            with torch.cuda.nvtx.range("loss-depth"):
+                depth_gt = gpu_batch.depth_gt.to(device=self.device, dtype=rgb_pred.dtype)
+                pred_dist = outputs["pred_dist"].to(dtype=depth_gt.dtype)
+                pred_depth = _predicted_axial_depth(
+                    pred_dist=pred_dist,
+                    rays_dir=gpu_batch.rays_dir,
+                    rays_in_world_space=bool(getattr(gpu_batch, "rays_in_world_space", False)),
+                    depth_ray_z=getattr(gpu_batch, "depth_ray_z", None),
+                )
+                if depth_gt.shape[1:3] != pred_depth.shape[1:3]:
+                    pred_depth = F.interpolate(
+                        pred_depth.permute(0, 3, 1, 2),
+                        size=depth_gt.shape[1:3],
+                        mode="nearest",
+                    ).permute(0, 2, 3, 1)
+                if depth_gt.shape[0] != pred_depth.shape[0]:
+                    depth_gt = depth_gt.expand(pred_depth.shape[0], -1, -1, -1)
+                min_depth = float(self.conf.loss.get("depth_min_m", 0.05))
+                valid_depth = (
+                    torch.isfinite(depth_gt)
+                    & torch.isfinite(pred_depth)
+                    & (depth_gt > min_depth)
+                    & (pred_depth > min_depth)
+                )
+                if mask is not None:
+                    depth_mask = mask
+                    if depth_mask.shape[1:3] != depth_gt.shape[1:3]:
+                        depth_mask = F.interpolate(
+                            depth_mask.permute(0, 3, 1, 2),
+                            size=depth_gt.shape[1:3],
+                            mode="nearest",
+                        ).permute(0, 2, 3, 1)
+                    valid_depth = valid_depth & (depth_mask > 0.5)
+                depth_denominator = torch.clamp(valid_depth.to(depth_gt.dtype).sum(), min=1.0)
+                depth_loss_type = str(self.conf.loss.get("depth_loss_type", "log_l1"))
+                if depth_loss_type == "log_l1":
+                    depth_error = torch.abs(
+                        torch.log(torch.clamp(pred_depth, min=min_depth))
+                        - torch.log(torch.clamp(depth_gt, min=min_depth))
+                    )
+                elif depth_loss_type == "relative_l1":
+                    depth_error = torch.abs(pred_depth - depth_gt) / torch.clamp(depth_gt, min=min_depth)
+                else:
+                    raise RuntimeError(
+                        f"Unsupported loss.depth_loss_type {depth_loss_type!r}. "
+                        "Supported values: log_l1, relative_l1."
+                    )
+                loss_depth = (depth_error * valid_depth.to(depth_error.dtype)).sum() / depth_denominator
+                lambda_depth = float(self.conf.loss.lambda_depth)
+
         # Total loss
-        loss = lambda_l1 * loss_l1 + lambda_ssim * loss_ssim + lambda_opacity * loss_opacity + lambda_scale * loss_scale
+        loss = (
+            lambda_l1 * loss_l1
+            + lambda_ssim * loss_ssim
+            + lambda_opacity * loss_opacity
+            + lambda_scale * loss_scale
+            + lambda_depth * loss_depth
+        )
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
@@ -889,6 +973,8 @@ class Trainer3DGRUT:
             ssim_loss=lambda_ssim * loss_ssim,
             opacity_loss=lambda_opacity * loss_opacity,
             scale_loss=lambda_scale * loss_scale,
+            depth_loss=lambda_depth * loss_depth,
+            depth_loss_raw=loss_depth,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -986,6 +1072,9 @@ class Trainer3DGRUT:
         if self.conf.loss.use_ssim:
             ssim_loss = np.mean(metrics["losses"]["ssim_loss"])
             writer.add_scalar("loss/ssim/val", ssim_loss, global_step)
+        if self.conf.loss.get("use_depth", False):
+            writer.add_scalar("loss/depth/val", np.mean(metrics["losses"]["depth_loss"]), global_step)
+            writer.add_scalar("loss/depth_raw/val", np.mean(metrics["losses"]["depth_loss_raw"]), global_step)
 
         table = {k: np.mean(v) for k, v in metrics.items() if k in ("psnr", "ssim", "lpips")}
         for time_key in mean_timings:
@@ -1028,6 +1117,11 @@ class Trainer3DGRUT:
             if self.conf.loss.use_scale:
                 scale_loss = np.mean(batch_metrics["losses"]["scale_loss"])
                 writer.add_scalar("loss/scale/train", scale_loss, global_step)
+            if self.conf.loss.get("use_depth", False):
+                writer.add_scalar("loss/depth/train", np.mean(batch_metrics["losses"]["depth_loss"]), global_step)
+                writer.add_scalar(
+                    "loss/depth_raw/train", np.mean(batch_metrics["losses"]["depth_loss_raw"]), global_step
+                )
             if self.post_processing is not None and "post_processing_reg_loss" in batch_metrics["losses"]:
                 post_processing_reg_loss = np.mean(batch_metrics["losses"]["post_processing_reg_loss"])
                 writer.add_scalar(
@@ -1196,23 +1290,15 @@ class Trainer3DGRUT:
             reg_lambda=conf.camera_residual.reg_lambda,
             max_rotation_rad=conf.camera_residual.max_rotation_rad,
             max_translation_m=conf.camera_residual.max_translation_m,
-            max_rolling_rotation_rad=(
-                conf.camera_residual.max_rolling_rotation_rad
-            ),
-            max_rolling_translation_m=(
-                conf.camera_residual.max_rolling_translation_m
-            ),
+            max_rolling_rotation_rad=(conf.camera_residual.max_rolling_rotation_rad),
+            max_rolling_translation_m=(conf.camera_residual.max_rolling_translation_m),
             optimize_global=conf.camera_residual.optimize_global,
             optimize_per_camera=conf.camera_residual.optimize_per_camera,
             optimize_per_image=optimize_per_image,
-            optimize_rolling_per_camera=(
-                conf.camera_residual.optimize_rolling_per_camera
-            ),
+            optimize_rolling_per_camera=(conf.camera_residual.optimize_rolling_per_camera),
             n_iterations=conf.n_iterations,
         ).to(self.device)
-        self.camera_residual_optimizer, self.camera_residual_scheduler = (
-            self.camera_residual.create_optimizer()
-        )
+        self.camera_residual_optimizer, self.camera_residual_scheduler = self.camera_residual.create_optimizer()
         logger.warning(
             "📷 CAMERA_RESIDUAL enabled. Current 3DGUT CUDA backward does not "
             "return ray/sensor gradients; monitor camera_residual/max_abs_grad."
@@ -1294,9 +1380,7 @@ class Trainer3DGRUT:
                 "module": self.camera_residual.state_dict(),
                 "optimizer": self.camera_residual_optimizer.state_dict(),
                 "scheduler": (
-                    self.camera_residual_scheduler.state_dict()
-                    if self.camera_residual_scheduler is not None
-                    else None
+                    self.camera_residual_scheduler.state_dict() if self.camera_residual_scheduler is not None else None
                 ),
             }
 
@@ -1416,15 +1500,9 @@ class Trainer3DGRUT:
 
             # Add camera-residual regularization loss
             if self.camera_residual is not None:
-                camera_residual_reg_loss = (
-                    self.camera_residual.get_regularization_loss()
-                )
-                batch_losses["total_loss"] = (
-                    batch_losses["total_loss"] + camera_residual_reg_loss
-                )
-                batch_losses["camera_residual_reg_loss"] = (
-                    camera_residual_reg_loss
-                )
+                camera_residual_reg_loss = self.camera_residual.get_regularization_loss()
+                batch_losses["total_loss"] = batch_losses["total_loss"] + camera_residual_reg_loss
+                batch_losses["camera_residual_reg_loss"] = camera_residual_reg_loss
 
         # Backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_pre_bwd"):
@@ -1444,9 +1522,7 @@ class Trainer3DGRUT:
         if self.camera_residual_optimizer is not None:
             self._validate_camera_residual_gradient(global_step)
             if self.camera_residual is not None:
-                self._last_camera_residual_stats = (
-                    self.camera_residual.stats()
-                )
+                self._last_camera_residual_stats = self.camera_residual.stats()
 
         # Post backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_post_bwd"):

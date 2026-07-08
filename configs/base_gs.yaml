@@ -195,6 +195,13 @@ loss:
   use_scale: false
   lambda_scale: 0.0
 
+  # Metric-depth supervision from COLMAP-aligned sidecars (anchors sparse
+  # geometry to cure floater/leakage in weakly-constrained regions).
+  use_depth: false
+  lambda_depth: 0.0
+  depth_loss_type: log_l1  # log_l1 | relative_l1
+  depth_min_m: 0.05  # ignore depths below this (metres) on both pred and GT
+
 # Post-processing configuration
 post_processing:
   # null | "ppisp" | "linear-to-srgb" | "luminance_affine"

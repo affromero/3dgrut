@@ -135,6 +135,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         gsplat_image_downscale: bool = False,
         train_exclude_image_list_path=None,
         holdout_image_list_path=None,
+        depth_folder: Optional[str] = None,
     ):
         self.path = path
         self.device = device
@@ -150,6 +151,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.world_normalization_transform = np.eye(4, dtype=np.float32)
         self.train_exclude_image_list_path = train_exclude_image_list_path
         self.holdout_image_list_path = holdout_image_list_path
+        self.depth_folder = depth_folder
+        self.depth_paths = None
 
         # Worker-based GPU cache for multiprocessing compatibility
         self._worker_gpu_cache = {}
@@ -201,8 +204,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                     "(check the .png suffix / basename)."
                 )
             logger.info(
-                f"[holdout] split={self.split}: {n_held}/"
-                f"{len(self.cam_extrinsics)} frames held out by name"
+                f"[holdout] split={self.split}: {n_held}/" f"{len(self.cam_extrinsics)} frames held out by name"
             )
             indices = in_holdout if self.split != "train" else ~in_holdout
         # If test_split_interval is set, every test_split_interval frame will be excluded from the training set
@@ -219,6 +221,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # numpy str array of image paths and mask paths
         self.image_paths = self.image_paths[indices]
         self.mask_paths = self.mask_paths[indices]
+        if self.depth_paths is not None:
+            self.depth_paths = self.depth_paths[indices]
 
         self.camera_centers = self.camera_centers[indices]
         self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
@@ -245,9 +249,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         if not self.holdout_image_list_path:
             return set()
         if not os.path.exists(self.holdout_image_list_path):
-            raise FileNotFoundError(
-                f"Holdout image list not found: {self.holdout_image_list_path}"
-            )
+            raise FileNotFoundError(f"Holdout image list not found: {self.holdout_image_list_path}")
         holdout = set()
         with open(self.holdout_image_list_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -260,9 +262,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         if not self.train_exclude_image_list_path:
             return set()
         if not os.path.exists(self.train_exclude_image_list_path):
-            raise FileNotFoundError(
-                f"Train exclude image list not found: {self.train_exclude_image_list_path}"
-            )
+            raise FileNotFoundError(f"Train exclude image list not found: {self.train_exclude_image_list_path}")
         excluded = set()
         with open(self.train_exclude_image_list_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -279,33 +279,21 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             [os.path.basename(path) for path in self.image_paths],
             dtype=object,
         )
-        keep = np.array(
-            [name not in excluded for name in image_names], dtype=bool
-        )
+        keep = np.array([name not in excluded for name in image_names], dtype=bool)
         if np.all(keep):
-            logger.warning(
-                f"Train exclude image list matched no images: {self.train_exclude_image_list_path}"
-            )
+            logger.warning(f"Train exclude image list matched no images: {self.train_exclude_image_list_path}")
             return
         dropped = int(np.count_nonzero(~keep))
-        logger.info(
-            f"Excluded {dropped} train images from {self.train_exclude_image_list_path}"
-        )
-        self.cam_extrinsics = [
-            extrinsic
-            for extrinsic, keep_item in zip(self.cam_extrinsics, keep)
-            if keep_item
-        ]
+        logger.info(f"Excluded {dropped} train images from {self.train_exclude_image_list_path}")
+        self.cam_extrinsics = [extrinsic for extrinsic, keep_item in zip(self.cam_extrinsics, keep) if keep_item]
         self.poses = self.poses[keep].astype(np.float32)
         self.image_paths = self.image_paths[keep]
         self.mask_paths = self.mask_paths[keep]
+        if self.depth_paths is not None:
+            self.depth_paths = self.depth_paths[keep]
         self.camera_centers = self.camera_centers[keep]
         if self.exif_exposures is not None:
-            self.exif_exposures = [
-                exposure
-                for exposure, keep_item in zip(self.exif_exposures, keep)
-                if keep_item
-            ]
+            self.exif_exposures = [exposure for exposure, keep_item in zip(self.exif_exposures, keep) if keep_item]
 
     def _load_points_for_world_normalization(self) -> np.ndarray:
         points_candidates = [
@@ -657,6 +645,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.poses = []
         self.image_paths = []
         self.mask_paths = []
+        self.depth_paths = [] if self.depth_folder is not None else None
 
         cam_centers = []
         for extr in logger.track(
@@ -680,6 +669,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 image_path = os.path.join(self.path, self.get_images_folder(), extr.name)
             self.image_paths.append(image_path)
             self.mask_paths.append(os.path.splitext(image_path)[0] + "_mask.png")
+            if self.depth_paths is not None:
+                self.depth_paths.append(self.resolve_depth_path(extr.name))
 
         self.camera_centers = np.array(cam_centers)
         _, diagonal = get_center_and_diag(self.camera_centers)
@@ -689,6 +680,36 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         self.image_paths = np.stack(self.image_paths, dtype=str)
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
+        if self.depth_paths is not None:
+            self.depth_paths = np.stack(self.depth_paths, dtype=str)
+
+    def resolve_depth_path(self, image_name: str) -> str:
+        """Resolve the metric-depth sidecar (.npy) for a COLMAP image name.
+
+        Tries ``<depth_folder>/<image_stem>.npy`` first, then a per-camera
+        ``<depth_folder>/<camera>/depth_zext/<frame>.npy`` layout. Returns the
+        primary candidate (may be missing) so __getitem__ can raise loudly.
+        """
+        if self.depth_folder is None:
+            return ""
+        depth_stem = os.path.splitext(image_name)[0] + ".npy"
+        direct = os.path.join(self.path, self.depth_folder, depth_stem)
+        if os.path.exists(direct):
+            return direct
+        parts = image_name.replace("\\", "/").split("/")
+        if len(parts) >= 2:
+            camera_name = parts[-2]
+            frame_name = os.path.splitext(parts[-1])[0] + ".npy"
+            candidate = os.path.join(
+                self.path,
+                self.depth_folder,
+                camera_name,
+                "depth_zext",
+                frame_name,
+            )
+            if os.path.exists(candidate):
+                return candidate
+        return direct
 
     def _lazy_worker_intrinsics_cache(self):
         """Create intrinsics cache for a specific worker."""
@@ -842,6 +863,25 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, actual_h, actual_w, 1)
             output_dict["mask"] = mask
 
+        # Metric-depth sidecar (must match the training-image resolution)
+        if self.depth_paths is not None:
+            depth_path = self.depth_paths[idx]
+            if not os.path.exists(depth_path):
+                raise FileNotFoundError(f"Depth sidecar not found: {depth_path}")
+            depth = np.asarray(np.load(depth_path), dtype=np.float32)
+            if depth.ndim == 3 and depth.shape[-1] == 1:
+                depth = depth[..., 0]
+            if depth.ndim != 2:
+                raise ValueError(f"Depth sidecar must be HxW or HxWx1: {depth_path}")
+            if depth.shape != (actual_h, actual_w):
+                raise ValueError(
+                    "Depth sidecar resolution must match the training image: "
+                    f"{depth_path} has {depth.shape}, expected "
+                    f"{(actual_h, actual_w)} for {self.image_paths[idx]}"
+                )
+            depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+            output_dict["depth_gt"] = torch.from_numpy(depth).reshape(1, depth.shape[0], depth.shape[1], 1)
+
         # Add EXIF exposure if available for this frame
         if self.exif_exposures is not None and self.exif_exposures[idx] is not None:
             output_dict["exposure"] = torch.tensor(self.exif_exposures[idx], dtype=torch.float32)
@@ -878,6 +918,12 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
             mask = (mask > 0.5).to(torch.float32)
             sample["mask"] = mask
+
+        if "depth_gt" in batch:
+            sample["depth_gt"] = batch["depth_gt"][0].to(self.device, non_blocking=True)
+            # Preserve camera-space |ray_z| before any world-ray injection so
+            # depth loss compares axial camera depth, not ray distance.
+            sample["depth_ray_z"] = torch.abs(rays_dir[..., 2:3])
 
         # Add exposure prior from EXIF if available (move to GPU)
         if "exposure" in batch and batch["exposure"][0] is not None:
