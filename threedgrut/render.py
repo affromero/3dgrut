@@ -142,6 +142,28 @@ class Renderer:
         global_step = checkpoint["global_step"]
 
         conf = checkpoint["config"]
+        # Pre-2.0 checkpoints embed configs without the keys 2.0 requires
+        # (feature_type, particle-feature knobs, ...). Merge the checkpoint
+        # config over today's defaults so new keys get legacy-equivalent
+        # defaults while every trained value wins where present.
+        from omegaconf import OmegaConf
+
+        _configs_dir = Path(__file__).resolve().parents[1] / "configs"
+        if OmegaConf.select(conf, "model.feature_type") is None:
+            defaults = OmegaConf.load(_configs_dir / "base_gs.yaml")
+            method = OmegaConf.select(conf, "render.method") or "3dgut"
+            # mirror the hydra group chain: 3dgut.yaml inherits 3dgrt.yaml
+            render_conf = OmegaConf.load(_configs_dir / "render" / "3dgrt.yaml")
+            if method != "3dgrt":
+                render_conf = OmegaConf.merge(
+                    render_conf,
+                    OmegaConf.load(_configs_dir / "render" / f"{method}.yaml"),
+                )
+            render_conf.pop("defaults", None)
+            render_defaults = OmegaConf.create(
+                {"render": OmegaConf.to_container(render_conf)}
+            )
+            conf = OmegaConf.merge(defaults, render_defaults, conf)
         # overrides
         if conf["render"]["method"] == "3dgrt":
             conf["render"]["particle_kernel_density_clamping"] = True
