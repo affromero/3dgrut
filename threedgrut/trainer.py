@@ -40,6 +40,7 @@ from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
+from threedgrut.post_processing import LuminanceAffine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import check_step_condition, create_summary_writer, jet_map
 from threedgrut.utils.render import (
@@ -521,6 +522,118 @@ class Trainer3DGRUT:
             self.post_processing_optimizers = []
             self.post_processing_schedulers = []
             logger.info("Post-processing: linear-to-sRGB (no trainable parameters)")
+        elif method == "luminance_affine":
+            frames_per_camera = self.train_dataset.get_frames_per_camera()
+            num_cameras = len(frames_per_camera)
+            num_frames = sum(frames_per_camera)
+
+            self.post_processing = LuminanceAffine(
+                num_cameras=num_cameras,
+                num_frames=num_frames,
+                lr=conf.post_processing.get("lr", 1e-3),
+                reg_lambda=conf.post_processing.get("reg_lambda", 1e-2),
+                use_frame_residual=conf.post_processing.get(
+                    "use_frame_residual",
+                    False,
+                ),
+                max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
+                max_bias=conf.post_processing.get("max_bias", 0.10),
+                use_color_matrix=conf.post_processing.get(
+                    "use_color_matrix",
+                    False,
+                ),
+                max_matrix_delta=conf.post_processing.get(
+                    "max_matrix_delta",
+                    0.10,
+                ),
+                color_matrix_reg_lambda=conf.post_processing.get(
+                    "color_matrix_reg_lambda",
+                    0.25,
+                ),
+                use_radial_affine=conf.post_processing.get(
+                    "use_radial_affine",
+                    False,
+                ),
+                radial_band_count=conf.post_processing.get(
+                    "radial_band_count",
+                    4,
+                ),
+                radial_max_log_gain=conf.post_processing.get(
+                    "radial_max_log_gain",
+                    0.08,
+                ),
+                radial_max_bias=conf.post_processing.get(
+                    "radial_max_bias",
+                    0.03,
+                ),
+                radial_reg_lambda=conf.post_processing.get(
+                    "radial_reg_lambda",
+                    0.50,
+                ),
+                use_residual_grid=conf.post_processing.get(
+                    "use_residual_grid",
+                    False,
+                ),
+                residual_grid_size=conf.post_processing.get(
+                    "residual_grid_size",
+                    32,
+                ),
+                residual_grid_max=conf.post_processing.get(
+                    "residual_grid_max",
+                    0.05,
+                ),
+                residual_grid_reg_lambda=conf.post_processing.get(
+                    "residual_grid_reg_lambda",
+                    0.01,
+                ),
+                use_residual_grid_edge_gate=conf.post_processing.get(
+                    "use_residual_grid_edge_gate",
+                    False,
+                ),
+                residual_grid_gate_floor=conf.post_processing.get(
+                    "residual_grid_gate_floor",
+                    0.20,
+                ),
+                use_temporal_affine=conf.post_processing.get(
+                    "use_temporal_affine",
+                    False,
+                ),
+                temporal_num_knots=conf.post_processing.get(
+                    "temporal_num_knots",
+                    32,
+                ),
+                temporal_max_sequence_idx=conf.post_processing.get(
+                    "temporal_max_sequence_idx",
+                    400,
+                ),
+                temporal_max_log_gain=conf.post_processing.get(
+                    "temporal_max_log_gain",
+                    0.08,
+                ),
+                temporal_max_bias=conf.post_processing.get(
+                    "temporal_max_bias",
+                    0.03,
+                ),
+                temporal_reg_lambda=conf.post_processing.get(
+                    "temporal_reg_lambda",
+                    0.50,
+                ),
+            ).to(self.device)
+
+            self.post_processing_optimizers = (
+                self.post_processing.create_optimizers()
+            )
+            self.post_processing_schedulers = (
+                self.post_processing.create_schedulers(
+                    self.post_processing_optimizers,
+                    max_optimization_iters=conf.n_iterations,
+                )
+            )
+
+            logger.info(
+                f"📷 LUMINANCE_AFFINE initialized: {num_cameras} cameras, "
+                f"{num_frames} frames"
+            )
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
 

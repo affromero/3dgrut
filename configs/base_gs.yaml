@@ -186,7 +186,7 @@ loss:
 
 # Post-processing configuration
 post_processing:
-  # null | "ppisp" | "linear-to-srgb"
+  # null | "ppisp" | "linear-to-srgb" | "luminance_affine"
   method: null
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.
@@ -195,6 +195,33 @@ post_processing:
   # When > 0, enables distillation mode: Gaussians and PPISP params are frozen,
   # only the controller is trained for these additional steps.
   n_distillation_steps: 5000
+  # Luminance affine parameters. Camera-only correction is the default;
+  # frame residuals are optional and strongly regularized.
+  lr: 0.001
+  reg_lambda: 0.01
+  use_frame_residual: false
+  max_log_gain: 0.25
+  max_bias: 0.10
+  use_color_matrix: false
+  max_matrix_delta: 0.10
+  color_matrix_reg_lambda: 0.25
+  use_radial_affine: false
+  radial_band_count: 4
+  radial_max_log_gain: 0.08
+  radial_max_bias: 0.03
+  radial_reg_lambda: 0.50
+  use_residual_grid: false
+  residual_grid_size: 32
+  residual_grid_max: 0.05
+  residual_grid_reg_lambda: 0.01
+  use_residual_grid_edge_gate: false
+  residual_grid_gate_floor: 0.20
+  use_temporal_affine: false
+  temporal_num_knots: 32
+  temporal_max_sequence_idx: 400
+  temporal_max_log_gain: 0.08
+  temporal_max_bias: 0.03
+  temporal_reg_lambda: 0.50
 
 hydra:
   output_subdir: null

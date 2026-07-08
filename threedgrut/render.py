@@ -29,11 +29,48 @@ from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.utils.color_correct import color_correct_affine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import create_summary_writer
+from threedgrut.post_processing import LuminanceAffine
 from threedgrut.utils.render import (
     apply_background,
     apply_feature_decoder,
     apply_post_processing,
 )
+
+
+def _load_luminance_affine_state_compat(
+    module: LuminanceAffine,
+    saved_state: dict,
+) -> list[str]:
+    current_state = module.state_dict()
+    filtered: dict = {}
+    dropped: list[str] = []
+    for key, value in saved_state.items():
+        target = current_state.get(key)
+        if target is None:
+            continue
+        if (
+            hasattr(value, "shape")
+            and hasattr(target, "shape")
+            and tuple(value.shape) != tuple(target.shape)
+        ):
+            if (
+                key == "residual_grid"
+                and value.ndim == 4
+                and target.ndim == 4
+                and value.shape[:2] == target.shape[:2]
+            ):
+                filtered[key] = F.interpolate(
+                    value.to(device=target.device, dtype=target.dtype),
+                    size=target.shape[-2:],
+                    mode="bilinear",
+                    align_corners=True,
+                )
+                continue
+            dropped.append(key)
+            continue
+        filtered[key] = value
+    module.load_state_dict(filtered, strict=False)
+    return dropped
 
 
 class Renderer:
@@ -162,6 +199,116 @@ class Renderer:
             num_cameras = post_processing.crf_params.shape[0]
             num_frames = post_processing.exposure_params.shape[0]
             logger.info(f"📷 {method.upper()} loaded from checkpoint: {num_cameras} cameras, {num_frames} frames")
+
+        elif "post_processing" in checkpoint and method == "luminance_affine":
+            state = checkpoint["post_processing"]["module"]
+            num_cameras = state["camera_log_gain"].shape[0]
+            num_frames = state["frame_log_gain"].shape[0]
+            post_processing = LuminanceAffine(
+                num_cameras=num_cameras,
+                num_frames=num_frames,
+                lr=conf.post_processing.get("lr", 1e-3),
+                reg_lambda=conf.post_processing.get("reg_lambda", 1e-2),
+                use_frame_residual=conf.post_processing.get(
+                    "use_frame_residual",
+                    False,
+                ),
+                max_log_gain=conf.post_processing.get("max_log_gain", 0.25),
+                max_bias=conf.post_processing.get("max_bias", 0.10),
+                use_color_matrix=conf.post_processing.get(
+                    "use_color_matrix",
+                    False,
+                ),
+                max_matrix_delta=conf.post_processing.get(
+                    "max_matrix_delta",
+                    0.10,
+                ),
+                color_matrix_reg_lambda=conf.post_processing.get(
+                    "color_matrix_reg_lambda",
+                    0.25,
+                ),
+                use_radial_affine=conf.post_processing.get(
+                    "use_radial_affine",
+                    False,
+                ),
+                radial_band_count=conf.post_processing.get(
+                    "radial_band_count",
+                    4,
+                ),
+                radial_max_log_gain=conf.post_processing.get(
+                    "radial_max_log_gain",
+                    0.08,
+                ),
+                radial_max_bias=conf.post_processing.get(
+                    "radial_max_bias",
+                    0.03,
+                ),
+                radial_reg_lambda=conf.post_processing.get(
+                    "radial_reg_lambda",
+                    0.50,
+                ),
+                use_residual_grid=conf.post_processing.get(
+                    "use_residual_grid",
+                    False,
+                ),
+                residual_grid_size=conf.post_processing.get(
+                    "residual_grid_size",
+                    32,
+                ),
+                residual_grid_max=conf.post_processing.get(
+                    "residual_grid_max",
+                    0.05,
+                ),
+                residual_grid_reg_lambda=conf.post_processing.get(
+                    "residual_grid_reg_lambda",
+                    0.01,
+                ),
+                use_residual_grid_edge_gate=conf.post_processing.get(
+                    "use_residual_grid_edge_gate",
+                    False,
+                ),
+                residual_grid_gate_floor=conf.post_processing.get(
+                    "residual_grid_gate_floor",
+                    0.20,
+                ),
+                use_temporal_affine=conf.post_processing.get(
+                    "use_temporal_affine",
+                    False,
+                ),
+                temporal_num_knots=conf.post_processing.get(
+                    "temporal_num_knots",
+                    32,
+                ),
+                temporal_max_sequence_idx=conf.post_processing.get(
+                    "temporal_max_sequence_idx",
+                    400,
+                ),
+                temporal_max_log_gain=conf.post_processing.get(
+                    "temporal_max_log_gain",
+                    0.08,
+                ),
+                temporal_max_bias=conf.post_processing.get(
+                    "temporal_max_bias",
+                    0.03,
+                ),
+                temporal_reg_lambda=conf.post_processing.get(
+                    "temporal_reg_lambda",
+                    0.50,
+                ),
+            ).to("cuda")
+            dropped = _load_luminance_affine_state_compat(
+                post_processing,
+                state,
+            )
+            if dropped:
+                logger.warning(
+                    "Dropping shape-mismatched luminance-affine buffers "
+                    f"during render restore: {sorted(dropped)}."
+                )
+            logger.info(
+                f"📷 {method.upper()} loaded from checkpoint: "
+                f"{num_cameras} cameras, {num_frames} frames"
+            )
 
         # Load feature decoder for nht models
         feature_decoder = None
