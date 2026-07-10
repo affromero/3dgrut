@@ -772,11 +772,18 @@ class GSStrategy(BaseStrategy):
         if n_bad == 0 and n_oversize == 0:
             return
 
-        logger.warning(
-            f"scale-guard: neutralized {n_bad} non-finite and clamped "
-            f"{n_oversize} oversized gaussians (max_world_size="
-            f"{self.conf.strategy.scale_guard.max_world_size})"
-        )
+        # A gaussian hovering at the cap re-clamps every step; only the
+        # non-finite case is a real pathology, so oversize-only events
+        # log sparsely to keep the training log readable.
+        oversize_events = getattr(self, "_scale_guard_oversize_events", 0)
+        self._scale_guard_oversize_events = oversize_events + 1
+        if n_bad > 0 or oversize_events % 200 == 0:
+            logger.warning(
+                f"scale-guard: neutralized {n_bad} non-finite and clamped "
+                f"{n_oversize} oversized gaussians (max_world_size="
+                f"{self.conf.strategy.scale_guard.max_world_size}, "
+                f"oversize event #{oversize_events + 1})"
+            )
         if n_bad:
             self.model.positions.data[bad_rows] = 0.0
             self.model.rotation.data[bad_rows] = torch.tensor(
