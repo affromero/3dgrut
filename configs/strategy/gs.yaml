@@ -71,3 +71,17 @@ prune_scale:
   start_iteration: -1
   end_iteration: -1
   threshold: 1.0
+
+# Non-finite / runaway-scale particle guard. A single Gaussian with a
+# non-finite position/rotation/scale/density, or a scale far beyond the
+# scene, yields a degenerate proxy AABB; OptiX traversal against such a
+# BVH can spin forever, freezing training at 100% GPU with no error.
+# When enabled, every optimizer step neutralizes non-finite particles in
+# place (origin, identity rotation, tiny scale), clamps scales above
+# max_world_size, and zeroes the affected optimizer-state rows so a
+# poisoned Adam moment cannot regrow the defect. A warning names the
+# count whenever anything is sanitized.
+# Default disabled -> byte-identical to upstream behaviour.
+scale_guard:
+  enabled: false
+  max_world_size: 10.0

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Optional
 
 import torch
@@ -227,6 +228,11 @@ class GSStrategy(BaseStrategy):
     ) -> bool:
         """Callback function to be executed after the optimizer step."""
         scene_updated = False
+
+        # Neutralize degenerate particles before the next BVH build
+        if self.conf.strategy.scale_guard.enabled:
+            self.sanitize_particles()
+
         # Densify the Gaussians
 
         if check_step_condition(
@@ -731,6 +737,82 @@ class GSStrategy(BaseStrategy):
 
         self._update_param_with_optimizer(update_param_fn, update_optimizer_fn)
         self.prune_densification_buffers(mask)
+
+    @torch.no_grad()
+    def sanitize_particles(self) -> None:
+        """Neutralize non-finite particles and clamp runaway scales.
+
+        A non-finite position/rotation/scale/density, or a scale far
+        beyond the scene, yields a degenerate proxy AABB and OptiX
+        traversal against such a BVH can spin forever (100% GPU, no
+        error, no progress). Runs every optimizer step when
+        ``strategy.scale_guard.enabled`` so a defect born in one
+        optimizer step never reaches the next render.
+        """
+        if self.conf.model.scale_activation != "exp":
+            raise ValueError(
+                "strategy.scale_guard requires the exp scale activation, "
+                f"got {self.conf.model.scale_activation!r}."
+            )
+        max_pre = math.log(
+            self.conf.strategy.scale_guard.max_world_size
+        )
+        tiny_pre = math.log(1e-6)
+        scale = self.model.scale.data
+        bad_rows = ~torch.isfinite(scale).all(dim=1)
+        for param in (
+            self.model.positions.data,
+            self.model.rotation.data,
+            self.model.density.data,
+        ):
+            bad_rows |= ~torch.isfinite(param).all(dim=1)
+        oversize_rows = (scale.amax(dim=1) > max_pre) & ~bad_rows
+        n_bad = int(bad_rows.sum())
+        n_oversize = int(oversize_rows.sum())
+        if n_bad == 0 and n_oversize == 0:
+            return
+
+        logger.warning(
+            f"scale-guard: neutralized {n_bad} non-finite and clamped "
+            f"{n_oversize} oversized gaussians (max_world_size="
+            f"{self.conf.strategy.scale_guard.max_world_size})"
+        )
+        if n_bad:
+            self.model.positions.data[bad_rows] = 0.0
+            self.model.rotation.data[bad_rows] = torch.tensor(
+                [1.0, 0.0, 0.0, 0.0],
+                dtype=self.model.rotation.dtype,
+                device=self.model.rotation.device,
+            )
+            scale[bad_rows] = tiny_pre
+            self.model.density.data.nan_to_num_(
+                nan=0.0, posinf=0.0, neginf=0.0
+            )
+        if n_oversize:
+            scale[oversize_rows] = scale[oversize_rows].clamp(max=max_pre)
+
+        # A poisoned Adam moment regrows the defect next step; zero the
+        # touched rows (and any non-finite state entries) as well.
+        touched = bad_rows | oversize_rows
+        for param_group in self.model.optimizer.param_groups:
+            if param_group["name"] not in (
+                "positions",
+                "rotation",
+                "scale",
+                "density",
+            ):
+                continue
+            param = param_group["params"][0]
+            for key, value in self.model.optimizer.state.get(
+                param, {}
+            ).items():
+                if (
+                    key != "step"
+                    and torch.is_tensor(value)
+                    and value.shape[0] == touched.shape[0]
+                ):
+                    value.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+                    value[touched] = 0.0
 
     def prune_gaussians_opacity(self):
         # Prune the Gaussians based on their opacity
