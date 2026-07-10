@@ -3748,6 +3748,17 @@ class Trainer3DGRUT:
                 device=self.device,
                 dtype=rgb_pred.dtype,
             )
+        image_loss_weight = 1.0
+        if self.conf.loss.get("use_image_loss_weights", False):
+            weights_by_name = self._image_loss_weights_by_name()
+            image_name = os.path.basename(gpu_batch.image_path)
+            if image_name not in weights_by_name:
+                msg = (
+                    "loss.image_loss_weights_path must map every training "
+                    f"image; missing entry for {image_name}."
+                )
+                raise RuntimeError(msg)
+            image_loss_weight = float(weights_by_name[image_name])
         loss = (
             lambda_l1 * loss_l1
             + lambda_ssim * loss_ssim
@@ -3759,7 +3770,7 @@ class Trainer3DGRUT:
             + lambda_rim_hf * loss_rim_hf
             + lambda_mvdino_rim * loss_mvdino_rim
         )
-        loss = loss * camera_loss_weight
+        loss = loss * camera_loss_weight * image_loss_weight
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
@@ -6249,6 +6260,38 @@ class Trainer3DGRUT:
                 else:
                     flat_dict[k].append(v)
         return flat_dict
+
+    def _image_loss_weights_by_name(self) -> dict:
+        """Load and cache the per-image loss-weight mapping.
+
+        The JSON at ``loss.image_loss_weights_path`` maps image
+        basenames to multiplicative loss weights (e.g. blur-derived).
+        Training-only: evaluation and validation metrics never apply
+        these weights.
+        """
+        cached = getattr(self, "_image_loss_weights_cache", None)
+        if cached is not None:
+            return cached
+        weights_path = str(
+            self.conf.loss.get("image_loss_weights_path", "")
+        )
+        if not weights_path or not os.path.isfile(weights_path):
+            raise RuntimeError(
+                "loss.use_image_loss_weights requires "
+                f"loss.image_loss_weights_path; not found: {weights_path!r}"
+            )
+        with open(weights_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict) or not payload:
+            raise RuntimeError(
+                "image loss weights must be a non-empty JSON object "
+                f"mapping image basenames to floats: {weights_path}"
+            )
+        weights = {
+            str(name): float(value) for name, value in payload.items()
+        }
+        self._image_loss_weights_cache = weights
+        return weights
 
     def run_training(self):
         """Initiate training logic for n_epochs.

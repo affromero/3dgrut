@@ -220,6 +220,11 @@ loss:
 
   use_camera_loss_weights: false
   camera_loss_weights: []
+  # Per-image loss weights: JSON mapping image basename -> weight,
+  # multiplied into the training loss alongside camera_loss_weights.
+  # Eval/validation metrics are never weighted.
+  use_image_loss_weights: false
+  image_loss_weights_path: ""
 
   use_opacity: false
   lambda_opacity: 0.0
