@@ -5420,7 +5420,12 @@ class Trainer3DGRUT:
             checkpoint_label = "latest"
         else:
             checkpoint_label = "step"
-        torch.save(parameters, ckpt_path)
+        # Atomic write: the wedge supervisor SIGABRTs mid-training, and a
+        # kill landing inside torch.save would corrupt the rolling
+        # ckpt_last.pt every later resume depends on.
+        ckpt_tmp_path = f"{ckpt_path}.tmp"
+        torch.save(parameters, ckpt_tmp_path)
+        os.replace(ckpt_tmp_path, ckpt_path)
         logger.info(
             f"💾 Saved {checkpoint_label} checkpoint to: "
             f'"{path_abs(ckpt_path)}"'
