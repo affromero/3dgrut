@@ -540,13 +540,42 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
     }
 }
 
+// THREEDGRUT_SYNC_ALLOC=1: route every tracer buffer through plain
+// cudaMalloc/cudaFree instead of the stream-ordered pool. Diagnostic +
+// mitigation for a deterministic failure where the Nth
+// rebuild/free/alloc cycle against the async pool yields a GAS whose
+// traversal hits [INTERNAL_TRAVERSAL_STACK_OVERFLOW] (reproducer:
+// rebuild-per-view eval sweep wedges at the 22nd rebuild regardless of
+// view order, permutation, or extra stream syncs).
+static bool tracerSyncAlloc() {
+    static const bool sync_alloc = [] {
+        const char* v = std::getenv("THREEDGRUT_SYNC_ALLOC");
+        return v != nullptr && v[0] == '1';
+    }();
+    return sync_alloc;
+}
+
+static cudaError_t tracerMallocAsync(void** ptr, size_t size, cudaStream_t stream) {
+    if (tracerSyncAlloc()) {
+        return cudaMalloc(ptr, size);
+    }
+    return cudaMallocAsync(ptr, size, stream);
+}
+
+static cudaError_t tracerFreeAsync(void* ptr, cudaStream_t stream) {
+    if (tracerSyncAlloc()) {
+        return cudaFree(ptr);
+    }
+    return cudaFreeAsync(ptr, stream);
+}
+
 OptixTraversableHandle OptixTracer::createParticleInstanceAS(cudaStream_t cudaStream) {
     OptixAccelBuildOptions accel_options = {};
     accel_options.buildFlags             = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
     accel_options.operation              = OPTIX_BUILD_OPERATION_BUILD;
 
     if (!_state->optixAabbPtr) {
-        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&_state->optixAabbPtr), sizeof(OptixAabb), cudaStream));
+        CUDA_CHECK(tracerMallocAsync(reinterpret_cast<void**>(&_state->optixAabbPtr), sizeof(OptixAabb), cudaStream));
     }
     OptixAabb hostOptixAabb{-1.f, -1.f, -1.f, 1.f, 1.f, 1.f};
     CUDA_CHECK(cudaMemcpyAsync(
@@ -567,14 +596,14 @@ OptixTraversableHandle OptixTracer::createParticleInstanceAS(cudaStream_t cudaSt
                                              1, // Number of build inputs
                                              &gas_buffer_sizes));
     if (_state->gasBufferTmpSz < gas_buffer_sizes.tempSizeInBytes) {
-        CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(_state->gasBufferTmp), cudaStream));
-        CUDA_CHECK(cudaMallocAsync(
+        CUDA_CHECK(tracerFreeAsync(reinterpret_cast<void*>(_state->gasBufferTmp), cudaStream));
+        CUDA_CHECK(tracerMallocAsync(
             reinterpret_cast<void**>(&_state->gasBufferTmp), gas_buffer_sizes.tempSizeInBytes, cudaStream));
         _state->gasBufferTmpSz = gas_buffer_sizes.tempSizeInBytes;
     }
     if ((_state->iasBufferSz < gas_buffer_sizes.outputSizeInBytes)) {
-        CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(_state->iasBuffer), cudaStream));
-        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&_state->iasBuffer),
+        CUDA_CHECK(tracerFreeAsync(reinterpret_cast<void*>(_state->iasBuffer), cudaStream));
+        CUDA_CHECK(tracerMallocAsync(reinterpret_cast<void**>(&_state->iasBuffer),
                                    gas_buffer_sizes.outputSizeInBytes, cudaStream));
         _state->iasBufferSz = gas_buffer_sizes.outputSizeInBytes;
     }
@@ -594,8 +623,8 @@ OptixTraversableHandle OptixTracer::createParticleInstanceAS(cudaStream_t cudaSt
 
 void OptixTracer::reallocateBuffer(CUdeviceptr* bufferPtr, size_t& size, size_t newSize, cudaStream_t cudaStream) {
     if (newSize > size) {
-        CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(*bufferPtr), cudaStream));
-        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(bufferPtr), newSize, cudaStream));
+        CUDA_CHECK(tracerFreeAsync(reinterpret_cast<void*>(*bufferPtr), cudaStream));
+        CUDA_CHECK(tracerMallocAsync(reinterpret_cast<void**>(bufferPtr), newSize, cudaStream));
         size = newSize;
     }
 }
@@ -644,8 +673,8 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
     // Create enclosing geometry primitives from 3d gaussians
     if (_state->gPrimType == MOGTracingCustom) {
         if (_state->gPrimAABBSz < sizeof(OptixAabb) * gNum) {
-            CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(_state->gPrimAABB), cudaStream));
-            CUDA_CHECK(cudaMallocAsync(
+            CUDA_CHECK(tracerFreeAsync(reinterpret_cast<void*>(_state->gPrimAABB), cudaStream));
+            CUDA_CHECK(tracerMallocAsync(
                 reinterpret_cast<void**>(&_state->gPrimAABB), sizeof(OptixAabb) * gNum, cudaStream));
             _state->gPrimAABBSz = sizeof(OptixAabb) * gNum;
         }
@@ -664,8 +693,8 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
     } else if (_state->gPrimType == MOGTracingInstances) {
 
         if (_state->gPrimAABBSz < sizeof(OptixInstance) * gNum) {
-            CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(_state->gPrimAABB), cudaStream));
-            CUDA_CHECK(cudaMallocAsync(
+            CUDA_CHECK(tracerFreeAsync(reinterpret_cast<void*>(_state->gPrimAABB), cudaStream));
+            CUDA_CHECK(tracerMallocAsync(
                 reinterpret_cast<void**>(&_state->gPrimAABB), sizeof(OptixInstance) * gNum, cudaStream));
             _state->gPrimAABBSz = sizeof(OptixInstance) * gNum;
         }
@@ -873,21 +902,21 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
                                                  1, // Number of build inputs
                                                  &gas_buffer_sizes));
         if (_state->gasBufferTmpSz < gas_buffer_sizes.tempSizeInBytes) {
-            CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(_state->gasBufferTmp), cudaStream));
-            CUDA_CHECK(cudaMallocAsync(
+            CUDA_CHECK(tracerFreeAsync(reinterpret_cast<void*>(_state->gasBufferTmp), cudaStream));
+            CUDA_CHECK(tracerMallocAsync(
                 reinterpret_cast<void**>(&_state->gasBufferTmp), gas_buffer_sizes.tempSizeInBytes, cudaStream));
             _state->gasBufferTmpSz = gas_buffer_sizes.tempSizeInBytes;
         }
 
         if (rebuild && (_state->gasBufferSz < gas_buffer_sizes.outputSizeInBytes)) {
-            CUDA_CHECK(cudaFreeAsync(reinterpret_cast<void*>(_state->gasBuffer), cudaStream));
-            CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&_state->gasBuffer),
+            CUDA_CHECK(tracerFreeAsync(reinterpret_cast<void*>(_state->gasBuffer), cudaStream));
+            CUDA_CHECK(tracerMallocAsync(reinterpret_cast<void**>(&_state->gasBuffer),
                                        gas_buffer_sizes.outputSizeInBytes, cudaStream));
             _state->gasBufferSz = gas_buffer_sizes.outputSizeInBytes;
         }
 
         if (!_state->optixAabbPtr) {
-            CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&_state->optixAabbPtr), sizeof(OptixAabb), cudaStream));
+            CUDA_CHECK(tracerMallocAsync(reinterpret_cast<void**>(&_state->optixAabbPtr), sizeof(OptixAabb), cudaStream));
         }
 
         OptixAccelEmitDesc emit_desc = {};

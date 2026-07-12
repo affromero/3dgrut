@@ -203,12 +203,33 @@ class Tracer:
 
     def build_acc(self, gaussians, rebuild=True):
         with torch.cuda.nvtx.range(f"build-bvh-full-build-{rebuild}"):
-            allow_bvh_update = (
-                self.conf.render.max_consecutive_bvh_update > 1
-            ) and not self.conf.render.particle_kernel_density_clamping
+            # THREEDGRUT_BVH_REFIT=1: allow BVH refit (UPDATE) between true
+            # rebuilds even under density clamping. Each full rebuild is a
+            # stochastic draw against the driver-side
+            # [INTERNAL_TRAVERSAL_STACK_OVERFLOW]; refit recomputes AABBs
+            # from the current parameters but preserves tree topology, so a
+            # known-good tree stays good and the dice are only rolled when
+            # the particle set actually changes (densify/prune resizes).
+            refit_env = os.environ.get("THREEDGRUT_BVH_REFIT", "0") == "1"
+            clamping_forces_rebuild = (
+                self.conf.render.particle_kernel_density_clamping
+                and not refit_env
+            )
+            allow_bvh_update = refit_env or (
+                (self.conf.render.max_consecutive_bvh_update > 1)
+                and not self.conf.render.particle_kernel_density_clamping
+            )
+            # A refit is only valid against a tree built over the same
+            # particle set: force a rebuild on the first build and on any
+            # count change (resize paths that bypass rebuild=True).
+            num_gaussians = int(gaussians.num_gaussians)
+            count_changed = (
+                getattr(self, "_last_built_num", -1) != num_gaussians
+            )
             rebuild_bvh = (
                 rebuild
-                or self.conf.render.particle_kernel_density_clamping
+                or clamping_forces_rebuild
+                or count_changed
                 or self.num_update_bvh >= self.conf.render.max_consecutive_bvh_update
             )
             self.tracer_wrapper.build_bvh(
@@ -220,6 +241,7 @@ class Tracer:
                 allow_bvh_update,
             )
             self.num_update_bvh = 0 if rebuild_bvh else self.num_update_bvh + 1
+            self._last_built_num = num_gaussians
 
     def render(self, gaussians, gpu_batch: Batch, train=False, frame_id=0):
         num_gaussians = gaussians.num_gaussians

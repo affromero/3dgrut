@@ -1716,6 +1716,38 @@ class Trainer3DGRUT:
                 f"🤸 Loading a pretrained checkpoint from {conf.resume}!"
             )
             checkpoint = torch.load(conf.resume, weights_only=False)
+            # THREEDGRUT_RESUME_PERMUTE=1: apply one random permutation to
+            # every per-gaussian row across the checkpoint (params,
+            # optimizer moments, densify buffers). The model is
+            # mathematically identical, but the BVH builder consumes
+            # primitives in memory order and checkpoint-restored order
+            # builds trees that hit the driver's internal-traversal-stack
+            # overflow at ~100x the live-state rate; re-randomizing the
+            # order re-rolls the tree distribution.
+            if os.environ.get("THREEDGRUT_RESUME_PERMUTE") == "1":
+                n_gaussians = checkpoint["positions"].shape[0]
+                perm = torch.randperm(n_gaussians)
+
+                def _permute_rows(node):
+                    if isinstance(node, torch.nn.Parameter):
+                        if node.ndim >= 1 and node.shape[0] == n_gaussians:
+                            return torch.nn.Parameter(
+                                node.data[perm],
+                                requires_grad=node.requires_grad,
+                            )
+                        return node
+                    if torch.is_tensor(node) and node.ndim >= 1 and node.shape[0] == n_gaussians:
+                        return node[perm]
+                    if isinstance(node, dict):
+                        return {k: _permute_rows(v) for k, v in node.items()}
+                    if isinstance(node, (list, tuple)):
+                        return type(node)(_permute_rows(v) for v in node)
+                    return node
+
+                checkpoint = _permute_rows(checkpoint)
+                logger.info(
+                    f"resume-permute: shuffled {n_gaussians} gaussian rows"
+                )
             model.init_from_checkpoint(checkpoint)
             self.strategy.init_densification_buffer(checkpoint)
             global_step = checkpoint["global_step"]
@@ -5999,14 +6031,19 @@ class Trainer3DGRUT:
         ):
             self.model.increase_num_active_features()
 
-        # Update the BVH if required
+        # Update the BVH if required. A periodic refresh (no particle-set
+        # change) passes rebuild=False so the tracer's refit policy
+        # (THREEDGRUT_BVH_REFIT=1) can preserve a known-good tree; a resize
+        # from densify/prune (scene_updated) always forces a full rebuild.
+        # Without the env gate the tracer still rebuilds under density
+        # clamping, so default behavior is unchanged.
         if scene_updated or (
             conf.model.bvh_update_frequency > 0
             and global_step % conf.model.bvh_update_frequency == 0
         ):
             with torch.cuda.nvtx.range(f"train_{global_step}_bvh"):
                 profilers["build_as"].start()
-                self.model.build_acc(rebuild=True)
+                self.model.build_acc(rebuild=bool(scene_updated))
                 profilers["build_as"].end()
 
         # Increment the global step
@@ -6191,6 +6228,26 @@ class Trainer3DGRUT:
         )
 
         for val_iteration, batch_idx in enumerate(self.val_dataloader):
+            # debug probe: per-view wall time with a hard sync so a wedged
+            # kernel is attributed to the view that enqueued it
+            view_t0 = time.time()
+            # debug probe: roll the BVH-build dice before every eval view to
+            # isolate rebuild+render (no training) as a wedge trigger
+            if os.environ.get("THREEDGRUT_EVAL_REBUILD_EACH_VIEW") == "1":
+                if os.environ.get("THREEDGRUT_EVAL_REBUILD_SYNC") == "1":
+                    torch.cuda.synchronize()
+                self.model.build_acc(rebuild=True)
+                if os.environ.get("THREEDGRUT_EVAL_REBUILD_SYNC") == "1":
+                    torch.cuda.synchronize()
+            # The resume path never builds the BVH, so a standalone
+            # validate_only pass renders an EMPTY GAS (background-only,
+            # checkpoint-independent metrics). Build once before the
+            # first view when requested.
+            if (
+                os.environ.get("THREEDGRUT_EVAL_BUILD_ONCE") == "1"
+                and val_iteration == 0
+            ):
+                self.model.build_acc(rebuild=True)
             # Access the GPU-cache batch data
             gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
                 batch_idx
@@ -6233,6 +6290,11 @@ class Trainer3DGRUT:
                     gpu_batch, outputs, batch_metrics, iteration=val_iteration
                 )
                 metrics.append(batch_metrics)
+            torch.cuda.synchronize()
+            logger.info(
+                f"[VAL-TIMING] step {self.global_step} view "
+                f"{val_iteration} done in {time.time() - view_t0:.2f}s"
+            )
 
         logger.end_progress(task_name="Validation")
 
