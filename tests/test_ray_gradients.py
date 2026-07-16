@@ -7,14 +7,15 @@ against numerical gradients (central finite differences on ray_ori / ray_dir).
 
 from __future__ import annotations
 
-import torch
 import numpy as np
+import torch
 from omegaconf import OmegaConf
 
 
 def _build_jit_config() -> OmegaConf:
     """Load the full 3DGUT config via Hydra compose."""
     import os
+
     from hydra import compose, initialize_config_dir
 
     config_dir = os.path.join(os.path.dirname(__file__), "..", "configs")
@@ -73,9 +74,9 @@ def test_ray_gradient_finite_differences():
         plugin.ShutterType.ROLLING_TOP_TO_BOTTOM,
         [W / 2.0, H / 2.0],  # principal point
         [W / 2.0, W / 2.0],  # focal length
-        [0.0] * 6,           # radial coeffs
-        [0.0, 0.0],          # tangential coeffs
-        [0.0] * 4,           # thin prism coeffs
+        [0.0] * 6,  # radial coeffs
+        [0.0, 0.0],  # tangential coeffs
+        [0.0] * 4,  # thin prism coeffs
     )
 
     start_ts = 0
@@ -110,11 +111,32 @@ def test_ray_gradient_finite_differences():
     ray_dir_test = ray_dir.clone().requires_grad_(True)
 
     result = raster.trace(
-        0, 1,
-        particle_density, particle_radiance,
-        ray_ori_test.contiguous(), ray_dir_test.contiguous(),
-        ray_time, sensor_params, start_ts, end_ts, start_pose, end_pose,
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori_test.contiguous(),
+        ray_dir_test.contiguous(),
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
     )
+    assert len(result) == 8
+    projected_conic_opacity = result[5]
+    projected_tiles_count = result[7].reshape(-1)
+    assert projected_conic_opacity.shape == (N_PARTICLES, 4)
+    on_screen = projected_tiles_count > 0
+    assert on_screen.any()
+    observed_conics = projected_conic_opacity[on_screen]
+    assert torch.isfinite(observed_conics).all()
+    determinant = observed_conics[:, 0] * observed_conics[:, 2] - observed_conics[:, 1].square()
+    assert (observed_conics[:, 0] > 0.0).all()
+    assert (observed_conics[:, 2] > 0.0).all()
+    assert (determinant > 0.0).all()
+    assert (observed_conics[:, 3] > 0.0).all()
     radiance_density = result[0]
     loss = radiance_density[..., :3].sum()
 
@@ -125,12 +147,22 @@ def test_ray_gradient_finite_differences():
     hit_dist_grad = torch.zeros_like(hit_dist)
 
     density_grd, radiance_grd, ori_grd, dir_grd = raster.trace_bwd(
-        0, 1,
-        particle_density, particle_radiance,
-        ray_ori_test, ray_dir_test, ray_time,
-        sensor_params, start_ts, end_ts, start_pose, end_pose,
-        radiance_density, radiance_density_grad,
-        hit_dist, hit_dist_grad,
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori_test,
+        ray_dir_test,
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
+        radiance_density,
+        radiance_density_grad,
+        hit_dist,
+        hit_dist_grad,
     )
 
     print(f"ori_grd shape: {ori_grd.shape}, max abs: {ori_grd.abs().max().item():.6f}")
@@ -144,9 +176,19 @@ def test_ray_gradient_finite_differences():
     # Finite difference validation: pick pixels with highest alpha (confirmed visible)
     eps = 1e-4
     fwd_result = raster.trace(
-        0, 1, particle_density, particle_radiance,
-        ray_ori.contiguous(), ray_dir.contiguous(), ray_time,
-        sensor_params, start_ts, end_ts, start_pose, end_pose)
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori.contiguous(),
+        ray_dir.contiguous(),
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
+    )
     fwd_alpha = fwd_result[0][..., 3]  # [H, W]
     topk_flat = fwd_alpha.flatten().topk(min(10, H * W)).indices
     test_pixels = [(idx.item() // W, idx.item() % W) for idx in topk_flat]
@@ -174,7 +216,9 @@ def test_ray_gradient_finite_differences():
                     rel_err = abs(an_grad - fd_grad) / max(abs(fd_grad), abs(an_grad))
                     max_rel_error = max(max_rel_error, rel_err)
                     status = "OK" if rel_err < 0.05 else "MISMATCH"
-                    print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}")
+                    print(
+                        f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}"
+                    )
                 else:
                     print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} FD~0")
 
@@ -202,7 +246,9 @@ def test_ray_gradient_finite_differences():
                     rel_err = abs(an_grad - fd_grad) / max(abs(fd_grad), abs(an_grad))
                     max_rel_error_dir = max(max_rel_error_dir, rel_err)
                     status = "OK" if rel_err < 0.05 else "MISMATCH"
-                    print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}")
+                    print(
+                        f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}"
+                    )
                 else:
                     print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} FD~0")
 

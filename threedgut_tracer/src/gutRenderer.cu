@@ -246,6 +246,7 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                                                         vec4* radianceDensityCudaPtr,
                                                         int* particlesVisibilityCudaPtr,
                                                         vec2* particlesProjectedPositionCudaPtr,
+                                                        vec4* particlesProjectedConicOpacityCudaPtr,
                                                         vec2* particlesProjectedExtentCudaPtr,
                                                         int* particlesTilesCountCudaPtr,
                                                         Parameters& parameters,
@@ -303,6 +304,16 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                 particlesProjectedPositionCudaPtr,
                 m_forwardContext->particlesProjectedPosition.data(),
                 numParticles * sizeof(vec2),
+                cudaMemcpyDeviceToDevice,
+                cudaStream),
+            m_logger);
+    }
+    if (particlesProjectedConicOpacityCudaPtr != nullptr) {
+        CUDA_CHECK_RETURN(
+            cudaMemcpyAsync(
+                particlesProjectedConicOpacityCudaPtr,
+                m_forwardContext->particlesProjectedConicOpacity.data(),
+                numParticles * sizeof(vec4),
                 cudaMemcpyDeviceToDevice,
                 cudaStream),
             m_logger);

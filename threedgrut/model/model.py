@@ -17,25 +17,24 @@ import os
 from pathlib import Path
 
 import numpy as np
-import threedgrt_tracer
-import threedgut_tracer
 import torch
 from omegaconf import DictConfig
 from plyfile import PlyData
 
+import threedgrt_tracer
 import threedgrut.model.background as background
+import threedgut_tracer
 from threedgrut.datasets.protocols import Batch
-from threedgrut.datasets.utils import (
-    read_colmap_points3D_text,
-    read_next_bytes,
-)
+from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
 from threedgrut.export import PLYExporter
 from threedgrut.export.base import ExportableModel
 from threedgrut.model.geometry import (
+    SurfaceAlignedPCAConfig,
     k_nearest_neighbors,
     nearest_neighbor_dist_cpuKD,
+    surface_aligned_pca_initialize,
 )
-from threedgrut.optimizers import SelectiveAdam
+from threedgrut.optimizers import SelectiveAdam, VisibilityDecayedAdam
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import (
     get_activation_function,
@@ -56,6 +55,116 @@ SIREN_CARRIER_INPUT_DIM = 5
 SIREN_CARRIER_DEFAULT_HIDDEN_DIM = 6
 
 
+def _validated_surface_aligned_pca_config(
+    initialization_conf: DictConfig,
+    points: torch.Tensor,
+    observer_points: torch.Tensor,
+) -> SurfaceAlignedPCAConfig | None:
+    surface_conf = initialization_conf.get("surface_aligned_pca")
+    if surface_conf is None or not bool(surface_conf.get("enabled", False)):
+        return None
+
+    method = str(initialization_conf.get("method", ""))
+    if method != "colmap":
+        raise ValueError(
+            "initialization.surface_aligned_pca requires " "initialization.method=colmap; " f"got {method!r}"
+        )
+    if not bool(initialization_conf.get("use_observation_points", False)):
+        raise ValueError(
+            "initialization.surface_aligned_pca requires "
+            "use_observation_points=true; local-neighbor incumbent scaling "
+            "is not supported"
+        )
+    if (
+        observer_points.ndim != 2
+        or observer_points.shape[1] != 3
+        or observer_points.shape[0] == 0
+        or not bool(torch.isfinite(observer_points).all())
+    ):
+        raise ValueError(
+            "initialization.surface_aligned_pca requires nonempty finite " "observer points with shape [N, 3]"
+        )
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(
+            "initialization.surface_aligned_pca requires COLMAP points " f"with shape [N, 3]; got {tuple(points.shape)}"
+        )
+
+    num_support_points_value = float(surface_conf.get("num_support_points", 0))
+    query_chunk_size_value = float(surface_conf.get("query_chunk_size", 0))
+    if not np.isfinite(num_support_points_value) or not num_support_points_value.is_integer():
+        raise ValueError("surface_aligned_pca.num_support_points must be a finite integer")
+    if not np.isfinite(query_chunk_size_value) or not query_chunk_size_value.is_integer():
+        raise ValueError("surface_aligned_pca.query_chunk_size must be a finite integer")
+    num_support_points = int(num_support_points_value)
+    query_chunk_size = int(query_chunk_size_value)
+    max_neighbor_radius_m = float(surface_conf.get("max_neighbor_radius_m", 0.0))
+    max_normal_to_mid_ratio = float(surface_conf.get("max_normal_to_mid_ratio", 0.0))
+    min_mid_to_max_ratio = float(surface_conf.get("min_mid_to_max_ratio", 0.0))
+    min_mid_eigenvalue_m2 = float(surface_conf.get("min_mid_eigenvalue_m2", 0.0))
+    min_thickness_ratio = float(surface_conf.get("min_thickness_ratio", 0.0))
+    if num_support_points < 3:
+        raise ValueError("surface_aligned_pca.num_support_points must be at least 3")
+    if points.shape[0] < num_support_points:
+        raise ValueError(
+            "surface_aligned_pca requires at least " f"{num_support_points} COLMAP points; got {points.shape[0]}"
+        )
+    if query_chunk_size <= 0:
+        raise ValueError("surface_aligned_pca.query_chunk_size must be positive")
+    positive_parameters = (
+        ("max_neighbor_radius_m", max_neighbor_radius_m),
+        ("max_normal_to_mid_ratio", max_normal_to_mid_ratio),
+        ("min_mid_to_max_ratio", min_mid_to_max_ratio),
+        ("min_mid_eigenvalue_m2", min_mid_eigenvalue_m2),
+    )
+    for parameter_name, parameter_value in positive_parameters:
+        if not np.isfinite(parameter_value) or parameter_value <= 0.0:
+            raise ValueError(
+                f"surface_aligned_pca.{parameter_name} must be finite and " f"positive; got {parameter_value}"
+            )
+    if max_normal_to_mid_ratio > 1.0:
+        raise ValueError("surface_aligned_pca.max_normal_to_mid_ratio must be at most 1")
+    if min_mid_to_max_ratio > 1.0:
+        raise ValueError("surface_aligned_pca.min_mid_to_max_ratio must be at most 1")
+    if not np.isfinite(min_thickness_ratio) or min_thickness_ratio <= 0.0 or min_thickness_ratio > 1.0:
+        raise ValueError(
+            "surface_aligned_pca.min_thickness_ratio must be finite and in " f"(0, 1]; got {min_thickness_ratio}"
+        )
+
+    expected_counts = (
+        (
+            "expected_point_count",
+            surface_conf.get("expected_point_count"),
+            points.shape[0],
+        ),
+        (
+            "expected_observer_count",
+            surface_conf.get("expected_observer_count"),
+            observer_points.shape[0],
+        ),
+    )
+    for count_name, configured_count, actual_count in expected_counts:
+        if configured_count is None:
+            continue
+        expected_count_value = float(configured_count)
+        if not np.isfinite(expected_count_value) or not expected_count_value.is_integer() or expected_count_value < 0.0:
+            raise ValueError(f"surface_aligned_pca.{count_name} must be null or a " "non-negative integer")
+        expected_count = int(expected_count_value)
+        if expected_count != actual_count:
+            raise ValueError(
+                f"surface_aligned_pca {count_name} mismatch: expected " f"{expected_count}, got {actual_count}"
+            )
+
+    return SurfaceAlignedPCAConfig(
+        num_support_points=num_support_points,
+        max_neighbor_radius_m=max_neighbor_radius_m,
+        max_normal_to_mid_ratio=max_normal_to_mid_ratio,
+        min_mid_to_max_ratio=min_mid_to_max_ratio,
+        min_mid_eigenvalue_m2=min_mid_eigenvalue_m2,
+        min_thickness_ratio=min_thickness_ratio,
+        query_chunk_size=query_chunk_size,
+    )
+
+
 def _gabor_carrier_enabled(conf) -> bool:
     return bool(conf.model.get("use_gabor_carrier", False))
 
@@ -66,10 +175,7 @@ def _siren_carrier_enabled(conf) -> bool:
 
 def _validate_carrier_config(conf) -> None:
     if _gabor_carrier_enabled(conf) and _siren_carrier_enabled(conf):
-        raise ValueError(
-            "model.use_gabor_carrier and model.use_siren_carrier are "
-            "mutually exclusive."
-        )
+        raise ValueError("model.use_gabor_carrier and model.use_siren_carrier are " "mutually exclusive.")
 
 
 def _gabor_carrier_coeffs(conf) -> int:
@@ -77,10 +183,7 @@ def _gabor_carrier_coeffs(conf) -> int:
         return 0
     num_terms = int(conf.model.get("gabor_num_terms", GABOR_CARRIER_NUM_TERMS))
     if num_terms != GABOR_CARRIER_NUM_TERMS:
-        raise ValueError(
-            "model.gabor_num_terms currently supports exactly 3 terms; "
-            f"got {num_terms}."
-        )
+        raise ValueError("model.gabor_num_terms currently supports exactly 3 terms; " f"got {num_terms}.")
     return GABOR_CARRIER_EXTRA_COEFFS
 
 
@@ -92,10 +195,7 @@ def _siren_carrier_hidden_dim(conf) -> int:
         )
     )
     if hidden_dim <= 0:
-        raise ValueError(
-            "model.siren_hidden_dim must be positive; got "
-            f"{hidden_dim}."
-        )
+        raise ValueError("model.siren_hidden_dim must be positive; got " f"{hidden_dim}.")
     return hidden_dim
 
 
@@ -165,19 +265,12 @@ def initial_siren_carrier_tail(
         return tail
 
     seed = int(conf.model.get("siren_init_seed", 20260626))
-    init_scale = float(
-        conf.model.get("siren_init_scale", 1.0 / SIREN_CARRIER_INPUT_DIM)
-    )
+    init_scale = float(conf.model.get("siren_init_scale", 1.0 / SIREN_CARRIER_INPUT_DIM))
     if init_scale < 0.0:
-        raise ValueError(
-            f"model.siren_init_scale must be non-negative; got {init_scale}."
-        )
+        raise ValueError(f"model.siren_init_scale must be non-negative; got {init_scale}.")
     output_init_scale = float(conf.model.get("siren_output_init_scale", 0.0))
     if output_init_scale < 0.0:
-        raise ValueError(
-            "model.siren_output_init_scale must be non-negative; got "
-            f"{output_init_scale}."
-        )
+        raise ValueError("model.siren_output_init_scale must be non-negative; got " f"{output_init_scale}.")
     generator = torch.Generator(device=device)
     generator.manual_seed(seed)
     w1 = (
@@ -203,9 +296,7 @@ def initial_siren_carrier_tail(
 
     for hidden_idx in range(hidden_dim):
         w1_slot = 2 * hidden_idx
-        tail[:, (w1_slot * 3) : (w1_slot * 3 + 3)] = w1[
-            :, hidden_idx, :3
-        ]
+        tail[:, (w1_slot * 3) : (w1_slot * 3 + 3)] = w1[:, hidden_idx, :3]
         tail[:, ((w1_slot + 1) * 3)] = w1[:, hidden_idx, 3]
         tail[:, ((w1_slot + 1) * 3 + 1)] = w1[:, hidden_idx, 4]
 
@@ -262,9 +353,7 @@ def _sample_point_rows(points: torch.Tensor) -> torch.Tensor:
     """Return a bounded deterministic row sample for extent estimates."""
     if points.shape[0] <= SCENE_EXTENT_MAX_SAMPLES:
         return points
-    step = (
-        points.shape[0] + SCENE_EXTENT_MAX_SAMPLES - 1
-    ) // SCENE_EXTENT_MAX_SAMPLES
+    step = (points.shape[0] + SCENE_EXTENT_MAX_SAMPLES - 1) // SCENE_EXTENT_MAX_SAMPLES
     return points[::step]
 
 
@@ -281,13 +370,8 @@ def _estimate_scene_extent_from_points(points: torch.Tensor) -> float:
     if torch.isfinite(radius) and radius.item() > SCENE_EXTENT_MIN:
         return float(radius.item() * 1.1)
 
-    bbox_diagonal = torch.linalg.norm(
-        sampled.max(dim=0).values - sampled.min(dim=0).values
-    )
-    if (
-        torch.isfinite(bbox_diagonal)
-        and bbox_diagonal.item() > SCENE_EXTENT_MIN
-    ):
+    bbox_diagonal = torch.linalg.norm(sampled.max(dim=0).values - sampled.min(dim=0).values)
+    if torch.isfinite(bbox_diagonal) and bbox_diagonal.item() > SCENE_EXTENT_MIN:
         return float(bbox_diagonal.item() * 0.1)
     return 1.0
 
@@ -303,9 +387,7 @@ def _subsample_initial_points(
     if max_points <= 0 or pts.shape[0] <= max_points:
         return pts, rgb
     rng = torch.Generator(device=pts.device).manual_seed(seed)
-    idxs = torch.randperm(
-        pts.shape[0], device=pts.device, generator=rng
-    )[:max_points]
+    idxs = torch.randperm(pts.shape[0], device=pts.device, generator=rng)[:max_points]
     return pts[idxs], rgb[idxs]
 
 
@@ -339,14 +421,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return self.features_specular
 
     def get_features(self):
-        return torch.cat(
-            (self.get_features_albedo(), self.features_specular), dim=1
-        )
+        return torch.cat((self.get_features_albedo(), self.features_specular), dim=1)
 
     def _specular_feature_dim(self) -> int:
-        return sh_degree_to_specular_dim(
-            self.max_n_features
-        ) + _carrier_specular_dim(self.conf)
+        return sh_degree_to_specular_dim(self.max_n_features) + _carrier_specular_dim(self.conf)
 
     def _with_carrier_tail(
         self,
@@ -365,8 +443,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
             return torch.cat((features_specular, tail), dim=1)
         raise ValueError(
-            "Unexpected features_specular width: "
-            f"got {features_specular.shape[1]}, expected {expected_dim}."
+            "Unexpected features_specular width: " f"got {features_specular.shape[1]}, expected {expected_dim}."
         )
 
     def get_scale(self, preactivation=False):
@@ -390,9 +467,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     def get_covariance(self) -> torch.Tensor:
         scales = self.get_scale()
 
-        S = torch.zeros(
-            (self.num_gaussians, 3, 3), dtype=scales.dtype, device=self.device
-        )
+        S = torch.zeros((self.num_gaussians, 3, 3), dtype=scales.dtype, device=self.device)
         R = quaternion_to_so3(self.get_rotation())
 
         S[:, 0, 0] = scales[:, 0]
@@ -402,9 +477,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return R @ S @ S.transpose(1, 2) @ R.transpose(1, 2)
 
     def get_model_parameters(self) -> dict:
-        assert self.optimizer is not None, (
-            "Optimizer need to be initialized when storing the checkpoint"
-        )
+        assert self.optimizer is not None, "Optimizer need to be initialized when storing the checkpoint"
 
         model_params = {
             "positions": self.positions,
@@ -423,12 +496,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         }
 
         if self.progressive_training:
-            model_params["feature_dim_increase_interval"] = (
-                self.feature_dim_increase_interval
-            )
-            model_params["feature_dim_increase_step"] = (
-                self.feature_dim_increase_step
-            )
+            model_params["feature_dim_increase_interval"] = self.feature_dim_increase_interval
+            model_params["feature_dim_increase_step"] = self.feature_dim_increase_step
 
         if self.feature_type == "sh":
             model_params["features_albedo"] = self.features_albedo
@@ -447,21 +516,15 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 f"Clamping max_n_features to {render_sph_degree}."
             )
             sh_degree = render_sph_degree
-        specular_dim = sh_degree_to_specular_dim(
-            sh_degree
-        ) + _carrier_specular_dim(conf)
+        specular_dim = sh_degree_to_specular_dim(sh_degree) + _carrier_specular_dim(conf)
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Positions of the 3D Gaussians (x, y, z) [n_gaussians, 3]
         self.rotation = torch.nn.Parameter(
             torch.empty([0, 4])
         )  # Rotation of each Gaussian represented as a unit quaternion [n_gaussians, 4]
-        self.scale = torch.nn.Parameter(
-            torch.empty([0, 3])
-        )  # Anisotropic scale of each Gaussian [n_gaussians, 3]
-        self.density = torch.nn.Parameter(
-            torch.empty([0, 1])
-        )  # Density of each Gaussian [n_gaussians, 1]
+        self.scale = torch.nn.Parameter(torch.empty([0, 3]))  # Anisotropic scale of each Gaussian [n_gaussians, 3]
+        self.density = torch.nn.Parameter(torch.empty([0, 1]))  # Density of each Gaussian [n_gaussians, 1]
         self.features_albedo = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Feature vector of the 0th order SH coefficients [n_gaussians, 3] (We split it into two due to different learning rates)
@@ -481,40 +544,24 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         self.device = "cuda"
         self.optimizer = None
-        self.density_activation = get_activation_function(
-            self.conf.model.density_activation
-        )
-        self.density_activation_inv = get_activation_function(
-            self.conf.model.density_activation, inverse=True
-        )
-        self.scale_activation = get_activation_function(
-            self.conf.model.scale_activation
-        )
-        self.scale_activation_inv = get_activation_function(
-            self.conf.model.scale_activation, inverse=True
-        )
-        self.rotation_activation = get_activation_function(
-            "normalize"
-        )  # The default value of the dim parameter is 1
+        self.density_activation = get_activation_function(self.conf.model.density_activation)
+        self.density_activation_inv = get_activation_function(self.conf.model.density_activation, inverse=True)
+        self.scale_activation = get_activation_function(self.conf.model.scale_activation)
+        self.scale_activation_inv = get_activation_function(self.conf.model.scale_activation, inverse=True)
+        self.rotation_activation = get_activation_function("normalize")  # The default value of the dim parameter is 1
 
-        self.background = background.make(
-            self.conf.model.background.name, self.conf.model.background
-        )
+        self.background = background.make(self.conf.model.background.name, self.conf.model.background)
 
         # Check if we would like to do progressive training
         self.feature_type = self.conf.model.progressive_training.feature_type
-        self.n_active_features = min(
-            self.conf.model.progressive_training.init_n_features, sh_degree
+        self.n_active_features = min(self.conf.model.progressive_training.init_n_features, sh_degree)
+        self.max_n_features = (
+            sh_degree  # For SH, this is the SH degree (clamped if > render.particle_radiance_sph_degree)
         )
-        self.max_n_features = sh_degree  # For SH, this is the SH degree (clamped if > render.particle_radiance_sph_degree)
         self.progressive_training = False
         if self.n_active_features < self.max_n_features:
-            self.feature_dim_increase_interval = (
-                self.conf.model.progressive_training.increase_frequency
-            )
-            self.feature_dim_increase_step = (
-                self.conf.model.progressive_training.increase_step
-            )
+            self.feature_dim_increase_interval = self.conf.model.progressive_training.increase_frequency
+            self.feature_dim_increase_step = self.conf.model.progressive_training.increase_step
             self.progressive_training = True
 
         # Rendering method
@@ -568,30 +615,26 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         else:
             raise ValueError("Neural features not yet supported.")
 
-    def init_from_colmap(self, root_path: str, observer_pts):
+    def init_from_colmap(
+        self,
+        root_path: str,
+        observer_pts: torch.Tensor,
+    ) -> None:
         # Special case for scannetpp dataset
         if self.conf.dataset.type == "scannetpp":
             points_file = os.path.join(root_path, "colmap", "points3D.txt")
             pts, rgb, _ = read_colmap_points3D_text(points_file)
-            file_pts = torch.tensor(
-                pts, dtype=torch.float32, device=self.device
-            )
+            file_pts = torch.tensor(pts, dtype=torch.float32, device=self.device)
             file_rgb = torch.tensor(rgb, dtype=torch.uint8, device=self.device)
 
         else:
             points_file = os.path.join(root_path, "sparse/0", "points3D.bin")
             # also handle nonbinary points files
             if not os.path.isfile(points_file):
-                points_file = os.path.join(
-                    root_path, "sparse/0", "points3D.txt"
-                )
+                points_file = os.path.join(root_path, "sparse/0", "points3D.txt")
                 pts, rgb, _ = read_colmap_points3D_text(points_file)
-                file_pts = torch.tensor(
-                    pts, dtype=torch.float32, device=self.device
-                )
-                file_rgb = torch.tensor(
-                    rgb, dtype=torch.uint8, device=self.device
-                )
+                file_pts = torch.tensor(pts, dtype=torch.float32, device=self.device)
+                file_rgb = torch.tensor(rgb, dtype=torch.uint8, device=self.device)
             else:
                 with open(points_file, "rb") as file:
                     n_pts = read_next_bytes(file, 8, "Q")[0]
@@ -608,25 +651,17 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                         # NOTE: error stored in last element of file, currently not used
 
                         # skip the track data
-                        t_len = read_next_bytes(
-                            file, num_bytes=8, format_char_sequence="Q"
-                        )[0]
+                        t_len = read_next_bytes(file, num_bytes=8, format_char_sequence="Q")[0]
                         read_next_bytes(
                             file,
                             num_bytes=8 * t_len,
                             format_char_sequence="ii" * t_len,
                         )
 
-                file_pts = torch.tensor(
-                    file_pts, dtype=torch.float32, device=self.device
-                )
-                file_rgb = torch.tensor(
-                    file_rgb, dtype=torch.uint8, device=self.device
-                )
+                file_pts = torch.tensor(file_pts, dtype=torch.float32, device=self.device)
+                file_rgb = torch.tensor(file_rgb, dtype=torch.uint8, device=self.device)
 
-        assert file_rgb.dtype == torch.uint8, (
-            "Expecting RGB values to be in [0, 255] range"
-        )
+        assert file_rgb.dtype == torch.uint8, "Expecting RGB values to be in [0, 255] range"
         max_points = int(self.conf.initialization.num_points)
         original_points = file_pts.shape[0]
         file_pts, file_rgb = _subsample_initial_points(
@@ -636,16 +671,27 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             seed=int(self.conf.seed_initialization),
         )
         if file_pts.shape[0] != original_points:
-            logger.info(
-                "Subsampled COLMAP initialization points "
-                f"from {original_points} to {file_pts.shape[0]}"
-            )
-        self.default_initialize_from_points(
+            logger.info("Subsampled COLMAP initialization points " f"from {original_points} to {file_pts.shape[0]}")
+        surface_aligned_pca_config = _validated_surface_aligned_pca_config(
+            self.conf.initialization,
             file_pts,
             observer_pts,
-            file_rgb,
-            use_observer_pts=self.conf.initialization.use_observation_points,
         )
+        if surface_aligned_pca_config is None:
+            self.default_initialize_from_points(
+                file_pts,
+                observer_pts,
+                file_rgb,
+                use_observer_pts=(self.conf.initialization.use_observation_points),
+            )
+        else:
+            self.default_initialize_from_points(
+                file_pts,
+                observer_pts,
+                file_rgb,
+                use_observer_pts=True,
+                surface_aligned_pca_config=surface_aligned_pca_config,
+            )
 
     def init_from_fused_point_cloud(self, pc_path: str, observer_pts):
         """
@@ -663,36 +709,24 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         vertices = plydata["vertex"]
 
         # Extract XYZ coordinates
-        xyz = np.stack(
-            [vertices["x"], vertices["y"], vertices["z"]], axis=1
-        ).astype(np.float32)
+        xyz = np.stack([vertices["x"], vertices["y"], vertices["z"]], axis=1).astype(np.float32)
 
         # Extract RGB colors (check if they exist)
         if "red" in vertices and "green" in vertices and "blue" in vertices:
-            rgb = np.stack(
-                [vertices["red"], vertices["green"], vertices["blue"]], axis=1
-            ).astype(np.uint8)
+            rgb = np.stack([vertices["red"], vertices["green"], vertices["blue"]], axis=1).astype(np.uint8)
         else:
             # If no colors, initialize with random colors
-            logger.warning(
-                "No RGB data found in point cloud, using random colors"
-            )
-            rgb = np.random.randint(
-                0, 256, size=(len(vertices), 3), dtype=np.uint8
-            )
+            logger.warning("No RGB data found in point cloud, using random colors")
+            rgb = np.random.randint(0, 256, size=(len(vertices), 3), dtype=np.uint8)
 
         # Convert to torch tensors
         file_pts = torch.tensor(xyz, dtype=torch.float32, device=self.device)
         file_rgb = torch.tensor(rgb, dtype=torch.uint8, device=self.device)
 
-        logger.info(
-            f"Loaded {len(file_pts)} points from accumulated point cloud"
-        )
+        logger.info(f"Loaded {len(file_pts)} points from accumulated point cloud")
 
         # Initialize using the same method as COLMAP
-        assert file_rgb.dtype == torch.uint8, (
-            "Expecting RGB values to be in [0, 255] range"
-        )
+        assert file_rgb.dtype == torch.uint8, "Expecting RGB values to be in [0, 255] range"
         self.default_initialize_from_points(
             file_pts,
             observer_pts,
@@ -700,9 +734,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             use_observer_pts=self.conf.initialization.use_observation_points,
         )
 
-    def init_from_pretrained_point_cloud(
-        self, pc_path: str, set_optimizable_parameters: bool = True
-    ):
+    def init_from_pretrained_point_cloud(self, pc_path: str, set_optimizable_parameters: bool = True):
         data = PlyData.read(pc_path)
         num_gaussians = len(data["vertex"])
         self.positions = torch.nn.Parameter(
@@ -753,9 +785,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )  # type: ignore
         self.density = torch.nn.Parameter(
             to_torch(
-                data["vertex"]["opacity"]
-                .astype(np.float32)
-                .reshape(num_gaussians, 1),
+                data["vertex"]["opacity"].astype(np.float32).reshape(num_gaussians, 1),
                 device=self.device,
             )
         )
@@ -832,11 +862,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
         # reinterpret from C-style to F-style layout
-        feats_sph = (
-            feats_sph.reshape(num_gaussians, 3, -1)
-            .transpose(-1, -2)
-            .reshape(num_gaussians, -1)
-        )
+        feats_sph = feats_sph.reshape(num_gaussians, 3, -1).transpose(-1, -2).reshape(num_gaussians, -1)
 
         self.features_specular = torch.nn.Parameter(feats_sph)
         if set_optimizable_parameters:
@@ -857,15 +883,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # We create random points inside the bounds of the synthetic Blender scenes
         # xyz in [-1.5, 1.5] -> standard NeRF convention, people often scale with 0.33 to get it to [-0.5, 0.5]
         fused_point_cloud = (
-            torch.rand((num_gaussians, 3), dtype=dtype, device=self.device)
-            * (xyz_max - xyz_min)
-            + xyz_min
+            torch.rand((num_gaussians, 3), dtype=dtype, device=self.device) * (xyz_max - xyz_min) + xyz_min
         )
         # sh albedo in [0, 0.0039]
-        fused_color = (
-            torch.rand((num_gaussians, 3), dtype=dtype, device=self.device)
-            / 255.0
-        )
+        fused_color = torch.rand((num_gaussians, 3), dtype=dtype, device=self.device) / 255.0
 
         features_albedo = features_specular = None
         if self.feature_type == "sh":
@@ -885,37 +906,22 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                     conf=self.conf,
                 )
 
-        dist = torch.clamp_min(
-            nearest_neighbor_dist_cpuKD(fused_point_cloud), 1e-3
-        )
-        scales = torch.log(dist * self.conf.model.default_scale_factor)[
-            ..., None
-        ].repeat(1, 3)
+        dist = torch.clamp_min(nearest_neighbor_dist_cpuKD(fused_point_cloud), 1e-3)
+        scales = torch.log(dist * self.conf.model.default_scale_factor)[..., None].repeat(1, 3)
 
         rots = torch.rand((num_gaussians, 4), device=self.device)
         rots[:, 0] = 1
 
         opacities = self.density_activation_inv(
-            self.conf.model.default_density
-            * torch.ones((num_gaussians, 1), dtype=dtype, device=self.device)
+            self.conf.model.default_density * torch.ones((num_gaussians, 1), dtype=dtype, device=self.device)
         )
 
         self.positions = torch.nn.Parameter(fused_point_cloud)  # type: ignore
-        self.rotation = torch.nn.Parameter(
-            rots.to(dtype=dtype, device=self.device)
-        )
-        self.scale = torch.nn.Parameter(
-            scales.to(dtype=dtype, device=self.device)
-        )
-        self.density = torch.nn.Parameter(
-            opacities.to(dtype=dtype, device=self.device)
-        )
-        self.features_albedo = torch.nn.Parameter(
-            features_albedo.to(dtype=dtype, device=self.device)
-        )
-        self.features_specular = torch.nn.Parameter(
-            features_specular.to(dtype=dtype, device=self.device)
-        )
+        self.rotation = torch.nn.Parameter(rots.to(dtype=dtype, device=self.device))
+        self.scale = torch.nn.Parameter(scales.to(dtype=dtype, device=self.device))
+        self.density = torch.nn.Parameter(opacities.to(dtype=dtype, device=self.device))
+        self.features_albedo = torch.nn.Parameter(features_albedo.to(dtype=dtype, device=self.device))
+        self.features_specular = torch.nn.Parameter(features_specular.to(dtype=dtype, device=self.device))
         if set_optimizable_parameters:
             self.set_optimizable_parameters()
         self.validate_fields()
@@ -926,9 +932,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.scale = checkpoint["scale"]
         self.density = checkpoint["density"]
         self.features_albedo = checkpoint["features_albedo"]
-        self.features_specular = torch.nn.Parameter(
-            self._with_carrier_tail(checkpoint["features_specular"])
-        )
+        self.features_specular = torch.nn.Parameter(self._with_carrier_tail(checkpoint["features_specular"]))
         if "rotation_activation" not in self.__dict__:
             self.rotation_activation = get_activation_function("normalize")
         self.n_active_features = checkpoint["n_active_features"]
@@ -967,8 +971,13 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
     def default_initialize_from_points(
-        self, pts, observer_pts, colors=None, use_observer_pts=True
-    ):
+        self,
+        pts: torch.Tensor,
+        observer_pts: torch.Tensor,
+        colors: torch.Tensor | None = None,
+        use_observer_pts: bool = True,
+        surface_aligned_pca_config: SurfaceAlignedPCAConfig | None = None,
+    ) -> None:
         """
         Given an Nx3 array of points (and optionally Nx3 rgb colors),
         initialize default values for the other parameters of the model
@@ -977,43 +986,41 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         dtype = torch.float32
 
         # Local generator for deterministic random initialization (does not affect global RNG)
-        rng = torch.Generator(device=self.device).manual_seed(
-            self.conf.seed_initialization
-        )
+        rng = torch.Generator(device=self.device).manual_seed(self.conf.seed_initialization)
 
         N = pts.shape[0]
         positions = pts
         self.ensure_scene_extent_from_points(positions)
 
         # Random rotations
-        rots = torch.rand(
-            (N, 4), dtype=dtype, device=self.device, generator=rng
-        )
+        rots = torch.rand((N, 4), dtype=dtype, device=self.device, generator=rng)
 
         if use_observer_pts:
             # NOTE: it seems we get different scales compared to the original 3DGS implementation
             # estimate scales based on distances to observers
-            dist_to_observers = torch.clamp_min(
-                nearest_neighbor_dist_cpuKD(pts, observer_pts), 1e-7
-            )
-            observation_scale = (
-                dist_to_observers
-                * self.conf.initialization.observation_scale_factor
-            )
+            dist_to_observers = torch.clamp_min(nearest_neighbor_dist_cpuKD(pts, observer_pts), 1e-7)
+            observation_scale = dist_to_observers * self.conf.initialization.observation_scale_factor
         else:
             # Initialize the GS size to be the average dist of the 3 nearest neighbors
-            dist2_avg = (k_nearest_neighbors(pts, 4)[:, 1:] ** 2).mean(
-                dim=-1
-            )  # [N,]
+            dist2_avg = (k_nearest_neighbors(pts, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
             observation_scale = torch.sqrt(dist2_avg)
 
-        observation_scale = (
-            observation_scale * self.conf.model.default_scale_factor
-        )
+        observation_scale = observation_scale * self.conf.model.default_scale_factor
 
-        scales = self.scale_activation_inv(observation_scale)[
-            :, None
-        ].repeat(1, 3)
+        if surface_aligned_pca_config is None:
+            scales = self.scale_activation_inv(observation_scale)[:, None].repeat(1, 3)
+        else:
+            incumbent_physical_scales = observation_scale[:, None].repeat(1, 3)
+            surface_result = surface_aligned_pca_initialize(
+                pts,
+                incumbent_physical_scales,
+                rots,
+                surface_aligned_pca_config,
+            )
+            rots = surface_result.raw_rotations_wxyz
+            scales = self.scale_activation_inv(surface_result.physical_scales)
+            audit = surface_result.audit
+            logger.info("Surface-aligned PCA initialization audit: " f"{audit}")
 
         if colors is None:
             colors = torch.randint(
@@ -1033,9 +1040,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
         opacities = self.density_activation_inv(density_values)
-        features_albedo = to_torch(
-            RGB2SH(to_np(colors.float() / 255.0)), device=self.device
-        )
+        features_albedo = to_torch(RGB2SH(to_np(colors.float() / 255.0)), device=self.device)
 
         N = positions.shape[0]
         num_specular_dims = self._specular_feature_dim()
@@ -1049,24 +1054,12 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 conf=self.conf,
             )
 
-        self.positions = torch.nn.Parameter(
-            positions.to(dtype=dtype, device=self.device)
-        )
-        self.rotation = torch.nn.Parameter(
-            rots.to(dtype=dtype, device=self.device)
-        )
-        self.scale = torch.nn.Parameter(
-            scales.to(dtype=dtype, device=self.device)
-        )
-        self.density = torch.nn.Parameter(
-            opacities.to(dtype=dtype, device=self.device)
-        )
-        self.features_albedo = torch.nn.Parameter(
-            features_albedo.to(dtype=dtype, device=self.device)
-        )
-        self.features_specular = torch.nn.Parameter(
-            features_specular.to(dtype=dtype, device=self.device)
-        )
+        self.positions = torch.nn.Parameter(positions.to(dtype=dtype, device=self.device))
+        self.rotation = torch.nn.Parameter(rots.to(dtype=dtype, device=self.device))
+        self.scale = torch.nn.Parameter(scales.to(dtype=dtype, device=self.device))
+        self.density = torch.nn.Parameter(opacities.to(dtype=dtype, device=self.device))
+        self.features_albedo = torch.nn.Parameter(features_albedo.to(dtype=dtype, device=self.device))
+        self.features_specular = torch.nn.Parameter(features_specular.to(dtype=dtype, device=self.device))
         self.set_optimizable_parameters()
         self.setup_optimizer()
         self.validate_fields()
@@ -1082,40 +1075,50 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                     lambda p: p.requires_grad and len(p) > 0,
                     module.parameters(),
                 )
-                n_params = sum(
-                    [np.prod(p.size(), dtype=int) for p in module_parameters]
-                )
+                n_params = sum([np.prod(p.size(), dtype=int) for p in module_parameters])
 
                 if n_params > 0:
-                    params.append(
-                        {"params": module.parameters(), "name": name, **args}
-                    )
+                    params.append({"params": module.parameters(), "name": name, **args})
 
             # If the module is a torch.nn.Parameter, we can add it to the optimizer
             elif isinstance(module, torch.nn.Parameter):
                 if module.requires_grad:
                     params.append({"params": [module], "name": name, **args})
 
+        optimizer_betas = tuple(float(beta) for beta in self.conf.optimizer.get("betas", (0.9, 0.999)))
+        if len(optimizer_betas) != 2:
+            raise ValueError("optimizer.betas must contain exactly two values")
+
         if self.conf.optimizer.type == "adam":
             self.optimizer = torch.optim.Adam(
-                params, lr=self.conf.optimizer.lr, eps=self.conf.optimizer.eps
+                params,
+                lr=self.conf.optimizer.lr,
+                betas=optimizer_betas,
+                eps=self.conf.optimizer.eps,
             )
             logger.info("🔆 Using Adam optimizer")
         elif self.conf.optimizer.type == "selective_adam":
-            self.optimizer = SelectiveAdam(
-                params, lr=self.conf.optimizer.lr, eps=self.conf.optimizer.eps
-            )
+            self.optimizer = SelectiveAdam(params, lr=self.conf.optimizer.lr, eps=self.conf.optimizer.eps)
             logger.info("🔆 Using Selective Adam optimizer")
-        else:
-            raise ValueError(
-                f"Unknown optimizer type: {self.conf.optimizer.type}"
+        elif self.conf.optimizer.type == "visibility_decayed_adam":
+            self.optimizer = VisibilityDecayedAdam(
+                params,
+                lr=self.conf.optimizer.lr,
+                betas=optimizer_betas,
+                eps=self.conf.optimizer.eps,
             )
+            logger.info("Using visibility-decayed Adam optimizer")
+        else:
+            raise ValueError(f"Unknown optimizer type: {self.conf.optimizer.type}")
 
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "positions":
-                param_group["lr"] *= (
-                    self.scene_extent
-                )  # Multiply the position lr by the scene scale
+            if param_group["name"] == "positions" and bool(
+                self.conf.optimizer.get(
+                    "scale_position_lr_by_scene_extent",
+                    True,
+                )
+            ):
+                param_group["lr"] *= self.scene_extent  # Multiply the position lr by the scene scale
 
         self.setup_scheduler()
 
@@ -1124,19 +1127,15 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             try:
                 self.optimizer.load_state_dict(state_dict)
             except ValueError as exc:
-                logger.warning(
-                    "🔆 Could not restore Gaussian optimizer state: "
-                    f"{exc}. Using fresh optimizer state for this run."
-                )
+                raise ValueError(
+                    "Cannot restore Gaussian optimizer state without changing " "the resume contract."
+                ) from exc
             self._apply_resume_lr_scale()
 
     def _apply_resume_lr_scale(self) -> None:
         scale = float(self.conf.optimizer.get("resume_lr_scale", 1.0))
         if not np.isfinite(scale) or scale <= 0.0:
-            raise ValueError(
-                "optimizer.resume_lr_scale must be finite and positive; "
-                f"got {scale}"
-            )
+            raise ValueError("optimizer.resume_lr_scale must be finite and positive; " f"got {scale}")
         self._resume_lr_scale = scale
         if scale == 1.0:
             return
@@ -1148,10 +1147,22 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.schedulers = {}
         for name, args in self.conf.scheduler.items():
             if args.type is not None and getattr(self, name).requires_grad:
-                if name == "positions":
+                if args.type == "skip":
+                    self.schedulers[name] = get_scheduler(args.type)()
+                elif name == "positions":
+                    position_lr_scale = (
+                        self.scene_extent
+                        if bool(
+                            self.conf.optimizer.get(
+                                "scale_position_lr_by_scene_extent",
+                                True,
+                            )
+                        )
+                        else 1.0
+                    )
                     self.schedulers[name] = get_scheduler(args.type)(
-                        lr_init=args.lr_init * self.scene_extent,
-                        lr_final=args.lr_final * self.scene_extent,
+                        lr_init=args.lr_init * position_lr_scale,
+                        lr_final=args.lr_final * position_lr_scale,
                         max_steps=args.max_steps,
                     )
                 else:
@@ -1164,10 +1175,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 if lr is not None:
                     lr = float(lr) * self._resume_lr_scale
                     if not np.isfinite(float(lr)):
-                        raise ValueError(
-                            "Non-finite scheduler LR for "
-                            f"{param_group['name']} at step {step}: {lr}"
-                        )
+                        raise ValueError("Non-finite scheduler LR for " f"{param_group['name']} at step {step}: {lr}")
                     param_group["lr"] = lr
 
     def ensure_scene_extent_from_points(self, points: torch.Tensor) -> None:
@@ -1185,11 +1193,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         point_extent = _estimate_scene_extent_from_points(points)
         if self.scene_extent is not None:
             scene_extent = float(self.scene_extent)
-            if (
-                np.isfinite(scene_extent)
-                and scene_extent > SCENE_EXTENT_MIN
-                and scene_extent >= 0.05 * point_extent
-            ):
+            if np.isfinite(scene_extent) and scene_extent > SCENE_EXTENT_MIN and scene_extent >= 0.05 * point_extent:
                 return
 
         self.scene_extent = point_extent
@@ -1199,21 +1203,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
     def set_optimizable_parameters(self):
-        if not self.conf.model.optimize_density:
-            self.density.requires_grad = False
-        if not self.conf.model.optimize_features_albedo:
-            self.features_albedo.requires_grad = False
-        if not self.conf.model.optimize_features_specular:
-            self.features_specular.requires_grad = False
-        if not self.conf.model.optimize_rotation:
-            self.rotation.requires_grad = False
-        if not self.conf.model.optimize_scale:
-            self.scale.requires_grad = False
-        if not self.conf.model.optimize_position:
-            self.positions.requires_grad = False
-    def update_optimizable_parameters(
-        self, optimizable_tensors: dict[str, torch.Tensor]
-    ):
+        self.density.requires_grad = bool(self.conf.model.optimize_density)
+        self.features_albedo.requires_grad = bool(self.conf.model.optimize_features_albedo)
+        self.features_specular.requires_grad = bool(self.conf.model.optimize_features_specular)
+        self.rotation.requires_grad = bool(self.conf.model.optimize_rotation)
+        self.scale.requires_grad = bool(self.conf.model.optimize_scale)
+        self.positions.requires_grad = bool(self.conf.model.optimize_position)
+
+    def update_optimizable_parameters(self, optimizable_tensors: dict[str, torch.Tensor]):
         for name, value in optimizable_tensors.items():
             setattr(self, name, value)
 
@@ -1241,17 +1238,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return mask
 
     def clamp_density(self):
-        updated_densities = torch.clamp(
-            self.get_density(), min=1e-4, max=1.0 - 1e-4
-        )
-        optimizable_tensors = self.replace_tensor_to_optimizer(
-            updated_densities, "density"
-        )
+        updated_densities = torch.clamp(self.get_density(), min=1e-4, max=1.0 - 1e-4)
+        optimizable_tensors = self.replace_tensor_to_optimizer(updated_densities, "density")
         self.density = optimizable_tensors["density"]
 
-    def forward(
-        self, batch: Batch, train=False, frame_id=0
-    ) -> dict[str, torch.Tensor]:
+    def forward(self, batch: Batch, train=False, frame_id=0) -> dict[str, torch.Tensor]:
         """
         Args:
             batch: a Batch structure containing the input data
@@ -1271,9 +1262,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         T_to_world: torch.Tensor  # [B, 4, 4] transformation matrix from the ray space to the world space
         """
         if T_to_world is None:
-            T_to_world = torch.eye(
-                4, dtype=rays_o.dtype, device=rays_o.device
-            )[None]
+            T_to_world = torch.eye(4, dtype=rays_o.dtype, device=rays_o.device)[None]
         inputs = Batch(T_to_world=T_to_world, rays_ori=rays_o, rays_dir=rays_d)
         return self.renderer.render(self, inputs)
 
@@ -1321,9 +1310,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             ),
             axis=1,
         )
-        mogt_densities = np.asarray(plydata.elements[0]["opacity"])[
-            ..., np.newaxis
-        ]
+        mogt_densities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
         num_gaussians = mogt_pos.shape[0]
         mogt_albedo = np.zeros((num_gaussians, 3))
@@ -1331,21 +1318,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         mogt_albedo[:, 1] = np.asarray(plydata.elements[0]["f_dc_1"])
         mogt_albedo[:, 2] = np.asarray(plydata.elements[0]["f_dc_2"])
 
-        extra_f_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("f_rest_")
-        ]
-        extra_f_names = sorted(
-            extra_f_names, key=lambda x: int(x.split("_")[-1])
-        )
+        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+        extra_f_names = sorted(extra_f_names, key=lambda x: int(x.split("_")[-1]))
         sh_speculars = (self.max_n_features + 1) ** 2 - 1
         sh_extra_f_count = 3 * sh_speculars
         expected_extra_f_count = self._specular_feature_dim()
         if len(extra_f_names) % 3 != 0:
             raise ValueError(
-                "PLY f_rest_* properties must be packed as float3 slots; "
-                f"found {len(extra_f_names)} fields."
+                "PLY f_rest_* properties must be packed as float3 slots; " f"found {len(extra_f_names)} fields."
             )
 
         if len(extra_f_names) in {sh_extra_f_count, expected_extra_f_count}:
@@ -1353,22 +1333,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             # append learned slots after the SH coefficients.
             mogt_specular = np.zeros((num_gaussians, len(extra_f_names)))
             for idx, attr_name in enumerate(extra_f_names):
-                mogt_specular[:, idx] = np.asarray(
-                    plydata.elements[0][attr_name]
-                )
+                mogt_specular[:, idx] = np.asarray(plydata.elements[0][attr_name])
             num_speculars = len(extra_f_names) // 3
-            mogt_specular = mogt_specular.reshape(
-                (num_gaussians, 3, num_speculars)
-            )
-            mogt_specular = mogt_specular.transpose(0, 2, 1).reshape(
-                (num_gaussians, num_speculars * 3)
-            )
+            mogt_specular = mogt_specular.reshape((num_gaussians, 3, num_speculars))
+            mogt_specular = mogt_specular.transpose(0, 2, 1).reshape((num_gaussians, num_speculars * 3))
         elif len(extra_f_names) == 0:
             # Only DC components available, create zero-filled higher-order harmonics
             mogt_specular = np.zeros((num_gaussians, sh_extra_f_count))
-            logger.info(
-                "PLY file only contains DC components, initializing higher-order spherical harmonics to zero"
-            )
+            logger.info("PLY file only contains DC components, initializing higher-order spherical harmonics to zero")
         else:
             # Partial data - this is unexpected
             raise ValueError(
@@ -1380,35 +1352,21 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             dtype=self.features_specular.dtype,
             device=self.device,
         )
-        mogt_specular_tensor = self._with_carrier_tail(
-            mogt_specular_tensor
-        )
+        mogt_specular_tensor = self._with_carrier_tail(mogt_specular_tensor)
 
-        scale_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("scale_")
-        ]
+        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key=lambda x: int(x.split("_")[-1]))
         mogt_scales = np.zeros((num_gaussians, len(scale_names)))
         for idx, attr_name in enumerate(scale_names):
             mogt_scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        rot_names = [
-            p.name
-            for p in plydata.elements[0].properties
-            if p.name.startswith("rot")
-        ]
+        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
         rot_names = sorted(rot_names, key=lambda x: int(x.split("_")[-1]))
         mogt_rotation = np.zeros((num_gaussians, len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             mogt_rotation[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self.positions = torch.nn.Parameter(
-            torch.tensor(
-                mogt_pos, dtype=self.positions.dtype, device=self.device
-            )
-        )
+        self.positions = torch.nn.Parameter(torch.tensor(mogt_pos, dtype=self.positions.dtype, device=self.device))
         self.features_albedo = torch.nn.Parameter(
             torch.tensor(
                 mogt_albedo,
@@ -1416,24 +1374,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 device=self.device,
             )
         )
-        self.features_specular = torch.nn.Parameter(
-            mogt_specular_tensor
-        )
-        self.density = torch.nn.Parameter(
-            torch.tensor(
-                mogt_densities, dtype=self.density.dtype, device=self.device
-            )
-        )
-        self.scale = torch.nn.Parameter(
-            torch.tensor(
-                mogt_scales, dtype=self.scale.dtype, device=self.device
-            )
-        )
-        self.rotation = torch.nn.Parameter(
-            torch.tensor(
-                mogt_rotation, dtype=self.rotation.dtype, device=self.device
-            )
-        )
+        self.features_specular = torch.nn.Parameter(mogt_specular_tensor)
+        self.density = torch.nn.Parameter(torch.tensor(mogt_densities, dtype=self.density.dtype, device=self.device))
+        self.scale = torch.nn.Parameter(torch.tensor(mogt_scales, dtype=self.scale.dtype, device=self.device))
+        self.rotation = torch.nn.Parameter(torch.tensor(mogt_rotation, dtype=self.rotation.dtype, device=self.device))
         self.n_active_features = self.max_n_features
 
         if init_model:
@@ -1445,8 +1389,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         """Copies fields from other onto self"""
         if self.optimizer is not None:
             raise NotImplementedError(
-                "Operations that create copies of the model during training "
-                "are currently not supported."
+                "Operations that create copies of the model during training " "are currently not supported."
             )
 
         if deepcopy:
@@ -1454,54 +1397,38 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.rotation = torch.nn.Parameter(other.rotation.clone())
             self.scale = torch.nn.Parameter(other.scale.clone())
             self.density = torch.nn.Parameter(other.density.clone())
-            self.features_albedo = torch.nn.Parameter(
-                other.features_albedo.clone()
-            )
-            self.features_specular = torch.nn.Parameter(
-                other.features_specular.clone()
-            )
+            self.features_albedo = torch.nn.Parameter(other.features_albedo.clone())
+            self.features_specular = torch.nn.Parameter(other.features_specular.clone())
         else:  # shared tensors
             self.positions = torch.nn.Parameter(other.positions)
             self.rotation = torch.nn.Parameter(other.rotation)
             self.scale = torch.nn.Parameter(other.scale)
             self.density = torch.nn.Parameter(other.density)
             self.features_albedo = torch.nn.Parameter(other.features_albedo)
-            self.features_specular = torch.nn.Parameter(
-                other.features_specular
-            )
+            self.features_specular = torch.nn.Parameter(other.features_specular)
         self.max_sh_degree = other.max_sh_degree
         self.n_active_features = other.n_active_features
         self.scene_extent = other.scene_extent
         self.progressive_training = other.progressive_training
-        self.feature_dim_increase_interval = (
-            other.feature_dim_increase_interval
-        )
+        self.feature_dim_increase_interval = other.feature_dim_increase_interval
         self.feature_dim_increase_step = other.feature_dim_increase_step
         self.background = other.background
         self.validate_fields()
 
     def clone(self):
-        other = MixtureOfGaussians(
-            conf=self.conf, scene_extent=self.scene_extent
-        )
+        other = MixtureOfGaussians(conf=self.conf, scene_extent=self.scene_extent)
         other.copy_fields(self, deepcopy=True)
         return other
 
     def __getitem__(self, idx):
-        sliced = MixtureOfGaussians(
-            conf=self.conf, scene_extent=self.scene_extent
-        )
+        sliced = MixtureOfGaussians(conf=self.conf, scene_extent=self.scene_extent)
         sliced.copy_fields(self, deepcopy=False)
         sliced.positions = torch.nn.Parameter(sliced.positions[idx])
         sliced.rotation = torch.nn.Parameter(sliced.rotation[idx])
         sliced.scale = torch.nn.Parameter(sliced.scale[idx])
         sliced.density = torch.nn.Parameter(sliced.density[idx])
-        sliced.features_albedo = torch.nn.Parameter(
-            sliced.features_albedo[idx]
-        )
-        sliced.features_specular = torch.nn.Parameter(
-            sliced.features_specular[idx]
-        )
+        sliced.features_albedo = torch.nn.Parameter(sliced.features_albedo[idx])
+        sliced.features_specular = torch.nn.Parameter(sliced.features_specular[idx])
         return sliced
 
     def __len__(self):

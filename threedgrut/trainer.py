@@ -26,7 +26,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.data
-import wandb
 from addict import Dict
 from klogr.path import path_abs, path_join, path_mkdir
 from omegaconf import DictConfig, OmegaConf
@@ -35,13 +34,10 @@ from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
+import wandb
 from threedgrut import datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
-from threedgrut.datasets.utils import (
-    DEFAULT_DEVICE,
-    MultiEpochsDataLoader,
-    PointCloud,
-)
+from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
 from threedgrut.model.camera_residual import CameraResidual
 from threedgrut.model.losses import rim_high_frequency_loss, ssim
 from threedgrut.model.model import MixtureOfGaussians
@@ -49,7 +45,11 @@ from threedgrut.model.mvdino_rim_loss import (
     mvdino_feature_rim_loss,
     mvdino_rim_crop_loss,
 )
-from threedgrut.optimizers import SelectiveAdam
+from threedgrut.optimizers import (
+    SelectiveAdam,
+    SparseGeometryAdam,
+    VisibilityDecayedAdam,
+)
 from threedgrut.post_processing import LuminanceAffine
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
@@ -134,13 +134,9 @@ def _predicted_axial_depth(
     return pred_dist * ray_z
 
 
-def _scale_optimizer_learning_rates(
-    optimizer: torch.optim.Optimizer, *, scale: float, label: str
-) -> None:
+def _scale_optimizer_learning_rates(optimizer: torch.optim.Optimizer, *, scale: float, label: str) -> None:
     if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError(
-            f"{label} LR scale must be finite and positive: {scale}"
-        )
+        raise ValueError(f"{label} LR scale must be finite and positive: {scale}")
     if scale == 1.0:
         return
     for param_group in optimizer.param_groups:
@@ -152,9 +148,7 @@ def _quantile_values(value: torch.Tensor) -> torch.Tensor:
     """Bound tensor size before quantile diagnostics on dense point clouds."""
     if value.numel() <= DIAGNOSTIC_QUANTILE_MAX_SAMPLES:
         return value
-    step = (
-        value.numel() + DIAGNOSTIC_QUANTILE_MAX_SAMPLES - 1
-    ) // DIAGNOSTIC_QUANTILE_MAX_SAMPLES
+    step = (value.numel() + DIAGNOSTIC_QUANTILE_MAX_SAMPLES - 1) // DIAGNOSTIC_QUANTILE_MAX_SAMPLES
     return value[::step]
 
 
@@ -171,13 +165,9 @@ def _robust_jet_map(
 
     valid_values = value_map[finite_mask]
     if valid_values.numel() == 0:
-        max_value = torch.tensor(
-            1.0, device=value_map.device, dtype=value_map.dtype
-        )
+        max_value = torch.tensor(1.0, device=value_map.device, dtype=value_map.dtype)
     else:
-        max_value = torch.quantile(
-            _quantile_values(valid_values), quantile
-        ).clamp_min(1e-6)
+        max_value = torch.quantile(_quantile_values(valid_values), quantile).clamp_min(1e-6)
     return jet_map(value_map, max_value)
 
 
@@ -187,9 +177,7 @@ def _colorize_semantic_mask(
 ) -> torch.Tensor:
     """Colorize one binary semantic mask with a deterministic palette entry."""
     color = torch.tensor(
-        SEMANTIC_LABEL_COLORS_RGB[
-            color_index % len(SEMANTIC_LABEL_COLORS_RGB)
-        ],
+        SEMANTIC_LABEL_COLORS_RGB[color_index % len(SEMANTIC_LABEL_COLORS_RGB)],
         device=mask.device,
         dtype=mask.dtype,
     )
@@ -206,9 +194,7 @@ def _colorize_semantic_label_masks(
         device=first_mask.device,
         dtype=first_mask.dtype,
     )
-    for label_index, (_, label_mask) in enumerate(
-        sorted(semantic_label_masks.items())
-    ):
+    for label_index, (_, label_mask) in enumerate(sorted(semantic_label_masks.items())):
         semantic_rgb = semantic_rgb + _colorize_semantic_mask(
             label_mask,
             label_index,
@@ -283,9 +269,7 @@ def _group_metric_summary(
         if not group:
             continue
         group_mask = groups == raw_group
-        group_summary: dict[str, float] = {
-            "view_count": float(np.count_nonzero(group_mask))
-        }
+        group_summary: dict[str, float] = {"view_count": float(np.count_nonzero(group_mask))}
         for source_name, metric_name in metric_names:
             if source_name not in metrics:
                 continue
@@ -310,36 +294,25 @@ def _group_metric_summary_by_keys(
     """Return per-composite-group metric means from flattened metrics."""
     if any(group_key not in metrics for group_key in group_keys):
         return {}
-    group_arrays = [
-        np.asarray(metrics[group_key], dtype=object) for group_key in group_keys
-    ]
+    group_arrays = [np.asarray(metrics[group_key], dtype=object) for group_key in group_keys]
     if not group_arrays or group_arrays[0].size == 0:
         return {}
     group_size = group_arrays[0].shape[0]
     if any(group_array.shape[0] != group_size for group_array in group_arrays):
         return {}
     raw_groups = sorted(
-        {
-            tuple(group_array[index] for group_array in group_arrays)
-            for index in range(group_size)
-        },
+        {tuple(group_array[index] for group_array in group_arrays) for index in range(group_size)},
         key=lambda group: tuple(str(value) for value in group),
     )
     summary: dict[str, dict[str, float]] = {}
     for raw_group in raw_groups:
-        group_parts = [
-            _safe_metric_group_name(str(value)) for value in raw_group
-        ]
+        group_parts = [_safe_metric_group_name(str(value)) for value in raw_group]
         if any(not group_part for group_part in group_parts):
             continue
         group_mask = np.ones(group_size, dtype=bool)
-        for group_array, group_value in zip(
-            group_arrays, raw_group, strict=True
-        ):
+        for group_array, group_value in zip(group_arrays, raw_group, strict=True):
             group_mask &= group_array == group_value
-        group_summary: dict[str, float] = {
-            "view_count": float(np.count_nonzero(group_mask))
-        }
+        group_summary: dict[str, float] = {"view_count": float(np.count_nonzero(group_mask))}
         group_name = "/".join(group_parts)
         for source_name, metric_name in metric_names:
             if source_name not in metrics:
@@ -379,9 +352,7 @@ def _scalar_tensor_stats(
         }
 
     values = detached[finite_mask].float()
-    nonzero_fraction = float((values.abs() > 0.0).sum().item()) / max(
-        float(values.numel()), 1.0
-    )
+    nonzero_fraction = float((values.abs() > 0.0).sum().item()) / max(float(values.numel()), 1.0)
     quantile_values = _quantile_values(values)
     return {
         f"{prefix}_finite_fraction": finite_fraction,
@@ -419,9 +390,7 @@ def _gradient_tensor_stats(
         }
     flat_grad = grad.reshape(-1)
     if flat_grad.numel() > DIAGNOSTIC_QUANTILE_MAX_SAMPLES:
-        step = (
-            flat_grad.numel() + DIAGNOSTIC_QUANTILE_MAX_SAMPLES - 1
-        ) // DIAGNOSTIC_QUANTILE_MAX_SAMPLES
+        step = (flat_grad.numel() + DIAGNOSTIC_QUANTILE_MAX_SAMPLES - 1) // DIAGNOSTIC_QUANTILE_MAX_SAMPLES
         flat_grad = flat_grad[::step]
     sampled_finite_mask = torch.isfinite(flat_grad)
     values = flat_grad[sampled_finite_mask]
@@ -431,9 +400,7 @@ def _gradient_tensor_stats(
             f"{prefix}/finite_fraction": finite_count / total_count,
             f"{prefix}/nonzero_fraction": 0.0,
         }
-    nonzero_fraction = float((values > 0.0).sum().item()) / max(
-        float(values.numel()), 1.0
-    )
+    nonzero_fraction = float((values > 0.0).sum().item()) / max(float(values.numel()), 1.0)
     quantile_values = _quantile_values(values)
     return {
         f"{prefix}/has_grad": 1.0,
@@ -494,11 +461,7 @@ def collapse_blur_samples(outputs: dict, gpu_batch) -> dict:
         return outputs
     collapsed = {}
     for key, value in outputs.items():
-        if (
-            torch.is_tensor(value)
-            and value.ndim == 4
-            and value.shape[0] == n_pred
-        ):
+        if torch.is_tensor(value) and value.ndim == 4 and value.shape[0] == n_pred:
             collapsed[key] = value.mean(dim=0, keepdim=True)
         else:
             collapsed[key] = value
@@ -535,9 +498,7 @@ def _sobel_grad_bhwc(image: torch.Tensor) -> torch.Tensor:
     ).reshape(1, 1, 3, 3)
     grad_x = F.conv2d(bchw, kernel_x, padding=1)
     grad_y = F.conv2d(bchw, kernel_y, padding=1)
-    grad = torch.sqrt(
-        torch.clamp_min(grad_x.square() + grad_y.square(), 1e-12)
-    )
+    grad = torch.sqrt(torch.clamp_min(grad_x.square() + grad_y.square(), 1e-12))
     return _restore_image_rank(grad.permute(0, 2, 3, 1), squeezed)
 
 
@@ -554,9 +515,7 @@ def _laplacian_bhwc(image: torch.Tensor) -> torch.Tensor:
     return _restore_image_rank(response.permute(0, 2, 3, 1), squeezed)
 
 
-def _masked_mean(
-    value: torch.Tensor, mask: torch.Tensor | None
-) -> torch.Tensor:
+def _masked_mean(value: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
     """Compute a mean over valid pixels and channels."""
     if mask is None:
         return value.mean()
@@ -585,9 +544,7 @@ def _region_mask(
     upper: float,
 ) -> torch.Tensor:
     """Return a BHWC-compatible radial region mask."""
-    return ((radius >= lower) & (radius < upper)).to(radius.dtype)[
-        None, :, :, None
-    ]
+    return ((radius >= lower) & (radius < upper)).to(radius.dtype)[None, :, :, None]
 
 
 def _radial_weight_map(
@@ -600,10 +557,7 @@ def _radial_weight_map(
 ) -> torch.Tensor:
     """Return a [1, H, W] radial loss-weight map."""
     if len(band_weights) != 4:
-        raise RuntimeError(
-            "Radial loss-weight entries must have four values: center, "
-            "mid, outer, rim."
-        )
+        raise RuntimeError("Radial loss-weight entries must have four values: center, " "mid, outer, rim.")
     radius = _image_radius(
         height=height,
         width=width,
@@ -661,9 +615,7 @@ def _radial_residual_metrics(
     batched_gt, squeezed_gt = _ensure_bhwc(rgb_gt)
     batched_pred, squeezed_pred = _ensure_bhwc(rgb_pred)
     if squeezed_gt != squeezed_pred:
-        raise RuntimeError(
-            "GT and prediction rank mismatch in radial diagnostics."
-        )
+        raise RuntimeError("GT and prediction rank mismatch in radial diagnostics.")
 
     height = batched_gt.shape[1]
     width = batched_gt.shape[2]
@@ -704,9 +656,7 @@ def _radial_residual_metrics(
     metrics = {}
     for band_name, (lower, upper) in bands.items():
         radial_mask = _region_mask(radius, lower=lower, upper=upper)
-        combined_mask = (
-            radial_mask if batched_mask is None else radial_mask * batched_mask
-        )
+        combined_mask = radial_mask if batched_mask is None else radial_mask * batched_mask
         metrics[f"radial_{band_name}_rgb_l1"] = _masked_mean(
             rgb_abs,
             combined_mask,
@@ -721,9 +671,7 @@ def _radial_residual_metrics(
         ).item()
         pred_edge = _masked_mean(grad_pred, combined_mask)
         gt_edge = _masked_mean(grad_gt, combined_mask)
-        metrics[f"radial_{band_name}_edge_energy_ratio"] = (
-            pred_edge / torch.clamp_min(gt_edge, 1e-12)
-        ).item()
+        metrics[f"radial_{band_name}_edge_energy_ratio"] = (pred_edge / torch.clamp_min(gt_edge, 1e-12)).item()
     return metrics
 
 
@@ -742,13 +690,9 @@ def _frequency_high_ratio(
     gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
     height = pred_luma.shape[1]
     width = pred_luma.shape[2]
-    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(
-        1, height, 1
-    )
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
     fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
-    high_mask = (torch.sqrt(fx.square() + fy.square()) > 0.18).to(
-        pred_luma.dtype
-    )
+    high_mask = (torch.sqrt(fx.square() + fy.square()) > 0.18).to(pred_luma.dtype)
     pred_energy = (pred_fft.abs().square() * high_mask).mean()
     gt_energy = (gt_fft.abs().square() * high_mask).mean()
     return pred_energy / torch.clamp_min(gt_energy, 1e-12)
@@ -770,9 +714,7 @@ def _frequency_band_ratios(
     gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
     height = pred_luma.shape[1]
     width = pred_luma.shape[2]
-    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(
-        1, height, 1
-    )
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
     fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
     radius = torch.sqrt(fx.square() + fy.square())
     pred_energy = pred_fft.abs().square()
@@ -790,9 +732,7 @@ def _frequency_band_ratios(
         band_mask = band_mask.to(pred_luma.dtype)
         pred_band_energy = (pred_energy * band_mask).mean()
         gt_band_energy = (gt_energy * band_mask).mean()
-        ratios[name] = pred_band_energy / torch.clamp_min(
-            gt_band_energy, 1e-12
-        )
+        ratios[name] = pred_band_energy / torch.clamp_min(gt_band_energy, 1e-12)
     return ratios
 
 
@@ -812,9 +752,7 @@ def _frequency_band_errors(
     gt_fft = torch.fft.rfft2(gt_luma.squeeze(-1), norm="ortho")
     height = pred_luma.shape[1]
     width = pred_luma.shape[2]
-    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(
-        1, height, 1
-    )
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).reshape(1, height, 1)
     fx = torch.fft.rfftfreq(width, device=pred_luma.device).reshape(1, 1, -1)
     radius = torch.sqrt(fx.square() + fy.square())
     error_energy = (pred_fft - gt_fft).abs().square()
@@ -935,9 +873,7 @@ def _gaussian_geometry_metrics(model: MixtureOfGaussians) -> dict[str, float]:
         density = model.get_density().detach().float()
         min_axis = torch.clamp_min(scales.min(dim=1).values, 1e-12)
         max_axis = scales.max(dim=1).values
-        geom_mean_scale = torch.clamp_min(scales.prod(dim=1), 1e-36).pow(
-            1.0 / 3.0
-        )
+        geom_mean_scale = torch.clamp_min(scales.prod(dim=1), 1e-36).pow(1.0 / 3.0)
         anisotropy = max_axis / min_axis
 
         metrics = {
@@ -1016,9 +952,7 @@ def _screen_space_footprint_metrics(
         if not in_front.any():
             return {"footprint_front_fraction": 0.0}
         focal_mean = _camera_focal_mean(gpu_batch)
-        projected_radius = (
-            scales[in_front] * focal_mean / depth[in_front].clamp_min(1e-3)
-        )
+        projected_radius = scales[in_front] * focal_mean / depth[in_front].clamp_min(1e-3)
         quantiles = torch.quantile(
             projected_radius,
             torch.tensor([0.5, 0.95, 0.99], device=projected_radius.device),
@@ -1030,14 +964,8 @@ def _screen_space_footprint_metrics(
             "footprint_radius_px_p95": quantiles[1].item(),
             "footprint_radius_px_p99": quantiles[2].item(),
             "footprint_radius_px_max": projected_radius.max().item(),
-            "footprint_radius_lt_0p5_fraction": (projected_radius < 0.5)
-            .float()
-            .mean()
-            .item(),
-            "footprint_radius_gt_8_fraction": (projected_radius > 8.0)
-            .float()
-            .mean()
-            .item(),
+            "footprint_radius_lt_0p5_fraction": (projected_radius < 0.5).float().mean().item(),
+            "footprint_radius_gt_8_fraction": (projected_radius > 8.0).float().mean().item(),
         }
 
 
@@ -1060,18 +988,10 @@ def _diagnostic_metrics(
     lap_pred = _laplacian_bhwc(luma_pred)
     metrics = {
         "low_freq_l1": _masked_mean(torch.abs(low_pred - low_gt), mask).item(),
-        "high_freq_l1": _masked_mean(
-            torch.abs(high_pred - high_gt), mask
-        ).item(),
-        "gradient_l1": _masked_mean(
-            torch.abs(grad_pred - grad_gt), mask
-        ).item(),
-        "laplacian_l1": _masked_mean(
-            torch.abs(lap_pred - lap_gt), mask
-        ).item(),
-        "fft_high_energy_ratio": _frequency_high_ratio(
-            rgb_pred, rgb_gt, mask
-        ).item(),
+        "high_freq_l1": _masked_mean(torch.abs(high_pred - high_gt), mask).item(),
+        "gradient_l1": _masked_mean(torch.abs(grad_pred - grad_gt), mask).item(),
+        "laplacian_l1": _masked_mean(torch.abs(lap_pred - lap_gt), mask).item(),
+        "fft_high_energy_ratio": _frequency_high_ratio(rgb_pred, rgb_gt, mask).item(),
     }
     metrics.update(
         {
@@ -1173,20 +1093,13 @@ def _save_validation_grid_jpeg(
     label_width = 220
     header_height = 54
     rows = row_end - row_start
-    grid_width = (
-        label_width
-        + gap_px
-        + len(column_names) * (panel_width + gap_px)
-        + gap_px
-    )
+    grid_width = label_width + gap_px + len(column_names) * (panel_width + gap_px) + gap_px
     grid_height = header_height + rows * (panel_height + gap_px) + gap_px
     grid = np.full((grid_height, grid_width, 3), (8, 8, 8), dtype=np.uint8)
 
     for column_idx, column_name in enumerate(column_names):
         x = label_width + gap_px + column_idx * (panel_width + gap_px)
-        header = np.full(
-            (header_height, panel_width, 3), (0, 0, 0), dtype=np.uint8
-        )
+        header = np.full((header_height, panel_width, 3), (0, 0, 0), dtype=np.uint8)
         cv2.putText(
             header,
             column_name,
@@ -1238,9 +1151,23 @@ def _make_validation_image_tiles(
     if mask is None:
         mask_rgb = torch.ones_like(rgb_gt)
         valid_mask = None
+        scored_rgb_gt = rgb_gt
+        scored_rgb_pred = rgb_pred
     else:
         valid_mask = mask.clip(0, 1.0)
         mask_rgb = valid_mask.expand_as(rgb_gt)
+        # Visualization only: checkerboarded panels expose the exact scored
+        # support without changing the tensors consumed by losses or metrics.
+        height, width = rgb_gt.shape[-3:-1]
+        checker_y = torch.arange(height, device=rgb_gt.device) // 32
+        checker_x = torch.arange(width, device=rgb_gt.device) // 32
+        checker = (checker_y[:, None] + checker_x[None, :]) % 2
+        checker = 0.18 + 0.14 * checker.to(dtype=rgb_gt.dtype)
+        checker_shape = (1,) * (rgb_gt.ndim - 3) + (height, width, 1)
+        checker_rgb = checker.reshape(checker_shape).expand_as(rgb_gt)
+        scored_support = valid_mask.expand_as(rgb_gt) > 0.5
+        scored_rgb_gt = torch.where(scored_support, rgb_gt, checker_rgb)
+        scored_rgb_pred = torch.where(scored_support, rgb_pred, checker_rgb)
 
     error = torch.abs(rgb_pred - rgb_gt).mean(dim=2, keepdim=True)
     if valid_mask is not None:
@@ -1252,10 +1179,7 @@ def _make_validation_image_tiles(
     high_gt = rgb_gt - low_gt
     high_pred = rgb_pred - low_pred
     high_error = torch.abs(high_pred - high_gt).mean(dim=2, keepdim=True)
-    edge_error = torch.abs(
-        _sobel_grad_bhwc(_rgb_to_luma(rgb_pred))
-        - _sobel_grad_bhwc(_rgb_to_luma(rgb_gt))
-    )
+    edge_error = torch.abs(_sobel_grad_bhwc(_rgb_to_luma(rgb_pred)) - _sobel_grad_bhwc(_rgb_to_luma(rgb_gt)))
     if valid_mask is not None:
         low_error = low_error * valid_mask
         high_error = high_error * valid_mask
@@ -1280,9 +1204,10 @@ def _make_validation_image_tiles(
         hits_sparse = hits_sparse * valid_mask
         opacity_low = opacity_low * valid_mask
     tiles = {
-        "input_rgb": rgb_gt,
-        "training_mask": mask_rgb,
-        "prediction_rgb": rgb_pred,
+        "raw_input_rgb": rgb_gt,
+        "scored_keep_mask": mask_rgb,
+        "scored_input_rgb": scored_rgb_gt,
+        "scored_prediction_rgb": scored_rgb_pred,
         "rgb_error": error_rgb,
         "low_freq_error": low_error_rgb,
         "high_freq_error": high_error_rgb,
@@ -1295,13 +1220,9 @@ def _make_validation_image_tiles(
     }
     if sky_mask is not None:
         if semantic_label_masks:
-            tiles[SEMANTIC_OPACITY_TILE] = _colorize_semantic_label_masks(
-                semantic_label_masks
-            )
+            tiles[SEMANTIC_OPACITY_TILE] = _colorize_semantic_label_masks(semantic_label_masks)
         else:
-            tiles[SEMANTIC_OPACITY_TILE] = sky_mask.clip(0, 1.0).expand_as(
-                rgb_gt
-            )
+            tiles[SEMANTIC_OPACITY_TILE] = sky_mask.clip(0, 1.0).expand_as(rgb_gt)
     return tiles
 
 
@@ -1323,15 +1244,8 @@ def _load_post_processing_state(
         target = current_state.get(key)
         if target is None:
             continue
-        if torch.is_tensor(value) and tuple(value.shape) != tuple(
-            target.shape
-        ):
-            if (
-                key == "residual_grid"
-                and value.ndim == 4
-                and target.ndim == 4
-                and value.shape[:2] == target.shape[:2]
-            ):
+        if torch.is_tensor(value) and tuple(value.shape) != tuple(target.shape):
+            if key == "residual_grid" and value.ndim == 4 and target.ndim == 4 and value.shape[:2] == target.shape[:2]:
                 filtered[key] = F.interpolate(
                     value.to(device=target.device, dtype=target.dtype),
                     size=target.shape[-2:],
@@ -1385,8 +1299,7 @@ def _load_optimizer_state(
         optimizer.load_state_dict(saved_state)
     except ValueError as exc:
         logger.warning(
-            f"📷 Could not restore {label} optimizer state: {exc}. "
-            "Using fresh optimizer state for this optimizer."
+            f"📷 Could not restore {label} optimizer state: {exc}. " "Using fresh optimizer state for this optimizer."
         )
         return []
     return _drop_shape_mismatched_optimizer_state(optimizer, label=label)
@@ -1437,10 +1350,14 @@ class Trainer3DGRUT:
     camera_residual_optimizer: torch.optim.Optimizer | None = None
     """Optimizer for camera residual parameters."""
 
-    camera_residual_scheduler: (
-        torch.optim.lr_scheduler.LRScheduler | None
-    ) = None
+    camera_residual_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
     """Scheduler for the camera residual optimizer."""
+
+    geometry_only_optimizer: SparseGeometryAdam | None = None
+    """Independent row-sparse optimizer for direct geometry supervision."""
+
+    _pending_geometry_optimizer_state: dict[str, object] | None = None
+    """Resume state loaded lazily after topology-changing stages finish."""
 
     _last_camera_residual_stats: dict[str, float] | None = None
     """Most recent camera residual stats captured before gradients are zeroed."""
@@ -1493,9 +1410,7 @@ class Trainer3DGRUT:
     _validation_training_window_end_step: int | None = None
     """Last training step included in the current validation snapshot."""
 
-    _post_processing_camera_index_mode: str = (
-        POST_PROCESSING_CAMERA_INDEX_DATASET
-    )
+    _post_processing_camera_index_mode: str = POST_PROCESSING_CAMERA_INDEX_DATASET
     """Post-processing-only camera index mapping mode."""
 
     @staticmethod
@@ -1541,13 +1456,14 @@ class Trainer3DGRUT:
         self._early_stopping_reference_step: int | None = None
         self._stale_validation_count = 0
         self._best_checkpoint_path: str | None = None
-        self._post_processing_camera_index_mode = (
-            post_processing_camera_index_mode(conf)
-        )
+        self._post_processing_camera_index_mode = post_processing_camera_index_mode(conf)
+        self.geometry_only_optimizer = None
+        self._pending_geometry_optimizer_state = None
 
         # Setup the trainer and components
         logger.log_rule("Load Datasets")
         self.init_dataloaders(conf)
+        self._validate_post_processing_camera_contract(conf)
         self.init_scene_extents(self.train_dataset)
         logger.log_rule("Initialize Model")
         self.init_model(conf, self.scene_extent)
@@ -1556,6 +1472,7 @@ class Trainer3DGRUT:
         self.init_metrics()
         self.init_post_processing(conf)
         self.init_camera_residual(conf)
+        self._validate_geometry_only_pass_config()
         self.setup_training(conf, self.model, self.train_dataset)
         self.init_experiments_tracking(conf)
         self.init_gui(
@@ -1598,13 +1515,22 @@ class Trainer3DGRUT:
         )
 
     def _post_processing_camera_names(self) -> list[str] | None:
-        if self._post_processing_camera_index_mode == (
-            POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL
-        ):
+        if self._post_processing_camera_index_mode == (POST_PROCESSING_CAMERA_INDEX_SINGLE_PHYSICAL):
             return ["physical_camera"]
-        if not hasattr(self.train_dataset, "get_camera_names"):
+        camera_names_fn = getattr(
+            self.train_dataset,
+            "get_post_processing_camera_names",
+            None,
+        )
+        if camera_names_fn is None:
+            camera_names_fn = getattr(
+                self.train_dataset,
+                "get_camera_names",
+                None,
+            )
+        if camera_names_fn is None:
             return None
-        camera_names = self.train_dataset.get_camera_names()
+        camera_names = camera_names_fn()
         frames_per_camera = self._post_processing_frames_per_camera()
         if len(camera_names) == len(frames_per_camera):
             return camera_names
@@ -1612,12 +1538,149 @@ class Trainer3DGRUT:
             return ["physical_camera"]
         return None
 
+    def _post_processing_checkpoint_metadata(self) -> dict[str, object]:
+        """Build the durable camera and inference contract for a checkpoint."""
+        camera_keys = self._post_processing_camera_names()
+        if camera_keys is None:
+            msg = "Cannot save post-processing state without stable physical-" "camera keys."
+            raise ValueError(msg)
+        if not camera_keys or any(not key for key in camera_keys):
+            msg = "Post-processing checkpoint camera keys must be non-empty: " f"{camera_keys}."
+            raise ValueError(msg)
+        if len(set(camera_keys)) != len(camera_keys):
+            msg = "Post-processing checkpoint camera keys must be unique: " f"{camera_keys}."
+            raise ValueError(msg)
+
+        camera_frame_counts = [int(count) for count in self._post_processing_frames_per_camera()]
+        if len(camera_frame_counts) != len(camera_keys):
+            msg = (
+                "Post-processing checkpoint camera keys/counts differ in "
+                f"length: {len(camera_keys)} keys and "
+                f"{len(camera_frame_counts)} counts."
+            )
+            raise ValueError(msg)
+        if any(count <= 0 for count in camera_frame_counts):
+            msg = "Post-processing checkpoint camera frame counts must be " f"positive: {camera_frame_counts}."
+            raise ValueError(msg)
+
+        method = self.conf.post_processing.method
+        controller_enabled = bool(method == "ppisp" and getattr(self.post_processing.config, "use_controller", False))
+        scheduler_last_epoch = None
+        if method == "ppisp":
+            scheduler = getattr(
+                self.post_processing,
+                "_ppisp_scheduler",
+                None,
+            )
+            if scheduler is None:
+                msg = "Cannot save PPISP inference metadata without its " "training scheduler."
+                raise ValueError(msg)
+            last_epoch = getattr(scheduler, "last_epoch", None)
+            if last_epoch is None:
+                msg = "Cannot save PPISP inference metadata without the " "scheduler epoch."
+                raise ValueError(msg)
+            scheduler_last_epoch = int(last_epoch)
+
+        activation_step = -1
+        if controller_enabled:
+            activation_step = int(
+                getattr(
+                    self.post_processing,
+                    "_controller_activation_step",
+                    -1,
+                )
+            )
+        checkpoint_global_step = int(self.global_step)
+        controller_trained = bool(
+            controller_enabled
+            and scheduler_last_epoch is not None
+            and activation_step >= 0
+            and scheduler_last_epoch > activation_step
+            and checkpoint_global_step >= activation_step
+        )
+        return {
+            "camera_keys": list(camera_keys),
+            "camera_frame_counts": camera_frame_counts,
+            "camera_index_mode": self._post_processing_camera_index_mode,
+            "inference_contract": {
+                "schema_version": 1,
+                "checkpoint_global_step": checkpoint_global_step,
+                "controller_enabled": controller_enabled,
+                "controller_trained": controller_trained,
+                "controller_activation_step": activation_step,
+                "scheduler_last_epoch": scheduler_last_epoch,
+            },
+        }
+
+    @staticmethod
+    def _validate_post_processing_camera_count(
+        *,
+        num_cameras: int,
+        expected_num_cameras: int | None,
+        frames_per_camera: list[int] | None = None,
+        camera_names: list[str] | None = None,
+        expected_camera_names: list[str] | None = None,
+    ) -> None:
+        """Fail when a recipe's expected physical rig was not recovered."""
+        if expected_num_cameras is not None and expected_num_cameras < 1:
+            msg = "post_processing.expected_num_cameras must be positive, " f"got {expected_num_cameras}."
+            raise ValueError(msg)
+        if expected_num_cameras is not None and num_cameras != expected_num_cameras:
+            msg = (
+                "Post-processing physical-camera count mismatch: expected "
+                f"{expected_num_cameras}, got {num_cameras}. Check the "
+                "dataset image naming and "
+                "post_processing.camera_index_mode."
+            )
+            raise ValueError(msg)
+        if frames_per_camera is not None:
+            inactive_indices = [index for index, frame_count in enumerate(frames_per_camera) if frame_count <= 0]
+            if inactive_indices:
+                msg = (
+                    "Post-processing physical-camera buckets must all have "
+                    "training frames; inactive indices: "
+                    f"{inactive_indices}, counts={frames_per_camera}."
+                )
+                raise ValueError(msg)
+        if expected_camera_names is None:
+            return
+        if camera_names is None:
+            msg = (
+                "Post-processing expected camera names were configured, but "
+                "the dataset does not expose physical-camera names."
+            )
+            raise ValueError(msg)
+        if camera_names != expected_camera_names:
+            msg = (
+                "Post-processing physical-camera names mismatch: expected "
+                f"{expected_camera_names}, got {camera_names}. Check image "
+                "naming and post_processing.camera_index_mode."
+            )
+            raise ValueError(msg)
+
+    def _validate_post_processing_camera_contract(
+        self,
+        conf: DictConfig,
+    ) -> None:
+        """Validate appearance-camera grouping before GPU model setup."""
+        if conf.post_processing.method is None:
+            return
+        frames_per_camera = self._post_processing_frames_per_camera()
+        expected_num_cameras = conf.post_processing.get("expected_num_cameras")
+        configured_names = conf.post_processing.get("expected_camera_names")
+        expected_camera_names = list(configured_names) if configured_names else None
+        self._validate_post_processing_camera_count(
+            num_cameras=len(frames_per_camera),
+            expected_num_cameras=(int(expected_num_cameras) if expected_num_cameras is not None else None),
+            frames_per_camera=frames_per_camera,
+            camera_names=self._post_processing_camera_names(),
+            expected_camera_names=expected_camera_names,
+        )
+
     def init_dataloaders(self, conf: DictConfig):
         from threedgrut.datasets.utils import configure_dataloader_for_platform
 
-        train_dataset, val_dataset = datasets.make(
-            name=conf.dataset.type, config=conf, ray_jitter=None
-        )
+        train_dataset, val_dataset = datasets.make(name=conf.dataset.type, config=conf, ray_jitter=None)
         train_dataloader_kwargs = configure_dataloader_for_platform(
             {
                 "num_workers": conf.num_workers,
@@ -1643,9 +1706,7 @@ class Trainer3DGRUT:
             generator=self.run_generator,
             **train_dataloader_kwargs,
         )
-        val_dataloader = torch.utils.data.DataLoader(
-            val_dataset, **val_dataloader_kwargs
-        )
+        val_dataloader = torch.utils.data.DataLoader(val_dataset, **val_dataloader_kwargs)
 
         self.train_dataset = train_dataset
         self.train_dataloader = train_dataloader
@@ -1662,12 +1723,8 @@ class Trainer3DGRUT:
         if self.val_dataset is not None:
             del self.val_dataset
 
-    def init_scene_extents(
-        self, train_dataset: BoundedMultiViewDataset
-    ) -> None:
-        scene_bbox: tuple[
-            torch.Tensor, torch.Tensor
-        ]  # Tuple of vec3 (min,max)
+    def init_scene_extents(self, train_dataset: BoundedMultiViewDataset) -> None:
+        scene_bbox: tuple[torch.Tensor, torch.Tensor]  # Tuple of vec3 (min,max)
         scene_extent = train_dataset.get_scene_extent()
         scene_bbox = train_dataset.get_scene_bbox()
         self.scene_extent = scene_extent
@@ -1677,9 +1734,7 @@ class Trainer3DGRUT:
         """Initializes the gaussian model and the optix context"""
         self.model = MixtureOfGaussians(conf, scene_extent=scene_extent)
 
-    def init_densification_and_pruning_strategy(
-        self, conf: DictConfig
-    ) -> None:
+    def init_densification_and_pruning_strategy(self, conf: DictConfig) -> None:
         """Set pre-train / post-train iteration logic. i.e. densification and pruning"""
         assert self.model is not None
         match self.conf.strategy.method:
@@ -1694,9 +1749,7 @@ class Trainer3DGRUT:
                 self.strategy = MCMCStrategy(conf, self.model)
                 logger.info("🔆 Using MCMC strategy")
             case _:
-                raise ValueError(
-                    f"unrecognized model.strategy {conf.strategy.method}"
-                )
+                raise ValueError(f"unrecognized model.strategy {conf.strategy.method}")
 
     def setup_training(
         self,
@@ -1712,9 +1765,7 @@ class Trainer3DGRUT:
         """
         # Initialize
         if conf.resume:  # Load a checkpoint
-            logger.info(
-                f"🤸 Loading a pretrained checkpoint from {conf.resume}!"
-            )
+            logger.info(f"🤸 Loading a pretrained checkpoint from {conf.resume}!")
             checkpoint = torch.load(conf.resume, weights_only=False)
             # THREEDGRUT_RESUME_PERMUTE=1: apply one random permutation to
             # every per-gaussian row across the checkpoint (params,
@@ -1745,18 +1796,13 @@ class Trainer3DGRUT:
                     return node
 
                 checkpoint = _permute_rows(checkpoint)
-                logger.info(
-                    f"resume-permute: shuffled {n_gaussians} gaussian rows"
-                )
+                logger.info(f"resume-permute: shuffled {n_gaussians} gaussian rows")
             model.init_from_checkpoint(checkpoint)
             self.strategy.init_densification_buffer(checkpoint)
             global_step = checkpoint["global_step"]
 
             # Restore post-processing state
-            if (
-                "post_processing" in checkpoint
-                and self.post_processing is not None
-            ):
+            if "post_processing" in checkpoint and self.post_processing is not None:
                 dropped = _load_post_processing_state(
                     self.post_processing,
                     checkpoint["post_processing"]["module"],
@@ -1786,11 +1832,7 @@ class Trainer3DGRUT:
                         )
                     _scale_optimizer_learning_rates(
                         opt,
-                        scale=float(
-                            self.conf.post_processing.get(
-                                "resume_lr_scale", 1.0
-                            )
-                        ),
+                        scale=float(self.conf.post_processing.get("resume_lr_scale", 1.0)),
                         label="post-processing resume",
                     )
                 for sched, sched_state in zip(
@@ -1799,16 +1841,9 @@ class Trainer3DGRUT:
                     strict=False,
                 ):
                     sched.load_state_dict(sched_state)
-                logger.info(
-                    "📷 Post-processing state restored from checkpoint"
-                )
-            if (
-                "camera_residual" in checkpoint
-                and self.camera_residual is not None
-            ):
-                self.camera_residual.load_state_dict(
-                    checkpoint["camera_residual"]["module"]
-                )
+                logger.info("📷 Post-processing state restored from checkpoint")
+            if "camera_residual" in checkpoint and self.camera_residual is not None:
+                self.camera_residual.load_state_dict(checkpoint["camera_residual"]["module"])
                 if self.camera_residual_optimizer is not None:
                     _load_optimizer_state(
                         self.camera_residual_optimizer,
@@ -1816,12 +1851,9 @@ class Trainer3DGRUT:
                         label="camera_residual",
                     )
                 if self.camera_residual_scheduler is not None:
-                    self.camera_residual_scheduler.load_state_dict(
-                        checkpoint["camera_residual"]["scheduler"]
-                    )
-                logger.info(
-                    "📷 Camera residual state restored from checkpoint"
-                )
+                    self.camera_residual_scheduler.load_state_dict(checkpoint["camera_residual"]["scheduler"])
+                logger.info("📷 Camera residual state restored from checkpoint")
+            self._pending_geometry_optimizer_state = checkpoint.get("geometry_only_optimizer")
         elif conf.import_ply.enabled:
             ply_path = (
                 conf.import_ply.path
@@ -1856,12 +1888,8 @@ class Trainer3DGRUT:
                         device=self.device,
                     )
                     ply_path = conf.initialization.fused_point_cloud_path
-                    logger.info(
-                        f"Initializing from accumulated point cloud: {ply_path}"
-                    )
-                    model.init_from_fused_point_cloud(
-                        ply_path, observer_points
-                    )
+                    logger.info(f"Initializing from accumulated point cloud: {ply_path}")
+                    model.init_from_fused_point_cloud(ply_path, observer_points)
                 case "point_cloud":
                     try:
                         ply_path = os.path.join(conf.path, "point_cloud.ply")
@@ -1870,59 +1898,33 @@ class Trainer3DGRUT:
                         logger.error(e)
                         raise e
                 case "checkpoint":
-                    checkpoint = torch.load(
-                        conf.initialization.path, weights_only=False
-                    )
-                    model.init_from_checkpoint(
-                        checkpoint, setup_optimizer=False
-                    )
-                    if (
-                        "post_processing" in checkpoint
-                        and self.post_processing is not None
-                    ):
+                    checkpoint = torch.load(conf.initialization.path, weights_only=False)
+                    model.init_from_checkpoint(checkpoint, setup_optimizer=False)
+                    if "post_processing" in checkpoint and self.post_processing is not None:
                         dropped = _load_post_processing_state(
                             self.post_processing,
                             checkpoint["post_processing"]["module"],
                         )
                         if dropped:
                             logger.warning(
-                                "📷 Dropping shape-mismatched "
-                                f"post-processing buffers: {sorted(dropped)}."
+                                "📷 Dropping shape-mismatched " f"post-processing buffers: {sorted(dropped)}."
                             )
-                        logger.info(
-                            "📷 Post-processing module restored from initialization checkpoint"
-                        )
-                    if (
-                        "camera_residual" in checkpoint
-                        and self.camera_residual is not None
-                    ):
-                        self.camera_residual.load_state_dict(
-                            checkpoint["camera_residual"]["module"]
-                        )
-                        logger.info(
-                            "📷 Camera residual module restored from "
-                            "initialization checkpoint"
-                        )
+                        logger.info("📷 Post-processing module restored from initialization checkpoint")
+                    if "camera_residual" in checkpoint and self.camera_residual is not None:
+                        self.camera_residual.load_state_dict(checkpoint["camera_residual"]["module"])
+                        logger.info("📷 Camera residual module restored from " "initialization checkpoint")
                 case "lidar":
-                    assert isinstance(train_dataset, datasets.NCoreDataset), (
-                        "can only initialize from lidar with NCoreDataset"
-                    )
+                    assert isinstance(
+                        train_dataset, datasets.NCoreDataset
+                    ), "can only initialize from lidar with NCoreDataset"
                     pc = PointCloud.from_sequence(
-                        list(
-                            train_dataset.get_point_clouds(
-                                step_frame=1, non_dynamic_points_only=True
-                            )
-                        ),
+                        list(train_dataset.get_point_clouds(step_frame=1, non_dynamic_points_only=True)),
                         device="cpu",
                     )
                     if conf.initialization.num_points < len(pc.xyz_end):
                         # Deterministically random subsample points if there are more points than the specified number of gaussians
-                        rng = torch.Generator().manual_seed(
-                            conf.seed_initialization
-                        )
-                        idxs = torch.randperm(len(pc.xyz_end), generator=rng)[
-                            : conf.initialization.num_points
-                        ]
+                        rng = torch.Generator().manual_seed(conf.seed_initialization)
+                        idxs = torch.randperm(len(pc.xyz_end), generator=rng)[: conf.initialization.num_points]
                         pc = pc.selected_idxs(idxs)
                     observer_points = torch.tensor(
                         train_dataset.get_observer_points(),
@@ -1942,9 +1944,7 @@ class Trainer3DGRUT:
             global_step = 0
 
         self.global_step = global_step
-        self.n_epochs = int(
-            (conf.n_iterations + len(train_dataset) - 1) / len(train_dataset)
-        )
+        self.n_epochs = int((conf.n_iterations + len(train_dataset) - 1) / len(train_dataset))
 
     def init_gui(
         self,
@@ -1974,12 +1974,8 @@ class Trainer3DGRUT:
         )
         if bool(self.conf.get("compute_extra_metrics", True)):
             criterions.update(
-                ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(
-                    self.device
-                ),
-                lpips=LearnedPerceptualImagePatchSimilarity(
-                    net_type="vgg", normalize=True
-                ).to(self.device),
+                ssim=StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device),
+                lpips=LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=True).to(self.device),
             )
         self.criterions = criterions
 
@@ -2010,9 +2006,7 @@ class Trainer3DGRUT:
         # Per-step Parquet sidecar (AI-readable diagnostics substrate).
         self.diagnostics = None
         diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
-        if diag_conf is not None and bool(
-            diag_conf.get("parquet_enabled", True)
-        ):
+        if diag_conf is not None and bool(diag_conf.get("parquet_enabled", True)):
             from threedgrut.utils.diagnostics_writer import DiagnosticsWriter
 
             diag_path = os.path.join(out_dir, "diagnostics.parquet")
@@ -2039,19 +2033,13 @@ class Trainer3DGRUT:
 
             # Distillation mode: controller activates after main training
             # Total iterations = n_iterations, distillation starts at n_iterations - n_distillation_steps
-            n_distillation_steps = conf.post_processing.get(
-                "n_distillation_steps", 5000
-            )
+            n_distillation_steps = conf.post_processing.get("n_distillation_steps", 5000)
             if use_controller and n_distillation_steps > 0:
                 main_training_steps = conf.n_iterations - n_distillation_steps
-                controller_activation_ratio = (
-                    main_training_steps / conf.n_iterations
-                )
+                controller_activation_ratio = main_training_steps / conf.n_iterations
                 controller_distillation = True
                 self._distillation_start_step = main_training_steps
-                logger.info(
-                    f"📷 PPISP distillation mode: controller activates at step {main_training_steps}"
-                )
+                logger.info(f"📷 PPISP distillation mode: controller activates at step {main_training_steps}")
             elif use_controller:
                 controller_activation_ratio = 0.8
                 controller_distillation = False
@@ -2073,19 +2061,13 @@ class Trainer3DGRUT:
                 config=ppisp_config,
             ).to(self.device)
 
-            self.post_processing_optimizers = (
-                self.post_processing.create_optimizers()
-            )
-            self.post_processing_schedulers = (
-                self.post_processing.create_schedulers(
-                    self.post_processing_optimizers,
-                    max_optimization_iters=conf.n_iterations,
-                )
+            self.post_processing_optimizers = self.post_processing.create_optimizers()
+            self.post_processing_schedulers = self.post_processing.create_schedulers(
+                self.post_processing_optimizers,
+                max_optimization_iters=conf.n_iterations,
             )
 
-            logger.info(
-                f"📷 {method.upper()} initialized: {num_cameras} cameras, {num_frames} frames"
-            )
+            logger.info(f"📷 {method.upper()} initialized: {num_cameras} cameras, {num_frames} frames")
         elif method == "luminance_affine":
             frames_per_camera = self._post_processing_frames_per_camera()
             num_cameras = len(frames_per_camera)
@@ -2184,20 +2166,13 @@ class Trainer3DGRUT:
                 ),
             ).to(self.device)
 
-            self.post_processing_optimizers = (
-                self.post_processing.create_optimizers()
-            )
-            self.post_processing_schedulers = (
-                self.post_processing.create_schedulers(
-                    self.post_processing_optimizers,
-                    max_optimization_iters=conf.n_iterations,
-                )
+            self.post_processing_optimizers = self.post_processing.create_optimizers()
+            self.post_processing_schedulers = self.post_processing.create_schedulers(
+                self.post_processing_optimizers,
+                max_optimization_iters=conf.n_iterations,
             )
 
-            logger.info(
-                f"📷 LUMINANCE_AFFINE initialized: {num_cameras} cameras, "
-                f"{num_frames} frames"
-            )
+            logger.info(f"📷 LUMINANCE_AFFINE initialized: {num_cameras} cameras, " f"{num_frames} frames")
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
 
@@ -2219,23 +2194,15 @@ class Trainer3DGRUT:
             reg_lambda=conf.camera_residual.reg_lambda,
             max_rotation_rad=conf.camera_residual.max_rotation_rad,
             max_translation_m=conf.camera_residual.max_translation_m,
-            max_rolling_rotation_rad=(
-                conf.camera_residual.max_rolling_rotation_rad
-            ),
-            max_rolling_translation_m=(
-                conf.camera_residual.max_rolling_translation_m
-            ),
+            max_rolling_rotation_rad=(conf.camera_residual.max_rolling_rotation_rad),
+            max_rolling_translation_m=(conf.camera_residual.max_rolling_translation_m),
             optimize_global=conf.camera_residual.optimize_global,
             optimize_per_camera=conf.camera_residual.optimize_per_camera,
             optimize_per_image=optimize_per_image,
-            optimize_rolling_per_camera=(
-                conf.camera_residual.optimize_rolling_per_camera
-            ),
+            optimize_rolling_per_camera=(conf.camera_residual.optimize_rolling_per_camera),
             n_iterations=conf.n_iterations,
         ).to(self.device)
-        self.camera_residual_optimizer, self.camera_residual_scheduler = (
-            self.camera_residual.create_optimizer()
-        )
+        self.camera_residual_optimizer, self.camera_residual_scheduler = self.camera_residual.create_optimizer()
         logger.warning(
             "📷 CAMERA_RESIDUAL enabled. Current 3DGUT CUDA backward does not "
             "return ray/sensor gradients; monitor camera_residual/max_abs_grad."
@@ -2351,9 +2318,7 @@ class Trainer3DGRUT:
         if not self.camera_residual.optimize_per_camera:
             if not self.camera_residual.optimize_rolling_per_camera:
                 return candidates
-            camera_count = int(
-                self.camera_residual.rolling_rotation_raw.shape[0]
-            )
+            camera_count = int(self.camera_residual.rolling_rotation_raw.shape[0])
             for camera_idx in range(camera_count):
                 candidates.extend(
                     self._camera_residual_audit_rolling_candidates(
@@ -2400,9 +2365,7 @@ class Trainer3DGRUT:
             raise RuntimeError("Camera residual module is not initialized.")
         if self._camera_residual_audit_is_rolling_candidate(candidate_name):
             if camera_idx is None:
-                raise RuntimeError(
-                    "Rolling camera residual audit requires a camera index."
-                )
+                raise RuntimeError("Rolling camera residual audit requires a camera index.")
             self.camera_residual.set_rolling_camera_delta(
                 camera_idx=camera_idx,
                 rotation=rotation,
@@ -2421,9 +2384,7 @@ class Trainer3DGRUT:
             translation=translation,
         )
 
-    def _camera_residual_audit_batch_metrics(
-        self, gpu_batch
-    ) -> dict[str, float]:
+    def _camera_residual_audit_batch_metrics(self, gpu_batch) -> dict[str, float]:
         """Evaluate one validation batch under the active residual candidate."""
         if self.camera_residual is None:
             raise RuntimeError("Camera residual module is not initialized.")
@@ -2435,14 +2396,10 @@ class Trainer3DGRUT:
                 outputs,
                 residual_batch,
                 training=False,
-                camera_idx_override=self._post_processing_camera_idx(
-                    residual_batch
-                ),
+                camera_idx_override=self._post_processing_camera_idx(residual_batch),
             )
         rgb_error = torch.square(outputs["pred_rgb"] - residual_batch.rgb_gt)
-        psnr_value = (
-            -10.0 * torch.log10(torch.clamp_min(rgb_error.mean(), 1e-12))
-        ).item()
+        psnr_value = (-10.0 * torch.log10(torch.clamp_min(rgb_error.mean(), 1e-12))).item()
         metrics = {"psnr": float(psnr_value)}
         if residual_batch.mask is not None:
             mask = residual_batch.mask
@@ -2452,53 +2409,30 @@ class Trainer3DGRUT:
                 1.0,
             )
             masked_mse = masked_error.sum() / denominator
-            metrics["masked_psnr"] = float(
-                (
-                    -10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))
-                ).item()
-            )
+            metrics["masked_psnr"] = float((-10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))).item())
         return metrics
 
     @torch.no_grad()
     def run_camera_residual_per_view_finite_difference_audit(self) -> None:
         """Evaluate per-image SO3/SE3 nudges on selected validation views."""
         if self.camera_residual is None:
-            raise RuntimeError(
-                "camera_residual.finite_difference_audit requires "
-                "camera_residual.enabled=true."
-            )
+            raise RuntimeError("camera_residual.finite_difference_audit requires " "camera_residual.enabled=true.")
         audit_conf = self.conf.camera_residual.finite_difference_audit
         max_views = int(audit_conf.max_views)
         if max_views <= 0:
-            raise ValueError(
-                "camera_residual.finite_difference_audit.max_views must be positive."
-            )
-        original_global_rotation = (
-            self.camera_residual.global_rotation_raw.detach().clone()
-        )
-        original_global_translation = (
-            self.camera_residual.global_translation_raw.detach().clone()
-        )
-        original_camera_rotation = (
-            self.camera_residual.camera_rotation_raw.detach().clone()
-        )
-        original_camera_translation = (
-            self.camera_residual.camera_translation_raw.detach().clone()
-        )
-        original_rolling_rotation = (
-            self.camera_residual.rolling_rotation_raw.detach().clone()
-        )
-        original_rolling_translation = (
-            self.camera_residual.rolling_translation_raw.detach().clone()
-        )
+            raise ValueError("camera_residual.finite_difference_audit.max_views must be positive.")
+        original_global_rotation = self.camera_residual.global_rotation_raw.detach().clone()
+        original_global_translation = self.camera_residual.global_translation_raw.detach().clone()
+        original_camera_rotation = self.camera_residual.camera_rotation_raw.detach().clone()
+        original_camera_translation = self.camera_residual.camera_translation_raw.detach().clone()
+        original_rolling_rotation = self.camera_residual.rolling_rotation_raw.detach().clone()
+        original_rolling_translation = self.camera_residual.rolling_translation_raw.detach().clone()
         target_image_names = self._camera_residual_audit_target_image_names()
         rows = []
         selected_views = 0
         try:
             for _, batch_idx in enumerate(self.val_dataloader):
-                gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
-                    batch_idx
-                )
+                gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
                 image_name = os.path.basename(gpu_batch.image_path)
                 if target_image_names and image_name not in target_image_names:
                     continue
@@ -2518,13 +2452,8 @@ class Trainer3DGRUT:
                         rotation=rotation,
                         translation=translation,
                     )
-                    logger.info(
-                        "Camera residual per-view finite-difference candidate: "
-                        f"{image_name} {name}"
-                    )
-                    metrics = self._camera_residual_audit_batch_metrics(
-                        gpu_batch
-                    )
+                    logger.info("Camera residual per-view finite-difference candidate: " f"{image_name} {name}")
+                    metrics = self._camera_residual_audit_batch_metrics(gpu_batch)
                     if baseline_metrics is None:
                         baseline_metrics = metrics
                     row = {
@@ -2539,67 +2468,35 @@ class Trainer3DGRUT:
                         "translation_y": float(translation[1].item()),
                         "translation_z": float(translation[2].item()),
                         "mean_psnr": metrics["psnr"],
-                        "delta_psnr": (
-                            metrics["psnr"] - baseline_metrics["psnr"]
-                        ),
+                        "delta_psnr": (metrics["psnr"] - baseline_metrics["psnr"]),
                     }
                     if "masked_psnr" in metrics:
                         baseline_masked = baseline_metrics["masked_psnr"]
                         row["mean_masked_psnr"] = metrics["masked_psnr"]
-                        row["delta_masked_psnr"] = (
-                            metrics["masked_psnr"] - baseline_masked
-                        )
+                        row["delta_masked_psnr"] = metrics["masked_psnr"] - baseline_masked
                     rows.append(row)
         finally:
             with torch.no_grad():
-                self.camera_residual.global_rotation_raw.copy_(
-                    original_global_rotation
-                )
-                self.camera_residual.global_translation_raw.copy_(
-                    original_global_translation
-                )
-                self.camera_residual.camera_rotation_raw.copy_(
-                    original_camera_rotation
-                )
-                self.camera_residual.camera_translation_raw.copy_(
-                    original_camera_translation
-                )
-                self.camera_residual.rolling_rotation_raw.copy_(
-                    original_rolling_rotation
-                )
-                self.camera_residual.rolling_translation_raw.copy_(
-                    original_rolling_translation
-                )
+                self.camera_residual.global_rotation_raw.copy_(original_global_rotation)
+                self.camera_residual.global_translation_raw.copy_(original_global_translation)
+                self.camera_residual.camera_rotation_raw.copy_(original_camera_rotation)
+                self.camera_residual.camera_translation_raw.copy_(original_camera_translation)
+                self.camera_residual.rolling_rotation_raw.copy_(original_rolling_rotation)
+                self.camera_residual.rolling_translation_raw.copy_(original_rolling_translation)
         if target_image_names and selected_views != len(target_image_names):
             found = {str(row["image_name"]) for row in rows}
             missing = sorted(target_image_names - found)
-            logger.warning(
-                "Camera residual per-view audit did not find all targets: "
-                f"{missing}"
-            )
+            logger.warning("Camera residual per-view audit did not find all targets: " f"{missing}")
         if not rows:
-            raise RuntimeError(
-                "Camera residual per-view finite-difference audit selected no "
-                "validation views."
-            )
-        score_key = (
-            "delta_masked_psnr"
-            if any("delta_masked_psnr" in row for row in rows)
-            else "delta_psnr"
-        )
+            raise RuntimeError("Camera residual per-view finite-difference audit selected no " "validation views.")
+        score_key = "delta_masked_psnr" if any("delta_masked_psnr" in row for row in rows) else "delta_psnr"
         finite_rows = [row for row in rows if np.isfinite(row[score_key])]
         best = max(finite_rows, key=lambda row: row[score_key])
-        baselines = [
-            row for row in rows if row["candidate"].endswith("_baseline")
-        ]
+        baselines = [row for row in rows if row["candidate"].endswith("_baseline")]
         for row in rows:
-            display_row = {
-                key: str(value) if isinstance(value, int) else value
-                for key, value in row.items()
-            }
+            display_row = {key: str(value) if isinstance(value, int) else value for key, value in row.items()}
             logger.log_table(
-                "Camera Residual Per-View Finite-Difference Audit - "
-                f"{row['image_name']} {row['candidate']}",
+                "Camera Residual Per-View Finite-Difference Audit - " f"{row['image_name']} {row['candidate']}",
                 record=display_row,
             )
         output_path = os.path.join(
@@ -2624,47 +2521,27 @@ class Trainer3DGRUT:
             f"{best['image_name']} {best['candidate']} "
             f"{score_key}={best[score_key]:.6f}"
         )
-        logger.info(
-            "Camera residual per-view finite-difference audit JSON: "
-            f"{output_path}"
-        )
+        logger.info("Camera residual per-view finite-difference audit JSON: " f"{output_path}")
 
     @torch.no_grad()
     def run_camera_residual_finite_difference_audit(self) -> None:
         """Evaluate fixed SO3/SE3 residual nudges without ray gradients."""
         if self.camera_residual is None:
-            raise RuntimeError(
-                "camera_residual.finite_difference_audit requires "
-                "camera_residual.enabled=true."
-            )
+            raise RuntimeError("camera_residual.finite_difference_audit requires " "camera_residual.enabled=true.")
         audit_conf = self.conf.camera_residual.finite_difference_audit
         max_views = int(audit_conf.max_views)
         if max_views <= 0:
-            raise ValueError(
-                "camera_residual.finite_difference_audit.max_views must be positive."
-            )
+            raise ValueError("camera_residual.finite_difference_audit.max_views must be positive.")
         if bool(audit_conf.get("per_view", False)):
             self.run_camera_residual_per_view_finite_difference_audit()
             return
 
-        original_rotation = (
-            self.camera_residual.global_rotation_raw.detach().clone()
-        )
-        original_translation = (
-            self.camera_residual.global_translation_raw.detach().clone()
-        )
-        original_camera_rotation = (
-            self.camera_residual.camera_rotation_raw.detach().clone()
-        )
-        original_camera_translation = (
-            self.camera_residual.camera_translation_raw.detach().clone()
-        )
-        original_rolling_rotation = (
-            self.camera_residual.rolling_rotation_raw.detach().clone()
-        )
-        original_rolling_translation = (
-            self.camera_residual.rolling_translation_raw.detach().clone()
-        )
+        original_rotation = self.camera_residual.global_rotation_raw.detach().clone()
+        original_translation = self.camera_residual.global_translation_raw.detach().clone()
+        original_camera_rotation = self.camera_residual.camera_rotation_raw.detach().clone()
+        original_camera_translation = self.camera_residual.camera_translation_raw.detach().clone()
+        original_rolling_rotation = self.camera_residual.rolling_rotation_raw.detach().clone()
+        original_rolling_translation = self.camera_residual.rolling_translation_raw.detach().clone()
         rows = []
         try:
             for (
@@ -2681,36 +2558,19 @@ class Trainer3DGRUT:
                 )
                 psnr_values = []
                 masked_psnr_values = []
-                logger.info(
-                    f"Camera residual finite-difference candidate: {name}"
-                )
+                logger.info(f"Camera residual finite-difference candidate: {name}")
                 for _, batch_idx in enumerate(self.val_dataloader):
-                    gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
-                        batch_idx
-                    )
-                    if (
-                        camera_idx is not None
-                        and gpu_batch.camera_idx != camera_idx
-                    ):
+                    gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
+                    if camera_idx is not None and gpu_batch.camera_idx != camera_idx:
                         continue
                     if len(psnr_values) >= max_views:
                         break
-                    metrics = self._camera_residual_audit_batch_metrics(
-                        gpu_batch
-                    )
+                    metrics = self._camera_residual_audit_batch_metrics(gpu_batch)
                     psnr_values.append(metrics["psnr"])
                     if "masked_psnr" in metrics:
                         masked_psnr_values.append(metrics["masked_psnr"])
-                mean_psnr = (
-                    float(np.mean(psnr_values))
-                    if psnr_values
-                    else float("nan")
-                )
-                mean_masked_psnr = (
-                    float(np.mean(masked_psnr_values))
-                    if masked_psnr_values
-                    else float("nan")
-                )
+                mean_psnr = float(np.mean(psnr_values)) if psnr_values else float("nan")
+                mean_masked_psnr = float(np.mean(masked_psnr_values)) if masked_psnr_values else float("nan")
                 rows.append(
                     {
                         "candidate": name,
@@ -2727,46 +2587,27 @@ class Trainer3DGRUT:
                 )
         finally:
             with torch.no_grad():
-                self.camera_residual.global_rotation_raw.copy_(
-                    original_rotation
-                )
-                self.camera_residual.global_translation_raw.copy_(
-                    original_translation
-                )
-                self.camera_residual.camera_rotation_raw.copy_(
-                    original_camera_rotation
-                )
-                self.camera_residual.camera_translation_raw.copy_(
-                    original_camera_translation
-                )
-                self.camera_residual.rolling_rotation_raw.copy_(
-                    original_rolling_rotation
-                )
-                self.camera_residual.rolling_translation_raw.copy_(
-                    original_rolling_translation
-                )
+                self.camera_residual.global_rotation_raw.copy_(original_rotation)
+                self.camera_residual.global_translation_raw.copy_(original_translation)
+                self.camera_residual.camera_rotation_raw.copy_(original_camera_rotation)
+                self.camera_residual.camera_translation_raw.copy_(original_camera_translation)
+                self.camera_residual.rolling_rotation_raw.copy_(original_rolling_rotation)
+                self.camera_residual.rolling_translation_raw.copy_(original_rolling_translation)
 
         score_key = "mean_masked_psnr"
         if not rows or all(np.isnan(row[score_key]) for row in rows):
             score_key = "mean_psnr"
         finite_rows = [row for row in rows if not np.isnan(row[score_key])]
         best = max(finite_rows, key=lambda row: row[score_key])
-        if self._camera_residual_audit_is_rolling_candidate(
-            str(best["candidate"])
-        ):
+        if self._camera_residual_audit_is_rolling_candidate(str(best["candidate"])):
             baseline_name = f"rolling_camera_{best['camera_idx']}_baseline"
         elif best["camera_idx"] >= 0:
             baseline_name = f"camera_{best['camera_idx']}_baseline"
         else:
             baseline_name = "global_baseline"
-        baseline = next(
-            row for row in rows if row["candidate"] == baseline_name
-        )
+        baseline = next(row for row in rows if row["candidate"] == baseline_name)
         for row in rows:
-            display_row = {
-                key: str(value) if isinstance(value, int) else value
-                for key, value in row.items()
-            }
+            display_row = {key: str(value) if isinstance(value, int) else value for key, value in row.items()}
             logger.log_table(
                 f"Camera Residual Finite-Difference Audit - {row['candidate']}",
                 record=display_row,
@@ -2792,16 +2633,12 @@ class Trainer3DGRUT:
             f"baseline={baseline[score_key]:.6f}; "
             f"delta={best[score_key] - baseline[score_key]:.6f}"
         )
-        logger.info(
-            f"Camera residual finite-difference audit JSON: {output_path}"
-        )
+        logger.info(f"Camera residual finite-difference audit JSON: {output_path}")
 
     def _camera_intrinsics_audit_candidates(self) -> list[dict[str, Any]]:
         """Return renderer-side RATIONAL intrinsics perturbation candidates."""
         audit_conf = self.conf.camera_intrinsics_audit
-        candidates = [
-            {"name": "baseline", "target": "", "index": -1, "scale": 0.0}
-        ]
+        candidates = [{"name": "baseline", "target": "", "index": -1, "scale": 0.0}]
         candidate_specs = (
             (
                 "fx",
@@ -2875,15 +2712,11 @@ class Trainer3DGRUT:
                 )
         return candidates
 
-    def _with_intrinsics_audit_delta(
-        self, gpu_batch, candidate: dict[str, Any]
-    ):
+    def _with_intrinsics_audit_delta(self, gpu_batch, candidate: dict[str, Any]):
         """Return a batch with one renderer-side RATIONAL intrinsic delta."""
         params = gpu_batch.intrinsics_RationalCameraModelParameters
         if params is None:
-            raise RuntimeError(
-                "camera_intrinsics_audit requires RATIONAL cameras."
-            )
+            raise RuntimeError("camera_intrinsics_audit requires RATIONAL cameras.")
         if candidate["name"] == "baseline":
             return gpu_batch
 
@@ -2900,17 +2733,13 @@ class Trainer3DGRUT:
         if target == "skew":
             updated_params[target] = float(updated_params[target]) + scale
         else:
-            values = np.asarray(
-                updated_params[target], dtype=np.float32
-            ).copy()
+            values = np.asarray(updated_params[target], dtype=np.float32).copy()
             delta = scale
             if bool(candidate.get("relative", False)):
                 delta = float(values[index]) * scale
             values[index] = values[index] + delta
             updated_params[target] = values
-        return replace(
-            gpu_batch, intrinsics_RationalCameraModelParameters=updated_params
-        )
+        return replace(gpu_batch, intrinsics_RationalCameraModelParameters=updated_params)
 
     @torch.no_grad()
     def _camera_intrinsics_candidate_metrics(
@@ -2923,14 +2752,10 @@ class Trainer3DGRUT:
         """Evaluate one intrinsics candidate on one camera head."""
         metrics = []
         for batch_idx in self.val_dataloader:
-            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
-                batch_idx
-            )
+            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
             if int(gpu_batch.camera_idx) != camera_idx:
                 continue
-            audited_batch = self._with_intrinsics_audit_delta(
-                gpu_batch, candidate
-            )
+            audited_batch = self._with_intrinsics_audit_delta(gpu_batch, candidate)
             outputs = self.model(audited_batch, train=False)
             if self.post_processing is not None:
                 outputs = apply_post_processing(
@@ -2938,9 +2763,7 @@ class Trainer3DGRUT:
                     outputs,
                     audited_batch,
                     training=False,
-                    camera_idx_override=self._post_processing_camera_idx(
-                        audited_batch
-                    ),
+                    camera_idx_override=self._post_processing_camera_idx(audited_batch),
                 )
             rgb_gt = audited_batch.rgb_gt
             rgb_pred = outputs["pred_rgb"]
@@ -2948,9 +2771,7 @@ class Trainer3DGRUT:
             if audited_batch.mask is not None:
                 mask = audited_batch.mask
                 rgb_error = rgb_error * mask
-                denominator = torch.clamp_min(
-                    mask.sum() * rgb_gt.shape[-1], 1.0
-                )
+                denominator = torch.clamp_min(mask.sum() * rgb_gt.shape[-1], 1.0)
             else:
                 denominator = torch.tensor(
                     rgb_gt.numel(),
@@ -2965,26 +2786,18 @@ class Trainer3DGRUT:
             )
             metrics.append(
                 {
-                    "masked_psnr": (
-                        -10.0 * torch.log10(torch.clamp_min(mse, 1e-12))
-                    ).item(),
+                    "masked_psnr": (-10.0 * torch.log10(torch.clamp_min(mse, 1e-12))).item(),
                     "gradient_l1": diagnostics["gradient_l1"],
                     "high_ratio": diagnostics["fft_energy_ratio_high"],
                     "rim_rgb_l1": diagnostics["radial_rim_rgb_l1"],
-                    "rim_edge_ratio": diagnostics[
-                        "radial_rim_edge_energy_ratio"
-                    ],
-                    "center_edge_ratio": diagnostics[
-                        "radial_center_edge_energy_ratio"
-                    ],
+                    "rim_edge_ratio": diagnostics["radial_rim_edge_energy_ratio"],
+                    "center_edge_ratio": diagnostics["radial_center_edge_energy_ratio"],
                 }
             )
             if len(metrics) >= max_views:
                 break
         if not metrics:
-            raise RuntimeError(
-                f"No validation views found for camera {camera_idx}."
-            )
+            raise RuntimeError(f"No validation views found for camera {camera_idx}.")
         return {
             "camera_idx": camera_idx,
             "candidate": str(candidate["name"]),
@@ -2993,12 +2806,8 @@ class Trainer3DGRUT:
             "gradient_l1": float(np.mean([m["gradient_l1"] for m in metrics])),
             "high_ratio": float(np.mean([m["high_ratio"] for m in metrics])),
             "rim_rgb_l1": float(np.mean([m["rim_rgb_l1"] for m in metrics])),
-            "rim_edge_ratio": float(
-                np.mean([m["rim_edge_ratio"] for m in metrics])
-            ),
-            "center_edge_ratio": float(
-                np.mean([m["center_edge_ratio"] for m in metrics])
-            ),
+            "rim_edge_ratio": float(np.mean([m["rim_edge_ratio"] for m in metrics])),
+            "center_edge_ratio": float(np.mean([m["center_edge_ratio"] for m in metrics])),
         }
 
     @torch.no_grad()
@@ -3007,9 +2816,7 @@ class Trainer3DGRUT:
         audit_conf = self.conf.camera_intrinsics_audit
         max_views = int(audit_conf.max_views_per_camera)
         if max_views <= 0:
-            raise ValueError(
-                "camera_intrinsics_audit.max_views_per_camera must be positive."
-            )
+            raise ValueError("camera_intrinsics_audit.max_views_per_camera must be positive.")
         camera_indices = [int(idx) for idx in audit_conf.camera_indices]
         rows = []
         for camera_idx in camera_indices:
@@ -3023,22 +2830,12 @@ class Trainer3DGRUT:
                     )
                 )
 
-        baselines = {
-            int(row["camera_idx"]): row
-            for row in rows
-            if row["candidate"] == "baseline"
-        }
+        baselines = {int(row["camera_idx"]): row for row in rows if row["candidate"] == "baseline"}
         for row in rows:
             baseline = baselines[int(row["camera_idx"])]
-            row["delta_masked_psnr"] = float(row["masked_psnr"]) - float(
-                baseline["masked_psnr"]
-            )
-            row["delta_rim_edge_ratio"] = float(row["rim_edge_ratio"]) - float(
-                baseline["rim_edge_ratio"]
-            )
-            row["delta_rim_rgb_l1"] = float(row["rim_rgb_l1"]) - float(
-                baseline["rim_rgb_l1"]
-            )
+            row["delta_masked_psnr"] = float(row["masked_psnr"]) - float(baseline["masked_psnr"])
+            row["delta_rim_edge_ratio"] = float(row["rim_edge_ratio"]) - float(baseline["rim_edge_ratio"])
+            row["delta_rim_rgb_l1"] = float(row["rim_rgb_l1"]) - float(baseline["rim_rgb_l1"])
 
         ranked_rows = sorted(
             rows,
@@ -3062,15 +2859,9 @@ class Trainer3DGRUT:
         )
         with open(output_path, "w", encoding="utf-8") as fp:
             json.dump(report, fp, indent=2)
-        logger.info(
-            f"Camera intrinsics finite-difference audit JSON: {output_path}"
-        )
+        logger.info(f"Camera intrinsics finite-difference audit JSON: {output_path}")
         for camera_idx in camera_indices:
-            best = next(
-                row
-                for row in ranked_rows
-                if int(row["camera_idx"]) == camera_idx
-            )
+            best = next(row for row in ranked_rows if int(row["camera_idx"]) == camera_idx)
             logger.log_table(
                 f"📷 Best camera {camera_idx} intrinsics audit candidate",
                 record={
@@ -3079,9 +2870,7 @@ class Trainer3DGRUT:
                     "masked_psnr": float(best["masked_psnr"]),
                     "delta_masked_psnr": float(best["delta_masked_psnr"]),
                     "rim_edge_ratio": float(best["rim_edge_ratio"]),
-                    "delta_rim_edge_ratio": float(
-                        best["delta_rim_edge_ratio"]
-                    ),
+                    "delta_rim_edge_ratio": float(best["delta_rim_edge_ratio"]),
                     "rim_rgb_l1": float(best["rim_rgb_l1"]),
                     "delta_rim_rgb_l1": float(best["delta_rim_rgb_l1"]),
                 },
@@ -3177,14 +2966,10 @@ class Trainer3DGRUT:
         # Move losses to cpu once
         metrics["losses"] = {k: v.detach().item() for k, v in losses.items()}
 
-        is_compute_train_hit_metrics = (split == "training") and (
-            step % self.conf.writer.hit_stat_frequency == 0
-        )
+        is_compute_train_hit_metrics = (split == "training") and (step % self.conf.writer.hit_stat_frequency == 0)
         is_compute_validation_metrics = split == "validation"
         is_compute_training_eval_metrics = split == "train_eval"
-        is_compute_eval_metrics = (
-            is_compute_validation_metrics or is_compute_training_eval_metrics
-        )
+        is_compute_eval_metrics = is_compute_validation_metrics or is_compute_training_eval_metrics
 
         if is_compute_train_hit_metrics or is_compute_eval_metrics:
             metrics["hits_mean"] = outputs["hits_count"].mean().item()
@@ -3211,12 +2996,8 @@ class Trainer3DGRUT:
             if gpu_batch.mask is not None:
                 valid = gpu_batch.mask
                 valid_denominator = torch.clamp_min(valid.sum(), 1.0)
-                metrics["valid_hit_coverage"] = (
-                    (hit_mask * valid).sum() / valid_denominator
-                ).item()
-                metrics["valid_opacity_coverage"] = (
-                    (opacity_mask * valid).sum() / valid_denominator
-                ).item()
+                metrics["valid_hit_coverage"] = ((hit_mask * valid).sum() / valid_denominator).item()
+                metrics["valid_opacity_coverage"] = ((opacity_mask * valid).sum() / valid_denominator).item()
             else:
                 metrics["valid_hit_coverage"] = hit_mask.mean().item()
                 metrics["valid_opacity_coverage"] = opacity_mask.mean().item()
@@ -3239,9 +3020,7 @@ class Trainer3DGRUT:
                         1.0,
                     )
                     masked_mse = masked_error.sum() / masked_denominator
-                    metrics["masked_psnr"] = (
-                        -10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))
-                    ).item()
+                    metrics["masked_psnr"] = (-10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))).item()
                     metrics["mask_coverage"] = mask.mean().item()
 
         if is_compute_validation_metrics:
@@ -3261,29 +3040,15 @@ class Trainer3DGRUT:
                     metrics["ssim"] = ssim(pred_rgb_full, rgb_gt_full).item()
             if "lpips" in self.criterions:
                 with torch.cuda.nvtx.range("criterions_lpips"):
-                    metrics["lpips"] = lpips(
-                        pred_rgb_full_clipped, rgb_gt_full
-                    ).item()
+                    metrics["lpips"] = lpips(pred_rgb_full_clipped, rgb_gt_full).item()
 
-            is_logged_view = (
-                is_compute_validation_metrics
-                and iteration in self._validation_log_image_views()
-            )
+            is_logged_view = is_compute_validation_metrics and iteration in self._validation_log_image_views()
 
-            diag_conf = (
-                self.conf.get("diagnostics") if hasattr(self.conf, "get")
-                else None
-            )
+            diag_conf = self.conf.get("diagnostics") if hasattr(self.conf, "get") else None
             diagnostics_key = (
-                "validation_metrics_enabled"
-                if is_compute_validation_metrics
-                else "training_metrics_enabled"
+                "validation_metrics_enabled" if is_compute_validation_metrics else "training_metrics_enabled"
             )
-            eval_diagnostics_enabled = (
-                bool(diag_conf.get(diagnostics_key, True))
-                if diag_conf is not None
-                else True
-            )
+            eval_diagnostics_enabled = bool(diag_conf.get(diagnostics_key, True)) if diag_conf is not None else True
             if eval_diagnostics_enabled:
                 metrics.update(
                     _diagnostic_metrics(
@@ -3296,21 +3061,13 @@ class Trainer3DGRUT:
                 _screen_space_footprint_metrics(
                     model=self.model,
                     gpu_batch=gpu_batch,
-                    max_samples=int(
-                        self.conf.writer.get("footprint_sample_count", 200000)
-                    ),
+                    max_samples=int(self.conf.writer.get("footprint_sample_count", 200000)),
                 )
             )
 
             if is_logged_view:
-                mask = (
-                    gpu_batch.mask[-1] if gpu_batch.mask is not None else None
-                )
-                sky_mask = (
-                    gpu_batch.sky_mask[-1]
-                    if gpu_batch.sky_mask is not None
-                    else None
-                )
+                mask = gpu_batch.mask[-1] if gpu_batch.mask is not None else None
+                sky_mask = gpu_batch.sky_mask[-1] if gpu_batch.sky_mask is not None else None
                 metrics["eval_image_path"] = gpu_batch.image_path
                 semantic_label_masks = _load_semantic_label_masks(
                     image_path=str(gpu_batch.image_path),
@@ -3361,9 +3118,7 @@ class Trainer3DGRUT:
         rgb_gt = gpu_batch.rgb_gt
         rgb_pred = outputs["pred_rgb"]
         mask = gpu_batch.mask
-        loss_denominator = torch.tensor(
-            rgb_gt.numel(), dtype=rgb_gt.dtype, device=self.device
-        )
+        loss_denominator = torch.tensor(rgb_gt.numel(), dtype=rgb_gt.dtype, device=self.device)
 
         # Mask out the invalid pixels if the mask is provided
         if mask is not None:
@@ -3387,11 +3142,8 @@ class Trainer3DGRUT:
                 # default-false flag AND on the current frame being ERP, so
                 # perspective/fisheye runs are byte-for-byte unchanged.
                 erp_weight = torch.ones(1, device=self.device)
-                if self.conf.loss.get(
-                    "erp_latitude_weighting", False
-                ) and (
-                    gpu_batch.intrinsics_EquirectCameraModelParameters
-                    is not None
+                if self.conf.loss.get("erp_latitude_weighting", False) and (
+                    gpu_batch.intrinsics_EquirectCameraModelParameters is not None
                 ):
                     height = rgb_error.shape[1]
                     width = rgb_error.shape[2]
@@ -3409,23 +3161,13 @@ class Trainer3DGRUT:
                             dtype=rgb_error.dtype,
                         )
                         cache[cache_key] = erp_weight
-                l1_loss_type = str(
-                    self.conf.loss.get("l1_loss_type", "absolute")
-                )
+                l1_loss_type = str(self.conf.loss.get("l1_loss_type", "absolute"))
                 if l1_loss_type == "absolute":
-                    loss_l1 = (
-                        torch.abs(rgb_error) * erp_weight
-                    ).sum() / loss_denominator
+                    loss_l1 = (torch.abs(rgb_error) * erp_weight).sum() / loss_denominator
                 elif l1_loss_type == "charbonnier":
-                    epsilon = float(
-                        self.conf.loss.get("charbonnier_epsilon", 0.01)
-                    )
+                    epsilon = float(self.conf.loss.get("charbonnier_epsilon", 0.01))
                     loss_l1 = (
-                        (
-                            torch.sqrt(rgb_error.square() + epsilon * epsilon)
-                            - epsilon
-                        )
-                        * erp_weight
+                        (torch.sqrt(rgb_error.square() + epsilon * epsilon) - epsilon) * erp_weight
                     ).sum() / loss_denominator
                 else:
                     msg = (
@@ -3475,24 +3217,19 @@ class Trainer3DGRUT:
         lambda_sky_opacity = 0.0
         if self.conf.loss.use_sky_opacity:
             if gpu_batch.sky_mask is None:
-                raise RuntimeError(
-                    "loss.use_sky_opacity requires dataset.sky_mask_folder."
-                )
+                raise RuntimeError("loss.use_sky_opacity requires dataset.sky_mask_folder.")
             with torch.cuda.nvtx.range("loss-sky-opacity"):
                 sky_mask = gpu_batch.sky_mask
                 sky_denominator = torch.clamp(sky_mask.sum(), min=1.0)
-                loss_sky_opacity = (
-                    outputs["pred_opacity"] * sky_mask
-                ).sum() / sky_denominator
+                loss_sky_opacity = (outputs["pred_opacity"] * sky_mask).sum() / sky_denominator
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
         loss_depth = torch.zeros(1, device=self.device)
+        depth_valid_count = torch.zeros(1, device=self.device)
         lambda_depth = 0.0
         if self.conf.loss.get("use_depth", False):
             if gpu_batch.depth_gt is None:
-                raise RuntimeError(
-                    "loss.use_depth requires dataset.depth_folder."
-                )
+                raise RuntimeError("loss.use_depth requires dataset.depth_folder.")
             with torch.cuda.nvtx.range("loss-depth"):
                 depth_gt = gpu_batch.depth_gt.to(
                     device=self.device,
@@ -3502,9 +3239,7 @@ class Trainer3DGRUT:
                 pred_depth = _predicted_axial_depth(
                     pred_dist=pred_dist,
                     rays_dir=gpu_batch.rays_dir,
-                    rays_in_world_space=bool(
-                        getattr(gpu_batch, "rays_in_world_space", False)
-                    ),
+                    rays_in_world_space=bool(getattr(gpu_batch, "rays_in_world_space", False)),
                     depth_ray_z=getattr(gpu_batch, "depth_ray_z", None),
                 )
                 if depth_gt.shape[1:3] != pred_depth.shape[1:3]:
@@ -3522,9 +3257,7 @@ class Trainer3DGRUT:
                     & (depth_gt > min_depth)
                     & (pred_depth > min_depth)
                 )
-                depth_apply_rgb_mask = bool(
-                    self.conf.loss.get("depth_apply_rgb_mask", True)
-                )
+                depth_apply_rgb_mask = bool(self.conf.loss.get("depth_apply_rgb_mask", True))
                 if depth_apply_rgb_mask and mask is not None:
                     depth_mask = mask
                     if depth_mask.shape[1:3] != depth_gt.shape[1:3]:
@@ -3534,22 +3267,16 @@ class Trainer3DGRUT:
                             mode="nearest",
                         ).permute(0, 2, 3, 1)
                     valid_depth = valid_depth & (depth_mask > 0.5)
-                depth_denominator = torch.clamp(
-                    valid_depth.to(depth_gt.dtype).sum(),
-                    min=1.0,
-                )
-                depth_loss_type = str(
-                    self.conf.loss.get("depth_loss_type", "log_l1")
-                )
+                depth_valid_count = valid_depth.to(depth_gt.dtype).sum()
+                depth_denominator = torch.clamp(depth_valid_count, min=1.0)
+                depth_loss_type = str(self.conf.loss.get("depth_loss_type", "log_l1"))
                 if depth_loss_type == "log_l1":
                     depth_error = torch.abs(
                         torch.log(torch.clamp(pred_depth, min=min_depth))
                         - torch.log(torch.clamp(depth_gt, min=min_depth))
                     )
                 elif depth_loss_type == "relative_l1":
-                    depth_error = torch.abs(
-                        pred_depth - depth_gt
-                    ) / torch.clamp(
+                    depth_error = torch.abs(pred_depth - depth_gt) / torch.clamp(
                         depth_gt,
                         min=min_depth,
                     )
@@ -3560,9 +3287,7 @@ class Trainer3DGRUT:
                         "log_l1, relative_l1."
                     )
                     raise RuntimeError(msg)
-                loss_depth = (
-                    depth_error * valid_depth.to(depth_error.dtype)
-                ).sum() / depth_denominator
+                loss_depth = (depth_error * valid_depth.to(depth_error.dtype)).sum() / depth_denominator
                 lambda_depth = float(self.conf.loss.lambda_depth)
 
         # --- rim-gated geometric prior (persistent, ray-distance) ----------
@@ -3578,19 +3303,15 @@ class Trainer3DGRUT:
         if self.conf.loss.get("use_rim_depth", False):
             if gpu_batch.depth_gt is None:
                 raise RuntimeError(
-                    "loss.use_rim_depth requires dataset.depth_folder "
-                    "(stored as RAY distance, not axial-z)."
+                    "loss.use_rim_depth requires dataset.depth_folder " "(stored as RAY distance, not axial-z)."
                 )
             depth_ray_z = getattr(gpu_batch, "depth_ray_z", None)
             if depth_ray_z is None:
                 raise RuntimeError(
-                    "loss.use_rim_depth requires per-pixel depth_ray_z "
-                    "(cos theta) from the fisheye dataset."
+                    "loss.use_rim_depth requires per-pixel depth_ray_z " "(cos theta) from the fisheye dataset."
                 )
             with torch.cuda.nvtx.range("loss-rim"):
-                rim_gt = gpu_batch.depth_gt.to(
-                    device=self.device, dtype=rgb_pred.dtype
-                )
+                rim_gt = gpu_batch.depth_gt.to(device=self.device, dtype=rgb_pred.dtype)
                 pred_dist = outputs["pred_dist"].to(dtype=rim_gt.dtype)
                 if pred_dist.ndim == 3:
                     # 3DGUT emits pred_dist as [B,H,W] (no channel dim);
@@ -3614,35 +3335,16 @@ class Trainer3DGRUT:
                     cos_t = cos_t.expand(pred_dist.shape[0], -1, -1, -1)
                 min_depth = float(self.conf.loss.get("depth_min_m", 0.05))
                 valid = (
-                    torch.isfinite(rim_gt)
-                    & torch.isfinite(pred_dist)
-                    & (rim_gt > min_depth)
-                    & (pred_dist > min_depth)
+                    torch.isfinite(rim_gt) & torch.isfinite(pred_dist) & (rim_gt > min_depth) & (pred_dist > min_depth)
                 )
-                cos_rim = float(
-                    np.cos(
-                        np.radians(
-                            float(self.conf.loss.get("rim_theta_min_deg", 60.0))
-                        )
-                    )
-                )
-                cos_ctr = float(
-                    np.cos(
-                        np.radians(
-                            float(
-                                self.conf.loss.get("rim_centre_band_deg", 40.0)
-                            )
-                        )
-                    )
-                )
+                cos_rim = float(np.cos(np.radians(float(self.conf.loss.get("rim_theta_min_deg", 60.0)))))
+                cos_ctr = float(np.cos(np.radians(float(self.conf.loss.get("rim_centre_band_deg", 40.0)))))
                 if bool(self.conf.loss.get("rim_centre_anchor", True)):
                     ctr = valid & (cos_t > cos_ctr)
                     if bool(ctr.any()):
                         x = rim_gt[ctr]
                         y = pred_dist[ctr]
-                        if bool(
-                            self.conf.loss.get("rim_detach_affine", False)
-                        ):
+                        if bool(self.conf.loss.get("rim_detach_affine", False)):
                             # Diagnostic: stop gradients flowing through the
                             # centre-anchor fit so the loss cannot co-adapt the
                             # evaluation calibration (isolates the metric
@@ -3651,18 +3353,12 @@ class Trainer3DGRUT:
                             y = y.detach()
                         xm = x.mean()
                         ym = y.mean()
-                        slope = ((x - xm) * (y - ym)).sum() / torch.clamp(
-                            ((x - xm) ** 2).sum(), min=1e-8
-                        )
+                        slope = ((x - xm) * (y - ym)).sum() / torch.clamp(((x - xm) ** 2).sum(), min=1e-8)
                         rim_gt = slope * (rim_gt - xm) + ym
                 rim_mask = valid & (cos_t < cos_rim)
-                rim_denom = torch.clamp(
-                    rim_mask.to(rim_gt.dtype).sum(), min=1.0
-                )
+                rim_denom = torch.clamp(rim_mask.to(rim_gt.dtype).sum(), min=1.0)
                 rim_err = torch.abs(pred_dist - rim_gt)
-                loss_rim = (
-                    rim_err * rim_mask.to(rim_err.dtype)
-                ).sum() / rim_denom
+                loss_rim = (rim_err * rim_mask.to(rim_err.dtype)).sum() / rim_denom
                 lambda_rim = float(self.conf.loss.lambda_rim)
 
         loss_rim_hf = torch.zeros(1, device=self.device)
@@ -3671,8 +3367,7 @@ class Trainer3DGRUT:
             depth_ray_z = getattr(gpu_batch, "depth_ray_z", None)
             if depth_ray_z is None:
                 raise RuntimeError(
-                    "loss.use_rim_hf requires per-pixel depth_ray_z "
-                    "(cos theta) from the fisheye dataset."
+                    "loss.use_rim_hf requires per-pixel depth_ray_z " "(cos theta) from the fisheye dataset."
                 )
             with torch.cuda.nvtx.range("loss-rim-hf"):
                 loss_rim_hf = rim_high_frequency_loss(
@@ -3680,15 +3375,9 @@ class Trainer3DGRUT:
                     rgb_gt=rgb_gt,
                     depth_ray_z=depth_ray_z,
                     mask=mask,
-                    theta_min_deg=float(
-                        self.conf.loss.get("rim_hf_theta_min_deg", 60.0)
-                    ),
-                    theta_max_deg=float(
-                        self.conf.loss.get("rim_hf_theta_max_deg", 80.0)
-                    ),
-                    kernel_size=int(
-                        self.conf.loss.get("rim_hf_kernel_size", 7)
-                    ),
+                    theta_min_deg=float(self.conf.loss.get("rim_hf_theta_min_deg", 60.0)),
+                    theta_max_deg=float(self.conf.loss.get("rim_hf_theta_max_deg", 80.0)),
+                    kernel_size=int(self.conf.loss.get("rim_hf_kernel_size", 7)),
                     sigma=float(self.conf.loss.get("rim_hf_sigma", 1.5)),
                     loss_type=str(
                         self.conf.loss.get(
@@ -3710,14 +3399,10 @@ class Trainer3DGRUT:
         lambda_mvdino_rim = 0.0
         if self.conf.loss.get("use_mvdino_rim", False):
             with torch.cuda.nvtx.range("loss-mvdino-rim"):
-                use_rim_crops = bool(
-                    self.conf.loss.get("mvdino_use_rim_crops", False)
-                )
+                use_rim_crops = bool(self.conf.loss.get("mvdino_use_rim_crops", False))
                 exp_dir = self.conf.loss.get("mvdino_exp_dir")
                 exp_dir = str(exp_dir) if exp_dir else None
-                model_name = str(
-                    self.conf.loss.get("mvdino_model_name", "dinov2_reg")
-                )
+                model_name = str(self.conf.loss.get("mvdino_model_name", "dinov2_reg"))
                 shared_kwargs = {
                     "rgb_pred": rgb_pred,
                     "rgb_gt": rgb_gt,
@@ -3725,16 +3410,8 @@ class Trainer3DGRUT:
                     "t_to_world": gpu_batch.T_to_world,
                     "depth_ray_z": getattr(gpu_batch, "depth_ray_z", None),
                     "mask": mask,
-                    "theta_min_deg": float(
-                        self.conf.loss.get(
-                            "mvdino_rim_theta_min_deg", 60.0
-                        )
-                    ),
-                    "theta_max_deg": float(
-                        self.conf.loss.get(
-                            "mvdino_rim_theta_max_deg", 80.0
-                        )
-                    ),
+                    "theta_min_deg": float(self.conf.loss.get("mvdino_rim_theta_min_deg", 60.0)),
+                    "theta_max_deg": float(self.conf.loss.get("mvdino_rim_theta_max_deg", 80.0)),
                     "exp_dir": exp_dir,
                     "name": model_name,
                 }
@@ -3747,19 +3424,11 @@ class Trainer3DGRUT:
                 else:
                     loss_mvdino_rim = mvdino_feature_rim_loss(
                         **shared_kwargs,
-                        use_feature_upsampler=bool(
-                            self.conf.loss.get("mvdino_use_anyup", False)
-                        ),
-                        upsampled_feature_size=int(
-                            self.conf.loss.get("mvdino_anyup_res", 512)
-                        ),
+                        use_feature_upsampler=bool(self.conf.loss.get("mvdino_use_anyup", False)),
+                        upsampled_feature_size=int(self.conf.loss.get("mvdino_anyup_res", 512)),
                     )
-                lambda_mvdino_rim = float(
-                    self.conf.loss.get("lambda_mvdino_rim", 0.0)
-                )
-                warmup_iters = int(
-                    self.conf.loss.get("mvdino_warmup_iters", 3000)
-                )
+                lambda_mvdino_rim = float(self.conf.loss.get("lambda_mvdino_rim", 0.0))
+                warmup_iters = int(self.conf.loss.get("mvdino_warmup_iters", 3000))
                 if warmup_iters > 0:
                     warmup_scale = min(1.0, self.global_step / warmup_iters)
                     lambda_mvdino_rim *= warmup_scale
@@ -3770,10 +3439,7 @@ class Trainer3DGRUT:
             camera_idx = int(gpu_batch.camera_idx)
             configured_weights = list(self.conf.loss.camera_loss_weights)
             if camera_idx >= len(configured_weights):
-                msg = (
-                    "loss.camera_loss_weights must include one weight per "
-                    f"camera. Missing index {camera_idx}."
-                )
+                msg = "loss.camera_loss_weights must include one weight per " f"camera. Missing index {camera_idx}."
                 raise RuntimeError(msg)
             camera_loss_weight = torch.tensor(
                 float(configured_weights[camera_idx]),
@@ -3785,10 +3451,7 @@ class Trainer3DGRUT:
             weights_by_name = self._image_loss_weights_by_name()
             image_name = os.path.basename(gpu_batch.image_path)
             if image_name not in weights_by_name:
-                msg = (
-                    "loss.image_loss_weights_path must map every training "
-                    f"image; missing entry for {image_name}."
-                )
+                msg = "loss.image_loss_weights_path must map every training " f"image; missing entry for {image_name}."
                 raise RuntimeError(msg)
             image_loss_weight = float(weights_by_name[image_name])
         loss = (
@@ -3797,7 +3460,7 @@ class Trainer3DGRUT:
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
-            + lambda_depth * loss_depth
+            + (0.0 if self._geometry_only_pass_enabled() else lambda_depth) * loss_depth
             + lambda_rim * loss_rim
             + lambda_rim_hf * loss_rim_hf
             + lambda_mvdino_rim * loss_mvdino_rim
@@ -3815,6 +3478,7 @@ class Trainer3DGRUT:
             sky_opacity_loss_raw=loss_sky_opacity,
             depth_loss=lambda_depth * loss_depth,
             depth_loss_raw=loss_depth,
+            depth_valid_count=depth_valid_count,
             rim_loss=lambda_rim * loss_rim,
             rim_loss_raw=loss_rim,
             rim_hf_loss=lambda_rim_hf * loss_rim_hf,
@@ -3874,10 +3538,11 @@ class Trainer3DGRUT:
             os.makedirs(jpg_dir, exist_ok=True)
             tile_groups = metrics["img_eval_tiles"]
             grid_columns = [
-                "input_rgb",
-                "training_mask",
+                "raw_input_rgb",
+                "scored_keep_mask",
+                "scored_input_rgb",
                 SEMANTIC_OPACITY_TILE,
-                "prediction_rgb",
+                "scored_prediction_rgb",
                 "rgb_error",
                 "low_freq_error",
                 "high_freq_error",
@@ -3889,9 +3554,7 @@ class Trainer3DGRUT:
                 "hits_sparse",
                 "opacity_low",
             ]
-            grid_columns = [
-                column for column in grid_columns if column in tile_groups
-            ]
+            grid_columns = [column for column in grid_columns if column in tile_groups]
             image_paths = metrics["eval_image_path"]
             group_size = int(self.conf.writer.get("eval_image_group_size", 5))
             if group_size < 1:
@@ -3913,14 +3576,14 @@ class Trainer3DGRUT:
                 )
                 if self.conf.use_wandb:
                     caption = (
-                        f"rows=image path, columns={', '.join(grid_columns)}"
+                        "checkerboard=outside scored_keep_mask; "
+                        "rows=image path, "
+                        f"columns={', '.join(grid_columns)}"
                     )
                     wandb.log(
                         {
                             "train/iteration": global_step,
-                            f"eval/image_grid/group_{group_idx:03d}": (
-                                wandb.Image(grid_path, caption=caption)
-                            ),
+                            f"eval/image_grid/group_{group_idx:03d}": (wandb.Image(grid_path, caption=caption)),
                         },
                     )
 
@@ -3928,9 +3591,7 @@ class Trainer3DGRUT:
         if "timings" in metrics:
             for time_key in metrics["timings"]:
                 mean_timings[time_key] = np.mean(metrics["timings"][time_key])
-                writer.add_scalar(
-                    f"time/val/{time_key}", mean_timings[time_key], global_step
-                )
+                writer.add_scalar(f"time/val/{time_key}", mean_timings[time_key], global_step)
 
         writer.add_scalar(
             "geometry/num_gaussians",
@@ -3941,12 +3602,8 @@ class Trainer3DGRUT:
         psnr_values = np.asarray(metrics["psnr"], dtype=np.float64)
         mean_psnr = float(psnr_values.mean())
         writer.add_scalar("val/psnr", mean_psnr, global_step)
-        writer.add_scalar(
-            "val/psnr_best_view", float(psnr_values.max()), global_step
-        )
-        writer.add_scalar(
-            "val/psnr_worst_view", float(psnr_values.min()), global_step
-        )
+        writer.add_scalar("val/psnr_best_view", float(psnr_values.max()), global_step)
+        writer.add_scalar("val/psnr_worst_view", float(psnr_values.min()), global_step)
         eval_paths = metrics.get("eval_image_path")
         if eval_paths is not None and len(eval_paths) == len(psnr_values):
             worst_idx = int(psnr_values.argmin())
@@ -3991,13 +3648,9 @@ class Trainer3DGRUT:
                 global_step,
             )
         if "masked_psnr" in metrics:
-            masked_values = np.asarray(
-                metrics["masked_psnr"], dtype=np.float64
-            )
+            masked_values = np.asarray(metrics["masked_psnr"], dtype=np.float64)
             mean_masked_psnr = float(masked_values.mean())
-            writer.add_scalar(
-                "val/masked_psnr", mean_masked_psnr, global_step
-            )
+            writer.add_scalar("val/masked_psnr", mean_masked_psnr, global_step)
             writer.add_scalar(
                 "val/masked_psnr_best_view",
                 float(masked_values.max()),
@@ -4008,9 +3661,7 @@ class Trainer3DGRUT:
                 float(masked_values.min()),
                 global_step,
             )
-            train_masked_psnr = self._validation_training_metric(
-                "masked_psnr"
-            )
+            train_masked_psnr = self._validation_training_metric("masked_psnr")
             if train_masked_psnr is not None:
                 masked_gap = train_masked_psnr - mean_masked_psnr
                 writer.add_scalar(
@@ -4023,9 +3674,7 @@ class Trainer3DGRUT:
                     masked_gap,
                     global_step,
                 )
-            train_window_masked_psnr = (
-                self._validation_training_masked_psnr
-            )
+            train_window_masked_psnr = self._validation_training_masked_psnr
             if train_window_masked_psnr is not None:
                 writer.add_scalar(
                     "generalization/train_window_masked_psnr",
@@ -4039,13 +3688,9 @@ class Trainer3DGRUT:
                 global_step,
             )
         if "ssim" in metrics:
-            writer.add_scalar(
-                "val/ssim", np.mean(metrics["ssim"]), global_step
-            )
+            writer.add_scalar("val/ssim", np.mean(metrics["ssim"]), global_step)
         if "lpips" in metrics:
-            writer.add_scalar(
-                "val/lpips", np.mean(metrics["lpips"]), global_step
-            )
+            writer.add_scalar("val/lpips", np.mean(metrics["lpips"]), global_step)
         diagnostic_metric_names = (
             ("low_freq_l1", "diagnostics/residual/low_freq_l1"),
             ("high_freq_l1", "diagnostics/residual/high_freq_l1"),
@@ -4148,9 +3793,7 @@ class Trainer3DGRUT:
                 camera_mask = camera_indices == camera_idx
                 for source_name, metric_name in camera_metric_names:
                     if source_name in metrics:
-                        values = np.asarray(
-                            metrics[source_name], dtype=np.float32
-                        )
+                        values = np.asarray(metrics[source_name], dtype=np.float32)
                         writer.add_scalar(
                             f"diagnostics/camera/{camera_idx}/{metric_name}",
                             values[camera_mask].mean(),
@@ -4177,10 +3820,7 @@ class Trainer3DGRUT:
             scan_id, camera_idx = group_name.split("/", 1)
             for metric_name, metric_value in group_metrics.items():
                 writer.add_scalar(
-                    (
-                        "diagnostics/source_scan_camera/"
-                        f"{scan_id}/camera_{camera_idx}/{metric_name}"
-                    ),
+                    ("diagnostics/source_scan_camera/" f"{scan_id}/camera_{camera_idx}/{metric_name}"),
                     metric_value,
                     global_step,
                 )
@@ -4207,9 +3847,7 @@ class Trainer3DGRUT:
         geometry_metrics = _gaussian_geometry_metrics(self.model)
         for metric_name, wandb_name in geometry_metric_names:
             if metric_name in geometry_metrics:
-                writer.add_scalar(
-                    wandb_name, geometry_metrics[metric_name], global_step
-                )
+                writer.add_scalar(wandb_name, geometry_metrics[metric_name], global_step)
         writer.add_scalar(
             "val/hits/min",
             np.mean(metrics["hits_min"]),
@@ -4298,9 +3936,7 @@ class Trainer3DGRUT:
         )
         for metric_name, wandb_name in footprint_metric_names:
             if metric_name in metrics:
-                writer.add_scalar(
-                    wandb_name, np.mean(metrics[metric_name]), global_step
-                )
+                writer.add_scalar(wandb_name, np.mean(metrics[metric_name]), global_step)
 
         loss = np.mean(metrics["losses"]["total_loss"])
         writer.add_scalar("val/loss/total", loss, global_step)
@@ -4315,22 +3951,14 @@ class Trainer3DGRUT:
             writer.add_scalar("val/loss/ssim", ssim_loss, global_step)
         if self.conf.loss.use_sky_opacity:
             sky_opacity_loss = np.mean(metrics["losses"]["sky_opacity_loss"])
-            sky_opacity_loss_raw = np.mean(
-                metrics["losses"]["sky_opacity_loss_raw"]
-            )
-            writer.add_scalar(
-                "val/loss/sky_opacity", sky_opacity_loss, global_step
-            )
-            writer.add_scalar(
-                "val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step
-            )
+            sky_opacity_loss_raw = np.mean(metrics["losses"]["sky_opacity_loss_raw"])
+            writer.add_scalar("val/loss/sky_opacity", sky_opacity_loss, global_step)
+            writer.add_scalar("val/loss/sky_opacity_raw", sky_opacity_loss_raw, global_step)
         if self.conf.loss.get("use_depth", False):
             depth_loss = np.mean(metrics["losses"]["depth_loss"])
             depth_loss_raw = np.mean(metrics["losses"]["depth_loss_raw"])
             writer.add_scalar("val/loss/depth", depth_loss, global_step)
-            writer.add_scalar(
-                "val/loss/depth_raw", depth_loss_raw, global_step
-            )
+            writer.add_scalar("val/loss/depth_raw", depth_loss_raw, global_step)
         table = {
             k: np.mean(v)
             for k, v in metrics.items()
@@ -4385,36 +4013,23 @@ class Trainer3DGRUT:
             table["train_lpips"] = train_lpips
         if self._validation_train_probe_psnr is not None:
             table["train_probe_psnr"] = self._validation_train_probe_psnr
-            table["train_probe_count"] = float(
-                self._validation_train_probe_count
-            )
+            table["train_probe_count"] = float(self._validation_train_probe_count)
         train_window_psnr = self._validation_training_psnr
         if train_window_psnr is not None:
             table["train_window_psnr"] = train_window_psnr
             table["train_window_steps"] = (
-                f"{self._validation_training_window_start_step}-"
-                f"{self._validation_training_window_end_step}"
+                f"{self._validation_training_window_start_step}-" f"{self._validation_training_window_end_step}"
             )
         if "masked_psnr" in table:
-            train_masked_psnr = self._validation_training_metric(
-                "masked_psnr"
-            )
+            train_masked_psnr = self._validation_training_metric("masked_psnr")
             if train_masked_psnr is not None:
                 table["train_masked_psnr"] = train_masked_psnr
-                table["masked_psnr_gap_train_minus_val"] = (
-                    train_masked_psnr - float(table["masked_psnr"])
-                )
+                table["masked_psnr_gap_train_minus_val"] = train_masked_psnr - float(table["masked_psnr"])
             if self._validation_train_probe_masked_psnr is not None:
-                table["train_probe_masked_psnr"] = (
-                    self._validation_train_probe_masked_psnr
-                )
-            train_window_masked_psnr = (
-                self._validation_training_masked_psnr
-            )
+                table["train_probe_masked_psnr"] = self._validation_train_probe_masked_psnr
+            train_window_masked_psnr = self._validation_training_masked_psnr
             if train_window_masked_psnr is not None:
-                table["train_window_masked_psnr"] = (
-                    train_window_masked_psnr
-                )
+                table["train_window_masked_psnr"] = train_window_masked_psnr
         for time_key in mean_timings:
             table[time_key] = f"{f'{mean_timings[time_key]:.2f}'}" + " ms/it"
         summary_path = os.path.join(
@@ -4433,29 +4048,18 @@ class Trainer3DGRUT:
         if source_scan_summary:
             validation_summary["source_scan_metrics"] = source_scan_summary
         if source_scan_camera_summary:
-            validation_summary["source_scan_camera_metrics"] = (
-                source_scan_camera_summary
-            )
+            validation_summary["source_scan_camera_metrics"] = source_scan_camera_summary
         with open(summary_path, "w", encoding="utf-8") as file:
             json.dump(validation_summary, file, indent=2, sort_keys=True)
-        logger.log_table(
-            f"📊 Validation Metrics - Step {global_step}", record=table
-        )
+        logger.log_table(f"📊 Validation Metrics - Step {global_step}", record=table)
 
-    def _validation_checkpoint_score(
-        self, metrics: dict[str, list[float]]
-    ) -> float:
+    def _validation_checkpoint_score(self, metrics: dict[str, list[float]]) -> float:
         """Return the configured scalar validation score for checkpointing."""
-        metric_name = str(
-            self.conf.early_stopping.get("metric", "masked_psnr")
-        )
+        metric_name = str(self.conf.early_stopping.get("metric", "masked_psnr"))
         if metric_name == EARLY_STOPPING_AUTO_PSNR_METRIC:
             metric_name = "masked_psnr" if "masked_psnr" in metrics else "psnr"
         if metric_name not in metrics:
-            msg = (
-                f"Early-stopping metric '{metric_name}' was not produced by "
-                "validation."
-            )
+            msg = f"Early-stopping metric '{metric_name}' was not produced by " "validation."
             raise KeyError(msg)
         values = metrics[metric_name]
         if len(values) == 0:
@@ -4496,14 +4100,9 @@ class Trainer3DGRUT:
             raise ValueError(msg)
         if min_score <= 0.0:
             return False
-        min_score_after_step = int(
-            early_stopping_conf.get("min_score_after_step", 0)
-        )
+        min_score_after_step = int(early_stopping_conf.get("min_score_after_step", 0))
         if min_score_after_step < 0:
-            msg = (
-                "early_stopping.min_score_after_step must be >= 0, got "
-                f"{min_score_after_step}."
-            )
+            msg = "early_stopping.min_score_after_step must be >= 0, got " f"{min_score_after_step}."
             raise ValueError(msg)
         return self.global_step >= min_score_after_step and score < min_score
 
@@ -4532,9 +4131,7 @@ class Trainer3DGRUT:
         scheduler = getattr(self.post_processing, "_ppisp_scheduler", None)
         activation_step = self.global_step
         if scheduler is not None:
-            activation_step = int(
-                getattr(scheduler, "last_epoch", self.global_step)
-            )
+            activation_step = int(getattr(scheduler, "last_epoch", self.global_step))
         if hasattr(self.post_processing, "_controller_activation_step"):
             self.post_processing._controller_activation_step = activation_step
 
@@ -4559,10 +4156,7 @@ class Trainer3DGRUT:
         self._early_stopping_reference_score = None
         self._early_stopping_reference_step = None
         self._stale_validation_count = 0
-        logger.info(
-            "Reset PPISP geometry plateau state at controller distillation "
-            f"step {self.global_step}."
-        )
+        logger.info("Reset PPISP geometry plateau state at controller distillation " f"step {self.global_step}.")
 
     def _handle_ppisp_pre_distillation_validation(
         self,
@@ -4586,9 +4180,7 @@ class Trainer3DGRUT:
         self._stale_validation_count += 1
         reference_score = self._early_stopping_reference_score
         if reference_score is None:
-            msg = (
-                "No early-stopping reference was recorded before stale update."
-            )
+            msg = "No early-stopping reference was recorded before stale update."
             raise RuntimeError(msg)
         patience = int(self.conf.early_stopping.get("patience", 3))
         if patience < 1:
@@ -4610,23 +4202,15 @@ class Trainer3DGRUT:
 
     def _snapshot_training_metric_window(self) -> None:
         """Capture train-window PSNR values for the current validation."""
-        self._validation_training_window_start_step = (
-            self._training_metric_window_start_step
-        )
-        self._validation_training_window_end_step = (
-            self._latest_training_metric_step
-        )
+        self._validation_training_window_start_step = self._training_metric_window_start_step
+        self._validation_training_window_end_step = self._latest_training_metric_step
         if self._training_psnr_window_count > 0:
-            self._validation_training_psnr = (
-                self._training_psnr_window_sum
-                / self._training_psnr_window_count
-            )
+            self._validation_training_psnr = self._training_psnr_window_sum / self._training_psnr_window_count
         else:
             self._validation_training_psnr = None
         if self._training_masked_psnr_window_count > 0:
             self._validation_training_masked_psnr = (
-                self._training_masked_psnr_window_sum
-                / self._training_masked_psnr_window_count
+                self._training_masked_psnr_window_sum / self._training_masked_psnr_window_count
             )
         else:
             self._validation_training_masked_psnr = None
@@ -4684,36 +4268,25 @@ class Trainer3DGRUT:
                 f"{self._validation_training_window_start_step}-"
                 f"{self._validation_training_window_end_step}"
             )
-        return (
-            f"; {source} {metric_name}={training_score:.6f}; "
-            f"train-val gap={gap:.6f}"
-        )
+        return f"; {source} {metric_name}={training_score:.6f}; " f"train-val gap={gap:.6f}"
 
-    def _handle_validation_checkpointing(
-        self, metrics: dict[str, list[float]]
-    ) -> None:
+    def _handle_validation_checkpointing(self, metrics: dict[str, list[float]]) -> None:
         """Update latest/best checkpoints and early-stopping state."""
         checkpoint_conf = self.conf.checkpoint
         early_stopping_conf = self.conf.early_stopping
         save_last = bool(checkpoint_conf.get("save_last_on_validation", False))
         save_best = bool(
-            checkpoint_conf.get("save_best_on_validation", False)
-            or early_stopping_conf.get("enabled", False)
+            checkpoint_conf.get("save_best_on_validation", False) or early_stopping_conf.get("enabled", False)
         )
 
         if save_last:
             self.save_checkpoint(last_checkpoint=True)
-        if not save_best and not bool(
-            early_stopping_conf.get("enabled", False)
-        ):
+        if not save_best and not bool(early_stopping_conf.get("enabled", False)):
             return
 
         min_step = self._validation_checkpoint_min_step()
         if self.global_step < min_step:
-            logger.info(
-                "Validation checkpointing deferred until step "
-                f"{min_step}; current step={self.global_step}."
-            )
+            logger.info("Validation checkpointing deferred until step " f"{min_step}; current step={self.global_step}.")
             return
 
         score = self._validation_checkpoint_score(metrics)
@@ -4746,13 +4319,8 @@ class Trainer3DGRUT:
             self._best_validation_score = score
             self._best_validation_step = self.global_step
             if save_best:
-                self._best_checkpoint_path = self.save_checkpoint(
-                    best_checkpoint=True
-                )
-            logger.info(
-                f"Best validation {metric_name}={score:.6f} "
-                f"at step {self.global_step}{training_suffix}"
-            )
+                self._best_checkpoint_path = self.save_checkpoint(best_checkpoint=True)
+            logger.info(f"Best validation {metric_name}={score:.6f} " f"at step {self.global_step}{training_suffix}")
         if self._best_validation_score is not None:
             self.tracking.writer.add_scalar(
                 f"val/{metric_name}_best_so_far",
@@ -4764,9 +4332,7 @@ class Trainer3DGRUT:
 
         if self._violates_early_stopping_score_floor(score):
             min_score = float(early_stopping_conf.get("min_score", 0.0))
-            min_score_after_step = int(
-                early_stopping_conf.get("min_score_after_step", 0)
-            )
+            min_score_after_step = int(early_stopping_conf.get("min_score_after_step", 0))
             self._should_stop_training = True
             logger.info(
                 "Early stopping score floor triggered at step "
@@ -4785,9 +4351,7 @@ class Trainer3DGRUT:
         self._stale_validation_count += 1
         reference_score = self._early_stopping_reference_score
         if reference_score is None:
-            msg = (
-                "No early-stopping reference was recorded before stale update."
-            )
+            msg = "No early-stopping reference was recorded before stale update."
             raise RuntimeError(msg)
         patience = int(early_stopping_conf.get("patience", 3))
         if patience < 1:
@@ -4799,10 +4363,7 @@ class Trainer3DGRUT:
             f"stale validations: {self._stale_validation_count}/{patience}"
             f"{training_suffix}"
         )
-        if (
-            bool(early_stopping_conf.get("enabled", False))
-            and self._stale_validation_count >= patience
-        ):
+        if bool(early_stopping_conf.get("enabled", False)) and self._stale_validation_count >= patience:
             best_score = self._best_validation_score
             best_step = self._best_validation_step
             if best_score is None or best_step is None:
@@ -4828,16 +4389,10 @@ class Trainer3DGRUT:
         if self._best_validation_step == self.global_step:
             return
 
-        logger.info(
-            "Restoring best validation checkpoint for export: "
-            f"{self._best_checkpoint_path}"
-        )
+        logger.info("Restoring best validation checkpoint for export: " f"{self._best_checkpoint_path}")
         checkpoint = torch.load(self._best_checkpoint_path, weights_only=False)
         self.model.init_from_checkpoint(checkpoint, setup_optimizer=False)
-        if (
-            self.post_processing is not None
-            and "post_processing" in checkpoint
-        ):
+        if self.post_processing is not None and "post_processing" in checkpoint:
             dropped = _load_post_processing_state(
                 self.post_processing,
                 checkpoint["post_processing"]["module"],
@@ -4882,11 +4437,7 @@ class Trainer3DGRUT:
             self._training_masked_psnr_window_sum += training_masked_psnr
             self._training_masked_psnr_window_count += 1
 
-        if (
-            self.conf.enable_writer
-            and global_step > 0
-            and global_step % self.conf.log_frequency == 0
-        ):
+        if self.conf.enable_writer and global_step > 0 and global_step % self.conf.log_frequency == 0:
             loss = np.mean(batch_metrics["losses"]["total_loss"])
             writer.add_scalar("train/loss/total", loss, global_step)
             if self.conf.loss.use_l1:
@@ -4899,9 +4450,7 @@ class Trainer3DGRUT:
                 ssim_loss = np.mean(batch_metrics["losses"]["ssim_loss"])
                 writer.add_scalar("train/loss/ssim", ssim_loss, global_step)
             if self.conf.loss.use_camera_loss_weights:
-                camera_loss_weight = np.mean(
-                    batch_metrics["losses"]["camera_loss_weight"]
-                )
+                camera_loss_weight = np.mean(batch_metrics["losses"]["camera_loss_weight"])
                 writer.add_scalar(
                     "train/loss/camera_weight",
                     camera_loss_weight,
@@ -4909,22 +4458,14 @@ class Trainer3DGRUT:
                 )
             if self.conf.loss.use_opacity:
                 opacity_loss = np.mean(batch_metrics["losses"]["opacity_loss"])
-                writer.add_scalar(
-                    "train/loss/opacity", opacity_loss, global_step
-                )
+                writer.add_scalar("train/loss/opacity", opacity_loss, global_step)
             if self.conf.loss.use_scale:
                 scale_loss = np.mean(batch_metrics["losses"]["scale_loss"])
                 writer.add_scalar("train/loss/scale", scale_loss, global_step)
             if self.conf.loss.use_sky_opacity:
-                sky_opacity_loss = np.mean(
-                    batch_metrics["losses"]["sky_opacity_loss"]
-                )
-                sky_opacity_loss_raw = np.mean(
-                    batch_metrics["losses"]["sky_opacity_loss_raw"]
-                )
-                writer.add_scalar(
-                    "train/loss/sky_opacity", sky_opacity_loss, global_step
-                )
+                sky_opacity_loss = np.mean(batch_metrics["losses"]["sky_opacity_loss"])
+                sky_opacity_loss_raw = np.mean(batch_metrics["losses"]["sky_opacity_loss_raw"])
+                writer.add_scalar("train/loss/sky_opacity", sky_opacity_loss, global_step)
                 writer.add_scalar(
                     "train/loss/sky_opacity_raw",
                     sky_opacity_loss_raw,
@@ -4932,32 +4473,18 @@ class Trainer3DGRUT:
                 )
             if self.conf.loss.get("use_depth", False):
                 depth_loss = np.mean(batch_metrics["losses"]["depth_loss"])
-                depth_loss_raw = np.mean(
-                    batch_metrics["losses"]["depth_loss_raw"]
-                )
+                depth_loss_raw = np.mean(batch_metrics["losses"]["depth_loss_raw"])
                 writer.add_scalar("train/loss/depth", depth_loss, global_step)
-                writer.add_scalar(
-                    "train/loss/depth_raw", depth_loss_raw, global_step
-                )
-            if (
-                self.post_processing is not None
-                and "post_processing_reg_loss" in batch_metrics["losses"]
-            ):
-                post_processing_reg_loss = np.mean(
-                    batch_metrics["losses"]["post_processing_reg_loss"]
-                )
+                writer.add_scalar("train/loss/depth_raw", depth_loss_raw, global_step)
+            if self.post_processing is not None and "post_processing_reg_loss" in batch_metrics["losses"]:
+                post_processing_reg_loss = np.mean(batch_metrics["losses"]["post_processing_reg_loss"])
                 writer.add_scalar(
                     "train/loss/post_processing_reg",
                     post_processing_reg_loss,
                     global_step,
                 )
-            if (
-                self.camera_residual is not None
-                and "camera_residual_reg_loss" in batch_metrics["losses"]
-            ):
-                camera_residual_reg_loss = np.mean(
-                    batch_metrics["losses"]["camera_residual_reg_loss"]
-                )
+            if self.camera_residual is not None and "camera_residual_reg_loss" in batch_metrics["losses"]:
+                camera_residual_reg_loss = np.mean(batch_metrics["losses"]["camera_residual_reg_loss"])
                 writer.add_scalar(
                     "train/loss/camera_residual_reg",
                     camera_residual_reg_loss,
@@ -4973,9 +4500,7 @@ class Trainer3DGRUT:
                         global_step,
                     )
             if "psnr" in batch_metrics:
-                writer.add_scalar(
-                    "train/psnr", batch_metrics["psnr"], self.global_step
-                )
+                writer.add_scalar("train/psnr", batch_metrics["psnr"], self.global_step)
             if "masked_psnr" in batch_metrics:
                 writer.add_scalar(
                     "train/masked_psnr",
@@ -4983,13 +4508,9 @@ class Trainer3DGRUT:
                     self.global_step,
                 )
             if "ssim" in batch_metrics:
-                writer.add_scalar(
-                    "train/ssim", batch_metrics["ssim"], self.global_step
-                )
+                writer.add_scalar("train/ssim", batch_metrics["ssim"], self.global_step)
             if "lpips" in batch_metrics:
-                writer.add_scalar(
-                    "train/lpips", batch_metrics["lpips"], self.global_step
-                )
+                writer.add_scalar("train/lpips", batch_metrics["lpips"], self.global_step)
             if "hits_mean" in batch_metrics:
                 writer.add_scalar(
                     "train/hits/mean",
@@ -5072,13 +4593,9 @@ class Trainer3DGRUT:
                         self.global_step,
                     )
 
-            writer.add_scalar(
-                "train/iteration", self.global_step, self.global_step
-            )
+            writer.add_scalar("train/iteration", self.global_step, self.global_step)
             if hasattr(self, "_training_start_time"):
-                elapsed_seconds = (
-                    time.perf_counter() - self._training_start_time
-                )
+                elapsed_seconds = time.perf_counter() - self._training_start_time
                 writer.add_scalar(
                     "time/train/elapsed_seconds",
                     elapsed_seconds,
@@ -5201,9 +4718,7 @@ class Trainer3DGRUT:
             "mask_coverage": "train_eval/mask_coverage",
             "loss_total": "train_eval/loss/total",
             "valid_hit_coverage": "train_eval/coverage/valid_hit_fraction",
-            "valid_opacity_coverage": (
-                "train_eval/coverage/valid_opacity_fraction"
-            ),
+            "valid_opacity_coverage": ("train_eval/coverage/valid_opacity_fraction"),
         }
         for metric_name, writer_name in scalar_names.items():
             if metric_name in table:
@@ -5235,14 +4750,10 @@ class Trainer3DGRUT:
         if source_scan_summary:
             training_summary["source_scan_metrics"] = source_scan_summary
         if source_scan_camera_summary:
-            training_summary["source_scan_camera_metrics"] = (
-                source_scan_camera_summary
-            )
+            training_summary["source_scan_camera_metrics"] = source_scan_camera_summary
         with open(summary_path, "w", encoding="utf-8") as file:
             json.dump(training_summary, file, indent=2, sort_keys=True)
-        logger.log_table(
-            f"📊 Training Metrics - Step {global_step}", record=table
-        )
+        logger.log_table(f"📊 Training Metrics - Step {global_step}", record=table)
 
     @torch.cuda.nvtx.range("on_training_end")
     def on_training_end(self):
@@ -5258,11 +4769,7 @@ class Trainer3DGRUT:
         if conf.export_ply.enabled:
             from threedgrut.export import PLYExporter
 
-            ply_path = (
-                conf.export_ply.path
-                if conf.export_ply.path
-                else os.path.join(out_dir, "export_last.ply")
-            )
+            ply_path = conf.export_ply.path if conf.export_ply.path else os.path.join(out_dir, "export_last.ply")
             exporter = PLYExporter()
             exporter.export(
                 self.model,
@@ -5290,9 +4797,7 @@ class Trainer3DGRUT:
                     usdz_path = os.path.join(out_dir, usdz_path)
             else:
                 # Default filename includes format suffix
-                usdz_path = os.path.join(
-                    out_dir, f"export_last_{format_suffix}.usdz"
-                )
+                usdz_path = os.path.join(out_dir, f"export_last_{format_suffix}.usdz")
 
             exporter.export(
                 self.model,
@@ -5303,10 +4808,7 @@ class Trainer3DGRUT:
             )
 
         # Export post-processing report (PPISP-based)
-        if (
-            self.post_processing is not None
-            and conf.post_processing.method == "ppisp"
-        ):
+        if self.post_processing is not None and conf.post_processing.method == "ppisp":
             from ppisp.report import export_ppisp_report
 
             logger.info("📊 Exporting PPISP report...")
@@ -5323,8 +4825,7 @@ class Trainer3DGRUT:
                 )
             except Exception as exc:
                 logger.warning(
-                    "PPISP report export failed; checkpoints and exported "
-                    f"model artifacts are still valid: {exc}"
+                    "PPISP report export failed; checkpoints and exported " f"model artifacts are still valid: {exc}"
                 )
             else:
                 logger.info(f"📊 PPISP report saved to: {ppisp_report_dir}")
@@ -5382,13 +4883,9 @@ class Trainer3DGRUT:
         if self.post_processing is not None:
             parameters["post_processing"] = {
                 "module": self.post_processing.state_dict(),
-                "optimizers": [
-                    opt.state_dict() for opt in self.post_processing_optimizers
-                ],
-                "schedulers": [
-                    sched.state_dict()
-                    for sched in self.post_processing_schedulers
-                ],
+                "optimizers": [opt.state_dict() for opt in self.post_processing_optimizers],
+                "schedulers": [sched.state_dict() for sched in self.post_processing_schedulers],
+                **self._post_processing_checkpoint_metadata(),
             }
         if (
             self.camera_residual is not None
@@ -5400,15 +4897,17 @@ class Trainer3DGRUT:
                 "optimizer": self.camera_residual_optimizer.state_dict(),
                 "scheduler": self.camera_residual_scheduler.state_dict(),
             }
+        if self.geometry_only_optimizer is not None:
+            parameters["geometry_only_optimizer"] = self.geometry_only_optimizer.state_dict()
+        elif self._pending_geometry_optimizer_state is not None:
+            parameters["geometry_only_optimizer"] = self._pending_geometry_optimizer_state
 
         if best_checkpoint:
             ckpt_path = path_join(out_dir, BEST_CHECKPOINT_FILENAME)
         elif last_checkpoint:
             ckpt_path = path_join(out_dir, LAST_CHECKPOINT_FILENAME)
         else:
-            if not bool(
-                self.conf.checkpoint.get("keep_step_checkpoints", True)
-            ):
+            if not bool(self.conf.checkpoint.get("keep_step_checkpoints", True)):
                 ckpt_path = path_join(out_dir, LAST_CHECKPOINT_FILENAME)
             else:
                 checkpoint_dir = path_join(out_dir, f"ours_{int(global_step)}")
@@ -5426,10 +4925,7 @@ class Trainer3DGRUT:
         ckpt_tmp_path = f"{ckpt_path}.tmp"
         torch.save(parameters, ckpt_tmp_path)
         os.replace(ckpt_tmp_path, ckpt_path)
-        logger.info(
-            f"💾 Saved {checkpoint_label} checkpoint to: "
-            f'"{path_abs(ckpt_path)}"'
-        )
+        logger.info(f"💾 Saved {checkpoint_label} checkpoint to: " f'"{path_abs(ckpt_path)}"')
         return ckpt_path
 
     def render_gui(self, scene_updated):
@@ -5484,9 +4980,7 @@ class Trainer3DGRUT:
             if param.grad is None:
                 continue
             g = param.grad.detach()
-            self.model._last_grad_norms[name] = g.reshape(g.shape[0], -1).norm(
-                dim=1
-            )
+            self.model._last_grad_norms[name] = g.reshape(g.shape[0], -1).norm(dim=1)
 
     @torch.no_grad()
     def _log_visual_snapshots(self, global_step: int) -> None:
@@ -5499,9 +4993,7 @@ class Trainer3DGRUT:
         same-resolution contact sheet so visual diagnostics can be compared in
         one W&B panel.
         """
-        diag = (
-            self.conf.get("diagnostics") if hasattr(self.conf, "get") else None
-        )
+        diag = self.conf.get("diagnostics") if hasattr(self.conf, "get") else None
         if diag is None:
             return
         freq = int(diag.get("snapshot_frequency", 0))
@@ -5510,9 +5002,7 @@ class Trainer3DGRUT:
         if self.train_dataset is None:
             return
 
-        cam_idx = int(diag.get("snapshot_camera_index", 0)) % max(
-            len(self.train_dataset), 1
-        )
+        cam_idx = int(diag.get("snapshot_camera_index", 0)) % max(len(self.train_dataset), 1)
         try:
             sample = self.train_dataset[cam_idx]
         except Exception as exc:
@@ -5553,11 +5043,7 @@ class Trainer3DGRUT:
         masked_render = None
         masked_residual = None
         if gpu_batch.mask is not None:
-            mask0 = (
-                gpu_batch.mask[0]
-                if gpu_batch.mask.ndim == 4
-                else gpu_batch.mask
-            )
+            mask0 = gpu_batch.mask[0] if gpu_batch.mask.ndim == 4 else gpu_batch.mask
             if mask0.ndim == 3 and mask0.shape[-1] == 1:
                 mask0 = mask0[..., 0]
             if mask0.shape[:2] != render.shape[:2]:
@@ -5578,13 +5064,9 @@ class Trainer3DGRUT:
         grad_scale_mode = str(diag.get("snapshot_grad_scale_mode", "p95"))
         if bool(diag.get("snapshot_grad_enabled", False)):
             try:
-                from threedgrut.utils.grad_viz import (
-                    build_features_override_for_grad,
-                )
+                from threedgrut.utils.grad_viz import build_features_override_for_grad
 
-                features_override = build_features_override_for_grad(
-                    self.model, grad_attr, grad_scale_mode
-                )
+                features_override = build_features_override_for_grad(self.model, grad_attr, grad_scale_mode)
                 if features_override is not None:
                     grad_outputs = self.model.render_diagnostic(
                         gpu_batch,
@@ -5600,16 +5082,12 @@ class Trainer3DGRUT:
 
         def _resize_rgb(t: torch.Tensor) -> torch.Tensor:
             chw = t.permute(2, 0, 1).unsqueeze(0)
-            chw = torch.nn.functional.interpolate(
-                chw, size=(res, res), mode="area"
-            )
+            chw = torch.nn.functional.interpolate(chw, size=(res, res), mode="area")
             return chw[0].permute(1, 2, 0).clamp(0.0, 1.0)
 
         def _resize_scalar(t: torch.Tensor) -> torch.Tensor:
             chw = t.unsqueeze(0).unsqueeze(0)
-            chw = torch.nn.functional.interpolate(
-                chw, size=(res, res), mode="area"
-            )
+            chw = torch.nn.functional.interpolate(chw, size=(res, res), mode="area")
             return chw[0, 0].clamp(0.0, 1.0)
 
         snapshots_dir = path_join(self.tracking.output_dir, "snapshots")
@@ -5620,14 +5098,10 @@ class Trainer3DGRUT:
         from PIL import ImageDraw as _PILImageDraw
 
         def _rgb_array(t: torch.Tensor) -> np.ndarray:
-            arr = (
-                (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
-            )
+            arr = (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype("uint8")
             return arr
 
-        def _scalar_hot_array(
-            t: torch.Tensor, vmax: float = 0.3
-        ) -> np.ndarray:
+        def _scalar_hot_array(t: torch.Tensor, vmax: float = 0.3) -> np.ndarray:
             v = (t.detach().cpu().numpy() / max(vmax, 1e-9)).clip(0.0, 1.0)
             try:
                 from matplotlib import cm
@@ -5635,16 +5109,12 @@ class Trainer3DGRUT:
                 rgba = cm.hot(v)
                 arr = (rgba[..., :3] * 255.0).astype("uint8")
             except ImportError:
-                arr = np.stack(
-                    [v * 255, v * 128, np.zeros_like(v)], axis=-1
-                ).astype("uint8")
+                arr = np.stack([v * 255, v * 128, np.zeros_like(v)], axis=-1).astype("uint8")
             return arr
 
         def _labeled_panel(label: str, arr: np.ndarray) -> np.ndarray:
             label_h = 22
-            canvas = np.zeros(
-                (arr.shape[0] + label_h, arr.shape[1], 3), dtype=np.uint8
-            )
+            canvas = np.zeros((arr.shape[0] + label_h, arr.shape[1], 3), dtype=np.uint8)
             canvas[:label_h, :, :] = 24
             canvas[label_h:, :, :] = arr
             image = _PILImage.fromarray(canvas)
@@ -5658,11 +5128,7 @@ class Trainer3DGRUT:
             if len(panels) < 2:
                 return None
             base_shape = panels[0][1].shape
-            matched = [
-                (label, arr)
-                for label, arr in panels
-                if arr.shape == base_shape
-            ]
+            matched = [(label, arr) for label, arr in panels if arr.shape == base_shape]
             if len(matched) < 2:
                 return None
             labeled = [_labeled_panel(label, arr) for label, arr in matched]
@@ -5695,16 +5161,12 @@ class Trainer3DGRUT:
         render_arr = _rgb_array(_resize_rgb(render))
         panels.append(("render", render_arr))
         if masked_render is not None:
-            panels.append(
-                ("render_masked", _rgb_array(_resize_rgb(masked_render)))
-            )
+            panels.append(("render_masked", _rgb_array(_resize_rgb(masked_render))))
         if residual is not None:
             residual_arr = _scalar_hot_array(_resize_scalar(residual))
             panels.append(("residual", residual_arr))
         if masked_residual is not None:
-            residual_masked_arr = _scalar_hot_array(
-                _resize_scalar(masked_residual)
-            )
+            residual_masked_arr = _scalar_hot_array(_resize_scalar(masked_residual))
             panels.append(("residual_masked", residual_masked_arr))
         if grad_render is not None:
             grad_arr = _rgb_array(_resize_rgb(grad_render))
@@ -5729,9 +5191,7 @@ class Trainer3DGRUT:
 
                 payload = {"train/iteration": global_step}
                 if contact_sheet_path is not None:
-                    payload["viz/contact_sheet"] = wandb.Image(
-                        contact_sheet_path
-                    )
+                    payload["viz/contact_sheet"] = wandb.Image(contact_sheet_path)
                 else:
                     for kind, image_path in individual_paths.items():
                         payload[f"viz/{kind}"] = wandb.Image(image_path)
@@ -5743,9 +5203,7 @@ class Trainer3DGRUT:
         """Compute and save the configured post-training loss volume."""
         conf = self.conf
         diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
-        if diag_conf is None or not bool(
-            diag_conf.get("loss_volume_after_training", False)
-        ):
+        if diag_conf is None or not bool(diag_conf.get("loss_volume_after_training", False)):
             return
         try:
             from threedgrut.post_processing.loss_volume import (
@@ -5757,16 +5215,12 @@ class Trainer3DGRUT:
             volume = compute_loss_volume(
                 self.model,
                 self.train_dataset,
-                voxel_size_m=float(
-                    diag_conf.get("loss_volume_voxel_size_m", 0.1)
-                ),
+                voxel_size_m=float(diag_conf.get("loss_volume_voxel_size_m", 0.1)),
                 view_stride=int(diag_conf.get("loss_volume_view_stride", 4)),
                 pixel_stride=int(diag_conf.get("loss_volume_pixel_stride", 8)),
             )
             if volume is not None:
-                npz_path, png_path = save_loss_volume(
-                    volume, self.tracking.output_dir
-                )
+                npz_path, png_path = save_loss_volume(volume, self.tracking.output_dir)
                 summary = summarize_loss_volume(volume)
                 logger.info(
                     f"loss_volume: saved {npz_path} "
@@ -5777,29 +5231,18 @@ class Trainer3DGRUT:
                     try:
                         import wandb
 
-                        payload = {
-                            f"loss_volume/{key}": value
-                            for key, value in summary.items()
-                        }
+                        payload = {f"loss_volume/{key}": value for key, value in summary.items()}
                         if png_path:
-                            payload["viz/loss_volume_topdown"] = wandb.Image(
-                                png_path
-                            )
+                            payload["viz/loss_volume_topdown"] = wandb.Image(png_path)
                         wandb.log(payload)
                     except Exception as exc:
-                        logger.warning(
-                            f"loss_volume: wandb upload failed: {exc}"
-                        )
+                        logger.warning(f"loss_volume: wandb upload failed: {exc}")
         except Exception as exc:
             logger.warning(f"loss_volume: compute failed: {exc}")
 
     def _log_gradient_diagnostics(self, global_step: int) -> None:
         """Log whether supervision reaches the Gaussian parameters."""
-        if (
-            not self.conf.enable_writer
-            or global_step <= 0
-            or global_step % self.conf.log_frequency != 0
-        ):
+        if not self.conf.enable_writer or global_step <= 0 or global_step % self.conf.log_frequency != 0:
             return
 
         writer = self.tracking.writer
@@ -5819,6 +5262,185 @@ class Trainer3DGRUT:
             for metric_name, value in stats.items():
                 writer.add_scalar(metric_name, value, global_step)
 
+    def _post_backward_strategy_step(
+        self,
+        *,
+        global_step: int,
+        gpu_batch: object,
+        outputs: dict[str, object],
+    ) -> bool:
+        """Forward raw renderer diagnostics to the post-backward strategy."""
+        return self.strategy.post_backward(
+            step=global_step,
+            scene_extent=self.scene_extent,
+            train_dataset=self.train_dataset,
+            batch=gpu_batch,
+            writer=self.tracking.writer,
+            outputs=outputs,
+        )
+
+    def _geometry_only_pass_enabled(self) -> bool:
+        config = self.conf.loss.get("geometry_only_pass", {})
+        return bool(config.get("enabled", False))
+
+    def _validate_geometry_only_pass_config(self) -> None:
+        if not self._geometry_only_pass_enabled():
+            return
+        config = self.conf.loss.geometry_only_pass
+        if self._distillation_start_step >= 0:
+            msg = (
+                "The geometry-only pass cannot run with PPISP distillation "
+                "because distillation freezes Gaussian parameters."
+            )
+            raise ValueError(msg)
+        if self.conf.optimizer.type != "adam":
+            msg = "The geometry-only pass requires ordinary Adam for images."
+            raise ValueError(msg)
+        if self.conf.strategy.method != "GSStrategy":
+            msg = "The geometry-only pass currently requires GSStrategy."
+            raise ValueError(msg)
+        if not bool(self.conf.loss.get("use_depth", False)) or float(self.conf.loss.get("lambda_depth", 0.0)) <= 0.0:
+            msg = "The geometry-only pass requires a positive depth loss."
+            raise ValueError(msg)
+        if self.camera_residual is not None:
+            msg = "The geometry-only pass cannot optimize camera residuals."
+            raise ValueError(msg)
+        frequency = int(config.get("frequency", 1))
+        if frequency <= 0:
+            msg = "Geometry-only pass frequency must be positive."
+            raise ValueError(msg)
+        learning_rate_scale = float(config.get("learning_rate_scale", 1.0))
+        if not 0.0 < learning_rate_scale <= 1.0:
+            msg = "Geometry-only learning-rate scale must be in (0, 1]."
+            raise ValueError(msg)
+        mutation_names = (
+            "densify",
+            "prune",
+            "prune_scale",
+            "density_decay",
+            "reset_density",
+        )
+        mutation_ends: list[int] = []
+        unbounded_mutations: list[str] = []
+        for name in mutation_names:
+            mutation = self.conf.strategy[name]
+            mutation_start = int(mutation.start_iteration)
+            mutation_end = int(mutation.end_iteration)
+            if mutation_start < 0:
+                continue
+            if mutation_end == -1:
+                unbounded_mutations.append(name)
+                continue
+            mutation_ends.append(mutation_end)
+        if unbounded_mutations:
+            msg = (
+                "Geometry-only pass requires bounded topology and density "
+                f"mutations; unbounded: {unbounded_mutations}."
+            )
+            raise ValueError(msg)
+        if bool(self.conf.strategy.scale_guard.enabled):
+            msg = "Geometry-only pass cannot run with the particle scale guard."
+            raise ValueError(msg)
+        if str(self.conf.model.density_activation) == "none":
+            msg = (
+                "Geometry-only pass requires a density activation that does "
+                "not clamp parameters outside its optimizer."
+            )
+            raise ValueError(msg)
+        mutation_end = max(mutation_ends, default=-1)
+        start_iteration = int(config.get("start_iteration", mutation_end + 1))
+        if start_iteration <= mutation_end:
+            msg = (
+                "Geometry-only pass must start after all topology and density "
+                f"mutations: start={start_iteration}, end={mutation_end}."
+            )
+            raise ValueError(msg)
+
+    def _geometry_only_pass_is_scheduled(self, global_step: int) -> bool:
+        if not self._geometry_only_pass_enabled():
+            return False
+        config = self.conf.loss.geometry_only_pass
+        start_iteration = int(config.start_iteration)
+        frequency = int(config.frequency)
+        return global_step >= start_iteration and (global_step - start_iteration) % frequency == 0
+
+    def _initialize_geometry_only_optimizer(self) -> SparseGeometryAdam:
+        if self.geometry_only_optimizer is not None:
+            return self.geometry_only_optimizer
+        if self.model.optimizer is None:
+            msg = "Cannot initialize geometry-only Adam without image Adam."
+            raise RuntimeError(msg)
+        learning_rate_scale = float(self.conf.loss.geometry_only_pass.learning_rate_scale)
+        optimizer = SparseGeometryAdam.from_primary_optimizer(
+            self.model.optimizer,
+            learning_rate_scale=learning_rate_scale,
+        )
+        if self._pending_geometry_optimizer_state is not None:
+            optimizer.load_state_dict(self._pending_geometry_optimizer_state)
+            self._pending_geometry_optimizer_state = None
+        self.geometry_only_optimizer = optimizer
+        return optimizer
+
+    def _validate_geometry_only_parameter_identity(
+        self,
+        optimizer: SparseGeometryAdam,
+    ) -> None:
+        """Reject Gaussian row replacement after sparse state is created."""
+        for group in optimizer.param_groups:
+            name = str(group["name"])
+            parameters = group["params"]
+            model_parameter = getattr(self.model, name)
+            if len(parameters) != 1 or parameters[0] is not model_parameter:
+                msg = (
+                    "Geometry-only optimizer parameter identity changed for "
+                    f"{name!r}; topology mutation after its start is unsafe."
+                )
+                raise RuntimeError(msg)
+
+    def _run_geometry_only_pass(
+        self,
+        *,
+        gpu_batch: object,
+        global_step: int,
+    ) -> bool:
+        if not self._geometry_only_pass_is_scheduled(global_step):
+            return False
+        optimizer = self._initialize_geometry_only_optimizer()
+        self._validate_geometry_only_parameter_identity(optimizer)
+        self.model.build_acc(rebuild=False)
+        with torch.cuda.nvtx.range(f"train_{global_step}_geometry_fwd"):
+            outputs = self.model(
+                gpu_batch,
+                train=True,
+                frame_id=global_step,
+            )
+            outputs = collapse_blur_samples(outputs, gpu_batch)
+            losses = self.get_losses(gpu_batch, outputs)
+            valid_count = int(losses["depth_valid_count"].detach().item())
+        if valid_count == 0:
+            return False
+        geometry_loss = losses["depth_loss"]
+        if not torch.isfinite(geometry_loss):
+            msg = f"Non-finite geometry-only depth loss at step {global_step}."
+            raise FloatingPointError(msg)
+        with torch.cuda.nvtx.range(f"train_{global_step}_geometry_bwd"):
+            geometry_loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            self.model.optimizer.zero_grad()
+        if self.conf.enable_writer:
+            self.tracking.writer.add_scalar(
+                "train/loss/geometry_only_depth",
+                float(geometry_loss.detach().item()),
+                global_step,
+            )
+            self.tracking.writer.add_scalar(
+                "train/geometry_only_valid_pixels",
+                valid_count,
+                global_step,
+            )
+        return True
+
     @torch.cuda.nvtx.range("run_train_iter")
     def run_train_iter(
         self,
@@ -5828,18 +5450,13 @@ class Trainer3DGRUT:
         metrics: list,
         conf: DictConfig,
     ):
-        camera_residual_freeze = (
-            self.camera_residual is not None
-            and bool(conf.camera_residual.get("freeze_gaussians", False))
+        camera_residual_freeze = self.camera_residual is not None and bool(
+            conf.camera_residual.get("freeze_gaussians", False)
         )
 
         # Freeze Gaussians and suspend strategy for correction-only phases.
-        if (
-            camera_residual_freeze
-            or (
-                self._distillation_start_step >= 0
-                and global_step >= self._distillation_start_step
-            )
+        if camera_residual_freeze or (
+            self._distillation_start_step >= 0 and global_step >= self._distillation_start_step
         ):
             self.model.freeze_gaussians()
             self.strategy.suspend()
@@ -5853,9 +5470,7 @@ class Trainer3DGRUT:
         )
 
         # Perform validation if required
-        is_time_to_validate = (global_step > 0 or conf.validate_first) and (
-            global_step % self.val_frequency == 0
-        )
+        is_time_to_validate = (global_step > 0 or conf.validate_first) and (global_step % self.val_frequency == 0)
         if is_time_to_validate:
             training_metrics = self.run_training_metrics_pass(conf)
             validation_metrics = self.run_validation_pass(
@@ -5881,9 +5496,7 @@ class Trainer3DGRUT:
                     outputs,
                     gpu_batch,
                     training=True,
-                    camera_idx_override=self._post_processing_camera_idx(
-                        gpu_batch
-                    ),
+                    camera_idx_override=self._post_processing_camera_idx(gpu_batch),
                 )
 
         # Compute the losses of a single batch
@@ -5891,25 +5504,13 @@ class Trainer3DGRUT:
             batch_losses = self.get_losses(gpu_batch, outputs)
             # Add post-processing regularization loss
             if self.post_processing is not None:
-                post_processing_reg_loss = (
-                    self.post_processing.get_regularization_loss()
-                )
-                batch_losses["total_loss"] = (
-                    batch_losses["total_loss"] + post_processing_reg_loss
-                )
-                batch_losses["post_processing_reg_loss"] = (
-                    post_processing_reg_loss
-                )
+                post_processing_reg_loss = self.post_processing.get_regularization_loss()
+                batch_losses["total_loss"] = batch_losses["total_loss"] + post_processing_reg_loss
+                batch_losses["post_processing_reg_loss"] = post_processing_reg_loss
             if self.camera_residual is not None:
-                camera_residual_reg_loss = (
-                    self.camera_residual.get_regularization_loss()
-                )
-                batch_losses["total_loss"] = (
-                    batch_losses["total_loss"] + camera_residual_reg_loss
-                )
-                batch_losses["camera_residual_reg_loss"] = (
-                    camera_residual_reg_loss
-                )
+                camera_residual_reg_loss = self.camera_residual.get_regularization_loss()
+                batch_losses["total_loss"] = batch_losses["total_loss"] + camera_residual_reg_loss
+                batch_losses["camera_residual_reg_loss"] = camera_residual_reg_loss
 
         # Backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_pre_bwd"):
@@ -5929,16 +5530,12 @@ class Trainer3DGRUT:
         if self.camera_residual_optimizer is not None:
             self._validate_camera_residual_gradient(global_step)
             if self.camera_residual is not None:
-                self._last_camera_residual_stats = (
-                    self.camera_residual.stats()
-                )
+                self._last_camera_residual_stats = self.camera_residual.stats()
         self._compute_per_gaussian_grad_norms()
         self._log_gradient_diagnostics(global_step)
         if self.diagnostics is not None:
             step_total_ms = float(
-                profilers["backward"].timing()
-                if hasattr(profilers.get("backward"), "timing")
-                else 0.0
+                profilers["backward"].timing() if hasattr(profilers.get("backward"), "timing") else 0.0
             )
             grad_norms = getattr(self.model, "_last_grad_norms", {}) or {}
             try:
@@ -5947,9 +5544,7 @@ class Trainer3DGRUT:
                 bvh_stats = {}
             diagnostic_metrics = self.diagnostics.compute_per_step_metrics(
                 batch_losses={
-                    k: (
-                        v.detach().item() if hasattr(v, "detach") else float(v)
-                    )
+                    k: (v.detach().item() if hasattr(v, "detach") else float(v))
                     for k, v in batch_losses.items()
                     if v is not None
                 },
@@ -5963,38 +5558,38 @@ class Trainer3DGRUT:
             if self.conf.enable_writer:
                 writer = self.tracking.writer
                 for k, v in diagnostic_metrics.items():
-                    if k.startswith("grad_") and k.endswith(
-                        ("_mean", "_p95", "_max")
-                    ):
-                        writer.add_scalar(
-                            f"train/grad_stats/{k}", float(v), global_step
-                        )
+                    if k.startswith("grad_") and k.endswith(("_mean", "_p95", "_max")):
+                        writer.add_scalar(f"train/grad_stats/{k}", float(v), global_step)
                     elif k.startswith("bvh_") and not isinstance(v, bool):
                         writer.add_scalar(f"train/{k}", float(v), global_step)
         self._log_visual_snapshots(global_step)
 
         # Post backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_post_bwd"):
-            scene_updated = self.strategy.post_backward(
-                step=global_step,
-                scene_extent=self.scene_extent,
-                train_dataset=self.train_dataset,
-                batch=gpu_batch,
-                writer=self.tracking.writer,
+            scene_updated = self._post_backward_strategy_step(
+                global_step=global_step,
+                gpu_batch=gpu_batch,
+                outputs=outputs,
             )
 
         # Optimizer step
         with torch.cuda.nvtx.range(f"train_{global_step}_backprop"):
-            if isinstance(self.model.optimizer, SelectiveAdam):
+            if isinstance(
+                self.model.optimizer,
+                (VisibilityDecayedAdam, SelectiveAdam),
+            ):
                 assert (
                     outputs["mog_visibility"].shape == self.model.density.shape
-                ), (
-                    f"Visibility shape {outputs['mog_visibility'].shape} does not match density shape {self.model.density.shape}"
-                )
+                ), f"Visibility shape {outputs['mog_visibility'].shape} does not match density shape {self.model.density.shape}"
                 self.model.optimizer.step(outputs["mog_visibility"])
             else:
                 self.model.optimizer.step()
             self.model.optimizer.zero_grad()
+
+        geometry_updated = self._run_geometry_only_pass(
+            gpu_batch=gpu_batch,
+            global_step=global_step,
+        )
 
         # Scheduler step
         with torch.cuda.nvtx.range(f"train_{global_step}_scheduler"):
@@ -6002,9 +5597,7 @@ class Trainer3DGRUT:
 
         # Post-processing optimizer/scheduler step
         if self.post_processing_optimizers is not None:
-            with torch.cuda.nvtx.range(
-                f"train_{global_step}_post_processing_opt"
-            ):
+            with torch.cuda.nvtx.range(f"train_{global_step}_post_processing_opt"):
                 for opt in self.post_processing_optimizers:
                     opt.step()
                     opt.zero_grad()
@@ -6012,9 +5605,7 @@ class Trainer3DGRUT:
                     sched.step()
 
         if self.camera_residual_optimizer is not None:
-            with torch.cuda.nvtx.range(
-                f"train_{global_step}_camera_residual_opt"
-            ):
+            with torch.cuda.nvtx.range(f"train_{global_step}_camera_residual_opt"):
                 self.camera_residual_optimizer.step()
                 self.camera_residual_optimizer.zero_grad()
                 if self.camera_residual_scheduler is not None:
@@ -6042,9 +5633,10 @@ class Trainer3DGRUT:
         # from densify/prune (scene_updated) always forces a full rebuild.
         # Without the env gate the tracer still rebuilds under density
         # clamping, so default behavior is unchanged.
-        if scene_updated or (
-            conf.model.bvh_update_frequency > 0
-            and global_step % conf.model.bvh_update_frequency == 0
+        if (
+            scene_updated
+            or geometry_updated
+            or (conf.model.bvh_update_frequency > 0 and global_step % conf.model.bvh_update_frequency == 0)
         ):
             with torch.cuda.nvtx.range(f"train_{global_step}_bvh"):
                 profilers["build_as"].start()
@@ -6065,13 +5657,9 @@ class Trainer3DGRUT:
             iteration=iter,
         )
         if "forward_render" in self.model.renderer.timings:
-            batch_metrics["timings"]["forward_render_cuda"] = (
-                self.model.renderer.timings["forward_render"]
-            )
+            batch_metrics["timings"]["forward_render_cuda"] = self.model.renderer.timings["forward_render"]
         if "backward_render" in self.model.renderer.timings:
-            batch_metrics["timings"]["backward_render_cuda"] = (
-                self.model.renderer.timings["backward_render"]
-            )
+            batch_metrics["timings"]["backward_render_cuda"] = self.model.renderer.timings["backward_render"]
         metrics.append(batch_metrics)
 
         # !!! Below global step has been incremented !!!
@@ -6104,9 +5692,7 @@ class Trainer3DGRUT:
                 return
 
             # Step for training iteration
-            self.run_train_iter(
-                self.global_step, batch, profilers, metrics, conf
-            )
+            self.run_train_iter(self.global_step, batch, profilers, metrics, conf)
             if self._should_stop_training:
                 return
 
@@ -6116,22 +5702,12 @@ class Trainer3DGRUT:
     @torch.no_grad()
     def run_training_metrics_pass(self, conf: DictConfig) -> dict[str, Any]:
         """Evaluate a deterministic subset of training views."""
-        diag_conf = (
-            conf.get("diagnostics") if hasattr(conf, "get") else None
-        )
-        enabled = (
-            bool(diag_conf.get("training_metrics_enabled", True))
-            if diag_conf is not None
-            else True
-        )
+        diag_conf = conf.get("diagnostics") if hasattr(conf, "get") else None
+        enabled = bool(diag_conf.get("training_metrics_enabled", True)) if diag_conf is not None else True
         if not enabled:
             return {}
 
-        max_views = (
-            int(diag_conf.get("training_metrics_max_views", 64))
-            if diag_conf is not None
-            else 64
-        )
+        max_views = int(diag_conf.get("training_metrics_max_views", 64)) if diag_conf is not None else 64
         selected_indices = self._selected_training_metric_indices(
             len(self.train_dataset),
             max_views,
@@ -6169,9 +5745,7 @@ class Trainer3DGRUT:
                 global_step=self.global_step,
             )
 
-            with torch.cuda.nvtx.range(
-                f"train.metrics_step_{self.global_step}"
-            ):
+            with torch.cuda.nvtx.range(f"train.metrics_step_{self.global_step}"):
                 profilers["inference"].start()
                 outputs = self.model(gpu_batch, train=False)
                 outputs = collapse_blur_samples(outputs, gpu_batch)
@@ -6181,9 +5755,7 @@ class Trainer3DGRUT:
                         outputs,
                         gpu_batch,
                         training=False,
-                        camera_idx_override=self._post_processing_camera_idx(
-                            gpu_batch
-                        ),
+                        camera_idx_override=self._post_processing_camera_idx(gpu_batch),
                     )
                 profilers["inference"].end()
 
@@ -6248,24 +5820,17 @@ class Trainer3DGRUT:
             # validate_only pass renders an EMPTY GAS (background-only,
             # checkpoint-independent metrics). Build once before the
             # first view when requested.
-            if (
-                os.environ.get("THREEDGRUT_EVAL_BUILD_ONCE") == "1"
-                and val_iteration == 0
-            ):
+            if os.environ.get("THREEDGRUT_EVAL_BUILD_ONCE") == "1" and val_iteration == 0:
                 self.model.build_acc(rebuild=True)
             # Access the GPU-cache batch data
-            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(
-                batch_idx
-            )
+            gpu_batch = self.val_dataset.get_gpu_batch_with_intrinsics(batch_idx)
             gpu_batch = self._apply_camera_residual(
                 gpu_batch,
                 global_step=self.global_step,
             )
 
             # Compute the outputs of a single batch
-            with torch.cuda.nvtx.range(
-                f"train.validation_step_{self.global_step}"
-            ):
+            with torch.cuda.nvtx.range(f"train.validation_step_{self.global_step}"):
                 profilers["inference"].start()
                 outputs = self.model(gpu_batch, train=False)
                 # Apply post-processing for validation (novel view mode)
@@ -6275,9 +5840,7 @@ class Trainer3DGRUT:
                         outputs,
                         gpu_batch,
                         training=False,
-                        camera_idx_override=self._post_processing_camera_idx(
-                            gpu_batch
-                        ),
+                        camera_idx_override=self._post_processing_camera_idx(gpu_batch),
                     )
                 profilers["inference"].end()
 
@@ -6291,14 +5854,11 @@ class Trainer3DGRUT:
                     iteration=val_iteration,
                 )
 
-                self.log_validation_iter(
-                    gpu_batch, outputs, batch_metrics, iteration=val_iteration
-                )
+                self.log_validation_iter(gpu_batch, outputs, batch_metrics, iteration=val_iteration)
                 metrics.append(batch_metrics)
             torch.cuda.synchronize()
             logger.info(
-                f"[VAL-TIMING] step {self.global_step} view "
-                f"{val_iteration} done in {time.time() - view_t0:.2f}s"
+                f"[VAL-TIMING] step {self.global_step} view " f"{val_iteration} done in {time.time() - view_t0:.2f}s"
             )
 
         logger.end_progress(task_name="Validation")
@@ -6317,11 +5877,7 @@ class Trainer3DGRUT:
         for d in list_of_dicts:
             for k, v in d.items():
                 if isinstance(v, dict):
-                    flat_dict[k] = (
-                        defaultdict(list)
-                        if k not in flat_dict
-                        else flat_dict[k]
-                    )
+                    flat_dict[k] = defaultdict(list) if k not in flat_dict else flat_dict[k]
                     for inner_k, inner_v in v.items():
                         flat_dict[k][inner_k].append(inner_v)
                 else:
@@ -6339,13 +5895,10 @@ class Trainer3DGRUT:
         cached = getattr(self, "_image_loss_weights_cache", None)
         if cached is not None:
             return cached
-        weights_path = str(
-            self.conf.loss.get("image_loss_weights_path", "")
-        )
+        weights_path = str(self.conf.loss.get("image_loss_weights_path", ""))
         if not weights_path or not os.path.isfile(weights_path):
             raise RuntimeError(
-                "loss.use_image_loss_weights requires "
-                f"loss.image_loss_weights_path; not found: {weights_path!r}"
+                "loss.use_image_loss_weights requires " f"loss.image_loss_weights_path; not found: {weights_path!r}"
             )
         with open(weights_path, encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -6354,9 +5907,7 @@ class Trainer3DGRUT:
                 "image loss weights must be a non-empty JSON object "
                 f"mapping image basenames to floats: {weights_path}"
             )
-        weights = {
-            str(name): float(value) for name, value in payload.items()
-        }
+        weights = {str(name): float(value) for name, value in payload.items()}
         self._image_loss_weights_cache = weights
         return weights
 
@@ -6364,26 +5915,20 @@ class Trainer3DGRUT:
         """Initiate training logic for n_epochs.
         Training and validation are controlled by the config.
         """
-        assert self.model.optimizer is not None, (
-            "Optimizer needs to be initialized before the training can start!"
-        )
+        assert self.model.optimizer is not None, "Optimizer needs to be initialized before the training can start!"
         conf = self.conf
 
         logger.log_rule(f"Training {conf.render.method.upper()}")
         if bool(conf.camera_residual.finite_difference_audit.enabled):
             self.run_camera_residual_finite_difference_audit()
             if bool(conf.camera_residual.finite_difference_audit.exit_after):
-                logger.info(
-                    "Camera residual finite-difference audit complete."
-                )
+                logger.info("Camera residual finite-difference audit complete.")
                 return
 
         if bool(conf.camera_intrinsics_audit.enabled):
             self.run_camera_intrinsics_finite_difference_audit()
             if bool(conf.camera_intrinsics_audit.exit_after):
-                logger.info(
-                    "Camera intrinsics finite-difference audit complete."
-                )
+                logger.info("Camera intrinsics finite-difference audit complete.")
                 return
 
         if bool(conf.get("validate_only", False)):
@@ -6416,10 +5961,7 @@ class Trainer3DGRUT:
         )
         logger.log_table("🎊 Training Statistics", record=table)
 
-        if (
-            bool(conf.get("validate_final", True))
-            and not self._should_stop_training
-        ):
+        if bool(conf.get("validate_final", True)) and not self._should_stop_training:
             logger.log_rule("Final Validation")
             training_metrics = self.run_training_metrics_pass(conf)
             validation_metrics = self.run_validation_pass(

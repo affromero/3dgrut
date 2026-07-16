@@ -169,10 +169,12 @@ checkpoint:
   save_best_on_validation: false
 
 optimizer:
-  type: adam # We only support adam and selective_adam for now
+  type: adam # adam, selective_adam, or visibility_decayed_adam
   lr: 0.0
+  betas: [0.9, 0.999]
   eps: 1.e-15
   resume_lr_scale: 1.0
+  scale_position_lr_by_scene_extent: true
   params:
     positions:
       lr: 0.00016 # 3DGS value: 0.00016 initial and decayed to 0.0000016
@@ -240,6 +242,15 @@ loss:
   depth_loss_type: log_l1
   depth_apply_rgb_mask: true
   depth_min_m: 0.05
+  # Optional second forward/backward pass for sparse measured depth. The
+  # image pass remains ordinary Adam and excludes depth; this pass owns
+  # independent row-sparse moments for position, opacity, rotation, and scale.
+  # It must begin after every topology or density mutation has ended.
+  geometry_only_pass:
+    enabled: false
+    start_iteration: 15001
+    frequency: 1
+    learning_rate_scale: 1.0
 
   # rim-gated geometric prior (persistent ray-distance constraint at theta>rim)
   use_rim_depth: false
@@ -280,6 +291,10 @@ post_processing:
   # dataset intrinsics. Use "single_physical_camera" for monocular video
   # COLMAP bundles whose frame-specific intrinsics create many camera_id rows.
   camera_index_mode: dataset
+  # Optional launch-contract guard for recipes with a known physical rig.
+  expected_num_cameras: null
+  # Optional ordered physical-camera names for a sealed rig contract.
+  expected_camera_names: null
   resume_lr_scale: 1.0
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.

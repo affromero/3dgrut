@@ -47,13 +47,36 @@ class BaseStrategy:
     def _pre_backward(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
         return False
 
-    def post_backward(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
+    def post_backward(
+        self,
+        step: int,
+        scene_extent: float,
+        train_dataset,
+        batch=None,
+        writer=None,
+        outputs: dict[str, object] | None = None,
+    ) -> bool:
         """Callback function to be executed after the `loss.backward()` call."""
         if self._suspended:
             return False
-        return self._post_backward(step, scene_extent, train_dataset, batch, writer)
+        return self._post_backward(
+            step,
+            scene_extent,
+            train_dataset,
+            batch,
+            writer,
+            outputs=outputs,
+        )
 
-    def _post_backward(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:
+    def _post_backward(
+        self,
+        step: int,
+        scene_extent: float,
+        train_dataset,
+        batch=None,
+        writer=None,
+        outputs: dict[str, object] | None = None,
+    ) -> bool:
         return False
 
     def post_optimizer_step(self, step: int, scene_extent: float, train_dataset, batch=None, writer=None) -> bool:

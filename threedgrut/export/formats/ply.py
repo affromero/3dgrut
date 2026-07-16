@@ -77,16 +77,11 @@ class PLYExporter(ModelExporter):
         # float3 coefficient packing.
         if attrs.specular.shape[1] % 3 != 0:
             raise ValueError(
-                "PLY export requires specular features packed as float3 slots; "
-                f"got width {attrs.specular.shape[1]}."
+                "PLY export requires specular features packed as float3 slots; " f"got width {attrs.specular.shape[1]}."
             )
         num_speculars = attrs.specular.shape[1] // 3
-        mogt_specular = attrs.specular.reshape(
-            (num_gaussians, num_speculars, 3)
-        )
-        mogt_specular = mogt_specular.transpose(0, 2, 1).reshape(
-            (num_gaussians, num_speculars * 3)
-        )
+        mogt_specular = attrs.specular.reshape((num_gaussians, num_speculars, 3))
+        mogt_specular = mogt_specular.transpose(0, 2, 1).reshape((num_gaussians, num_speculars * 3))
 
         # Build PLY dtype
         dtype_full = [
@@ -104,4 +99,5 @@ class PLYExporter(ModelExporter):
         )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         PlyData([el]).write(output_path)

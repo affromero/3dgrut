@@ -12,6 +12,43 @@ densify:
   relative_size_threshold: 0.01 # Gaussians larger than relative_size_threshold * scene_extent will be split not cloned. Called percent_dense in 3DGS with default value 0.01
   split:
     n_gaussians: 2 # Hardcoded to 2 in 3DGS
+  # Route otherwise-cloned Gaussians with a large on-screen 3DGUT support
+  # box through the existing split operation. max_px is the largest axis of
+  # the renderer's tight, opacity-bounded half-extent after covariance
+  # dilation and Mip opacity scaling. It is not an eigen-radius or an scale-shape
+  # native status value. Default disabled preserves the upstream decisions.
+  projected_extent_split:
+    enabled: false
+    max_px: 8.0
+  # Reroute a strict subset of otherwise-cloned Gaussians through the existing
+  # split operation only when the SAME camera observations have both a large
+  # covariance eigen-radius and positional gradient demand. The renderer
+  # exposes its existing inverse-covariance conic packet for this diagnostic;
+  # RGB and compositing are unchanged. The reroute ceiling is a fail-closed
+  # experiment guard, not a truncation policy.
+  covariance_gradient_split:
+    enabled: false
+    radius_px: 8.0
+    min_large_observations: 6
+    max_reroute_fraction: 0.22385751031338305
+    # Fail at the next densification boundary when invalid on-screen conic
+    # packets exceed 10 ppm in that accumulation window. Invalid packets are
+    # excluded from G+ and N+ but remain in the existing total denominator N.
+    max_invalid_fraction: 0.00001
+  # Isolated visibility-and-shape-derived topology arm for ordinary 3DGUT/Adam. Existing
+  # split eligibility remains unchanged. Among those candidates only rows with
+  # at least 32 per-iteration renderer visibility observations in the current
+  # densification window, strict physical anisotropy > 8, and largest scale
+  # > 0.01 world units use the deterministic largest-axis split. Repeated
+  # sampling of one image contributes repeated observations; this is not a
+  # distinct-frame count. Two child opacities preserve the parent's base-alpha
+  # algebra; displaced, rescaled kernels do not preserve arbitrary-ray
+  # transmittance. Default disabled preserves upstream topology.
+  scale_shape_split:
+    enabled: false
+    anisotropy_threshold: 8.0
+    min_largest_scale: 0.01
+    min_observations: 32
   # Field-angle-aware (solid-angle-weighted) densification. Screen-space
   # density control is blind to the fisheye projection Jacobian, so the
   # periphery (few pixels per steradian) is under-densified -> oversized,

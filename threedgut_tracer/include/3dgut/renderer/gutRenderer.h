@@ -70,6 +70,7 @@ public:
                          tcnn::vec4* radianceDensityCudaPtr,
                          int* particlesVisibilityCudaPtr,
                          tcnn::vec2* particlesProjectedPositionCudaPtr,
+                         tcnn::vec4* particlesProjectedConicOpacityCudaPtr,
                          tcnn::vec2* particlesProjectedExtentCudaPtr,
                          int* particlesTilesCountCudaPtr,
                          Parameters& parameters,

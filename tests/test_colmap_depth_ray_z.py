@@ -1,6 +1,7 @@
 """Tests for COLMAP camera ray angle sidecars."""
 
 import torch
+
 from threedgrut.datasets.dataset_colmap import ColmapDataset
 
 
@@ -56,6 +57,7 @@ def test_colmap_batch_includes_depth_ray_z_without_depth_gt() -> None:
         "pose": torch.eye(4, dtype=torch.float32).reshape(1, 1, 4, 4),
         "intr": torch.tensor([5]),
         "camera_idx": torch.tensor([0]),
+        "post_processing_camera_idx": torch.tensor([0]),
         "frame_idx": torch.tensor([7]),
         "sequence_idx": torch.tensor([-1]),
         "image_path": ["cam0/frame0007.png"],

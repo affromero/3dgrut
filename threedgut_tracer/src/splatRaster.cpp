@@ -170,7 +170,7 @@ SplatRaster::SplatRaster(const nlohmann::json& config)
 SplatRaster::~SplatRaster(void) {
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
                    torch::Tensor particleDensity,
                    torch::Tensor particleRadiance,
@@ -193,13 +193,14 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
 
     const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 
-    torch::Tensor rayRadianceDensity = torch::zeros({height, width, 4}, opts);
-    torch::Tensor rayHitDistance     = torch::ones({height, width, 1}, opts).multiply(1e06f);
-    torch::Tensor rayHitCount        = torch::zeros({height, width, 1}, opts);
-    torch::Tensor particleVisibility = torch::zeros({numParticles, 1}, opts);
-    torch::Tensor particleProjectedPosition = torch::zeros({numParticles, 2}, opts);
-    torch::Tensor particleProjectedExtent = torch::zeros({numParticles, 2}, opts);
-    torch::Tensor particleTilesCount = torch::zeros(
+    torch::Tensor rayRadianceDensity            = torch::zeros({height, width, 4}, opts);
+    torch::Tensor rayHitDistance                = torch::ones({height, width, 1}, opts).multiply(1e06f);
+    torch::Tensor rayHitCount                   = torch::zeros({height, width, 1}, opts);
+    torch::Tensor particleVisibility            = torch::zeros({numParticles, 1}, opts);
+    torch::Tensor particleProjectedPosition     = torch::zeros({numParticles, 2}, opts);
+    torch::Tensor particleProjectedConicOpacity = torch::zeros({numParticles, 4}, opts);
+    torch::Tensor particleProjectedExtent       = torch::zeros({numParticles, 2}, opts);
+    torch::Tensor particleTilesCount            = torch::zeros(
         {numParticles, 1},
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 
@@ -236,6 +237,7 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         reinterpret_cast<tcnn::vec4*>(voidDataPtr(rayRadianceDensity)),
         reinterpret_cast<int*>(voidDataPtr(particleVisibility)),
         reinterpret_cast<tcnn::vec2*>(voidDataPtr(particleProjectedPosition)),
+        reinterpret_cast<tcnn::vec4*>(voidDataPtr(particleProjectedConicOpacity)),
         reinterpret_cast<tcnn::vec2*>(voidDataPtr(particleProjectedExtent)),
         reinterpret_cast<int*>(voidDataPtr(particleTilesCount)),
         m_parameters,
@@ -248,12 +250,13 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         timer->stop();
     }
 
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
         rayRadianceDensity,
         rayHitDistance,
         rayHitCount,
         particleVisibility,
         particleProjectedPosition,
+        particleProjectedConicOpacity,
         particleProjectedExtent,
         particleTilesCount);
 }

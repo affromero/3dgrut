@@ -191,6 +191,7 @@ class Tracer:
                 ray_hit_count,
                 mog_visibility,
                 mog_projected_position,
+                mog_projected_conic_opacity,
                 mog_projected_extent,
                 mog_tiles_count,
             ) = tracer_wrapper.trace(
@@ -230,6 +231,7 @@ class Tracer:
                 ray_hit_count,
                 mog_visibility,
                 mog_projected_position,
+                mog_projected_conic_opacity,
                 mog_projected_extent,
                 mog_tiles_count,
             )
@@ -242,6 +244,7 @@ class Tracer:
             ray_hit_count_grd_UNUSED,
             mog_visibility_grd_UNUSED,
             mog_projected_position_grd_UNUSED,
+            mog_projected_conic_opacity_grd_UNUSED,
             mog_projected_extent_grd_UNUSED,
             mog_tiles_count_grd_UNUSED,
         ):
@@ -325,10 +328,7 @@ class Tracer:
         if probability <= 0.0:
             return densities
         if probability >= 1.0:
-            raise ValueError(
-                "render.gaussian_dropout.probability must be in [0, 1), "
-                f"got {probability}."
-            )
+            raise ValueError("render.gaussian_dropout.probability must be in [0, 1), " f"got {probability}.")
         step = int(frame_id)
         start_iteration = int(dropout_conf.get("start_iteration", 0))
         end_iteration = int(dropout_conf.get("end_iteration", -1))
@@ -363,6 +363,7 @@ class Tracer:
                 hits_count,
                 mog_visibility,
                 mog_projected_position,
+                mog_projected_conic_opacity,
                 mog_projected_extent,
                 mog_tiles_count,
             ) = Tracer._Autograd.apply(
@@ -400,6 +401,7 @@ class Tracer:
             "frame_time_ms": timings["forward_render"] if "forward_render" in timings else 0.0,
             "mog_visibility": mog_visibility,
             "mog_projected_position": mog_projected_position,
+            "mog_projected_conic_opacity": mog_projected_conic_opacity,
             "mog_projected_extent": mog_projected_extent,
             "mog_tiles_count": mog_tiles_count,
         }
@@ -424,11 +426,7 @@ class Tracer:
 
         sensor, poses = Tracer.__create_camera_parameters(gpu_batch)
 
-        n_active_features = (
-            sph_degree_override
-            if sph_degree_override is not None
-            else gaussians.n_active_features
-        )
+        n_active_features = sph_degree_override if sph_degree_override is not None else gaussians.n_active_features
 
         mog_pos = gaussians.positions.contiguous()
         mog_rot = gaussians.get_rotation().contiguous()
@@ -438,9 +436,7 @@ class Tracer:
             [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
         ).contiguous()
         particle_radiance = (
-            features_override.contiguous()
-            if features_override is not None
-            else gaussians.get_features().contiguous()
+            features_override.contiguous() if features_override is not None else gaussians.get_features().contiguous()
         )
 
         ray_time = (
@@ -458,6 +454,7 @@ class Tracer:
             ray_hit_count,
             _mog_visibility,
             _mog_projected_position,
+            _mog_projected_conic_opacity,
             _mog_projected_extent,
             _mog_tiles_count,
         ) = self.tracer_wrapper.trace(
