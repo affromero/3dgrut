@@ -198,6 +198,29 @@ def apply_post_processing(
         post_processing_kwargs["sequence_idx"] = sequence_idx
     if hasattr(post_processing, "use_residual_grid"):
         post_processing_kwargs["residual_grid_gate"] = residual_grid_gate
+    if getattr(post_processing, "use_view_context", False):
+        if bool(getattr(gpu_batch, "rays_in_world_space", False)):
+            raise ValueError(
+                "View-conditioned post-processing requires camera-space "
+                "rays and a non-identity camera-to-world pose."
+            )
+        end_pose = getattr(gpu_batch, "T_to_world_end", None)
+        if end_pose is not None and not torch.allclose(
+            end_pose,
+            gpu_batch.T_to_world,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "View-conditioned post-processing supports global shutter "
+                "only; distinct start and end poses are ambiguous."
+            )
+        post_processing_kwargs["render_ray_distance"] = outputs.get(
+            "pred_dist"
+        )
+        post_processing_kwargs["render_opacity"] = outputs.get(
+            "pred_opacity"
+        )
+        post_processing_kwargs["camera_to_world"] = gpu_batch.T_to_world
     pred_rgb_pp = post_processing(
         pred_rgb_flat,
         pixel_coords_flat,

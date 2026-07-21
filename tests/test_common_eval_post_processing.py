@@ -6,13 +6,15 @@ import os
 import sys
 from types import SimpleNamespace
 
+import render_common_eval
 import pytest
 import torch
 from omegaconf import OmegaConf
-
-import render_common_eval
 from threedgrut.datasets.dataset_colmap import ColmapDataset
 from threedgrut.post_processing import LuminanceAffine
+from threedgrut.post_processing.predictive_multiscale_ppisp import (
+    view_context_inference_contract,
+)
 from threedgrut.render import (
     POST_PROCESSING_EVAL_MODE_INFERENCE,
     POST_PROCESSING_EVAL_MODE_INFERENCE_SEQUENCE_METADATA,
@@ -241,6 +243,111 @@ def test_common_eval_cli_defaults_to_raw(
     args = render_common_eval._parse_args()
 
     assert args.post_processing_mode == POST_PROCESSING_EVAL_MODE_RAW
+    assert args.split == "val"
+
+
+def test_common_eval_cli_accepts_train_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Train and validation use the same sealed common evaluator."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_common_eval.py",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--eval-bundle",
+            "eval_bundle",
+            "--holdout-list",
+            "holdout.txt",
+            "--out-dir",
+            "out",
+            "--split",
+            "train",
+            "--train-exclude-list",
+            "exclude.txt",
+        ],
+    )
+
+    args = render_common_eval._parse_args()
+
+    assert args.split == "train"
+    assert args.train_exclude_list == "exclude.txt"
+
+
+def test_common_eval_cli_rejects_train_without_exclusion_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Train metrics must never mean the unqualified holdout complement."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "render_common_eval.py",
+            "--checkpoint",
+            "checkpoint.pt",
+            "--eval-bundle",
+            "eval_bundle",
+            "--holdout-list",
+            "holdout.txt",
+            "--out-dir",
+            "out",
+            "--split",
+            "train",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        render_common_eval._parse_args()
+
+
+def test_common_eval_train_split_contract_rejects_unsafe_lists(
+    tmp_path: object,
+) -> None:
+    """Only a disjoint, registered exclusion partition is accepted."""
+    root = str(tmp_path)
+    sparse_path = os.path.join(root, "eval", "sparse", "0")
+    os.makedirs(sparse_path)
+    with open(
+        os.path.join(sparse_path, "images.txt"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        for image_id, name in enumerate(
+            ("train.png", "holdout.png", "exclude.png"),
+            start=1,
+        ):
+            handle.write(
+                f"{image_id} 1 0 0 0 0 0 0 1 {name}\n\n"
+            )
+    holdout_path = os.path.join(root, "holdout.txt")
+    with open(holdout_path, "w", encoding="utf-8") as handle:
+        handle.write("holdout.png\n")
+    exclude_path = os.path.join(root, "exclude.txt")
+
+    with open(exclude_path, "w", encoding="utf-8") as handle:
+        handle.write("exclude.png\n")
+    render_common_eval._validate_train_split_contract(
+        eval_bundle=os.path.join(root, "eval"),
+        holdout_list=holdout_path,
+        train_exclude_list=exclude_path,
+    )
+
+    for invalid_names in (
+        "",
+        "exclude.png\nexclude.png\n",
+        "missing.png\n",
+        "holdout.png\n",
+    ):
+        with open(exclude_path, "w", encoding="utf-8") as handle:
+            handle.write(invalid_names)
+        with pytest.raises((ValueError, FileNotFoundError)):
+            render_common_eval._validate_train_split_contract(
+                eval_bundle=os.path.join(root, "eval"),
+                holdout_list=holdout_path,
+                train_exclude_list=exclude_path,
+            )
 
 
 def test_common_eval_cli_accepts_camera_only_diagnostic(
@@ -361,6 +468,7 @@ def test_common_eval_inference_requires_proven_controller(
         eval_bundle="eval_bundle",
         out_dir="out",
         post_processing_mode=POST_PROCESSING_EVAL_MODE_INFERENCE,
+        split="train",
     )
 
     _, kwargs = _RendererFactory.calls[0]
@@ -368,6 +476,7 @@ def test_common_eval_inference_requires_proven_controller(
     assert kwargs["post_processing"] is restored
     assert kwargs["post_processing_source"] == (POST_PROCESSING_SOURCE_CHECKPOINT)
     assert kwargs["strict_post_processing_contract"] is True
+    assert kwargs["split"] == "train"
 
 
 def test_common_eval_camera_only_disables_controller_without_readiness_gate(
@@ -779,6 +888,129 @@ def test_ppisp_controller_readiness_records_durable_proof() -> None:
     assert manifest["proof_source"] == "checkpoint_inference_contract"
 
 
+def test_multiscale_readiness_requires_explicit_training_proof() -> None:
+    """A local controller cannot inherit readiness from global PPISP alone."""
+    checkpoint = {
+        "global_step": 100,
+        "post_processing": {
+            "schedulers": [{"last_epoch": 81}],
+            "inference_contract": {
+                "checkpoint_global_step": 100,
+                "controller_activation_step": 80,
+                "scheduler_last_epoch": 81,
+                "controller_trained": True,
+                "multiscale_controller_trained": False,
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="requires proof"):
+        _ppisp_controller_restore_manifest(
+            checkpoint,
+            use_controller=True,
+            configured_activation_step=80,
+            require_controller_ready=True,
+            use_multiscale_controller=True,
+        )
+
+
+def test_multiscale_readiness_accepts_matching_local_training_proof() -> None:
+    """Global and local proof together authorize strict inference."""
+    checkpoint = {
+        "global_step": 100,
+        "post_processing": {
+            "schedulers": [{"last_epoch": 81}],
+            "inference_contract": {
+                "checkpoint_global_step": 100,
+                "controller_activation_step": 80,
+                "scheduler_last_epoch": 81,
+                "controller_trained": True,
+                "multiscale_controller_trained": True,
+            },
+        },
+    }
+
+    manifest = _ppisp_controller_restore_manifest(
+        checkpoint,
+        use_controller=True,
+        configured_activation_step=80,
+        require_controller_ready=True,
+        use_multiscale_controller=True,
+    )
+
+    assert manifest["multiscale_trained"] is True
+    assert manifest["multiscale_ready_for_inference"] is True
+
+
+def test_view_context_readiness_requires_exact_versioned_contract() -> None:
+    """Pose-conditioned inference must prove its exact feature semantics."""
+    checkpoint = {
+        "global_step": 100,
+        "post_processing": {
+            "schedulers": [{"last_epoch": 81}],
+            "inference_contract": {
+                "checkpoint_global_step": 100,
+                "controller_activation_step": 80,
+                "scheduler_last_epoch": 81,
+                "controller_trained": True,
+                "multiscale_controller_trained": True,
+                "multiscale_view_context_enabled": True,
+                "multiscale_view_context_trained": True,
+                "multiscale_view_context_contract": (
+                    view_context_inference_contract()
+                ),
+            },
+        },
+    }
+
+    manifest = _ppisp_controller_restore_manifest(
+        checkpoint,
+        use_controller=True,
+        configured_activation_step=80,
+        require_controller_ready=True,
+        use_multiscale_controller=True,
+        use_view_context=True,
+    )
+
+    assert manifest["view_context_trained"] is True
+    assert manifest["view_context_ready_for_inference"] is True
+    assert manifest["view_context_contract"] == (
+        view_context_inference_contract()
+    )
+
+
+def test_view_context_readiness_rejects_contract_drift() -> None:
+    """Changed channel semantics cannot be accepted as exact inference."""
+    checkpoint = {
+        "global_step": 100,
+        "post_processing": {
+            "schedulers": [{"last_epoch": 81}],
+            "inference_contract": {
+                "checkpoint_global_step": 100,
+                "controller_activation_step": 80,
+                "scheduler_last_epoch": 81,
+                "controller_trained": True,
+                "multiscale_controller_trained": True,
+                "multiscale_view_context_enabled": True,
+                "multiscale_view_context_trained": True,
+                "multiscale_view_context_contract": {
+                    "schema_version": 999
+                },
+            },
+        },
+    }
+
+    with pytest.raises(ValueError, match="exact versioned"):
+        _ppisp_controller_restore_manifest(
+            checkpoint,
+            use_controller=True,
+            configured_activation_step=80,
+            require_controller_ready=True,
+            use_multiscale_controller=True,
+            use_view_context=True,
+        )
+
+
 def test_luminance_restore_is_exact_and_records_manifest() -> None:
     """An exact LuminanceAffine state round-trip records no transformations."""
     source = LuminanceAffine(num_cameras=1, num_frames=2)
@@ -868,12 +1100,18 @@ def test_common_eval_main_disables_exif_and_preserves_training_path(
             checkpoint="checkpoint.pt",
             eval_bundle="eval_bundle",
             holdout_list="holdout.txt",
+            train_exclude_list=None,
             out_dir="out",
+            split="val",
             post_processing_mode=POST_PROCESSING_EVAL_MODE_RAW,
         ),
     )
     monkeypatch.setattr(render_common_eval.torch, "load", lambda *a, **k: checkpoint)
-    monkeypatch.setattr(render_common_eval, "MixtureOfGaussians", FakeModel)
+    monkeypatch.setattr(
+        render_common_eval,
+        "create_gaussian_model",
+        lambda *args, **kwargs: FakeModel(conf),
+    )
     monkeypatch.setattr(render_common_eval, "_build_renderer", build_renderer)
 
     render_common_eval.main()
@@ -881,6 +1119,7 @@ def test_common_eval_main_disables_exif_and_preserves_training_path(
     assert conf.dataset.load_exif is False
     assert conf.path == "eval_bundle"
     assert conf.dataset.holdout_image_list_path == "holdout.txt"
+    assert conf.dataset.train_exclude_image_list_path is None
     renderer_kwargs = captured["renderer_kwargs"]
     assert isinstance(renderer_kwargs, dict)
     assert renderer_kwargs["original_training_bundle"] == "training_bundle"

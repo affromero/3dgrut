@@ -86,6 +86,7 @@ public:
                           const tcnn::vec4* radianceDensityGradientCudaPtr,
                           tcnn::vec3* worldRayOriginGradientCudaPtr,
                           tcnn::vec3* worldRayDirectionGradientCudaPtr,
+                          tcnn::vec3* particlePositionGradientAbsCudaPtr,
                           Parameters& parameters,
                           int cudaDeviceIndex,
                           cudaStream_t cudaStream);

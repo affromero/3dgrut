@@ -238,7 +238,12 @@ def test_gs_clone_preserves_optimizer_state_dtypes() -> None:
     parameters = _parameters(point_count=2)
     optimizer = _optimizer(parameters)
     optimizer.step(torch.tensor((True, True)))
-    model = SimpleNamespace(optimizer=optimizer, **parameters)
+    model = SimpleNamespace(
+        optimizer=optimizer,
+        protected_gaussian_count=0,
+        refresh_protected_gradient_hooks=lambda: None,
+        **parameters,
+    )
     strategy = GSStrategy.__new__(GSStrategy)
     strategy.model = model
     strategy.conf = OmegaConf.create({"strategy": {"print_stats": False}})

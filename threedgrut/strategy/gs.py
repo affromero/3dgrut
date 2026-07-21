@@ -22,6 +22,11 @@ from jaxtyping import Float, jaxtyped
 
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.strategy.base import BaseStrategy
+from threedgrut.strategy.moment_preserving_split import (
+    GAUSS_HERMITE_CHILD_COUNT,
+    MomentPreservingSplitChildren,
+    gauss_hermite_split_children,
+)
 from threedgrut.strategy.scale_shape_split import (
     ScaleShapeThresholds,
     deterministic_split_children,
@@ -42,6 +47,38 @@ _COVARIANCE_INVALID_REASON_NAMES = (
     "nonpositive_opacity",
 )
 _COVARIANCE_INVALID_EXAMPLES_PER_REASON = 8
+
+
+def exclude_protected_prefix(
+    mask: torch.Tensor,
+    protected_count: int,
+) -> torch.Tensor:
+    """Exclude immutable prefix rows from topology expansion."""
+    if protected_count < 0 or protected_count > mask.shape[0]:
+        raise ValueError(
+            "Protected prefix count is outside the topology mask: "
+            f"{protected_count} for shape {tuple(mask.shape)}."
+        )
+    if protected_count:
+        mask = mask.clone()
+        mask[:protected_count] = False
+    return mask
+
+
+def retain_protected_prefix(
+    mask: torch.Tensor,
+    protected_count: int,
+) -> torch.Tensor:
+    """Force immutable prefix rows to survive topology pruning."""
+    if protected_count < 0 or protected_count > mask.shape[0]:
+        raise ValueError(
+            "Protected prefix count is outside the topology mask: "
+            f"{protected_count} for shape {tuple(mask.shape)}."
+        )
+    if protected_count:
+        mask = mask.clone()
+        mask[:protected_count] = True
+    return mask
 
 
 class GSStrategy(BaseStrategy):
@@ -72,6 +109,39 @@ class GSStrategy(BaseStrategy):
         self.feature_grad_quantile = float(feature_cfg.get("quantile", 0.95))
         self.feature_grad_max_boost = float(feature_cfg.get("max_boost", 4.0))
         self.feature_grad_carrier_tail_only = bool(feature_cfg.get("carrier_tail_only", False))
+        tile_coverage_cfg = self.conf.strategy.densify.get(
+            "tile_coverage_weighted_gradient",
+            {},
+        )
+        self.tile_coverage_weighted_gradient_enabled = bool(tile_coverage_cfg.get("enabled", False))
+        absolute_ray_cfg = self.conf.strategy.densify.get(
+            "absolute_ray_gradient_diagnostics",
+            {},
+        )
+        self.absolute_ray_gradient_diagnostics_enabled = bool(absolute_ray_cfg.get("enabled", False))
+        absolute_ray_frequency = absolute_ray_cfg.get("frequency", 10)
+        self.absolute_ray_gradient_diagnostics_frequency = int(absolute_ray_frequency)
+        absolute_ray_densify_cfg = self.conf.strategy.densify.get(
+            "absolute_ray_gradient_densification",
+            {},
+        )
+        self.absolute_ray_gradient_densification_enabled = bool(absolute_ray_densify_cfg.get("enabled", False))
+        cancellation_split_cfg = self.conf.strategy.densify.get(
+            "cancellation_conditioned_split",
+            {},
+        )
+        self.cancellation_conditioned_split_enabled = bool(cancellation_split_cfg.get("enabled", False))
+        self.cancellation_conditioned_split_threshold = float(cancellation_split_cfg.get("cancellation_threshold", 0.5))
+        self.cancellation_conditioned_split_extent_px = float(cancellation_split_cfg.get("extent_px", 8.0))
+        min_joint_observations = cancellation_split_cfg.get(
+            "min_joint_observations",
+            2,
+        )
+        self.cancellation_conditioned_split_min_observations = int(min_joint_observations)
+        self.cancellation_conditioned_split_min_fraction = float(cancellation_split_cfg.get("min_joint_fraction", 0.5))
+        self.cancellation_conditioned_split_max_reroute_fraction = float(
+            cancellation_split_cfg.get("max_reroute_fraction", 0.5)
+        )
         projected_extent_cfg = self.conf.strategy.densify.get("projected_extent_split", {})
         self.projected_extent_split_enabled = bool(projected_extent_cfg.get("enabled", False))
         self.projected_extent_split_max_px = float(projected_extent_cfg.get("max_px", 8.0))
@@ -97,12 +167,121 @@ class GSStrategy(BaseStrategy):
         self.scale_shape_min_largest_scale = float(scale_shape_split_cfg.get("min_largest_scale", 0.01))
         min_observations = scale_shape_split_cfg.get("min_observations", 32)
         self.scale_shape_min_observations = int(min_observations)
+        moment_split_cfg = self.conf.strategy.densify.get(
+            "moment_preserving_split",
+            {},
+        )
+        self.moment_preserving_split_enabled = bool(
+            moment_split_cfg.get("enabled", False)
+        )
+        self.moment_preserving_split_beta = float(
+            moment_split_cfg.get("beta", 0.390625)
+        )
         if self.projected_extent_split_enabled and self.covariance_gradient_split_enabled:
             raise ValueError(
                 "strategy.densify.projected_extent_split and "
                 "strategy.densify.covariance_gradient_split are mutually "
                 "exclusive experiment arms."
             )
+        if self.tile_coverage_weighted_gradient_enabled:
+            if self.covariance_gradient_split_enabled:
+                raise ValueError(
+                    "strategy.densify.tile_coverage_weighted_gradient and "
+                    "strategy.densify.covariance_gradient_split are "
+                    "mutually exclusive experiment arms."
+                )
+            render_method = self.conf.get("render", {}).get("method")
+            if render_method != "3dgut":
+                raise ValueError(
+                    "strategy.densify.tile_coverage_weighted_gradient "
+                    "requires render.method=3dgut, got "
+                    f"{render_method!r}."
+                )
+        if self.absolute_ray_gradient_diagnostics_enabled:
+            if self.tile_coverage_weighted_gradient_enabled:
+                raise ValueError(
+                    "absolute-ray-gradient diagnostics require the ordinary "
+                    "per-view signed-gradient control, not tile weighting."
+                )
+            render_method = self.conf.get("render", {}).get("method")
+            if render_method != "3dgut":
+                raise ValueError(
+                    "absolute-ray-gradient diagnostics require " f"render.method=3dgut, got {render_method!r}."
+                )
+            if (
+                isinstance(absolute_ray_frequency, bool)
+                or self.absolute_ray_gradient_diagnostics_frequency != absolute_ray_frequency
+                or self.absolute_ray_gradient_diagnostics_frequency < 1
+            ):
+                raise ValueError(
+                    "absolute_ray_gradient_diagnostics.frequency must be a "
+                    f"positive integer, got {absolute_ray_frequency!r}."
+                )
+        if self.absolute_ray_gradient_densification_enabled:
+            incompatible_arms = (
+                self.tile_coverage_weighted_gradient_enabled
+                or self.cancellation_conditioned_split_enabled
+                or self.projected_extent_split_enabled
+                or self.covariance_gradient_split_enabled
+                or self.scale_shape_split_enabled
+            )
+            if incompatible_arms:
+                raise ValueError(
+                    "absolute-ray-gradient densification is mutually exclusive "
+                    "with tile, cancellation-conditioned, projected-extent, "
+                    "covariance-gradient, and scale-shape structural arms."
+                )
+            render_method = self.conf.get("render", {}).get("method")
+            if render_method != "3dgut":
+                raise ValueError(
+                    "absolute-ray-gradient densification requires " f"render.method=3dgut, got {render_method!r}."
+                )
+        if self.cancellation_conditioned_split_enabled:
+            incompatible_arms = (
+                self.tile_coverage_weighted_gradient_enabled
+                or self.projected_extent_split_enabled
+                or self.covariance_gradient_split_enabled
+                or self.scale_shape_split_enabled
+            )
+            if incompatible_arms:
+                raise ValueError(
+                    "cancellation-conditioned splitting is mutually exclusive "
+                    "with tile, projected-extent, covariance-gradient, and "
+                    "scale-shape structural arms."
+                )
+            render_method = self.conf.get("render", {}).get("method")
+            if render_method != "3dgut":
+                raise ValueError(
+                    "cancellation-conditioned splitting requires " f"render.method=3dgut, got {render_method!r}."
+                )
+            if not (
+                math.isfinite(self.cancellation_conditioned_split_threshold)
+                and 0.0 < self.cancellation_conditioned_split_threshold < 1.0
+            ):
+                raise ValueError(
+                    "cancellation_conditioned_split.cancellation_threshold " "must be finite and in (0, 1)."
+                )
+            if (
+                not math.isfinite(self.cancellation_conditioned_split_extent_px)
+                or self.cancellation_conditioned_split_extent_px <= 0.0
+            ):
+                raise ValueError("cancellation_conditioned_split.extent_px must be finite " "and positive.")
+            if (
+                isinstance(min_joint_observations, bool)
+                or self.cancellation_conditioned_split_min_observations != min_joint_observations
+                or self.cancellation_conditioned_split_min_observations < 1
+            ):
+                raise ValueError("cancellation_conditioned_split.min_joint_observations " "must be a positive integer.")
+            if not (
+                math.isfinite(self.cancellation_conditioned_split_min_fraction)
+                and 0.0 < self.cancellation_conditioned_split_min_fraction <= 1.0
+            ):
+                raise ValueError("cancellation_conditioned_split.min_joint_fraction must " "be finite and in (0, 1].")
+            if not (
+                math.isfinite(self.cancellation_conditioned_split_max_reroute_fraction)
+                and 0.0 < self.cancellation_conditioned_split_max_reroute_fraction < 1.0
+            ):
+                raise ValueError("cancellation_conditioned_split.max_reroute_fraction " "must be finite and in (0, 1).")
         if self.projected_extent_split_enabled:
             render_method = self.conf.get("render", {}).get("method")
             if render_method != "3dgut":
@@ -191,6 +370,50 @@ class GSStrategy(BaseStrategy):
                 raise ValueError(
                     "scale_shape_split.min_observations must be a " f"positive integer, got {min_observations!r}."
                 )
+        if self.moment_preserving_split_enabled:
+            incompatible_selection = (
+                self.theta_aware
+                or self.feature_grad_aware
+                or self.tile_coverage_weighted_gradient_enabled
+                or self.absolute_ray_gradient_densification_enabled
+                or self.projected_extent_split_enabled
+                or self.covariance_gradient_split_enabled
+                or self.scale_shape_split_enabled
+            )
+            if incompatible_selection:
+                message = (
+                    "moment-preserving splitting is mutually exclusive with "
+                    "candidate weighting and alternate structural split "
+                    "operators."
+                )
+                raise ValueError(message)
+            if self.conf.model.density_activation != "sigmoid":
+                message = (
+                    "moment-preserving splitting requires "
+                    "model.density_activation=sigmoid."
+                )
+                raise ValueError(message)
+            if self.conf.model.scale_activation != "exp":
+                message = (
+                    "moment-preserving splitting requires "
+                    "model.scale_activation=exp."
+                )
+                raise ValueError(message)
+            if self.split_n_gaussians != 2:
+                message = (
+                    "moment-preserving splitting requires the incumbent "
+                    "two-child control configuration."
+                )
+                raise ValueError(message)
+            if (
+                not math.isfinite(self.moment_preserving_split_beta)
+                or not 0.0 < self.moment_preserving_split_beta < 1.0
+            ):
+                message = (
+                    "moment_preserving_split.beta must be finite and in "
+                    f"(0, 1), got {self.moment_preserving_split_beta}."
+                )
+                raise ValueError(message)
         if self.feature_grad_power <= 0:
             msg = "strategy.densify.feature_grad.power must be positive; " f"got {self.feature_grad_power}."
             raise ValueError(msg)
@@ -212,6 +435,14 @@ class GSStrategy(BaseStrategy):
         self.densify_feature_grad_accum = torch.empty([0, 1])
         self.densify_feature_grad_denom = torch.empty([0, 1])
         self.densify_projected_extent_max = torch.empty([0])
+        self.densify_cancellation_joint_observations = torch.empty(
+            [0, 1],
+            dtype=torch.int,
+        )
+        self.densify_cancellation_valid_observations = torch.empty(
+            [0, 1],
+            dtype=torch.int,
+        )
         self.densify_scale_shape_observation_count = torch.empty([0, 1], dtype=torch.int)
         self.densify_covariance_gradient_mass = torch.empty([0, 1])
         self.densify_covariance_large_observations = torch.empty([0, 1])
@@ -232,6 +463,9 @@ class GSStrategy(BaseStrategy):
         params["densify_feature_grad_denom"] = (self.densify_feature_grad_denom,)
         if self.projected_extent_split_enabled:
             params["densify_projected_extent_max"] = (self.densify_projected_extent_max,)
+        if self.cancellation_conditioned_split_enabled:
+            params["densify_cancellation_joint_observations"] = (self.densify_cancellation_joint_observations,)
+            params["densify_cancellation_valid_observations"] = (self.densify_cancellation_valid_observations,)
         if self.scale_shape_split_enabled:
             params["densify_scale_shape_observation_count"] = (self.densify_scale_shape_observation_count,)
         if self.covariance_gradient_split_enabled:
@@ -248,6 +482,14 @@ class GSStrategy(BaseStrategy):
         return params
 
     def init_densification_buffer(self, checkpoint: Optional[dict] = None):
+        if (
+            self.model.protected_gaussian_count
+            and self.conf.strategy.scale_guard.enabled
+        ):
+            raise ValueError(
+                "Protected Gaussian prefixes require "
+                "strategy.scale_guard.enabled=false."
+            )
         if checkpoint is not None:
             self.densify_grad_norm_accum = checkpoint["densify_grad_norm_accum"][0].detach()
             self.densify_grad_norm_denom = checkpoint["densify_grad_norm_denom"][0].detach()
@@ -256,6 +498,8 @@ class GSStrategy(BaseStrategy):
             feature_accum = checkpoint.get("densify_feature_grad_accum")
             feature_denom = checkpoint.get("densify_feature_grad_denom")
             projected_extent_max = checkpoint.get("densify_projected_extent_max")
+            cancellation_joint_observations = checkpoint.get("densify_cancellation_joint_observations")
+            cancellation_valid_observations = checkpoint.get("densify_cancellation_valid_observations")
             scale_shape_observation_count = checkpoint.get("densify_scale_shape_observation_count")
             covariance_gradient_mass = checkpoint.get("densify_covariance_gradient_mass")
             covariance_large_observations = checkpoint.get("densify_covariance_large_observations")
@@ -300,6 +544,14 @@ class GSStrategy(BaseStrategy):
                 projected_extent_max,
                 num_gaussians=num_gaussians,
             )
+            (
+                self.densify_cancellation_joint_observations,
+                self.densify_cancellation_valid_observations,
+            ) = self._restored_cancellation_split_buffers(
+                joint_observations=cancellation_joint_observations,
+                valid_observations=cancellation_valid_observations,
+                num_gaussians=num_gaussians,
+            )
             self.densify_scale_shape_observation_count = self._restored_scale_shape_observation_count(
                 checkpoint=checkpoint,
                 checkpoint_value=scale_shape_observation_count,
@@ -334,6 +586,16 @@ class GSStrategy(BaseStrategy):
             self.densify_projected_extent_max = torch.zeros(
                 num_gaussians,
                 dtype=torch.float,
+                device=self.model.device,
+            )
+            self.densify_cancellation_joint_observations = torch.zeros(
+                (num_gaussians, 1),
+                dtype=torch.int,
+                device=self.model.device,
+            )
+            self.densify_cancellation_valid_observations = torch.zeros(
+                (num_gaussians, 1),
+                dtype=torch.int,
                 device=self.model.device,
             )
             self.densify_scale_shape_observation_count = torch.zeros(
@@ -392,6 +654,57 @@ class GSStrategy(BaseStrategy):
         if not restored.is_floating_point():
             raise ValueError("Checkpoint densify_projected_extent_max must be floating " "point.")
         return restored
+
+    def _restored_cancellation_split_buffers(
+        self,
+        *,
+        joint_observations: object,
+        valid_observations: object,
+        num_gaussians: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        empty = torch.zeros(
+            (num_gaussians, 1),
+            dtype=torch.int,
+            device=self.model.device,
+        )
+        if not self.cancellation_conditioned_split_enabled:
+            return empty, empty.clone()
+        if joint_observations is None and valid_observations is None:
+            return empty, empty.clone()
+        if joint_observations is None or valid_observations is None:
+            raise ValueError("Cancellation-conditioned split checkpoint requires both " "observation buffers.")
+        restored = []
+        for name, value in (
+            ("joint", joint_observations),
+            ("valid", valid_observations),
+        ):
+            if not isinstance(value, (list, tuple)) or len(value) != 1 or not torch.is_tensor(value[0]):
+                raise ValueError(
+                    "Cancellation-conditioned split checkpoint " f"{name} observations must contain one tensor."
+                )
+            tensor = value[0].detach()
+            if tensor.shape != (num_gaussians, 1):
+                raise ValueError(
+                    "Cancellation-conditioned split checkpoint "
+                    f"{name} observations must have shape "
+                    f"({num_gaussians}, 1), got {tuple(tensor.shape)}."
+                )
+            if tensor.device != self.model.positions.device:
+                raise ValueError("Cancellation-conditioned split checkpoint buffers must " "share the model device.")
+            if (
+                tensor.is_floating_point()
+                or tensor.is_complex()
+                or tensor.dtype == torch.bool
+                or bool((tensor < 0).any())
+            ):
+                raise ValueError(
+                    "Cancellation-conditioned split checkpoint buffers must " "contain non-negative integers."
+                )
+            restored.append(tensor)
+        joint, valid = restored
+        if bool((joint > valid).any()):
+            raise ValueError("Cancellation-conditioned joint observations cannot exceed " "valid observations.")
+        return joint, valid
 
     def _restored_scale_shape_observation_count(
         self,
@@ -729,7 +1042,16 @@ class GSStrategy(BaseStrategy):
         """Callback function to be executed after the `loss.backward()` call."""
 
         # Update densification buffer:
-        if check_step_condition(step, 0, self.conf.strategy.densify.end_iteration, 1):
+        densification_enabled = (
+            self.conf.strategy.densify.start_iteration >= 0
+            and self.model.positions.requires_grad
+        )
+        if densification_enabled and check_step_condition(
+            step,
+            0,
+            self.conf.strategy.densify.end_iteration,
+            1,
+        ):
             with torch.cuda.nvtx.range(f"train_{step}_grad_buffer"):
                 if self.scale_shape_split_enabled:
                     self.update_scale_shape_observation_count(outputs)
@@ -740,9 +1062,22 @@ class GSStrategy(BaseStrategy):
                         outputs,
                         sensor_position=batch.T_to_world[0, :3, 3],
                     )
+                if self.cancellation_conditioned_split_enabled:
+                    self.update_cancellation_conditioned_split_buffer(outputs)
+                if (
+                    self.absolute_ray_gradient_diagnostics_enabled
+                    and step % self.absolute_ray_gradient_diagnostics_frequency == 0
+                ):
+                    self.log_absolute_ray_gradient_diagnostics(
+                        outputs=outputs,
+                        sensor_position=batch.T_to_world[0, :3, 3],
+                        writer=writer,
+                        step=step,
+                    )
                 self.update_gradient_buffer(
                     sensor_position=batch.T_to_world[0, :3, 3],
                     sensor_forward=batch.T_to_world[0, :3, 2],
+                    outputs=outputs,
                 )
 
         # Clamp density
@@ -751,6 +1086,211 @@ class GSStrategy(BaseStrategy):
                 self.model.clamp_density()
 
         return False
+
+    @torch.no_grad()
+    def log_absolute_ray_gradient_diagnostics(
+        self,
+        *,
+        outputs: dict[str, object] | None,
+        sensor_position: torch.Tensor,
+        writer: object | None,
+        step: int,
+    ) -> dict[str, float]:
+        """Measure per-ray positional-gradient cancellation without mutation.
+
+        3DGUT differentiates ray/Gaussian intersections directly in 3D, so
+        this is deliberately not named an AbsGS screen-space statistic. The
+        native backward pass sums absolute per-ray contributions before its
+        ordinary signed atomic reduction; both tensors therefore contain only
+        renderer-derived gradients from the same backward invocation.
+        """
+        if outputs is None:
+            raise RuntimeError("Absolute-ray-gradient diagnostics require renderer outputs.")
+        signed_gradient = outputs.get("mog_signed_ray_position_grad")
+        absolute_gradient = outputs.get("mog_abs_ray_position_grad")
+        projected_extent = outputs.get("mog_projected_extent")
+        tensors = (
+            ("mog_signed_ray_position_grad", signed_gradient, (3,)),
+            ("mog_abs_ray_position_grad", absolute_gradient, (3,)),
+            ("mog_projected_extent", projected_extent, (2,)),
+        )
+        num_gaussians = self.model.num_gaussians
+        for name, value, trailing_shape in tensors:
+            if not torch.is_tensor(value):
+                raise RuntimeError(f"Absolute-ray-gradient diagnostics require outputs[{name!r}].")
+            expected_shape = (num_gaussians, *trailing_shape)
+            if value.shape != expected_shape:
+                raise ValueError(f"{name} must have shape {expected_shape}, got " f"{tuple(value.shape)}.")
+            if value.device != self.model.positions.device:
+                raise ValueError(f"{name} must share the Gaussian model device.")
+            if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+                raise ValueError(f"{name} must contain finite floating-point values.")
+        if bool((absolute_gradient < 0).any()):
+            raise ValueError("mog_abs_ray_position_grad must be componentwise non-negative.")
+        if bool((projected_extent < 0).any()):
+            raise ValueError("mog_projected_extent must be non-negative.")
+        if sensor_position.shape != (3,):
+            raise ValueError("sensor_position must have shape (3,), got " f"{tuple(sensor_position.shape)}.")
+        if sensor_position.device != self.model.positions.device or not bool(torch.isfinite(sensor_position).all()):
+            raise ValueError("sensor_position must be finite and share the model device.")
+
+        distance = (self.model.positions.detach() - sensor_position).norm(dim=1)
+        signed_mass = (signed_gradient * distance.unsqueeze(1)).norm(dim=1) / 2
+        absolute_mass = (absolute_gradient * distance.unsqueeze(1)).norm(dim=1) / 2
+        tolerance = max(
+            1e-7,
+            float(absolute_mass.max().item()) * 1e-4,
+        )
+        violation = signed_mass - absolute_mass
+        if bool((violation > tolerance).any()):
+            max_violation = float(violation.max().item())
+            raise RuntimeError(
+                "Signed ray-gradient mass exceeds its absolute pre-reduction " f"upper bound by {max_violation:.6g}."
+            )
+        active = absolute_mass > 0
+        if not bool(active.any()):
+            raise RuntimeError(
+                "Absolute-ray-gradient diagnostics observed no renderer " "position-gradient contribution."
+            )
+        active_absolute = absolute_mass[active]
+        active_signed = signed_mass[active].clamp_max(active_absolute)
+        cancellation = 1.0 - active_signed / active_absolute.clamp_min(1e-20)
+        weights = active_absolute / active_absolute.sum().clamp_min(1e-20)
+        extent = projected_extent.detach().amax(dim=1)[active]
+
+        physical_scale = self.model.get_scale().detach()[active]
+        if not bool(torch.isfinite(physical_scale).all()) or bool((physical_scale <= 0).any()):
+            raise RuntimeError("Absolute-ray-gradient diagnostics require finite positive " "physical Gaussian scales.")
+        covariance_eigenvalues = physical_scale.square()
+        normalized_eigenvalues = covariance_eigenvalues / (
+            covariance_eigenvalues.sum(dim=1, keepdim=True).clamp_min(1e-20)
+        )
+        spectral_entropy = -(normalized_eigenvalues * normalized_eigenvalues.clamp_min(1e-20).log()).sum(
+            dim=1
+        ) / math.log(3.0)
+        condition = physical_scale.amax(dim=1) / physical_scale.amin(dim=1)
+
+        def weighted_fraction(mask: torch.Tensor) -> float:
+            return float(weights[mask].sum().item())
+
+        metrics = {
+            "active_gaussians": float(active.sum().item()),
+            "signed_mass": float(active_signed.sum().item()),
+            "absolute_mass": float(active_absolute.sum().item()),
+            "cancellation_global": float(
+                1.0 - active_signed.sum().item() / active_absolute.sum().clamp_min(1e-20).item()
+            ),
+            "cancellation_weighted_mean": float((weights * cancellation).sum().item()),
+            "cancellation_gt_0p5_mass_fraction": weighted_fraction(cancellation > 0.5),
+            "cancellation_gt_0p9_mass_fraction": weighted_fraction(cancellation > 0.9),
+            "extent_weighted_mean_px": float((weights * extent).sum().item()),
+            "extent_gt_8_mass_fraction": weighted_fraction(extent > 8.0),
+            "extent_gt_16_mass_fraction": weighted_fraction(extent > 16.0),
+            "spectral_entropy_weighted_mean": float((weights * spectral_entropy).sum().item()),
+            "condition_gt_8_mass_fraction": weighted_fraction(condition > 8.0),
+        }
+        logger.info(
+            "Absolute ray-gradient diagnostics: "
+            f"step={step}, active={int(metrics['active_gaussians'])}, "
+            f"cancellation={metrics['cancellation_global']:.4f}, "
+            f"mass(c>0.5)="
+            f"{metrics['cancellation_gt_0p5_mass_fraction']:.4f}, "
+            f"extent={metrics['extent_weighted_mean_px']:.2f}px, "
+            f"mass(extent>8px)={metrics['extent_gt_8_mass_fraction']:.4f}, "
+            f"entropy={metrics['spectral_entropy_weighted_mean']:.4f}, "
+            f"mass(condition>8)="
+            f"{metrics['condition_gt_8_mass_fraction']:.4f}."
+        )
+        if writer is not None:
+            for metric_name, value in metrics.items():
+                writer.add_scalar(
+                    f"train/densify/ray_abs/{metric_name}",
+                    value,
+                    step,
+                )
+        return metrics
+
+    @torch.no_grad()
+    def update_cancellation_conditioned_split_buffer(
+        self,
+        outputs: dict[str, object] | None,
+    ) -> None:
+        """Accumulate cancellation and extent as a joint per-view event."""
+        if outputs is None:
+            raise RuntimeError("Cancellation-conditioned splitting requires renderer outputs.")
+        signed_gradient = outputs.get("mog_signed_ray_position_grad")
+        absolute_gradient = outputs.get("mog_abs_ray_position_grad")
+        projected_extent = outputs.get("mog_projected_extent")
+        tile_count = outputs.get("mog_tiles_count")
+        num_gaussians = self.model.num_gaussians
+        tensors = (
+            ("mog_signed_ray_position_grad", signed_gradient, (num_gaussians, 3)),
+            ("mog_abs_ray_position_grad", absolute_gradient, (num_gaussians, 3)),
+            ("mog_projected_extent", projected_extent, (num_gaussians, 2)),
+        )
+        for name, value, shape in tensors:
+            if not torch.is_tensor(value):
+                raise RuntimeError("Cancellation-conditioned splitting requires " f"outputs[{name!r}].")
+            if value.shape != shape:
+                raise ValueError(f"{name} must have shape {shape}, got " f"{tuple(value.shape)}.")
+            if value.device != self.model.positions.device:
+                raise ValueError(f"{name} must share the model device.")
+            if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+                raise ValueError(f"{name} must contain finite floating-point values.")
+        if not torch.is_tensor(tile_count):
+            raise RuntimeError("Cancellation-conditioned splitting requires " "outputs['mog_tiles_count'].")
+        if tile_count.numel() != num_gaussians:
+            raise ValueError("mog_tiles_count must contain one value per Gaussian.")
+        if (
+            tile_count.device != self.model.positions.device
+            or tile_count.is_floating_point()
+            or tile_count.is_complex()
+            or tile_count.dtype == torch.bool
+            or bool((tile_count < 0).any())
+        ):
+            raise ValueError("mog_tiles_count must contain non-negative integers on the " "model device.")
+        if bool((absolute_gradient < 0).any()):
+            raise ValueError("mog_abs_ray_position_grad must be componentwise non-negative.")
+        if bool((projected_extent < 0).any()):
+            raise ValueError("mog_projected_extent must be non-negative.")
+        expected_buffer_shape = (num_gaussians, 1)
+        for name, buffer in (
+            (
+                "densify_cancellation_joint_observations",
+                self.densify_cancellation_joint_observations,
+            ),
+            (
+                "densify_cancellation_valid_observations",
+                self.densify_cancellation_valid_observations,
+            ),
+        ):
+            if buffer.shape != expected_buffer_shape:
+                raise RuntimeError(f"{name} must have shape {expected_buffer_shape}, got " f"{tuple(buffer.shape)}.")
+
+        signed_mass = signed_gradient.detach().norm(dim=1)
+        absolute_mass = absolute_gradient.detach().norm(dim=1)
+        tolerance = max(
+            1e-7,
+            float(absolute_mass.max().item()) * 1e-4,
+        )
+        if bool(((signed_mass - absolute_mass) > tolerance).any()):
+            raise RuntimeError(
+                "Cancellation-conditioned splitting observed signed mass " "above the native absolute upper bound."
+            )
+        valid = (absolute_mass > 0.0) & (tile_count.detach().reshape(-1) > 0)
+        cancellation = 1.0 - signed_mass.clamp_max(absolute_mass) / (absolute_mass.clamp_min(1e-20))
+        extent = projected_extent.detach().amax(dim=1)
+        joint = (
+            valid
+            & (cancellation > self.cancellation_conditioned_split_threshold)
+            & (extent > self.cancellation_conditioned_split_extent_px)
+        )
+        self.densify_cancellation_valid_observations.add_(
+            valid[:, None].to(dtype=self.densify_cancellation_valid_observations.dtype)
+        )
+        self.densify_cancellation_joint_observations.add_(
+            joint[:, None].to(dtype=self.densify_cancellation_joint_observations.dtype)
+        )
 
     @torch.no_grad()
     def update_scale_shape_observation_count(
@@ -1170,16 +1710,112 @@ class GSStrategy(BaseStrategy):
         self,
         sensor_position: torch.Tensor,
         sensor_forward: torch.Tensor | None = None,
+        outputs: dict[str, object] | None = None,
     ) -> None:
-        params_grad = self.model.positions.grad
-        mask = (params_grad != 0).max(dim=1)[0]
-        assert params_grad is not None
+        signed_ray_gradient = None
+        absolute_ray_gradient = None
+        if self.absolute_ray_gradient_densification_enabled:
+            if outputs is None:
+                raise RuntimeError("Absolute-ray-gradient densification requires renderer " "outputs.")
+            signed_ray_gradient = outputs.get("mog_signed_ray_position_grad")
+            absolute_ray_gradient = outputs.get("mog_abs_ray_position_grad")
+            expected_shape = (self.model.num_gaussians, 3)
+            for name, value in (
+                ("mog_signed_ray_position_grad", signed_ray_gradient),
+                ("mog_abs_ray_position_grad", absolute_ray_gradient),
+            ):
+                if not torch.is_tensor(value):
+                    raise RuntimeError("Absolute-ray-gradient densification requires " f"outputs[{name!r}].")
+                if value.shape != expected_shape:
+                    raise ValueError(f"{name} must have shape {expected_shape}, got " f"{tuple(value.shape)}.")
+                if value.device != self.model.positions.device:
+                    raise ValueError(f"{name} must share the Gaussian model device.")
+                if not value.is_floating_point() or not bool(torch.isfinite(value).all()):
+                    raise ValueError(f"{name} must contain finite floating-point values.")
+            if bool((absolute_ray_gradient < 0).any()):
+                raise ValueError("mog_abs_ray_position_grad must be componentwise " "non-negative.")
+            mask = (absolute_ray_gradient != 0).any(dim=1)
+        else:
+            params_grad = self.model.positions.grad
+            assert params_grad is not None
+            mask = (params_grad != 0).max(dim=1)[0]
+        tile_weights = None
+        if self.tile_coverage_weighted_gradient_enabled:
+            if outputs is None:
+                raise RuntimeError("Tile-coverage gradient weighting requires renderer " "outputs.")
+            tile_count = outputs.get("mog_tiles_count")
+            if not torch.is_tensor(tile_count):
+                raise RuntimeError("Tile-coverage gradient weighting requires " "outputs['mog_tiles_count'].")
+            if tile_count.numel() != self.model.num_gaussians:
+                raise ValueError(
+                    "mog_tiles_count must contain one value per Gaussian; "
+                    f"got {tuple(tile_count.shape)} for "
+                    f"{self.model.num_gaussians} Gaussians."
+                )
+            if tile_count.is_floating_point() or tile_count.is_complex() or tile_count.dtype == torch.bool:
+                raise ValueError("mog_tiles_count must use an integer dtype.")
+            if tile_count.device != self.model.positions.device:
+                raise ValueError(
+                    "mog_tiles_count must share the model device "
+                    f"{self.model.positions.device}, got "
+                    f"{tile_count.device}."
+                )
+            tile_count = tile_count.reshape(-1)
+            if bool((tile_count < 0).any()):
+                raise ValueError("mog_tiles_count must be non-negative.")
+            mask = mask & (tile_count > 0)
+            tile_weights = tile_count[mask].unsqueeze(1)
+        if not bool(mask.any()):
+            return
         to_camera = self.model.positions[mask] - sensor_position
         distance_to_camera = to_camera.norm(dim=1, keepdim=True)
 
-        grad_increment = torch.norm(params_grad[mask] * distance_to_camera, dim=-1, keepdim=True) / 2
-        self.densify_grad_norm_accum[mask] += grad_increment
-        self.densify_grad_norm_denom[mask] += 1
+        if self.absolute_ray_gradient_densification_enabled:
+            absolute_increment = (
+                torch.norm(
+                    absolute_ray_gradient[mask] * distance_to_camera,
+                    dim=-1,
+                    keepdim=True,
+                )
+                / 2
+            )
+            signed_increment = (
+                torch.norm(
+                    signed_ray_gradient[mask] * distance_to_camera,
+                    dim=-1,
+                    keepdim=True,
+                )
+                / 2
+            )
+            tolerance = max(
+                1e-7,
+                float(absolute_increment.max().item()) * 1e-4,
+            )
+            violation = signed_increment - absolute_increment
+            if bool((violation > tolerance).any()):
+                raise RuntimeError(
+                    "Absolute-ray-gradient densification observed signed " "mass above the native absolute upper bound."
+                )
+            absolute_total = absolute_increment.sum()
+            signed_total = signed_increment.sum()
+            mass_scale = signed_total / absolute_total.clamp_min(1e-20)
+            grad_increment = absolute_increment * mass_scale
+        else:
+            grad_increment = (
+                torch.norm(
+                    params_grad[mask] * distance_to_camera,
+                    dim=-1,
+                    keepdim=True,
+                )
+                / 2
+            )
+        weighted_grad_increment = grad_increment
+        if tile_weights is not None:
+            weighted_grad_increment = grad_increment * tile_weights.to(grad_increment.dtype)
+            self.densify_grad_norm_denom[mask] += tile_weights.to(self.densify_grad_norm_denom.dtype)
+        else:
+            self.densify_grad_norm_denom[mask] += 1
+        self.densify_grad_norm_accum[mask] += weighted_grad_increment
 
         # Field-angle-aware: accumulate the gradient-weighted cos(theta) of
         # each observed Gaussian relative to this camera's optical axis. The
@@ -1190,8 +1826,8 @@ class GSStrategy(BaseStrategy):
             forward = sensor_forward / sensor_forward.norm().clamp_min(1e-8)
             cos_theta = (to_camera / distance_to_camera.clamp_min(1e-8)) @ forward
             cos_theta = cos_theta.unsqueeze(1).clamp(-1.0, 1.0)
-            self.densify_cos_accum[mask] += grad_increment * cos_theta
-            self.densify_cos_weight[mask] += grad_increment
+            self.densify_cos_accum[mask] += weighted_grad_increment * cos_theta
+            self.densify_cos_weight[mask] += weighted_grad_increment
 
         feature_grad = self.model.features_specular.grad
         if self.feature_grad_aware and feature_grad is not None:
@@ -1352,6 +1988,8 @@ class GSStrategy(BaseStrategy):
         covariance_gradient_mass = self.densify_covariance_gradient_mass.detach().clone()
         covariance_large_observations = self.densify_covariance_large_observations.detach().clone()
         covariance_total_observations = self.densify_grad_norm_denom.detach().clone()
+        cancellation_joint_observations = self.densify_cancellation_joint_observations.detach().clone()
+        cancellation_valid_observations = self.densify_cancellation_valid_observations.detach().clone()
         scale_shape_observation_count = None
         if self.scale_shape_split_enabled:
             scale_shape_observation_count = self.densify_scale_shape_observation_count.detach().clone()
@@ -1369,6 +2007,13 @@ class GSStrategy(BaseStrategy):
             covariance_gradient_mass,
             covariance_large_observations,
             covariance_total_observations,
+            cancellation_joint_observations,
+            cancellation_valid_observations,
+            tile_coverage_weight_sum=(
+                self.densify_grad_norm_denom.squeeze(1).float()
+                if self.tile_coverage_weighted_gradient_enabled
+                else None
+            ),
             writer=writer,
             step=step,
         )
@@ -1380,6 +2025,8 @@ class GSStrategy(BaseStrategy):
             covariance_gradient_mass,
             covariance_large_observations,
             covariance_total_observations,
+            cancellation_joint_observations,
+            cancellation_valid_observations,
         )
         self.split_gaussians(
             densify_scores,
@@ -1389,6 +2036,8 @@ class GSStrategy(BaseStrategy):
             covariance_gradient_mass,
             covariance_large_observations,
             covariance_total_observations,
+            cancellation_joint_observations,
+            cancellation_valid_observations,
             scale_shape_observation_count,
             writer=writer,
             step=step,
@@ -1408,11 +2057,19 @@ class GSStrategy(BaseStrategy):
         covariance_gradient_mass: torch.Tensor | None = None,
         covariance_large_observations: torch.Tensor | None = None,
         covariance_total_observations: torch.Tensor | None = None,
+        cancellation_joint_observations: torch.Tensor | None = None,
+        cancellation_valid_observations: torch.Tensor | None = None,
+        tile_coverage_weight_sum: torch.Tensor | None = None,
         *,
         writer: object | None = None,
         step: int | None = None,
     ) -> None:
-        if not self.conf.strategy.print_stats and not self.covariance_gradient_split_enabled:
+        if (
+            not self.conf.strategy.print_stats
+            and not self.covariance_gradient_split_enabled
+            and not self.tile_coverage_weighted_gradient_enabled
+            and not self.cancellation_conditioned_split_enabled
+        ):
             return
         n_points = densify_grad_norm.shape[0]
         finite_mask = torch.isfinite(densify_grad_norm)
@@ -1421,6 +2078,24 @@ class GSStrategy(BaseStrategy):
             logger.info("Densify grad stats: no finite gradients")
             return
         positive_values = finite_values[finite_values > 0]
+        if tile_coverage_weight_sum is not None:
+            positive_tile_weight = tile_coverage_weight_sum[tile_coverage_weight_sum > 0]
+            if positive_tile_weight.numel() > 0:
+                quantiles = torch.quantile(
+                    positive_tile_weight,
+                    torch.tensor(
+                        (0.5, 0.95, 0.99),
+                        device=positive_tile_weight.device,
+                    ),
+                )
+                logger.info(
+                    "Tile-coverage weight sum: "
+                    f"observed={positive_tile_weight.numel()}/"
+                    f"{tile_coverage_weight_sum.numel()}, "
+                    f"p50={float(quantiles[0]):.1f}, "
+                    f"p95={float(quantiles[1]):.1f}, "
+                    f"p99={float(quantiles[2]):.1f}."
+                )
         if positive_values.numel() > 200000:
             stride = max(positive_values.numel() // 200000, 1)
             positive_values = positive_values[::stride][:200000]
@@ -1432,6 +2107,8 @@ class GSStrategy(BaseStrategy):
             covariance_gradient_mass,
             covariance_large_observations,
             covariance_total_observations,
+            cancellation_joint_observations,
+            cancellation_valid_observations,
         )
         if self.covariance_gradient_split_enabled:
             if covariance_gradient_mass is None:
@@ -1477,6 +2154,39 @@ class GSStrategy(BaseStrategy):
                     "train/densify/covgrad_rerouted_splits": float(rerouted),
                     "train/densify/covgrad_clone_population": float(clone_population),
                     "train/densify/covgrad_reroute_fraction": reroute_fraction,
+                }
+                for metric_name, value in telemetry.items():
+                    writer.add_scalar(metric_name, value, step)
+        if self.cancellation_conditioned_split_enabled:
+            if cancellation_joint_observations is None:
+                raise RuntimeError("Cancellation-conditioned telemetry requires joint " "observation counts.")
+            if cancellation_valid_observations is None:
+                raise RuntimeError("Cancellation-conditioned telemetry requires valid " "observation counts.")
+            joint_count = cancellation_joint_observations.squeeze(-1)
+            valid_count = cancellation_valid_observations.squeeze(-1)
+            joint_fraction = joint_count.to(torch.float32) / (valid_count.clamp_min(1).to(torch.float32))
+            enough_joint = joint_count >= self.cancellation_conditioned_split_min_observations
+            conditioned = enough_joint & (joint_fraction >= self.cancellation_conditioned_split_min_fraction)
+            rerouted = int(projected_split_mask.sum().item())
+            clone_population = rerouted + int(clone_mask.sum().item())
+            reroute_fraction = rerouted / clone_population if clone_population else 0.0
+            logger.info(
+                "Densify cancellation-conditioned split: "
+                f"valid_observed={int((valid_count > 0).sum())}/{n_points}, "
+                f"min_joint={int(enough_joint.sum())}, "
+                f"conditioned={int(conditioned.sum())}, "
+                f"rerouted_splits={rerouted}/{clone_population} "
+                f"({reroute_fraction:.6f}), ceiling="
+                f"{self.cancellation_conditioned_split_max_reroute_fraction:.6f}"
+            )
+            if writer is not None and step is not None:
+                telemetry = {
+                    "train/densify/cancel_valid_observed": float((valid_count > 0).sum().item()),
+                    "train/densify/cancel_min_joint": float(enough_joint.sum().item()),
+                    "train/densify/cancel_conditioned": float(conditioned.sum().item()),
+                    "train/densify/cancel_rerouted_splits": float(rerouted),
+                    "train/densify/cancel_clone_population": float(clone_population),
+                    "train/densify/cancel_reroute_fraction": reroute_fraction,
                 }
                 for metric_name, value in telemetry.items():
                     writer.add_scalar(metric_name, value, step)
@@ -1584,6 +2294,8 @@ class GSStrategy(BaseStrategy):
         covariance_gradient_mass: torch.Tensor | None = None,
         covariance_large_observations: torch.Tensor | None = None,
         covariance_total_observations: torch.Tensor | None = None,
+        cancellation_joint_observations: torch.Tensor | None = None,
+        cancellation_valid_observations: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Partition clone candidates from unchanged world/rerouted splits."""
         n_points = densify_grad_norm.shape[0]
@@ -1705,10 +2417,72 @@ class GSStrategy(BaseStrategy):
                     f"{clone_population}) exceeds the preregistered ceiling "
                     f"{self.covariance_gradient_split_max_reroute_fraction:.12f}."
                 )
-        rerouted_split = projected_split | covariance_gradient_split
+        cancellation_split = torch.zeros_like(
+            clone_candidates,
+            dtype=torch.bool,
+        )
+        if self.cancellation_conditioned_split_enabled:
+            if cancellation_joint_observations is None:
+                raise RuntimeError("Cancellation-conditioned split decisions require joint " "observation counts.")
+            if cancellation_valid_observations is None:
+                raise RuntimeError("Cancellation-conditioned split decisions require valid " "observation counts.")
+            expected_shape = (n_points, 1)
+            buffers = (
+                ("joint", cancellation_joint_observations),
+                ("valid", cancellation_valid_observations),
+            )
+            for name, buffer in buffers:
+                if buffer.shape != expected_shape:
+                    raise ValueError(
+                        "Cancellation-conditioned split "
+                        f"{name} observations must have shape "
+                        f"{expected_shape}, got {tuple(buffer.shape)}."
+                    )
+                if buffer.device != self.model.positions.device:
+                    raise ValueError("Cancellation-conditioned split buffers must share " "the model device.")
+                if (
+                    buffer.is_floating_point()
+                    or buffer.is_complex()
+                    or buffer.dtype == torch.bool
+                    or bool((buffer < 0).any())
+                ):
+                    raise ValueError("Cancellation-conditioned split buffers must contain " "non-negative integers.")
+            if bool((cancellation_joint_observations > cancellation_valid_observations).any()):
+                raise ValueError("Cancellation-conditioned joint observations cannot " "exceed valid observations.")
+            joint_count = cancellation_joint_observations.squeeze(-1)
+            valid_count = cancellation_valid_observations.squeeze(-1)
+            joint_fraction = joint_count.to(torch.float32) / (valid_count.clamp_min(1).to(torch.float32))
+            cancellation_condition = (joint_count >= self.cancellation_conditioned_split_min_observations) & (
+                joint_fraction >= self.cancellation_conditioned_split_min_fraction
+            )
+            cancellation_split = clone_candidates & cancellation_condition
+            clone_population = int(clone_candidates.sum().item())
+            rerouted = int(cancellation_split.sum().item())
+            reroute_fraction = rerouted / clone_population if clone_population else 0.0
+            if reroute_fraction > self.cancellation_conditioned_split_max_reroute_fraction:
+                raise RuntimeError(
+                    "Cancellation-conditioned reroute fraction "
+                    f"{reroute_fraction:.12f} ({rerouted}/"
+                    f"{clone_population}) exceeds the preregistered ceiling "
+                    f"{self.cancellation_conditioned_split_max_reroute_fraction:.12f}."
+                )
+        rerouted_split = projected_split | covariance_gradient_split | cancellation_split
         clone_mask = clone_candidates & ~rerouted_split
         world_split = (densify_grad_norm >= split_thresh) & ~world_small
         split_mask = world_split | rerouted_split
+        protected_count = self.model.protected_gaussian_count
+        clone_mask = exclude_protected_prefix(
+            clone_mask,
+            protected_count,
+        )
+        split_mask = exclude_protected_prefix(
+            split_mask,
+            protected_count,
+        )
+        rerouted_split = exclude_protected_prefix(
+            rerouted_split,
+            protected_count,
+        )
         return clone_mask, split_mask, rerouted_split
 
     @torch.no_grad()
@@ -1750,6 +2524,8 @@ class GSStrategy(BaseStrategy):
         covariance_gradient_mass: torch.Tensor | None = None,
         covariance_large_observations: torch.Tensor | None = None,
         covariance_total_observations: torch.Tensor | None = None,
+        cancellation_joint_observations: torch.Tensor | None = None,
+        cancellation_valid_observations: torch.Tensor | None = None,
         scale_shape_observation_count: torch.Tensor | None = None,
         *,
         writer: object | None = None,
@@ -1765,6 +2541,12 @@ class GSStrategy(BaseStrategy):
             raise RuntimeError("Covariance-gradient splitting requires all pre-clone " "accumulation snapshots.")
         if self.scale_shape_split_enabled and scale_shape_observation_count is None:
             raise RuntimeError("scale-shape splitting requires its pre-clone " "observation-count snapshot.")
+        if self.cancellation_conditioned_split_enabled and (
+            cancellation_joint_observations is None or cancellation_valid_observations is None
+        ):
+            raise RuntimeError(
+                "Cancellation-conditioned splitting requires both pre-clone " "observation-count snapshots."
+            )
 
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros(
@@ -1802,6 +2584,24 @@ class GSStrategy(BaseStrategy):
             padded_covariance_total_observations[: covariance_total_observations.shape[0]] = (
                 covariance_total_observations
             )
+        padded_cancellation_joint_observations = torch.zeros(
+            (n_init_points, 1),
+            device=padded_grad.device,
+            dtype=(cancellation_joint_observations.dtype if cancellation_joint_observations is not None else torch.int),
+        )
+        if cancellation_joint_observations is not None:
+            padded_cancellation_joint_observations[: cancellation_joint_observations.shape[0]] = (
+                cancellation_joint_observations
+            )
+        padded_cancellation_valid_observations = torch.zeros(
+            (n_init_points, 1),
+            device=padded_grad.device,
+            dtype=(cancellation_valid_observations.dtype if cancellation_valid_observations is not None else torch.int),
+        )
+        if cancellation_valid_observations is not None:
+            padded_cancellation_valid_observations[: cancellation_valid_observations.shape[0]] = (
+                cancellation_valid_observations
+            )
         padded_scale_shape_observations = torch.zeros(
             (n_init_points, 1),
             device=padded_grad.device,
@@ -1817,6 +2617,8 @@ class GSStrategy(BaseStrategy):
             padded_covariance_gradient_mass,
             padded_covariance_large_observations,
             padded_covariance_total_observations,
+            padded_cancellation_joint_observations,
+            padded_cancellation_valid_observations,
         )
 
         scale_shape_mask = torch.zeros_like(mask)
@@ -1832,16 +2634,39 @@ class GSStrategy(BaseStrategy):
                 ),
             )
 
-        stds = self.model.get_scale()[mask].repeat(self.split_n_gaussians, 1)
-        means = torch.zeros(
-            (stds.size(0), 3),
-            dtype=stds.dtype,
-            device=stds.device,
-        )
-        samples = torch.normal(mean=means, std=stds)
-        rots = quaternion_to_so3(self.model.rotation[mask]).repeat(self.split_n_gaussians, 1, 1)
-        offsets = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1)
-        scale_shape_child_mask = scale_shape_mask[mask].repeat(self.split_n_gaussians)
+        child_count = self.split_n_gaussians
+        moment_children: MomentPreservingSplitChildren | None = None
+        offsets: torch.Tensor | None = None
+        if self.moment_preserving_split_enabled:
+            child_count = GAUSS_HERMITE_CHILD_COUNT
+            moment_children = gauss_hermite_split_children(
+                positions=self.model.positions[mask],
+                physical_scales=self.model.get_scale()[mask],
+                rotations=self.model.get_rotation()[mask],
+                physical_opacities=self.model.get_density()[mask],
+                beta=self.moment_preserving_split_beta,
+            )
+        else:
+            stds = self.model.get_scale()[mask].repeat(
+                self.split_n_gaussians,
+                1,
+            )
+            means = torch.zeros(
+                (stds.size(0), 3),
+                dtype=stds.dtype,
+                device=stds.device,
+            )
+            samples = torch.normal(mean=means, std=stds)
+            rots = quaternion_to_so3(self.model.rotation[mask]).repeat(
+                self.split_n_gaussians,
+                1,
+                1,
+            )
+            offsets = torch.bmm(
+                rots,
+                samples.unsqueeze(-1),
+            ).squeeze(-1)
+        scale_shape_child_mask = scale_shape_mask[mask].repeat(child_count)
         scale_shape_child_positions = torch.empty(
             (0, 3),
             dtype=self.model.positions.dtype,
@@ -1885,18 +2710,47 @@ class GSStrategy(BaseStrategy):
             logger.info(f"Splitted {n_clone} / {n_before} ({n_clone / n_before * 100:.2f}%) gaussians")
 
         def update_param_fn(name: str, param: torch.Tensor) -> torch.Tensor:
-            repeats = [self.split_n_gaussians] + [1] * (param.dim() - 1)
+            repeats = [child_count] + [1] * (param.dim() - 1)
             if name == "positions":
-                p_split = param[mask].repeat(repeats) + offsets  # [2N, 3]
-                p_split[scale_shape_child_mask] = scale_shape_child_positions
+                if moment_children is not None:
+                    p_split = moment_children.positions
+                else:
+                    if offsets is None:
+                        message = (
+                            "Ordinary split offsets were not constructed."
+                        )
+                        raise RuntimeError(message)
+                    p_split = param[mask].repeat(repeats) + offsets
+                    p_split[scale_shape_child_mask] = (
+                        scale_shape_child_positions
+                    )
             elif name == "scale":
-                p_split = self.model.scale_activation_inv(
-                    self.model.scale_activation(param[mask].repeat(repeats)) / (0.8 * self.split_n_gaussians)
-                )
-                p_split[scale_shape_child_mask] = self.model.scale_activation_inv(scale_shape_child_scales)
+                if moment_children is not None:
+                    p_split = self.model.scale_activation_inv(
+                        moment_children.scales
+                    )
+                else:
+                    p_split = self.model.scale_activation_inv(
+                        self.model.scale_activation(
+                            param[mask].repeat(repeats)
+                        )
+                        / (0.8 * self.split_n_gaussians)
+                    )
+                    p_split[scale_shape_child_mask] = (
+                        self.model.scale_activation_inv(
+                            scale_shape_child_scales
+                        )
+                    )
             elif name == "density":
-                p_split = param[mask].repeat(repeats)
-                p_split[scale_shape_child_mask] = scale_shape_child_density
+                if moment_children is not None:
+                    p_split = self.model.density_activation_inv(
+                        moment_children.opacities
+                    )
+                else:
+                    p_split = param[mask].repeat(repeats)
+                    p_split[scale_shape_child_mask] = (
+                        scale_shape_child_density
+                    )
             else:
                 p_split = param[mask].repeat(repeats)
 
@@ -1909,7 +2763,7 @@ class GSStrategy(BaseStrategy):
 
         def update_optimizer_fn(key: str, v: torch.Tensor) -> torch.Tensor:
             v_split = torch.zeros(
-                (self.split_n_gaussians * int(mask.sum()), *v.shape[1:]),
+                (child_count * int(mask.sum()), *v.shape[1:]),
                 device=v.device,
                 dtype=v.dtype,
             )
@@ -1933,6 +2787,8 @@ class GSStrategy(BaseStrategy):
         covariance_gradient_mass: torch.Tensor | None = None,
         covariance_large_observations: torch.Tensor | None = None,
         covariance_total_observations: torch.Tensor | None = None,
+        cancellation_joint_observations: torch.Tensor | None = None,
+        cancellation_valid_observations: torch.Tensor | None = None,
     ) -> None:
         assert densify_grad_norm is not None, "Positional gradients must be available in order to clone the Gaussians"
         densify_grad_norm = densify_grad_norm.squeeze()
@@ -1944,6 +2800,8 @@ class GSStrategy(BaseStrategy):
             covariance_gradient_mass,
             covariance_large_observations,
             covariance_total_observations,
+            cancellation_joint_observations,
+            cancellation_valid_observations,
         )
 
         # stats
@@ -1974,6 +2832,10 @@ class GSStrategy(BaseStrategy):
     def prune_gaussians_weight(self):
         # Prune the Gaussians based on their weight
         mask = self.model.rolling_weight_contrib[:, 0] >= self.conf.strategy.prune_weight.weight_threshold
+        mask = retain_protected_prefix(
+            mask,
+            self.model.protected_gaussian_count,
+        )
         if self.conf.strategy.print_stats:
             n_before = mask.shape[0]
             n_prune = n_before - mask.sum()
@@ -1996,6 +2858,10 @@ class GSStrategy(BaseStrategy):
 
         # Prune the Gaussians based on their weight
         mask = ratio >= self.conf.strategy.prune_scale.threshold
+        mask = retain_protected_prefix(
+            mask,
+            self.model.protected_gaussian_count,
+        )
         if self.conf.strategy.print_stats:
             n_before = mask.shape[0]
             n_prune = n_before - mask.sum()
@@ -2085,6 +2951,10 @@ class GSStrategy(BaseStrategy):
     def prune_gaussians_opacity(self):
         # Prune the Gaussians based on their opacity
         mask = self.model.get_density().squeeze() >= self.prune_density_threshold
+        mask = retain_protected_prefix(
+            mask,
+            self.model.protected_gaussian_count,
+        )
 
         if self.conf.strategy.print_stats:
             n_before = mask.shape[0]
@@ -2130,6 +3000,16 @@ class GSStrategy(BaseStrategy):
             device=self.model.device,
             dtype=self.densify_projected_extent_max.dtype,
         )
+        self.densify_cancellation_joint_observations = torch.zeros(
+            (n, 1),
+            device=self.model.device,
+            dtype=self.densify_cancellation_joint_observations.dtype,
+        )
+        self.densify_cancellation_valid_observations = torch.zeros(
+            (n, 1),
+            device=self.model.device,
+            dtype=self.densify_cancellation_valid_observations.dtype,
+        )
         self.densify_scale_shape_observation_count = torch.zeros(
             (n, 1),
             device=self.model.device,
@@ -2160,6 +3040,8 @@ class GSStrategy(BaseStrategy):
         self.densify_grad_norm_accum = self.densify_grad_norm_accum[valid_mask]
         self.densify_grad_norm_denom = self.densify_grad_norm_denom[valid_mask]
         self.densify_projected_extent_max = self.densify_projected_extent_max[valid_mask]
+        self.densify_cancellation_joint_observations = self.densify_cancellation_joint_observations[valid_mask]
+        self.densify_cancellation_valid_observations = self.densify_cancellation_valid_observations[valid_mask]
         if self.densify_scale_shape_observation_count.shape[0] == (valid_mask.shape[0]):
             self.densify_scale_shape_observation_count = self.densify_scale_shape_observation_count[valid_mask]
         self.densify_covariance_gradient_mass = self.densify_covariance_gradient_mass[valid_mask]

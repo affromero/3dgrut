@@ -21,6 +21,7 @@ namespace gaussianParticle
     static const float MinParticleAlpha = GAUSSIAN_PARTICLE_MIN_ALPHA;
     static const bool EnableNormal = false;
     static const bool Surfel = false;
+    static const bool SignedRayDepth = GAUSSIAN_SIGNED_RAY_DEPTH;
 };
 
 #include <3dgut/kernels/slang/models/gaussianParticles.slang>
@@ -32,6 +33,7 @@ namespace shRadiativeParticle
     static const bool GaborEnabled = PARTICLE_RADIANCE_GABOR_ENABLED;
     static const int GaborNumTerms = PARTICLE_RADIANCE_GABOR_NUM_TERMS;
     static const float GaborMaxFrequency = PARTICLE_RADIANCE_GABOR_MAX_FREQUENCY;
+    static const bool HermiteEnabled = PARTICLE_RADIANCE_HERMITE_ENABLED;
     static const bool SirenEnabled = PARTICLE_RADIANCE_SIREN_ENABLED;
     static const int SirenHiddenDim = PARTICLE_RADIANCE_SIREN_HIDDEN_DIM;
     static const float SirenOmega = PARTICLE_RADIANCE_SIREN_OMEGA;

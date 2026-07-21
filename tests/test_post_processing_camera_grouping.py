@@ -130,12 +130,17 @@ def test_checkpoint_metadata_seals_camera_order_and_controller_proof() -> None:
         "camera_frame_counts": [212, 212, 212],
         "camera_index_mode": "dataset",
         "inference_contract": {
-            "schema_version": 1,
+            "schema_version": 3,
             "checkpoint_global_step": 101,
             "controller_enabled": True,
             "controller_trained": True,
             "controller_activation_step": 100,
             "scheduler_last_epoch": 101,
+            "multiscale_controller_enabled": False,
+            "multiscale_controller_trained": False,
+            "multiscale_view_context_enabled": False,
+            "multiscale_view_context_trained": False,
+            "multiscale_view_context_contract": None,
         },
     }
 

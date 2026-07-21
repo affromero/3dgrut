@@ -23,6 +23,7 @@ from ncore.data import FThetaCameraModelParameters, ShutterType
 from omegaconf import OmegaConf
 
 from threedgrut.datasets.protocols import Batch
+from threedgut_tracer.setup_3dgut import particle_radiance_width
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,30 @@ class SensorPose3DModel:
 
 
 class Tracer:
+    @staticmethod
+    def _optional_densify_config(conf):
+        """Return GS densification options or an empty MCMC-safe mapping."""
+        return conf.strategy.get("densify", {})
+
+    @staticmethod
+    def _pad_particle_radiance(
+        features: torch.Tensor,
+        compiled_width: int,
+    ) -> torch.Tensor:
+        """Zero-pad inactive features to the native compiled row stride."""
+        feature_width = features.shape[1]
+        if feature_width > compiled_width:
+            raise ValueError(
+                "Particle radiance width exceeds the compiled layout: "
+                f"got {feature_width}, compiled width is {compiled_width}."
+            )
+        if feature_width == compiled_width:
+            return features
+        padding = features.new_zeros(
+            (features.shape[0], compiled_width - feature_width)
+        )
+        return torch.cat((features, padding), dim=1)
+
     class _Autograd(torch.autograd.Function):
         @staticmethod
         def forward(
@@ -170,6 +195,8 @@ class Tracer:
             mog_scl,
             mog_dns,
             mog_sph,
+            mog_signed_ray_position_grad,
+            mog_abs_ray_position_grad,
             sensor_params,
             sensor_poses,
         ):
@@ -217,6 +244,8 @@ class Tracer:
                 ray_hit_distance,
                 particle_density,
                 particle_radiance,
+                mog_signed_ray_position_grad,
+                mog_abs_ray_position_grad,
             )
 
             ctx.frame_id = frame_id
@@ -256,6 +285,8 @@ class Tracer:
                 ray_hit_distance,
                 particle_density,
                 particle_radiance,
+                mog_signed_ray_position_grad,
+                mog_abs_ray_position_grad,
             ) = ctx.saved_variables
 
             frame_id = ctx.frame_id
@@ -263,28 +294,33 @@ class Tracer:
             sensor_params = ctx.sensor_params
             sensor_poses = ctx.sensor_poses
 
-            particle_density_grd, particle_radiance_grd, ray_ori_grd, ray_dir_grd = ctx.tracer_wrapper.trace_bwd(
-                frame_id,
-                n_active_features,
-                particle_density,
-                particle_radiance,
-                ray_ori,
-                ray_dir,
-                ray_time,
-                sensor_params,
-                sensor_poses.timestamps_us[0],
-                sensor_poses.timestamps_us[1],
-                sensor_poses.T_world_sensors[0],
-                sensor_poses.T_world_sensors[1],
-                ray_radiance_density,
-                ray_radiance_density_grd,
-                ray_hit_distance,
-                ray_hit_distance_grd,
+            particle_density_grd, particle_radiance_grd, ray_ori_grd, ray_dir_grd = (
+                ctx.tracer_wrapper.trace_bwd_with_abs(
+                    frame_id,
+                    n_active_features,
+                    particle_density,
+                    particle_radiance,
+                    ray_ori,
+                    ray_dir,
+                    ray_time,
+                    sensor_params,
+                    sensor_poses.timestamps_us[0],
+                    sensor_poses.timestamps_us[1],
+                    sensor_poses.T_world_sensors[0],
+                    sensor_poses.T_world_sensors[1],
+                    ray_radiance_density,
+                    ray_radiance_density_grd,
+                    ray_hit_distance,
+                    ray_hit_distance_grd,
+                    mog_abs_ray_position_grad,
+                )
             )
 
             mog_pos_grd, mog_dns_grd, mog_rot_grd, mog_scl_grd, _ = torch.split(
                 particle_density_grd, [3, 1, 4, 3, 1], dim=1
             )
+            if mog_signed_ray_position_grad.numel() > 0:
+                mog_signed_ray_position_grad.copy_(mog_pos_grd)
             mog_sph_grd = particle_radiance_grd
 
             return (
@@ -298,6 +334,8 @@ class Tracer:
                 mog_scl_grd.contiguous(),
                 mog_dns_grd.contiguous(),
                 mog_sph_grd.contiguous(),
+                None,  # mog_signed_ray_position_grad
+                None,  # mog_abs_ray_position_grad
                 None,  # sensor_params
                 None,  # sensor_poses
             )
@@ -305,6 +343,22 @@ class Tracer:
     def __init__(self, conf):
         self.device = "cuda"
         self.conf = conf
+        densify = self._optional_densify_config(conf)
+        diagnostics = densify.get(
+            "absolute_ray_gradient_diagnostics",
+            {},
+        )
+        self.absolute_ray_gradient_diagnostics_enabled = bool(diagnostics.get("enabled", False))
+        absolute_densification = densify.get(
+            "absolute_ray_gradient_densification",
+            {},
+        )
+        self.absolute_ray_gradient_densification_enabled = bool(absolute_densification.get("enabled", False))
+        cancellation_split = densify.get(
+            "cancellation_conditioned_split",
+            {},
+        )
+        self.cancellation_conditioned_split_enabled = bool(cancellation_split.get("enabled", False))
 
         torch.zeros(1, device=self.device)  # Create a dummy tensor to force cuda context init
         load_3dgut_plugin(conf)
@@ -357,6 +411,37 @@ class Tracer:
                 train,
                 frame_id,
             )
+            absolute_ray_gradient_enabled = (
+                self.absolute_ray_gradient_diagnostics_enabled
+                or self.absolute_ray_gradient_densification_enabled
+                or self.cancellation_conditioned_split_enabled
+            )
+            if absolute_ray_gradient_enabled and train:
+                mog_signed_ray_position_grad = torch.zeros(
+                    (num_gaussians, 3),
+                    device=gaussians.positions.device,
+                    dtype=gaussians.positions.dtype,
+                )
+                mog_abs_ray_position_grad = torch.zeros(
+                    (num_gaussians, 3),
+                    device=gaussians.positions.device,
+                    dtype=gaussians.positions.dtype,
+                )
+            else:
+                mog_signed_ray_position_grad = torch.empty(
+                    (0, 3),
+                    device=gaussians.positions.device,
+                    dtype=gaussians.positions.dtype,
+                )
+                mog_abs_ray_position_grad = torch.empty(
+                    (0, 3),
+                    device=gaussians.positions.device,
+                    dtype=gaussians.positions.dtype,
+                )
+            particle_radiance = self._pad_particle_radiance(
+                gaussians.get_features(),
+                particle_radiance_width(self.conf),
+            )
             (
                 pred_rgba,
                 pred_dist,
@@ -376,7 +461,9 @@ class Tracer:
                 gaussians.get_rotation().contiguous(),
                 gaussians.get_scale().contiguous(),
                 densities.contiguous(),
-                gaussians.get_features().contiguous(),
+                particle_radiance.contiguous(),
+                mog_signed_ray_position_grad,
+                mog_abs_ray_position_grad,
                 sensor,
                 poses,
             )
@@ -404,6 +491,8 @@ class Tracer:
             "mog_projected_conic_opacity": mog_projected_conic_opacity,
             "mog_projected_extent": mog_projected_extent,
             "mog_tiles_count": mog_tiles_count,
+            "mog_signed_ray_position_grad": mog_signed_ray_position_grad,
+            "mog_abs_ray_position_grad": mog_abs_ray_position_grad,
         }
 
     @torch.no_grad()
@@ -435,9 +524,16 @@ class Tracer:
         particle_density = torch.concat(
             [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
         ).contiguous()
-        particle_radiance = (
-            features_override.contiguous() if features_override is not None else gaussians.get_features().contiguous()
+        features = (
+            features_override
+            if features_override is not None
+            else gaussians.get_features()
         )
+        particle_radiance = self._pad_particle_radiance(
+            features,
+            particle_radiance_width(self.conf),
+        )
+        particle_radiance = particle_radiance.contiguous()
 
         ray_time = (
             torch.ones(

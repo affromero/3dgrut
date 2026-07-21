@@ -85,6 +85,24 @@ public:
              torch::Tensor rayHitDistance,
              torch::Tensor rayHitDistanceGradient);
 
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+    traceBwdWithAbs(uint32_t frameNumber, int numActiveFeatures,
+             torch::Tensor particleDensity,
+             torch::Tensor particleRadiance,
+             torch::Tensor rayOrigin,
+             torch::Tensor rayDirection,
+             torch::Tensor rayTimestamp,
+             threedgut::TSensorModel sensorModel,
+             TTimestamp startTimestamp,
+             TTimestamp endTimestamp,
+             torch::Tensor sensorsStartPose,
+             torch::Tensor sensorsEndPose,
+             torch::Tensor rayRadianceDensity,
+             torch::Tensor rayRadianceDensityGradient,
+             torch::Tensor rayHitDistance,
+             torch::Tensor rayHitDistanceGradient,
+             torch::Tensor particlePositionGradientAbs);
+
     std::map<std::string, float>
     collectTimes();
 };

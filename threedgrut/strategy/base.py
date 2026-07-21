@@ -136,3 +136,4 @@ class BaseStrategy:
                     self.model.optimizer.param_groups[i]["params"] = [p_new]
                     self.model.optimizer.state[p_new] = p_state
                     setattr(self.model, name, p_new)
+        self.model.refresh_protected_gradient_hooks()

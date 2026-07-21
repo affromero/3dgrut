@@ -60,6 +60,14 @@ def _loss_config(*, geometry_enabled: bool) -> object:
             "depth_loss_type": "log_l1",
             "depth_apply_rgb_mask": True,
             "depth_min_m": 0.05,
+            "depth_normalize_by_opacity": False,
+            "depth_opacity_floor": 1e-4,
+            "use_depth_free_space": False,
+            "lambda_depth_free_space": 0.0,
+            "depth_free_space_absolute_margin_m": 0.05,
+            "depth_free_space_relative_margin": 0.02,
+            "use_depth_occupancy": False,
+            "lambda_depth_occupancy": 0.0,
             "use_rim_depth": False,
             "use_rim_hf": False,
             "use_mvdino_rim": False,
@@ -70,6 +78,10 @@ def _loss_config(*, geometry_enabled: bool) -> object:
                 "start_iteration": 101,
                 "frequency": 2,
                 "learning_rate_scale": 0.25,
+                "native_ray_evidence_folder": "",
+                "native_ray_evidence_manifest_sha256": "",
+                "native_ray_sample_count": 16,
+                "native_ray_seed": 7,
             },
         }
     )
@@ -79,6 +91,7 @@ def _loss_trainer(*, geometry_enabled: bool) -> Trainer3DGRUT:
     trainer = Trainer3DGRUT.__new__(Trainer3DGRUT)
     trainer.device = torch.device("cpu")
     trainer.conf = OmegaConf.create({"loss": _loss_config(geometry_enabled=geometry_enabled)})
+    trainer.native_ray_evidence = None
     return trainer
 
 
@@ -101,6 +114,10 @@ def _depth_outputs() -> dict[str, torch.Tensor]:
     return {
         "pred_rgb": torch.zeros((1, 2, 2, 3)),
         "pred_dist": torch.ones((1, 2, 2, 1), requires_grad=True),
+        "pred_opacity": torch.ones(
+            (1, 2, 2, 1),
+            requires_grad=True,
+        ),
     }
 
 
@@ -119,6 +136,90 @@ def test_geometry_only_pass_isolates_depth_from_image_loss() -> None:
     assert isolated["depth_loss"].item() > 0.0
     assert isolated["total_loss"].item() == pytest.approx(0.0)
     assert joint["total_loss"].item() == pytest.approx(joint["depth_loss"].item())
+
+
+def test_premultiplied_depth_is_conditioned_on_hit_opacity() -> None:
+    """A premultiplied first moment is not itself metric hit depth."""
+    trainer = _loss_trainer(geometry_enabled=False)
+    trainer.conf.loss.depth_normalize_by_opacity = True
+    outputs = _depth_outputs()
+    outputs["pred_opacity"] = torch.full(
+        (1, 2, 2, 1),
+        0.5,
+        requires_grad=True,
+    )
+
+    losses = trainer.get_losses(_depth_batch(), outputs)
+
+    assert losses["depth_loss_raw"].item() == pytest.approx(0.0)
+
+
+def test_depth_free_space_evidence_is_asymmetric() -> None:
+    """Only opacity in front of the measured endpoint violates free space."""
+    trainer = _loss_trainer(geometry_enabled=False)
+    trainer.conf.loss.depth_normalize_by_opacity = True
+    trainer.conf.loss.use_depth_free_space = True
+    trainer.conf.loss.lambda_depth_free_space = 0.05
+    near_outputs = _depth_outputs()
+    far_outputs = _depth_outputs()
+    far_outputs["pred_dist"] = torch.full(
+        (1, 2, 2, 1),
+        3.0,
+        requires_grad=True,
+    )
+
+    near = trainer.get_losses(_depth_batch(), near_outputs)
+    far = trainer.get_losses(_depth_batch(), far_outputs)
+
+    assert near["depth_free_space_loss_raw"].item() > 0.0
+    assert far["depth_free_space_loss_raw"].item() == pytest.approx(0.0)
+
+
+def test_depth_endpoint_evidence_penalizes_low_opacity() -> None:
+    """A measured return supplies positive occupied evidence at its endpoint."""
+    trainer = _loss_trainer(geometry_enabled=False)
+    trainer.conf.loss.depth_normalize_by_opacity = True
+    trainer.conf.loss.use_depth_occupancy = True
+    trainer.conf.loss.lambda_depth_occupancy = 0.005
+    low_outputs = _depth_outputs()
+    low_outputs["pred_dist"] = torch.full(
+        (1, 2, 2, 1),
+        0.5,
+        requires_grad=True,
+    )
+    low_outputs["pred_opacity"] = torch.full(
+        (1, 2, 2, 1),
+        0.25,
+        requires_grad=True,
+    )
+
+    low = trainer.get_losses(_depth_batch(), low_outputs)
+    opaque = trainer.get_losses(_depth_batch(), _depth_outputs())
+
+    assert low["depth_loss_raw"].item() == pytest.approx(0.0)
+    assert low["depth_occupancy_loss_raw"].item() > 0.0
+    assert opaque["depth_occupancy_loss_raw"].item() == pytest.approx(0.0)
+
+
+def test_l2_image_loss_contributes_to_total_loss() -> None:
+    """An MSE-only configuration remains differentiable and optimizable."""
+    trainer = _loss_trainer(geometry_enabled=False)
+    trainer.conf.loss.use_l1 = False
+    trainer.conf.loss.use_l2 = True
+    trainer.conf.loss.lambda_l2 = 2.0
+    trainer.conf.loss.use_depth = False
+    outputs = _depth_outputs()
+    outputs["pred_rgb"] = torch.ones(
+        (1, 2, 2, 3),
+        requires_grad=True,
+    )
+
+    losses = trainer.get_losses(_depth_batch(), outputs)
+
+    assert losses["l2_loss"].item() == pytest.approx(2.0)
+    assert losses["total_loss"].item() == pytest.approx(2.0)
+    losses["total_loss"].backward()
+    assert outputs["pred_rgb"].grad is not None
 
 
 def _validation_trainer() -> Trainer3DGRUT:
@@ -217,6 +318,84 @@ def test_geometry_only_pass_rejects_ppisp_distillation_freeze() -> None:
         trainer._validate_geometry_only_pass_config()
 
 
+def test_native_interval_evidence_requires_signed_half_rays() -> None:
+    """Exact interval evidence needs half-rays but no depth regression."""
+    trainer = _validation_trainer()
+    trainer.native_ray_evidence = object()
+    trainer.conf.loss.use_depth = False
+    trainer.conf.loss.lambda_depth = 0.0
+    trainer.conf.loss.depth_normalize_by_opacity = False
+    geometry = trainer.conf.loss.geometry_only_pass
+    geometry.use_native_ray_interval_transmittance = True
+    geometry.lambda_native_ray_free_prefix = 0.05
+    geometry.lambda_native_ray_return_window = 0.005
+    geometry.native_ray_interval_probability_floor = 1e-6
+    trainer.conf.render = OmegaConf.create(
+        {
+            "gaussian_dropout": {"enabled": False},
+            "splat": {"signed_ray_depth": False},
+        }
+    )
+
+    with pytest.raises(ValueError, match="signed half-ray"):
+        trainer._validate_geometry_only_pass_config()
+
+    trainer.conf.render.splat.signed_ray_depth = True
+    trainer._validate_geometry_only_pass_config()
+
+
+def test_native_interval_pass_excludes_endpoint_depth_regression() -> None:
+    """Weak returns act only through probabilistic interval evidence."""
+    trainer = Trainer3DGRUT.__new__(Trainer3DGRUT)
+    trainer.device = torch.device("cpu")
+    trainer.model = _GeometryModel()
+    loss = _loss_config(geometry_enabled=True)
+    loss.use_depth = False
+    loss.lambda_depth = 0.0
+    geometry = loss.geometry_only_pass
+    geometry.use_native_ray_interval_transmittance = True
+    geometry.lambda_native_ray_free_prefix = 0.05
+    geometry.lambda_native_ray_return_window = 0.005
+    geometry.native_ray_interval_probability_floor = 1e-6
+    trainer.conf = OmegaConf.create(
+        {
+            "enable_writer": False,
+            "loss": loss,
+        }
+    )
+    trainer.geometry_only_optimizer = None
+    trainer._pending_geometry_optimizer_state = None
+    geometry_batch = SimpleNamespace(
+        rgb_gt=torch.zeros((1, 2, 2, 3)),
+        mask=torch.ones((1, 2, 2, 1)),
+    )
+    trainer.native_ray_evidence = SimpleNamespace(
+        sample=lambda **kwargs: geometry_batch,
+    )
+    trainer.get_losses = lambda gpu_batch, outputs: pytest.fail(
+        "Exact interval evidence must not call endpoint depth regression."
+    )
+    zero = torch.zeros(1)
+    trainer._native_ray_interval_evidence = lambda **kwargs: (
+        trainer.model.positions[0].sum(),
+        trainer.model.positions[0].sum(),
+        zero,
+        zero,
+    )
+    gpu_batch = SimpleNamespace(
+        rgb_gt=torch.zeros((1, 2, 2, 3)),
+        sequence_idx=169,
+    )
+
+    geometry_updated = trainer._run_geometry_only_pass(
+        gpu_batch=gpu_batch,
+        global_step=101,
+    )
+
+    assert geometry_updated
+    assert torch.all(trainer.model.positions[0] < 0.0)
+
+
 def test_geometry_only_pass_rejects_parameter_replacement() -> None:
     """Runtime row replacement cannot silently retain stale sparse state."""
     parameters = {
@@ -248,9 +427,11 @@ def test_geometry_only_pass_refits_before_render_and_steps_geometry() -> None:
     )
     trainer.geometry_only_optimizer = None
     trainer._pending_geometry_optimizer_state = None
+    trainer.native_ray_evidence = None
     trainer.get_losses = lambda gpu_batch, outputs: {
         "depth_valid_count": torch.ones(1),
         "depth_loss": trainer.model.positions[0].sum(),
+        "geometry_loss": trainer.model.positions[0].sum(),
     }
     gpu_batch = SimpleNamespace(rgb_gt=torch.zeros((1, 2, 2, 3)))
 

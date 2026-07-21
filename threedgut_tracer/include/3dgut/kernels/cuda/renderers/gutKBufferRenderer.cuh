@@ -185,6 +185,7 @@ struct GUTKBufferRenderer : Params {
                                        tcnn::vec4* __restrict__ /*particlesProjectedConicOpacityGradPtr*/ = nullptr,
                                        float* __restrict__ /*particlesGlobalDepthGradPtr*/                = nullptr,
                                        float* __restrict__ particlesPrecomputedFeaturesGradPtr            = nullptr,
+                                       tcnn::vec3* __restrict__ particlePositionGradientAbsPtr             = nullptr,
                                        threedgut::MemoryHandles parametersGradient                        = {}) {
 
         using namespace threedgut;
@@ -209,7 +210,8 @@ struct GUTKBufferRenderer : Params {
 
         if constexpr (Backward && (Params::KHitBufferSize == 0) && !Params::PerRayParticleFeatures) {
             evalBackwardNoKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
-                                  sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
+                                  sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer,
+                                  particlePositionGradientAbsPtr);
         } else {
             evalKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
                         sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
@@ -478,7 +480,8 @@ struct GUTKBufferRenderer : Params {
                                                         const uint32_t tileThreadIdx,
                                                         const uint32_t* __restrict__ sortedTileParticleIdxPtr,
                                                         const TFeaturesVec* __restrict__ particleFeaturesBuffer,
-                                                        TFeaturesVec* __restrict__ particleFeaturesGradientBuffer) {
+                                                        TFeaturesVec* __restrict__ particleFeaturesGradientBuffer,
+                                                        tcnn::vec3* __restrict__ particlePositionGradientAbsPtr) {
         static_assert(Backward && (Params::KHitBufferSize == 0), "Optimized path for backward pass with no KBuffer");
 
         using namespace threedgut;
@@ -564,7 +567,11 @@ struct GUTKBufferRenderer : Params {
                     particles.processHitBwdUpdateFeaturesGradient(particleData.idx, featuresGrad,
                                                                   particleFeaturesGradientBuffer, tileThreadIdx);
                 }
-                particles.processHitBwdUpdateDensityGradient(particleData.idx, densityRawParametersGrad, tileThreadIdx);
+                particles.processHitBwdUpdateDensityGradient(
+                    particleData.idx,
+                    densityRawParametersGrad,
+                    tileThreadIdx,
+                    particlePositionGradientAbsPtr);
             }
         }
     }

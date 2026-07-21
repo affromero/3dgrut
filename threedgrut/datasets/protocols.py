@@ -34,6 +34,7 @@ class Batch:
     rgb_gt: Optional[torch.Tensor] = None
     depth_gt: Optional[torch.Tensor] = None
     depth_ray_z: Optional[torch.Tensor] = None
+    range_return_weight: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
     sky_mask: Optional[torch.Tensor] = None
     intrinsics: Optional[list] = None
@@ -87,6 +88,13 @@ class Batch:
             assert self.depth_ray_z.shape[0] == batch_size, (
                 "depth_ray_z must have the same batch size"
             )
+        if self.range_return_weight is not None:
+            assert self.range_return_weight.ndim == 4, (
+                "range_return_weight must be a 4D tensor [B, H, W, 1]"
+            )
+            assert self.range_return_weight.shape[0] == batch_size, (
+                "range_return_weight must have the same batch size"
+            )
         if self.mask is not None:
             assert self.mask.ndim == 4, "mask must be a 3D tensor [B, H, W, 1]"
             assert self.mask.shape[0] == batch_size, (
@@ -131,6 +139,10 @@ class BoundedMultiViewDataset(Protocol):
 
     def get_observer_points(self) -> np.ndarray:
         """TODO"""
+        ...
+
+    def get_image_names(self) -> list[str]:
+        """Return exact image identities after split and exclusion filters."""
         ...
 
     def get_poses(self) -> np.ndarray:

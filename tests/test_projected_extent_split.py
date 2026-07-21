@@ -15,6 +15,7 @@ class _StrategyModel:
 
     def __init__(self, scales: tuple[float, ...]) -> None:
         self.device = torch.device("cpu")
+        self.protected_gaussian_count = 0
         count = len(scales)
         positions = torch.arange(1, count + 1, dtype=torch.float32)
         self.positions = torch.nn.Parameter(
@@ -71,6 +72,10 @@ class _StrategyModel:
     def scale_activation_inv(value: torch.Tensor) -> torch.Tensor:
         return torch.log(value)
 
+    @staticmethod
+    def refresh_protected_gradient_hooks() -> None:
+        """The test model has no protected prefix hooks to refresh."""
+
 
 def _strategy(
     *,
@@ -82,6 +87,7 @@ def _strategy(
     scales: tuple[float, ...] = (0.5, 0.5),
     print_stats: bool = False,
     theta_aware: bool = False,
+    densify_start_iteration: int = 500,
 ) -> tuple[GSStrategy, _StrategyModel]:
     model = _StrategyModel(scales)
     config = OmegaConf.create(
@@ -95,7 +101,7 @@ def _strategy(
                 "print_stats": print_stats,
                 "densify": {
                     "frequency": 300,
-                    "start_iteration": 500,
+                    "start_iteration": densify_start_iteration,
                     "end_iteration": 15_000,
                     "clone_grad_threshold": clone_threshold,
                     "split_grad_threshold": split_threshold,
@@ -151,6 +157,19 @@ def test_disabled_gate_preserves_world_decisions_and_requires_no_outputs() -> No
     assert "densify_projected_extent_max" not in (strategy.get_strategy_parameters())
     assert not strategy.post_backward(
         step=15_001,
+        scene_extent=1.0,
+        train_dataset=(),
+        outputs=None,
+    )
+
+
+def test_disabled_densification_requires_no_position_gradient() -> None:
+    """A negative start disables gradient accumulation for frozen geometry."""
+    strategy, model = _strategy(densify_start_iteration=-1)
+    model.positions.requires_grad_(False)
+
+    assert not strategy.post_backward(
+        step=1,
         scene_extent=1.0,
         train_dataset=(),
         outputs=None,

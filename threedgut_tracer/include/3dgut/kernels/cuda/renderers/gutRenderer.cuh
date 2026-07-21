@@ -237,6 +237,7 @@ __global__ void renderBackward(threedgut::RenderParameters params,
                                tcnn::vec4* __restrict__ particlesProjectedConicOpacityGradPtr,
                                float* __restrict__ particlesGlobalDepthGradPtr,
                                float* __restrict__ particlesPrecomputedFeaturesGradPtr,
+                               tcnn::vec3* __restrict__ particlePositionGradientAbsPtr,
                                const uint64_t* __restrict__ parameterGradientMemoryHandles) {
 
     auto ray = initializeBackwardRay<TGUTRenderer::TRayPayloadBackward>(params,
@@ -263,6 +264,7 @@ __global__ void renderBackward(threedgut::RenderParameters params,
                                particlesProjectedConicOpacityGradPtr,
                                particlesGlobalDepthGradPtr,
                                particlesPrecomputedFeaturesGradPtr,
+                               particlePositionGradientAbsPtr,
                                {parameterGradientMemoryHandles});
 
     if (worldRayOriginGradientPtr && ray.idx != ~0u) {

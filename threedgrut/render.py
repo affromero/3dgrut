@@ -30,8 +30,17 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import Batch
+from threedgrut.model.factory import create_gaussian_model
 from threedgrut.model.model import MixtureOfGaussians
-from threedgrut.post_processing import LuminanceAffine
+from threedgrut.post_processing import (
+    LuminanceAffine,
+    MultiscalePPISPConfig,
+    PredictiveMultiscalePPISP,
+    view_context_inference_contract,
+)
+from threedgrut.post_processing.checkpoint_contract import (
+    module_state_sha256,
+)
 from threedgrut.utils.color_correct import color_correct_affine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import create_summary_writer
@@ -116,6 +125,8 @@ def _ppisp_controller_restore_manifest(
     use_controller: bool,
     configured_activation_step: int,
     require_controller_ready: bool,
+    use_multiscale_controller: bool = False,
+    use_view_context: bool = False,
 ) -> dict:
     post_processing_state = checkpoint["post_processing"]
     explicit = post_processing_state.get("inference_contract")
@@ -125,6 +136,11 @@ def _ppisp_controller_restore_manifest(
     activation_step = configured_activation_step
     proof_source = "legacy_scheduler_state"
     explicit_controller_trained = None
+    explicit_multiscale_trained = None
+    explicit_view_context_enabled = None
+    explicit_view_context_trained = None
+    explicit_view_context_contract = None
+    inherited_controller_proves_training = False
 
     if explicit is not None:
         proof_source = "checkpoint_inference_contract"
@@ -145,6 +161,97 @@ def _ppisp_controller_restore_manifest(
                     "PPISP inference-contract scheduler epoch does not match " "the serialized scheduler state."
                 )
         explicit_controller_trained = explicit.get("controller_trained")
+        explicit_multiscale_trained = explicit.get(
+            "multiscale_controller_trained"
+        )
+        explicit_view_context_enabled = explicit.get(
+            "multiscale_view_context_enabled"
+        )
+        explicit_view_context_trained = explicit.get(
+            "multiscale_view_context_trained"
+        )
+        explicit_view_context_contract = explicit.get(
+            "multiscale_view_context_contract"
+        )
+        inherited = explicit.get("frozen_parent_controller")
+        if inherited is not None:
+            if not isinstance(inherited, dict):
+                raise ValueError(
+                    "Frozen parent controller proof must be a mapping."
+                )
+            if inherited.get("schema_version") != 1:
+                raise ValueError(
+                    "Unsupported frozen parent controller proof version."
+                )
+            config = checkpoint.get("config")
+            post_processing_config = getattr(
+                config,
+                "post_processing",
+                None,
+            )
+            frozen_inference = bool(
+                post_processing_config is not None
+                and post_processing_config.get(
+                    "frozen_inference_during_training",
+                    False,
+                )
+            )
+            if not frozen_inference:
+                raise ValueError(
+                    "Frozen parent controller proof requires a checkpoint "
+                    "configured for frozen inference during training."
+                )
+            if scheduler_last_epoch is not None:
+                raise ValueError(
+                    "Frozen parent controller checkpoint must not contain a "
+                    "local post-processing scheduler."
+                )
+            module_state = post_processing_state.get("module")
+            if not isinstance(module_state, dict):
+                raise ValueError(
+                    "Frozen parent controller checkpoint has no module state."
+                )
+            expected_module_sha256 = inherited.get(
+                "module_state_sha256"
+            )
+            actual_module_sha256 = module_state_sha256(module_state)
+            if expected_module_sha256 != actual_module_sha256:
+                raise ValueError(
+                    "Frozen parent controller module-state hash mismatch."
+                )
+            parent_global_step = int(
+                inherited.get("parent_checkpoint_global_step", -1)
+            )
+            parent_activation_step = int(
+                inherited.get("parent_controller_activation_step", -1)
+            )
+            parent_scheduler_epoch = int(
+                inherited.get("parent_scheduler_last_epoch", -1)
+            )
+            inherited_controller_proves_training = bool(
+                inherited.get("parent_controller_trained") is True
+                and parent_activation_step >= 0
+                and parent_scheduler_epoch > parent_activation_step
+                and parent_global_step >= parent_activation_step
+            )
+            if not inherited_controller_proves_training:
+                raise ValueError(
+                    "Frozen parent controller metadata does not prove a "
+                    "controller update."
+                )
+            proof_source = "checkpoint_frozen_parent_contract"
+
+    if use_view_context and (
+        explicit_view_context_enabled is not True
+        or explicit_view_context_trained is not True
+        or explicit_view_context_contract
+        != view_context_inference_contract()
+    ):
+        raise ValueError(
+            "View-conditioned PPISP requires an exact versioned inference "
+            "contract proving its context trained with serialized train-fold "
+            "normalization."
+        )
 
     scheduler_proves_training = (
         scheduler_last_epoch is not None
@@ -152,9 +259,34 @@ def _ppisp_controller_restore_manifest(
         and scheduler_last_epoch > activation_step
         and checkpoint_global_step >= activation_step
     )
-    controller_trained = bool(use_controller and scheduler_proves_training and explicit_controller_trained is not False)
+    controller_trained = bool(
+        use_controller
+        and (
+            scheduler_proves_training
+            or inherited_controller_proves_training
+        )
+        and explicit_controller_trained is not False
+    )
     controller_ready = not use_controller or controller_trained
-    if require_controller_ready and not controller_ready:
+    multiscale_trained = bool(
+        use_multiscale_controller
+        and controller_trained
+        and explicit_multiscale_trained is True
+    )
+    multiscale_ready = (
+        not use_multiscale_controller or multiscale_trained
+    )
+    view_context_trained = bool(
+        use_view_context
+        and multiscale_trained
+        and explicit_view_context_trained is True
+    )
+    view_context_ready = not use_view_context or view_context_trained
+    if require_controller_ready and (
+        not controller_ready
+        or not multiscale_ready
+        or not view_context_ready
+    ):
         raise ValueError(
             "PPISP controller-backed common evaluation requires proof that "
             "the controller was trained. The checkpoint scheduler/activation "
@@ -170,6 +302,15 @@ def _ppisp_controller_restore_manifest(
         "scheduler_last_epoch": scheduler_last_epoch,
         "checkpoint_global_step": checkpoint_global_step,
         "proof_source": proof_source,
+        "multiscale_enabled": bool(use_multiscale_controller),
+        "multiscale_trained": multiscale_trained,
+        "multiscale_ready_for_inference": multiscale_ready,
+        "view_context_enabled": bool(use_view_context),
+        "view_context_trained": view_context_trained,
+        "view_context_ready_for_inference": view_context_ready,
+        "view_context_contract": (
+            explicit_view_context_contract if use_view_context else None
+        ),
     }
 
 
@@ -230,11 +371,27 @@ def load_checkpoint_post_processing(
             controller_distillation = False
 
         configured_activation_step = int(controller_activation_ratio * int(conf.n_iterations))
+        use_multiscale_controller = bool(
+            conf.post_processing.get("use_multiscale_controller", False)
+        )
+        use_view_context = bool(
+            conf.post_processing.get(
+                "multiscale_use_view_context",
+                False,
+            )
+        )
+        if use_view_context and not use_multiscale_controller:
+            raise ValueError(
+                "Checkpoint enables multiscale view context without the "
+                "multiscale controller."
+            )
         controller_manifest = _ppisp_controller_restore_manifest(
             checkpoint,
             use_controller=bool(use_controller),
             configured_activation_step=configured_activation_step,
             require_controller_ready=require_controller_ready,
+            use_multiscale_controller=use_multiscale_controller,
+            use_view_context=use_view_context,
         )
 
         ppisp_config = PPISPConfig(
@@ -243,10 +400,59 @@ def load_checkpoint_post_processing(
             controller_activation_ratio=controller_activation_ratio,
         )
         try:
-            post_processing = PPISP.from_state_dict(
-                post_processing_state["module"],
-                config=ppisp_config,
-            ).to(device)
+            if use_multiscale_controller:
+                post_processing = PredictiveMultiscalePPISP.from_state_dict(
+                    post_processing_state["module"],
+                    config=ppisp_config,
+                    multiscale_config=MultiscalePPISPConfig(
+                        coarse_grid_size=conf.post_processing.get(
+                            "multiscale_coarse_grid_size",
+                            4,
+                        ),
+                        fine_grid_size=conf.post_processing.get(
+                            "multiscale_fine_grid_size",
+                            16,
+                        ),
+                        coarse_max_log_gain=conf.post_processing.get(
+                            "multiscale_coarse_max_log_gain",
+                            0.04,
+                        ),
+                        coarse_max_bias=conf.post_processing.get(
+                            "multiscale_coarse_max_bias",
+                            0.02,
+                        ),
+                        fine_max_log_gain=conf.post_processing.get(
+                            "multiscale_fine_max_log_gain",
+                            0.02,
+                        ),
+                        fine_max_bias=conf.post_processing.get(
+                            "multiscale_fine_max_bias",
+                            0.01,
+                        ),
+                        magnitude_regularization=(
+                            conf.post_processing.get(
+                                "multiscale_magnitude_regularization",
+                                0.01,
+                            )
+                        ),
+                        total_variation_regularization=(
+                            conf.post_processing.get(
+                                "multiscale_total_variation_regularization",
+                                0.01,
+                            )
+                        ),
+                        init_seed=conf.post_processing.get(
+                            "multiscale_init_seed",
+                            20_260_717,
+                        ),
+                        use_view_context=use_view_context,
+                    ),
+                ).to(device)
+            else:
+                post_processing = PPISP.from_state_dict(
+                    post_processing_state["module"],
+                    config=ppisp_config,
+                ).to(device)
         except RuntimeError as exc:
             raise ValueError(
                 "Exact PPISP checkpoint restoration failed; evaluation will " "not drop or transform learned state."
@@ -692,6 +898,18 @@ class Renderer:
             None,
         )
         self.holdout_image_list_sha256 = _sha256_of_file(self.holdout_image_list_path)
+        self.train_exclude_image_list_path = (
+            getattr(
+                self.dataset,
+                "train_exclude_image_list_path",
+                None,
+            )
+            if self.split == "train"
+            else None
+        )
+        self.train_exclude_image_list_sha256 = _sha256_of_file(
+            self.train_exclude_image_list_path
+        )
 
         if conf.model.background.color == "black":
             self.bg_color = torch.zeros((3,), dtype=torch.float32, device="cuda")
@@ -910,6 +1128,14 @@ class Renderer:
             frame["image_relative_name"] for frame in per_frame_metrics if "image_relative_name" in frame
         ]
         uses_sequence_metadata = self.post_processing_mode == (POST_PROCESSING_EVAL_MODE_INFERENCE_SEQUENCE_METADATA)
+        uses_view_context = bool(
+            self.post_processing is not None
+            and getattr(
+                self.post_processing,
+                "use_view_context",
+                False,
+            )
+        )
         sequence_metadata = [
             {
                 "image_relative_name": frame["image_relative_name"],
@@ -958,6 +1184,10 @@ class Renderer:
         )
         if uses_sequence_metadata:
             render_signal_contract = "field_plus_temporal_luminance_affine_non_rgb_" "sequence_metadata"
+        elif uses_view_context:
+            render_signal_contract = (
+                "field_plus_sealed_predictive_view_context"
+            )
         elif self.post_processing_mode == (POST_PROCESSING_EVAL_MODE_PPISP_CAMERA_ONLY_DIAGNOSTIC):
             render_signal_contract = "field_plus_ppisp_camera_only_diagnostic_noncanonical"
         elif self.post_processing is None:
@@ -996,6 +1226,14 @@ class Renderer:
             inference_contract = "frame_idx_minus_one_sequence_idx_from_dataset_image_name_" "exposure_prior_none"
             conditioning_source = "non_rgb_sequence_metadata"
             conditioning_contract = "dataset_filename_sequence_idx_only_no_rgb_no_exif_no_" "per_frame_latent"
+        elif uses_view_context:
+            inference_contract = (
+                "sealed_frame_minus_one_exif_none_plus_render_context"
+            )
+            conditioning_source = (
+                "render_rgb_ray_distance_opacity_and_camera_pose"
+            )
+            conditioning_contract = view_context_inference_contract()
         elif self.post_processing is not None:
             inference_contract = "sealed_frame_minus_one_sequence_minus_one_exif_none"
             conditioning_source = "none"
@@ -1046,6 +1284,20 @@ class Renderer:
             "dataset_load_exif": bool(self.conf.dataset.get("load_exif", True)),
             "holdout_image_list_path": holdout_path,
             "holdout_image_list_sha256": holdout_sha256,
+            "train_exclude_image_list_path": (
+                getattr(
+                    self,
+                    "train_exclude_image_list_path",
+                    None,
+                )
+            ),
+            "train_exclude_image_list_sha256": (
+                getattr(
+                    self,
+                    "train_exclude_image_list_sha256",
+                    None,
+                )
+            ),
             "evaluated_frame_count": len(evaluated_frames),
             "evaluated_frame_names": evaluated_frames,
             "evaluated_frame_names_sha256": _sha256_of_json(evaluated_frames),
@@ -1114,7 +1366,10 @@ class Renderer:
 
         if model is None:
             # Initialize the model and the optix context
-            model = MixtureOfGaussians(conf)
+            model = create_gaussian_model(
+                conf,
+                checkpoint=checkpoint,
+            )
             # Initialize the parameters from checkpoint
             model.init_from_checkpoint(checkpoint, setup_optimizer=False)
         model.build_acc()

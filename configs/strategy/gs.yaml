@@ -12,6 +12,51 @@ densify:
   relative_size_threshold: 0.01 # Gaussians larger than relative_size_threshold * scene_extent will be split not cloned. Called percent_dense in 3DGS with default value 0.01
   split:
     n_gaussians: 2 # Hardcoded to 2 in 3DGS
+  # Replace each ordinary two-child random split with a deterministic
+  # three-node Gauss-Hermite mixture. beta is the retained variance fraction
+  # on the selected parent axis; 0.390625 keeps the incumbent 0.625 child
+  # standard deviation while preserving mixture moments through degree five.
+  # This arm requires ordinary, unmodified candidate selection.
+  moment_preserving_split:
+    enabled: false
+    beta: 0.390625
+  # Pixel-GS-style evidence weighting using 3DGUT's exact intersected-tile
+  # count as the available coverage proxy. This is not a count of final
+  # contributing pixels: it weights each view's existing distance-normalized
+  # position-gradient norm by intersected tiles, then divides by total tiles.
+  # Default disabled preserves the upstream per-visible-view average.
+  tile_coverage_weighted_gradient:
+    enabled: false
+  # Diagnostic-only 3DGUT cancellation instrument. The CUDA backward pass
+  # accumulates the componentwise absolute value of every per-ray position
+  # gradient before the ordinary signed atomic reduction. This is the
+  # ray-traced analogue of AbsGS evidence, not the paper's raster-space 2D
+  # mean gradient. It does not alter gradients, optimizer state, topology, or
+  # rendering. Default disabled avoids the Nx3 telemetry allocation.
+  absolute_ray_gradient_diagnostics:
+    enabled: false
+    frequency: 10
+  # 3DGUT-native non-cancelling densification. Per-ray absolute position
+  # gradients are rescaled in every view to conserve the ordinary signed
+  # gradient's total densification mass, then accumulated through the existing
+  # view-average buffer. This redistributes a controlled dose toward
+  # cancellation-hidden Gaussians without changing the renderer or loss.
+  absolute_ray_gradient_densification:
+    enabled: false
+  # Causal clone-versus-split probe for 3DGUT. Ordinary signed-gradient clone
+  # eligibility is unchanged. A clone is rerouted through the existing split
+  # operation only when at least two observations in the current densification
+  # window jointly exhibit >0.5 native ray-gradient cancellation and a tight
+  # projected half-extent >8 px, and those joint observations are at least half
+  # of the row's valid native-gradient observations. The reroute ceiling fails
+  # closed rather than silently truncating the intervention.
+  cancellation_conditioned_split:
+    enabled: false
+    cancellation_threshold: 0.5
+    extent_px: 8.0
+    min_joint_observations: 2
+    min_joint_fraction: 0.5
+    max_reroute_fraction: 0.5
   # Route otherwise-cloned Gaussians with a large on-screen 3DGUT support
   # box through the existing split operation. max_px is the largest axis of
   # the renderer's tight, opacity-bounded half-extent after covariance

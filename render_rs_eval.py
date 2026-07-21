@@ -14,7 +14,7 @@ import argparse
 
 import torch
 
-from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.model.factory import create_gaussian_model
 from threedgrut.render import Renderer
 
 if __name__ == "__main__":
@@ -32,7 +32,7 @@ if __name__ == "__main__":
     conf.dataset.holdout_image_list_path = args.holdout_list
     conf.dataset.shutter_type = "GLOBAL"
 
-    model = MixtureOfGaussians(conf)
+    model = create_gaussian_model(conf, checkpoint=checkpoint)
     model.init_from_checkpoint(checkpoint, setup_optimizer=False)
     model.build_acc()
 

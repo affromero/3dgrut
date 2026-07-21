@@ -30,7 +30,15 @@ import os
 
 import torch
 
+from threedgrut.datasets.utils import (
+    read_colmap_extrinsics_binary,
+    read_colmap_extrinsics_text,
+)
+from threedgrut.model.factory import create_gaussian_model
 from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.model.view_conditioned_anchor_field import (
+    ViewConditionedAnchorField,
+)
 from threedgrut.render import (
     POST_PROCESSING_EVAL_MODE_INFERENCE,
     POST_PROCESSING_EVAL_MODE_INFERENCE_SEQUENCE_METADATA,
@@ -78,11 +86,12 @@ def _post_processing_for_mode(
 
 def _build_renderer(
     checkpoint: dict,
-    model: MixtureOfGaussians,
+    model: MixtureOfGaussians | ViewConditionedAnchorField,
     *,
     eval_bundle: str,
     out_dir: str,
     post_processing_mode: str,
+    split: str = "val",
     checkpoint_path: str | None = None,
     checkpoint_sha256: str | None = None,
     original_training_bundle: str | None = None,
@@ -96,7 +105,7 @@ def _build_renderer(
         out_dir=out_dir,
         path=eval_bundle,
         global_step=checkpoint["global_step"],
-        split="val",
+        split=split,
         compute_extra_metrics=True,
         post_processing=post_processing,
         post_processing_mode=post_processing_mode,
@@ -115,7 +124,24 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True, type=str)
     parser.add_argument("--eval-bundle", required=True, type=str)
     parser.add_argument("--holdout-list", required=True, type=str)
+    parser.add_argument(
+        "--train-exclude-list",
+        type=str,
+        help=(
+            "Required with --split train. Names embargoed from the "
+            "holdout complement before train metrics are computed."
+        ),
+    )
     parser.add_argument("--out-dir", required=True, type=str)
+    parser.add_argument(
+        "--split",
+        choices=("train", "val"),
+        default="val",
+        help=(
+            "Render the held-out validation split or the complementary "
+            "training split under the same sealed inference contract."
+        ),
+    )
     parser.add_argument(
         "--post-processing-mode",
         choices=POST_PROCESSING_EVAL_MODES,
@@ -128,11 +154,107 @@ def _parse_args() -> argparse.Namespace:
             "noncanonical"
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.split == "train" and args.train_exclude_list is None:
+        parser.error(
+            "--split train requires --train-exclude-list so embargoed "
+            "frames cannot enter train metrics."
+        )
+    if args.split == "val" and args.train_exclude_list is not None:
+        parser.error(
+            "--train-exclude-list is only valid with --split train."
+        )
+    return args
+
+
+def _read_unique_image_names(path: str, *, label: str) -> set[str]:
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{label} not found: {path}")
+    names: list[str] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            name = line.strip()
+            if name and not name.startswith("#"):
+                names.append(name)
+    if not names:
+        raise ValueError(f"{label} must contain at least one image name.")
+    unique_names = set(names)
+    if len(unique_names) != len(names):
+        raise ValueError(f"{label} contains duplicate image names.")
+    return unique_names
+
+
+def _registered_image_names(eval_bundle: str) -> set[str]:
+    sparse_path = os.path.join(eval_bundle, "sparse", "0")
+    binary_path = os.path.join(sparse_path, "images.bin")
+    text_path = os.path.join(sparse_path, "images.txt")
+    if os.path.isfile(binary_path):
+        extrinsics = read_colmap_extrinsics_binary(binary_path)
+    elif os.path.isfile(text_path):
+        extrinsics = read_colmap_extrinsics_text(text_path)
+    else:
+        raise FileNotFoundError(
+            "Eval bundle has no COLMAP images.bin or images.txt: "
+            f"{sparse_path}"
+        )
+    names = [os.path.basename(extrinsic.name) for extrinsic in extrinsics]
+    unique_names = set(names)
+    if len(unique_names) != len(names):
+        raise ValueError(
+            "Eval bundle image basenames are not unique; train exclusions "
+            "would be ambiguous."
+        )
+    return unique_names
+
+
+def _validate_train_split_contract(
+    *,
+    eval_bundle: str,
+    holdout_list: str,
+    train_exclude_list: str,
+) -> None:
+    registered = _registered_image_names(eval_bundle)
+    holdout = _read_unique_image_names(
+        holdout_list,
+        label="Holdout image list",
+    )
+    excluded = _read_unique_image_names(
+        train_exclude_list,
+        label="Train exclude image list",
+    )
+    unknown_holdout = holdout - registered
+    if unknown_holdout:
+        raise ValueError(
+            "Holdout image list contains unregistered names: "
+            f"{sorted(unknown_holdout)[:5]}"
+        )
+    overlap = excluded & holdout
+    if overlap:
+        raise ValueError(
+            "Train exclude image list overlaps the holdout: "
+            f"{sorted(overlap)[:5]}"
+        )
+    unknown_excluded = excluded - registered
+    if unknown_excluded:
+        raise ValueError(
+            "Train exclude image list contains unregistered names: "
+            f"{sorted(unknown_excluded)[:5]}"
+        )
+    remaining = registered - holdout - excluded
+    if not remaining:
+        raise ValueError(
+            "Train exclusion contract leaves no images for train metrics."
+        )
 
 
 def main() -> None:
     args = _parse_args()
+    if args.split == "train":
+        _validate_train_split_contract(
+            eval_bundle=args.eval_bundle,
+            holdout_list=args.holdout_list,
+            train_exclude_list=args.train_exclude_list,
+        )
 
     checkpoint_path = os.path.abspath(args.checkpoint)
     checkpoint_sha256 = _sha256_of_file(checkpoint_path)
@@ -142,6 +264,9 @@ def main() -> None:
     # Score every arm on the SAME held-out cameras + GT, GLOBAL shutter.
     conf.path = args.eval_bundle
     conf.dataset.holdout_image_list_path = args.holdout_list
+    conf.dataset.train_exclude_image_list_path = (
+        args.train_exclude_list if args.split == "train" else None
+    )
     conf.dataset.shutter_type = "GLOBAL"
     conf.dataset.load_exif = False
     # Eval-only: drop training sidecars tied to the TRAINING bundle. A
@@ -152,7 +277,7 @@ def main() -> None:
     conf.dataset.sky_mask_folder = None
     conf.loss.use_sky_opacity = False
 
-    model = MixtureOfGaussians(conf)
+    model = create_gaussian_model(conf, checkpoint=checkpoint)
     model.init_from_checkpoint(checkpoint, setup_optimizer=False)
     model.build_acc()
 
@@ -162,6 +287,7 @@ def main() -> None:
         out_dir=args.out_dir,
         eval_bundle=args.eval_bundle,
         post_processing_mode=args.post_processing_mode,
+        split=args.split,
         checkpoint_path=checkpoint_path,
         checkpoint_sha256=checkpoint_sha256,
         original_training_bundle=original_training_bundle,

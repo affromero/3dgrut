@@ -37,6 +37,10 @@ from .protocols import Batch, BoundedMultiViewDataset, DatasetVisualization
 from .rs_rays import build_rs_world_rays
 
 _CANONICAL_FLAT_PHYSICAL_CAMERA_NAMES = ("front", "left", "right")
+_SOFT_MASK_CONTRACT_FILENAME = "soft_training_masks.json"
+_SOFT_MASK_SEMANTICS = (
+    "solid_angle_partition_of_unity_loss_weight_v1"
+)
 
 
 def _read_rgb_image_array(image_path: str) -> np.ndarray:
@@ -116,6 +120,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.shutter_type = ShutterType[shutter_type].name
         self.rs_ray_injection = rs_ray_injection
         self.blur_samples = int(blur_samples)
+        self.preserve_soft_training_masks = (
+            self._validate_soft_training_mask_contract()
+        )
         if self.blur_samples < 1:
             raise ValueError(f"blur_samples must be >= 1, got {self.blur_samples}.")
         if self.blur_samples > 1 and not rs_ray_injection:
@@ -203,7 +210,6 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             self.depth_paths = self.depth_paths[split_mask]
 
         self.camera_centers = self.camera_centers[split_mask]
-        self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
 
         # Apply split indices to EXIF exposures
         if self._all_exif_exposures is not None:
@@ -215,6 +221,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         if self.split == "train":
             self.apply_train_exclude_image_list()
+
+        # Train-only exclusions must be applied before scene normalization.
+        # Otherwise embargoed or outer-holdout camera poses influence the
+        # scene extent and position learning-rate scale of an inner-fold run.
+        self.center, self.length_scale, self.scene_bbox = (
+            self.compute_spatial_extents()
+        )
+        _, diagonal = get_center_and_diag(self.camera_centers)
+        self.cameras_extent = diagonal * 1.1
 
         # Update the number of frames to only include the samples from the split
         self.n_frames = self.poses.shape[0]
@@ -355,6 +370,38 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             return colmap_mask_path
         return os.path.splitext(image_path)[0] + "_mask.png"
 
+    def _validate_soft_training_mask_contract(self) -> bool:
+        contract_path = os.path.join(
+            self.path,
+            _SOFT_MASK_CONTRACT_FILENAME,
+        )
+        if not os.path.isfile(contract_path):
+            return False
+        with open(contract_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("mask_semantics") != _SOFT_MASK_SEMANTICS
+            or payload.get("intended_split") != "training_only"
+        ):
+            raise ValueError(
+                "Invalid soft training-mask contract: "
+                f"{contract_path}"
+            )
+        return True
+
+    @staticmethod
+    def _normalize_training_mask(
+        mask: torch.Tensor,
+        *,
+        preserve_soft_weights: bool,
+    ) -> torch.Tensor:
+        normalized = mask / 255.0
+        if preserve_soft_weights:
+            return normalized.to(torch.float32)
+        return (normalized > 0.5).to(torch.float32)
+
     def resolve_sky_mask_path(self, image_name):
         return os.path.join(self.path, self.get_sky_masks_folder(), image_name)
 
@@ -365,6 +412,18 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         direct = os.path.join(self.path, self.depth_folder, depth_stem)
         if os.path.exists(direct):
             return direct
+        flat_stem = os.path.splitext(os.path.basename(image_name))[0]
+        camera_name, separator, frame_name = flat_stem.rpartition("_")
+        if separator and camera_name and frame_name.isdigit():
+            candidate = os.path.join(
+                self.path,
+                self.depth_folder,
+                camera_name,
+                "depth",
+                f"{frame_name}.npy",
+            )
+            if os.path.exists(candidate):
+                return candidate
         parts = image_name.replace("\\", "/").split("/")
         if len(parts) >= 2:
             camera_name = parts[-2]
@@ -843,6 +902,10 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     def get_observer_points(self):
         return self.camera_centers
 
+    def get_image_names(self) -> list[str]:
+        """Return image identities after holdout and train exclusions."""
+        return [extrinsic.name for extrinsic in self.cam_extrinsics]
+
     def get_poses(self) -> np.ndarray:
         """Get camera poses as 4x4 transformation matrices.
 
@@ -1160,8 +1223,13 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             sample["rays_in_world_space"] = True
 
         if "mask" in batch:
-            mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
-            mask = (mask > 0.5).to(torch.float32)
+            mask = self._normalize_training_mask(
+                batch["mask"][0].to(self.device, non_blocking=True),
+                preserve_soft_weights=(
+                    self.preserve_soft_training_masks
+                    and self.split == "train"
+                ),
+            )
             sample["mask"] = mask
 
         if "sky_mask" in batch:

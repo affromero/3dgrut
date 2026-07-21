@@ -108,6 +108,16 @@ vector<float, Dim> radianceFromParameters(float3 incidentDirection,
         }
         radiance = max(radiance, vector<float, Dim>(0));
     }
+    if (HermiteEnabled)
+    {
+        const int carrierOffset = RadianceNumSphCoefficients;
+        const vector<float, Dim> slopeU =
+            parameters.sphCoefficients[carrierOffset];
+        const vector<float, Dim> slopeV =
+            parameters.sphCoefficients[carrierOffset + 1];
+        radiance += slopeU * localUv.x + slopeV * localUv.y;
+        radiance = max(radiance, vector<float, Dim>(0));
+    }
     if (SirenEnabled)
     {
         const int sirenOffset = RadianceNumSphCoefficients;

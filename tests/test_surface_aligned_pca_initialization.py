@@ -16,7 +16,7 @@ from threedgrut.model.geometry import (
 )
 from threedgrut.model.model import (
     MixtureOfGaussians,
-    _validated_surface_aligned_pca_config,
+    validated_surface_aligned_pca_config,
 )
 from threedgrut.utils.misc import (
     quaternion_to_so3,
@@ -423,7 +423,7 @@ def test_enabled_validation_accepts_a_valid_colmap_contract() -> None:
     observers = torch.zeros((2, 3))
     config = _initialization_config()
 
-    validated = _validated_surface_aligned_pca_config(
+    validated = validated_surface_aligned_pca_config(
         config,
         points,
         observers,
@@ -475,7 +475,7 @@ def test_enabled_validation_rejects_contract_mismatches(
     OmegaConf.update(config, mutation[0], mutation[1])
 
     with pytest.raises(ValueError, match=message):
-        _validated_surface_aligned_pca_config(
+        validated_surface_aligned_pca_config(
             config,
             torch.zeros((32, 3)),
             torch.zeros((2, 3)),
@@ -485,7 +485,7 @@ def test_enabled_validation_rejects_contract_mismatches(
 def test_enabled_validation_rejects_bad_observers_and_sparse_points() -> None:
     config = _initialization_config()
     with pytest.raises(ValueError, match="nonempty finite observer"):
-        _validated_surface_aligned_pca_config(
+        validated_surface_aligned_pca_config(
             config,
             torch.zeros((32, 3)),
             torch.tensor(((torch.nan, 0.0, 0.0), (0.0, 0.0, 0.0))),
@@ -493,7 +493,7 @@ def test_enabled_validation_rejects_bad_observers_and_sparse_points() -> None:
 
     config.surface_aligned_pca.expected_point_count = None
     with pytest.raises(ValueError, match="at least 32 COLMAP points"):
-        _validated_surface_aligned_pca_config(
+        validated_surface_aligned_pca_config(
             config,
             torch.zeros((31, 3)),
             torch.zeros((2, 3)),
@@ -506,7 +506,7 @@ def test_disabled_validation_is_a_noop() -> None:
     config.method = "random"
     config.use_observation_points = False
 
-    validated = _validated_surface_aligned_pca_config(
+    validated = validated_surface_aligned_pca_config(
         config,
         torch.empty((0, 3)),
         torch.empty((0, 3)),

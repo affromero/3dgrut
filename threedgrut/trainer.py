@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import math
 import os
 import time
 from collections import defaultdict
@@ -36,23 +37,50 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 import wandb
 from threedgrut import datasets
-from threedgrut.datasets.protocols import BoundedMultiViewDataset
+from threedgrut.datasets.protocols import Batch, BoundedMultiViewDataset
+from threedgrut.datasets.native_ray_evidence import NativeRayEvidence
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
 from threedgrut.model.camera_residual import CameraResidual
+from threedgrut.model.factory import (
+    GaussianRepresentation,
+    checkpoint_representation,
+    create_gaussian_model,
+)
 from threedgrut.model.losses import rim_high_frequency_loss, ssim
-from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.model.model import (
+    MixtureOfGaussians,
+    validated_surface_aligned_pca_config,
+)
+from threedgrut.model.native_ray_inverse_sensor import (
+    interval_transmittance_losses,
+    shift_ray_origins,
+)
 from threedgrut.model.mvdino_rim_loss import (
     mvdino_feature_rim_loss,
     mvdino_rim_crop_loss,
+)
+from threedgrut.model.view_conditioned_anchor_field import (
+    ViewConditionedAnchorField,
+    load_fold_safe_point_source,
 )
 from threedgrut.optimizers import (
     SelectiveAdam,
     SparseGeometryAdam,
     VisibilityDecayedAdam,
 )
-from threedgrut.post_processing import LuminanceAffine
+from threedgrut.post_processing import (
+    LuminanceAffine,
+    MultiscalePPISPConfig,
+    PredictiveMultiscalePPISP,
+    view_context_inference_contract,
+)
+from threedgrut.post_processing.checkpoint_contract import (
+    inherited_controller_inference_contract,
+    module_state_sha256,
+)
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
+from threedgrut.strategy.fixed_anchor import FixedAnchorStrategy
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import (
     check_step_condition,
@@ -132,6 +160,47 @@ def _predicted_axial_depth(
     if ray_z.shape[0] != pred_dist.shape[0]:
         ray_z = ray_z.expand(pred_dist.shape[0], -1, -1, -1)
     return pred_dist * ray_z
+
+
+def _conditional_hit_depth(
+    *,
+    pred_dist: torch.Tensor,
+    pred_opacity: torch.Tensor,
+    opacity_floor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover conditional hit depth from a premultiplied depth moment."""
+    if not 0.0 < opacity_floor < 1.0:
+        raise ValueError(
+            "Depth opacity floor must be in (0, 1): "
+            f"{opacity_floor}"
+        )
+    if pred_dist.ndim == 3:
+        pred_dist = pred_dist.unsqueeze(-1)
+    if pred_opacity.ndim == 3:
+        pred_opacity = pred_opacity.unsqueeze(-1)
+    pred_opacity = pred_opacity.to(
+        device=pred_dist.device,
+        dtype=pred_dist.dtype,
+    )
+    if pred_opacity.shape[1:3] != pred_dist.shape[1:3]:
+        pred_opacity = F.interpolate(
+            pred_opacity.permute(0, 3, 1, 2),
+            size=pred_dist.shape[1:3],
+            mode="bilinear",
+            align_corners=False,
+        ).permute(0, 2, 3, 1)
+    if pred_opacity.shape[0] != pred_dist.shape[0]:
+        pred_opacity = pred_opacity.expand(
+            pred_dist.shape[0],
+            -1,
+            -1,
+            -1,
+        )
+    conditional_depth = pred_dist / torch.clamp(
+        pred_opacity,
+        min=opacity_floor,
+    )
+    return conditional_depth, pred_opacity
 
 
 def _scale_optimizer_learning_rates(optimizer: torch.optim.Optimizer, *, scale: float, label: str) -> None:
@@ -1308,7 +1377,7 @@ def _load_optimizer_state(
 class Trainer3DGRUT:
     """Trainer for paper: "3D Gaussian Ray Tracing: Fast Tracing of Particle Scenes" """
 
-    model: MixtureOfGaussians
+    model: MixtureOfGaussians | ViewConditionedAnchorField
     """ Gaussian Model """
 
     train_dataset: BoundedMultiViewDataset
@@ -1344,6 +1413,9 @@ class Trainer3DGRUT:
     post_processing_schedulers: list | None = None
     """ Schedulers for post-processing module optimizers """
 
+    _frozen_post_processing_metadata: dict[str, object] | None = None
+    """Inference proof copied from the checkpoint that supplied frozen PPISP."""
+
     camera_residual: CameraResidual | None = None
     """Optional bounded ray-space camera residual module."""
 
@@ -1355,6 +1427,9 @@ class Trainer3DGRUT:
 
     geometry_only_optimizer: SparseGeometryAdam | None = None
     """Independent row-sparse optimizer for direct geometry supervision."""
+
+    native_ray_evidence: NativeRayEvidence | None = None
+    """Optional authenticated world-space range rays for geometry training."""
 
     _pending_geometry_optimizer_state: dict[str, object] | None = None
     """Resume state loaded lazily after topology-changing stages finish."""
@@ -1459,6 +1534,49 @@ class Trainer3DGRUT:
         self._post_processing_camera_index_mode = post_processing_camera_index_mode(conf)
         self.geometry_only_optimizer = None
         self._pending_geometry_optimizer_state = None
+        native_ray_folder = str(
+            conf.loss.geometry_only_pass.get(
+                "native_ray_evidence_folder",
+                "",
+            )
+        )
+        self.native_ray_evidence = (
+            NativeRayEvidence(
+                folder=native_ray_folder,
+                manifest_sha256=str(
+                    conf.loss.geometry_only_pass.get(
+                        "native_ray_evidence_manifest_sha256",
+                        "",
+                    )
+                ),
+                sample_count=int(
+                    conf.loss.geometry_only_pass.get(
+                        "native_ray_sample_count",
+                        16_384,
+                    )
+                ),
+                seed=int(
+                    conf.loss.geometry_only_pass.get(
+                        "native_ray_seed",
+                        20260718,
+                    )
+                ),
+                equirect_width=int(
+                    conf.loss.geometry_only_pass.get(
+                        "native_ray_equirect_width",
+                        256,
+                    )
+                ),
+                equirect_height=int(
+                    conf.loss.geometry_only_pass.get(
+                        "native_ray_equirect_height",
+                        128,
+                    )
+                ),
+            )
+            if native_ray_folder
+            else None
+        )
 
         # Setup the trainer and components
         logger.log_rule("Load Datasets")
@@ -1563,6 +1681,69 @@ class Trainer3DGRUT:
             msg = "Post-processing checkpoint camera frame counts must be " f"positive: {camera_frame_counts}."
             raise ValueError(msg)
 
+        frozen_inference = bool(
+            getattr(
+                self.conf.post_processing,
+                "frozen_inference_during_training",
+                False,
+            )
+        )
+        if frozen_inference:
+            source = self._frozen_post_processing_metadata
+            if source is None:
+                raise ValueError(
+                    "Frozen post-processing has no authenticated parent "
+                    "inference metadata."
+                )
+            source_keys = source.get("camera_keys")
+            source_counts = source.get("camera_frame_counts")
+            source_mode = source.get("camera_index_mode")
+            source_contract = source.get("inference_contract")
+            if source_keys != list(camera_keys):
+                raise ValueError(
+                    "Frozen post-processing camera keys differ from its "
+                    "parent checkpoint."
+                )
+            if source_counts != camera_frame_counts:
+                raise ValueError(
+                    "Frozen post-processing frame counts differ from its "
+                    "parent checkpoint."
+                )
+            if source_mode != self._post_processing_camera_index_mode:
+                raise ValueError(
+                    "Frozen post-processing camera index mode differs from "
+                    "its parent checkpoint."
+                )
+            if not isinstance(source_contract, dict):
+                raise ValueError(
+                    "Frozen post-processing parent has no inference contract."
+                )
+            if not bool(source_contract.get("controller_trained", False)):
+                raise ValueError(
+                    "Frozen PPISP parent does not prove a trained novel-view "
+                    "controller."
+                )
+            source_module_sha256 = source.get("module_state_sha256")
+            current_module_sha256 = module_state_sha256(
+                self.post_processing.state_dict()
+            )
+            if source_module_sha256 != current_module_sha256:
+                raise ValueError(
+                    "Frozen post-processing module state changed after "
+                    "parent restoration."
+                )
+            current_contract = inherited_controller_inference_contract(
+                source_contract,
+                module_sha256=current_module_sha256,
+                checkpoint_global_step=int(self.global_step),
+            )
+            return {
+                "camera_keys": list(camera_keys),
+                "camera_frame_counts": camera_frame_counts,
+                "camera_index_mode": self._post_processing_camera_index_mode,
+                "inference_contract": current_contract,
+            }
+
         method = self.conf.post_processing.method
         controller_enabled = bool(method == "ppisp" and getattr(self.post_processing.config, "use_controller", False))
         scheduler_last_epoch = None
@@ -1598,17 +1779,50 @@ class Trainer3DGRUT:
             and scheduler_last_epoch > activation_step
             and checkpoint_global_step >= activation_step
         )
+        multiscale_controller_enabled = bool(
+            controller_enabled
+            and getattr(
+                self.conf.post_processing,
+                "use_multiscale_controller",
+                False,
+            )
+        )
+        multiscale_view_context_enabled = bool(
+            multiscale_controller_enabled
+            and getattr(
+                self.conf.post_processing,
+                "multiscale_use_view_context",
+                False,
+            )
+        )
         return {
             "camera_keys": list(camera_keys),
             "camera_frame_counts": camera_frame_counts,
             "camera_index_mode": self._post_processing_camera_index_mode,
             "inference_contract": {
-                "schema_version": 1,
+                "schema_version": 3,
                 "checkpoint_global_step": checkpoint_global_step,
                 "controller_enabled": controller_enabled,
                 "controller_trained": controller_trained,
                 "controller_activation_step": activation_step,
                 "scheduler_last_epoch": scheduler_last_epoch,
+                "multiscale_controller_enabled": (
+                    multiscale_controller_enabled
+                ),
+                "multiscale_controller_trained": bool(
+                    multiscale_controller_enabled and controller_trained
+                ),
+                "multiscale_view_context_enabled": (
+                    multiscale_view_context_enabled
+                ),
+                "multiscale_view_context_trained": bool(
+                    multiscale_view_context_enabled and controller_trained
+                ),
+                "multiscale_view_context_contract": (
+                    view_context_inference_contract()
+                    if multiscale_view_context_enabled
+                    else None
+                ),
             },
         }
 
@@ -1732,29 +1946,49 @@ class Trainer3DGRUT:
 
     def init_model(self, conf: DictConfig, scene_extent=None) -> None:
         """Initializes the gaussian model and the optix context"""
-        self.model = MixtureOfGaussians(conf, scene_extent=scene_extent)
+        checkpoint = None
+        if conf.resume:
+            checkpoint = torch.load(conf.resume, weights_only=False)
+        self.model = create_gaussian_model(
+            conf,
+            scene_extent=scene_extent,
+            checkpoint=checkpoint,
+        )
 
     def init_densification_and_pruning_strategy(self, conf: DictConfig) -> None:
         """Set pre-train / post-train iteration logic. i.e. densification and pruning"""
         assert self.model is not None
         match self.conf.strategy.method:
             case "GSStrategy":
+                if isinstance(self.model, ViewConditionedAnchorField):
+                    raise ValueError(
+                        "The view-conditioned anchor representation requires "
+                        "FixedAnchorStrategy."
+                    )
                 from threedgrut.strategy.gs import GSStrategy
 
                 self.strategy = GSStrategy(conf, self.model)
                 logger.info("🔆 Using GS strategy")
             case "MCMCStrategy":
+                if isinstance(self.model, ViewConditionedAnchorField):
+                    raise ValueError(
+                        "The view-conditioned anchor representation requires "
+                        "FixedAnchorStrategy."
+                    )
                 from threedgrut.strategy.mcmc import MCMCStrategy
 
                 self.strategy = MCMCStrategy(conf, self.model)
                 logger.info("🔆 Using MCMC strategy")
+            case "FixedAnchorStrategy":
+                self.strategy = FixedAnchorStrategy(conf, self.model)
+                logger.info("Using fixed anchor strategy")
             case _:
                 raise ValueError(f"unrecognized model.strategy {conf.strategy.method}")
 
     def setup_training(
         self,
         conf: DictConfig,
-        model: MixtureOfGaussians,
+        model: MixtureOfGaussians | ViewConditionedAnchorField,
         train_dataset: BoundedMultiViewDataset,
     ):
         """Performs required steps to setup the optimization:
@@ -1775,7 +2009,19 @@ class Trainer3DGRUT:
             # builds trees that hit the driver's internal-traversal-stack
             # overflow at ~100x the live-state rate; re-randomizing the
             # order re-rolls the tree distribution.
-            if os.environ.get("THREEDGRUT_RESUME_PERMUTE") == "1":
+            representation = checkpoint_representation(checkpoint)
+            if (
+                representation == GaussianRepresentation.MIXTURE
+                and os.environ.get("THREEDGRUT_RESUME_PERMUTE") == "1"
+            ):
+                protected_prefix = checkpoint.get(
+                    "protected_gaussian_prefix"
+                )
+                if protected_prefix is not None:
+                    raise RuntimeError(
+                        "THREEDGRUT_RESUME_PERMUTE cannot permute a "
+                        "protected Gaussian prefix."
+                    )
                 n_gaussians = checkpoint["positions"].shape[0]
                 perm = torch.randperm(n_gaussians)
 
@@ -1798,6 +2044,19 @@ class Trainer3DGRUT:
                 checkpoint = _permute_rows(checkpoint)
                 logger.info(f"resume-permute: shuffled {n_gaussians} gaussian rows")
             model.init_from_checkpoint(checkpoint)
+            if isinstance(model, ViewConditionedAnchorField):
+                fold_contract_sha256 = str(
+                    conf.model.anchor_field.fold_contract_sha256
+                )
+                if len(fold_contract_sha256) != 64:
+                    raise ValueError(
+                        "Anchor resume requires a SHA-256 "
+                        "model.anchor_field.fold_contract_sha256."
+                    )
+                model.validate_training_contract(
+                    training_image_names=train_dataset.get_image_names(),
+                    fold_contract_sha256=fold_contract_sha256,
+                )
             self.strategy.init_densification_buffer(checkpoint)
             global_step = checkpoint["global_step"]
 
@@ -1807,6 +2066,7 @@ class Trainer3DGRUT:
                     self.post_processing,
                     checkpoint["post_processing"]["module"],
                 )
+                self._capture_frozen_post_processing_metadata(checkpoint)
                 if dropped:
                     logger.warning(
                         "📷 Dropping shape-mismatched post-processing "
@@ -1855,6 +2115,11 @@ class Trainer3DGRUT:
                 logger.info("📷 Camera residual state restored from checkpoint")
             self._pending_geometry_optimizer_state = checkpoint.get("geometry_only_optimizer")
         elif conf.import_ply.enabled:
+            if isinstance(model, ViewConditionedAnchorField):
+                raise ValueError(
+                    "View-conditioned anchors cannot initialize from a "
+                    "static PLY."
+                )
             ply_path = (
                 conf.import_ply.path
                 if conf.import_ply.path
@@ -1867,75 +2132,169 @@ class Trainer3DGRUT:
             global_step = conf.import_ply.init_global_step
         else:
             logger.info("🤸 Initiating new 3dgrut training..")
-            match conf.initialization.method:
-                case "random":
-                    model.init_from_random_point_cloud(
-                        num_gaussians=conf.initialization.num_gaussians,
-                        xyz_max=conf.initialization.xyz_max,
-                        xyz_min=conf.initialization.xyz_min,
-                    )
-                case "colmap":
-                    observer_points = torch.tensor(
-                        train_dataset.get_observer_points(),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    model.init_from_colmap(conf.path, observer_points)
-                case "fused_point_cloud":
-                    observer_points = torch.tensor(
-                        train_dataset.get_observer_points(),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    ply_path = conf.initialization.fused_point_cloud_path
-                    logger.info(f"Initializing from accumulated point cloud: {ply_path}")
-                    model.init_from_fused_point_cloud(ply_path, observer_points)
-                case "point_cloud":
-                    try:
-                        ply_path = os.path.join(conf.path, "point_cloud.ply")
-                        model.init_from_pretrained_point_cloud(ply_path)
-                    except FileNotFoundError as e:
-                        logger.error(e)
-                        raise e
-                case "checkpoint":
-                    checkpoint = torch.load(conf.initialization.path, weights_only=False)
-                    model.init_from_checkpoint(checkpoint, setup_optimizer=False)
-                    if "post_processing" in checkpoint and self.post_processing is not None:
-                        dropped = _load_post_processing_state(
-                            self.post_processing,
-                            checkpoint["post_processing"]["module"],
-                        )
-                        if dropped:
-                            logger.warning(
-                                "📷 Dropping shape-mismatched " f"post-processing buffers: {sorted(dropped)}."
-                            )
-                        logger.info("📷 Post-processing module restored from initialization checkpoint")
-                    if "camera_residual" in checkpoint and self.camera_residual is not None:
-                        self.camera_residual.load_state_dict(checkpoint["camera_residual"]["module"])
-                        logger.info("📷 Camera residual module restored from " "initialization checkpoint")
-                case "lidar":
-                    assert isinstance(
-                        train_dataset, datasets.NCoreDataset
-                    ), "can only initialize from lidar with NCoreDataset"
-                    pc = PointCloud.from_sequence(
-                        list(train_dataset.get_point_clouds(step_frame=1, non_dynamic_points_only=True)),
-                        device="cpu",
-                    )
-                    if conf.initialization.num_points < len(pc.xyz_end):
-                        # Deterministically random subsample points if there are more points than the specified number of gaussians
-                        rng = torch.Generator().manual_seed(conf.seed_initialization)
-                        idxs = torch.randperm(len(pc.xyz_end), generator=rng)[: conf.initialization.num_points]
-                        pc = pc.selected_idxs(idxs)
-                    observer_points = torch.tensor(
-                        train_dataset.get_observer_points(),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    model.init_from_lidar(pc, observer_points)
-                case _:
+            if isinstance(model, ViewConditionedAnchorField):
+                if str(conf.initialization.method) != "colmap":
                     raise ValueError(
-                        f"unrecognized initialization.method {conf.initialization.method}, choose from [colmap, point_cloud, random, checkpoint, lidar]"
+                        "View-conditioned anchors require "
+                        "initialization.method=colmap plus a train-only "
+                        "anchor source manifest."
                     )
+                fold_contract_sha256 = str(
+                    conf.model.anchor_field.fold_contract_sha256
+                )
+                if len(fold_contract_sha256) != 64:
+                    raise ValueError(
+                        "Anchor training requires a SHA-256 "
+                        "model.anchor_field.fold_contract_sha256."
+                    )
+                model.initialize_from_source_manifest(
+                    training_image_names=train_dataset.get_image_names(),
+                    fold_contract_sha256=fold_contract_sha256,
+                )
+            else:
+                match conf.initialization.method:
+                    case "random":
+                        model.init_from_random_point_cloud(
+                            num_gaussians=conf.initialization.num_gaussians,
+                            xyz_max=conf.initialization.xyz_max,
+                            xyz_min=conf.initialization.xyz_min,
+                        )
+                    case "colmap":
+                        observer_points = torch.tensor(
+                            train_dataset.get_observer_points(),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        source_manifest_path = str(
+                            conf.model.anchor_field.get(
+                                "source_manifest_path",
+                                "",
+                            )
+                        )
+                        if source_manifest_path:
+                            fold_contract_sha256 = str(
+                                conf.model.anchor_field.fold_contract_sha256
+                            )
+                            if len(fold_contract_sha256) != 64:
+                                raise ValueError(
+                                    "Fold-safe ordinary initialization "
+                                    "requires a SHA-256 anchor fold contract."
+                                )
+                            _, points, colors = load_fold_safe_point_source(
+                                source_manifest_path,
+                                expected_training_image_names=(
+                                    train_dataset.get_image_names()
+                                ),
+                                expected_fold_contract_sha256=(
+                                    fold_contract_sha256
+                                ),
+                            )
+                            points = points.to(
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            surface_aligned_pca_config = (
+                                validated_surface_aligned_pca_config(
+                                    conf.initialization,
+                                    points,
+                                    observer_points,
+                                )
+                            )
+                            model.default_initialize_from_points(
+                                points,
+                                observer_points,
+                                colors.clamp(0.0, 255.0).to(
+                                    dtype=torch.uint8,
+                                    device=self.device,
+                                ),
+                                use_observer_pts=bool(
+                                    conf.initialization.use_observation_points
+                                ),
+                                surface_aligned_pca_config=(
+                                    surface_aligned_pca_config
+                                ),
+                            )
+                            logger.info(
+                                "Initialized ordinary Gaussian control from "
+                                f"{points.shape[0]} fold-safe source points."
+                            )
+                        else:
+                            model.init_from_colmap(
+                                conf.path,
+                                observer_points,
+                            )
+                    case "fused_point_cloud":
+                        observer_points = torch.tensor(
+                            train_dataset.get_observer_points(),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        ply_path = conf.initialization.fused_point_cloud_path
+                        logger.info(f"Initializing from accumulated point cloud: {ply_path}")
+                        model.init_from_fused_point_cloud(ply_path, observer_points)
+                    case "point_cloud":
+                        try:
+                            ply_path = os.path.join(conf.path, "point_cloud.ply")
+                            model.init_from_pretrained_point_cloud(ply_path)
+                        except FileNotFoundError as e:
+                            logger.error(e)
+                            raise e
+                    case "checkpoint":
+                        checkpoint = torch.load(conf.initialization.path, weights_only=False)
+                        model.init_from_checkpoint(checkpoint, setup_optimizer=False)
+                        model.set_optimizable_parameters()
+                        if "post_processing" in checkpoint and self.post_processing is not None:
+                            dropped = _load_post_processing_state(
+                                self.post_processing,
+                                checkpoint["post_processing"]["module"],
+                            )
+                            self._capture_frozen_post_processing_metadata(
+                                checkpoint
+                            )
+                            if dropped:
+                                logger.warning(
+                                    "📷 Dropping shape-mismatched "
+                                    f"post-processing buffers: {sorted(dropped)}."
+                                )
+                            logger.info(
+                                "📷 Post-processing module restored from "
+                                "initialization checkpoint"
+                            )
+                        if "camera_residual" in checkpoint and self.camera_residual is not None:
+                            self.camera_residual.load_state_dict(checkpoint["camera_residual"]["module"])
+                            logger.info(
+                                "📷 Camera residual module restored from "
+                                "initialization checkpoint"
+                            )
+                    case "lidar":
+                        assert isinstance(
+                            train_dataset, datasets.NCoreDataset
+                        ), "can only initialize from lidar with NCoreDataset"
+                        pc = PointCloud.from_sequence(
+                            list(train_dataset.get_point_clouds(step_frame=1, non_dynamic_points_only=True)),
+                            device="cpu",
+                        )
+                        if conf.initialization.num_points < len(pc.xyz_end):
+                            rng = torch.Generator().manual_seed(
+                                conf.seed_initialization
+                            )
+                            idxs = torch.randperm(
+                                len(pc.xyz_end),
+                                generator=rng,
+                            )[: conf.initialization.num_points]
+                            pc = pc.selected_idxs(idxs)
+                        observer_points = torch.tensor(
+                            train_dataset.get_observer_points(),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        model.init_from_lidar(pc, observer_points)
+                    case _:
+                        raise ValueError(
+                            "unrecognized initialization.method "
+                            f"{conf.initialization.method}, choose from "
+                            "[colmap, point_cloud, random, checkpoint, lidar]"
+                        )
 
             self.strategy.init_densification_buffer()
 
@@ -2030,11 +2389,26 @@ class Trainer3DGRUT:
             num_frames = sum(frames_per_camera)
 
             use_controller = conf.post_processing.get("use_controller", True)
+            frozen_inference = bool(
+                conf.post_processing.get(
+                    "frozen_inference_during_training",
+                    False,
+                )
+            )
+            if frozen_inference and not use_controller:
+                raise ValueError(
+                    "Frozen inference post-processing requires "
+                    "post_processing.use_controller=true."
+                )
 
             # Distillation mode: controller activates after main training
             # Total iterations = n_iterations, distillation starts at n_iterations - n_distillation_steps
             n_distillation_steps = conf.post_processing.get("n_distillation_steps", 5000)
-            if use_controller and n_distillation_steps > 0:
+            if frozen_inference:
+                controller_activation_ratio = 0.8
+                controller_distillation = False
+                self._distillation_start_step = -1
+            elif use_controller and n_distillation_steps > 0:
                 main_training_steps = conf.n_iterations - n_distillation_steps
                 controller_activation_ratio = main_training_steps / conf.n_iterations
                 controller_distillation = True
@@ -2055,17 +2429,119 @@ class Trainer3DGRUT:
                 controller_activation_ratio=controller_activation_ratio,
             )
 
-            self.post_processing = PPISP(
-                num_cameras=num_cameras,
-                num_frames=num_frames,
-                config=ppisp_config,
-            ).to(self.device)
-
-            self.post_processing_optimizers = self.post_processing.create_optimizers()
-            self.post_processing_schedulers = self.post_processing.create_schedulers(
-                self.post_processing_optimizers,
-                max_optimization_iters=conf.n_iterations,
+            use_multiscale_controller = conf.post_processing.get(
+                "use_multiscale_controller",
+                False,
             )
+            use_view_context = conf.post_processing.get(
+                "multiscale_use_view_context",
+                False,
+            )
+            if use_view_context and not use_multiscale_controller:
+                raise ValueError(
+                    "post_processing.multiscale_use_view_context requires "
+                    "use_multiscale_controller=true."
+                )
+            if use_view_context and bool(
+                conf.dataset.get("rs_ray_injection", False)
+            ):
+                raise ValueError(
+                    "View-conditioned multiscale PPISP requires "
+                    "dataset.rs_ray_injection=false."
+                )
+            if use_view_context and str(
+                conf.dataset.get("shutter_type", "GLOBAL")
+            ) != "GLOBAL":
+                raise ValueError(
+                    "View-conditioned multiscale PPISP supports GLOBAL "
+                    "shutter only."
+                )
+            if use_view_context and bool(conf.camera_residual.enabled):
+                raise ValueError(
+                    "View-conditioned multiscale PPISP requires "
+                    "camera_residual.enabled=false."
+                )
+            if use_multiscale_controller:
+                self.post_processing = PredictiveMultiscalePPISP(
+                    num_cameras=num_cameras,
+                    num_frames=num_frames,
+                    config=ppisp_config,
+                    multiscale_config=MultiscalePPISPConfig(
+                        coarse_grid_size=conf.post_processing.get(
+                            "multiscale_coarse_grid_size",
+                            4,
+                        ),
+                        fine_grid_size=conf.post_processing.get(
+                            "multiscale_fine_grid_size",
+                            16,
+                        ),
+                        coarse_max_log_gain=conf.post_processing.get(
+                            "multiscale_coarse_max_log_gain",
+                            0.04,
+                        ),
+                        coarse_max_bias=conf.post_processing.get(
+                            "multiscale_coarse_max_bias",
+                            0.02,
+                        ),
+                        fine_max_log_gain=conf.post_processing.get(
+                            "multiscale_fine_max_log_gain",
+                            0.02,
+                        ),
+                        fine_max_bias=conf.post_processing.get(
+                            "multiscale_fine_max_bias",
+                            0.01,
+                        ),
+                        magnitude_regularization=conf.post_processing.get(
+                            "multiscale_magnitude_regularization",
+                            0.01,
+                        ),
+                        total_variation_regularization=(
+                            conf.post_processing.get(
+                                "multiscale_total_variation_regularization",
+                                0.01,
+                            )
+                        ),
+                        init_seed=conf.post_processing.get(
+                            "multiscale_init_seed",
+                            20_260_717,
+                        ),
+                        use_view_context=use_view_context,
+                    ),
+                    view_center=(
+                        self.train_dataset.get_center()
+                        if use_view_context
+                        else None
+                    ),
+                    view_scale=(
+                        self.train_dataset.get_length_scale()
+                        if use_view_context
+                        else None
+                    ),
+                ).to(self.device)
+            else:
+                self.post_processing = PPISP(
+                    num_cameras=num_cameras,
+                    num_frames=num_frames,
+                    config=ppisp_config,
+                ).to(self.device)
+
+            if frozen_inference:
+                self.post_processing.requires_grad_(False)
+                self.post_processing_optimizers = []
+                self.post_processing_schedulers = []
+                logger.info(
+                    "Post-processing frozen in held-out inference mode."
+                )
+            else:
+                self.post_processing_optimizers = (
+                    self.post_processing.create_optimizers()
+                )
+                self.post_processing_schedulers = (
+                    self.post_processing.create_schedulers(
+                        self.post_processing_optimizers,
+                        max_optimization_iters=conf.n_iterations,
+                    )
+                )
 
             logger.info(f"📷 {method.upper()} initialized: {num_cameras} cameras, {num_frames} frames")
         elif method == "luminance_affine":
@@ -2166,15 +2642,75 @@ class Trainer3DGRUT:
                 ),
             ).to(self.device)
 
-            self.post_processing_optimizers = self.post_processing.create_optimizers()
-            self.post_processing_schedulers = self.post_processing.create_schedulers(
-                self.post_processing_optimizers,
-                max_optimization_iters=conf.n_iterations,
+            frozen_inference = bool(
+                conf.post_processing.get(
+                    "frozen_inference_during_training",
+                    False,
+                )
             )
+            if frozen_inference:
+                self.post_processing.requires_grad_(False)
+                self.post_processing_optimizers = []
+                self.post_processing_schedulers = []
+                logger.info(
+                    "Post-processing frozen in held-out inference mode."
+                )
+            else:
+                self.post_processing_optimizers = (
+                    self.post_processing.create_optimizers()
+                )
+                self.post_processing_schedulers = (
+                    self.post_processing.create_schedulers(
+                        self.post_processing_optimizers,
+                        max_optimization_iters=conf.n_iterations,
+                    )
+                )
 
             logger.info(f"📷 LUMINANCE_AFFINE initialized: {num_cameras} cameras, " f"{num_frames} frames")
         else:
             raise ValueError(f"Unknown post-processing method: {method}")
+
+    def _capture_frozen_post_processing_metadata(
+        self,
+        checkpoint: dict[str, object],
+    ) -> None:
+        if not bool(
+            getattr(
+                self.conf.post_processing,
+                "frozen_inference_during_training",
+                False,
+            )
+        ):
+            return
+        post_processing = checkpoint.get("post_processing")
+        if not isinstance(post_processing, dict):
+            raise ValueError(
+                "Frozen post-processing requires state and inference metadata "
+                "in its parent checkpoint."
+            )
+        keys = (
+            "camera_keys",
+            "camera_frame_counts",
+            "camera_index_mode",
+            "inference_contract",
+        )
+        missing = [key for key in keys if key not in post_processing]
+        if missing:
+            raise ValueError(
+                "Frozen post-processing parent metadata is incomplete: "
+                f"{missing}."
+            )
+        self._frozen_post_processing_metadata = {
+            key: post_processing[key] for key in keys
+        }
+        module_state = post_processing.get("module")
+        if not isinstance(module_state, dict):
+            raise ValueError(
+                "Frozen post-processing parent module state is missing."
+            )
+        self._frozen_post_processing_metadata["module_state_sha256"] = (
+            module_state_sha256(module_state)
+        )
 
     def init_camera_residual(self, conf: DictConfig) -> None:
         """Initialize optional bounded camera residual calibration."""
@@ -3225,17 +3761,60 @@ class Trainer3DGRUT:
                 lambda_sky_opacity = self.conf.loss.lambda_sky_opacity
 
         loss_depth = torch.zeros(1, device=self.device)
+        loss_depth_free_space = torch.zeros(1, device=self.device)
+        loss_depth_occupancy = torch.zeros(1, device=self.device)
         depth_valid_count = torch.zeros(1, device=self.device)
         lambda_depth = 0.0
+        lambda_depth_free_space = 0.0
+        lambda_depth_occupancy = 0.0
         if self.conf.loss.get("use_depth", False):
             if gpu_batch.depth_gt is None:
-                raise RuntimeError("loss.use_depth requires dataset.depth_folder.")
-            with torch.cuda.nvtx.range("loss-depth"):
+                if not (
+                    self._geometry_only_pass_enabled()
+                    and self.native_ray_evidence is not None
+                ):
+                    raise RuntimeError(
+                        "loss.use_depth requires dataset.depth_folder."
+                    )
+            else:
                 depth_gt = gpu_batch.depth_gt.to(
                     device=self.device,
                     dtype=rgb_pred.dtype,
                 )
                 pred_dist = outputs["pred_dist"].to(dtype=depth_gt.dtype)
+                use_conditional_depth = bool(
+                    self.conf.loss.get(
+                        "depth_normalize_by_opacity",
+                        False,
+                    )
+                )
+                use_free_space = bool(
+                    self.conf.loss.get("use_depth_free_space", False)
+                )
+                use_occupancy = bool(
+                    self.conf.loss.get("use_depth_occupancy", False)
+                )
+                pred_opacity = None
+                if (
+                    use_conditional_depth
+                    or use_free_space
+                    or use_occupancy
+                ):
+                    if "pred_opacity" not in outputs:
+                        raise RuntimeError(
+                            "Conditional depth and occupancy evidence require "
+                            "renderer pred_opacity."
+                        )
+                    pred_dist, pred_opacity = _conditional_hit_depth(
+                        pred_dist=pred_dist,
+                        pred_opacity=outputs["pred_opacity"],
+                        opacity_floor=float(
+                            self.conf.loss.get(
+                                "depth_opacity_floor",
+                                1e-4,
+                            )
+                        ),
+                    )
                 pred_depth = _predicted_axial_depth(
                     pred_dist=pred_dist,
                     rays_dir=gpu_batch.rays_dir,
@@ -3248,14 +3827,31 @@ class Trainer3DGRUT:
                         size=depth_gt.shape[1:3],
                         mode="nearest",
                     ).permute(0, 2, 3, 1)
+                if (
+                    pred_opacity is not None
+                    and pred_opacity.shape[1:3]
+                    != depth_gt.shape[1:3]
+                ):
+                    pred_opacity = F.interpolate(
+                        pred_opacity.permute(0, 3, 1, 2),
+                        size=depth_gt.shape[1:3],
+                        mode="nearest",
+                    ).permute(0, 2, 3, 1)
                 if depth_gt.shape[0] != pred_depth.shape[0]:
                     depth_gt = depth_gt.expand(pred_depth.shape[0], -1, -1, -1)
+                if (
+                    pred_opacity is not None
+                    and pred_opacity.shape[0] != pred_depth.shape[0]
+                ):
+                    pred_opacity = pred_opacity.expand(
+                        pred_depth.shape[0],
+                        -1,
+                        -1,
+                        -1,
+                    )
                 min_depth = float(self.conf.loss.get("depth_min_m", 0.05))
-                valid_depth = (
-                    torch.isfinite(depth_gt)
-                    & torch.isfinite(pred_depth)
-                    & (depth_gt > min_depth)
-                    & (pred_depth > min_depth)
+                valid_measurement = (
+                    torch.isfinite(depth_gt) & (depth_gt > min_depth)
                 )
                 depth_apply_rgb_mask = bool(self.conf.loss.get("depth_apply_rgb_mask", True))
                 if depth_apply_rgb_mask and mask is not None:
@@ -3266,9 +3862,19 @@ class Trainer3DGRUT:
                             size=depth_gt.shape[1:3],
                             mode="nearest",
                         ).permute(0, 2, 3, 1)
-                    valid_depth = valid_depth & (depth_mask > 0.5)
-                depth_valid_count = valid_depth.to(depth_gt.dtype).sum()
-                depth_denominator = torch.clamp(depth_valid_count, min=1.0)
+                    valid_measurement = (
+                        valid_measurement & (depth_mask > 0.5)
+                    )
+                valid_depth = (
+                    valid_measurement
+                    & torch.isfinite(pred_depth)
+                    & (pred_depth > min_depth)
+                )
+                depth_valid_count = valid_measurement.to(depth_gt.dtype).sum()
+                depth_denominator = torch.clamp(
+                    valid_depth.to(depth_gt.dtype).sum(),
+                    min=1.0,
+                )
                 depth_loss_type = str(self.conf.loss.get("depth_loss_type", "log_l1"))
                 if depth_loss_type == "log_l1":
                     depth_error = torch.abs(
@@ -3287,8 +3893,104 @@ class Trainer3DGRUT:
                         "log_l1, relative_l1."
                     )
                     raise RuntimeError(msg)
-                loss_depth = (depth_error * valid_depth.to(depth_error.dtype)).sum() / depth_denominator
+                loss_depth = torch.where(
+                    valid_depth,
+                    depth_error,
+                    torch.zeros_like(depth_error),
+                ).sum() / depth_denominator
                 lambda_depth = float(self.conf.loss.lambda_depth)
+                if use_free_space or use_occupancy:
+                    if pred_opacity is None:
+                        raise RuntimeError(
+                            "Depth occupancy evidence requires opacity."
+                        )
+                    valid_opacity = torch.isfinite(pred_opacity)
+                    bounded_opacity = torch.clamp(
+                        pred_opacity,
+                        min=0.0,
+                        max=1.0,
+                    )
+                    if use_free_space:
+                        absolute_margin = float(
+                            self.conf.loss.get(
+                                "depth_free_space_absolute_margin_m",
+                                0.05,
+                            )
+                        )
+                        relative_margin = float(
+                            self.conf.loss.get(
+                                "depth_free_space_relative_margin",
+                                0.02,
+                            )
+                        )
+                        free_boundary = torch.clamp(
+                            depth_gt
+                            - torch.maximum(
+                                torch.full_like(
+                                    depth_gt,
+                                    absolute_margin,
+                                ),
+                                relative_margin * depth_gt,
+                            ),
+                            min=min_depth,
+                        )
+                        free_error = bounded_opacity * torch.relu(
+                            torch.log(free_boundary)
+                            - torch.log(
+                                torch.clamp(
+                                    pred_depth,
+                                    min=min_depth,
+                                )
+                            )
+                        )
+                        valid_free = valid_depth & valid_opacity
+                        free_denominator = torch.clamp(
+                            valid_free.to(depth_gt.dtype).sum(),
+                            min=1.0,
+                        )
+                        loss_depth_free_space = torch.where(
+                            valid_free,
+                            free_error,
+                            torch.zeros_like(free_error),
+                        ).sum() / free_denominator
+                        lambda_depth_free_space = float(
+                            self.conf.loss.get(
+                                "lambda_depth_free_space",
+                                0.0,
+                            )
+                        )
+                    if use_occupancy:
+                        opacity_floor = float(
+                            self.conf.loss.get(
+                                "depth_opacity_floor",
+                                1e-4,
+                            )
+                        )
+                        occupied_probability = (
+                            bounded_opacity * (1.0 - opacity_floor)
+                            + opacity_floor
+                        )
+                        occupied_error = -torch.log(
+                            occupied_probability
+                        )
+                        valid_occupied = (
+                            valid_measurement & valid_opacity
+                        )
+                        occupied_denominator = torch.clamp(
+                            valid_occupied.to(depth_gt.dtype).sum(),
+                            min=1.0,
+                        )
+                        loss_depth_occupancy = torch.where(
+                            valid_occupied,
+                            occupied_error,
+                            torch.zeros_like(occupied_error),
+                        ).sum() / occupied_denominator
+                        lambda_depth_occupancy = float(
+                            self.conf.loss.get(
+                                "lambda_depth_occupancy",
+                                0.0,
+                            )
+                        )
 
         # --- rim-gated geometric prior (persistent, ray-distance) ----------
         # Supervises outputs['pred_dist'] (RAY distance) DIRECTLY against a
@@ -3454,13 +4156,23 @@ class Trainer3DGRUT:
                 msg = "loss.image_loss_weights_path must map every training " f"image; missing entry for {image_name}."
                 raise RuntimeError(msg)
             image_loss_weight = float(weights_by_name[image_name])
+        geometry_loss = (
+            lambda_depth * loss_depth
+            + lambda_depth_free_space * loss_depth_free_space
+            + lambda_depth_occupancy * loss_depth_occupancy
+        )
         loss = (
             lambda_l1 * loss_l1
+            + lambda_l2 * loss_l2
             + lambda_ssim * loss_ssim
             + lambda_opacity * loss_opacity
             + lambda_scale * loss_scale
             + lambda_sky_opacity * loss_sky_opacity
-            + (0.0 if self._geometry_only_pass_enabled() else lambda_depth) * loss_depth
+            + (
+                torch.zeros_like(geometry_loss)
+                if self._geometry_only_pass_enabled()
+                else geometry_loss
+            )
             + lambda_rim * loss_rim
             + lambda_rim_hf * loss_rim_hf
             + lambda_mvdino_rim * loss_mvdino_rim
@@ -3478,6 +4190,15 @@ class Trainer3DGRUT:
             sky_opacity_loss_raw=loss_sky_opacity,
             depth_loss=lambda_depth * loss_depth,
             depth_loss_raw=loss_depth,
+            depth_free_space_loss=(
+                lambda_depth_free_space * loss_depth_free_space
+            ),
+            depth_free_space_loss_raw=loss_depth_free_space,
+            depth_occupancy_loss=(
+                lambda_depth_occupancy * loss_depth_occupancy
+            ),
+            depth_occupancy_loss_raw=loss_depth_occupancy,
+            geometry_loss=geometry_loss,
             depth_valid_count=depth_valid_count,
             rim_loss=lambda_rim * loss_rim,
             rim_loss_raw=loss_rim,
@@ -4767,6 +5488,17 @@ class Trainer3DGRUT:
         self._restore_best_checkpoint_for_export()
 
         if conf.export_ply.enabled:
+            if not bool(
+                getattr(
+                    self.model,
+                    "supports_static_export",
+                    True,
+                )
+            ):
+                raise RuntimeError(
+                    "The selected representation requires an explicit bake "
+                    "before static PLY export."
+                )
             from threedgrut.export import PLYExporter
 
             ply_path = conf.export_ply.path if conf.export_ply.path else os.path.join(out_dir, "export_last.ply")
@@ -4779,6 +5511,17 @@ class Trainer3DGRUT:
             )
 
         if conf.export_usd.enabled:
+            if not bool(
+                getattr(
+                    self.model,
+                    "supports_static_export",
+                    True,
+                )
+            ):
+                raise RuntimeError(
+                    "The selected representation requires an explicit bake "
+                    "before static USD export."
+                )
             from threedgrut.export import NuRecExporter, USDExporter
 
             # Determine format for filename suffix
@@ -4968,14 +5711,19 @@ class Trainer3DGRUT:
         gradient render modes. Uncongated — runs every training step.
         Frozen or gradient-less parameters are skipped silently.
         """
-        params: tuple[tuple[str, torch.nn.Parameter], ...] = (
-            ("positions", self.model.positions),
-            ("rotation", self.model.rotation),
-            ("scale", self.model.scale),
-            ("density", self.model.density),
-            ("features_albedo", self.model.features_albedo),
-            ("features_specular", self.model.features_specular),
-        )
+        parameters_fn = getattr(self.model, "diagnostic_parameters", None)
+        if parameters_fn is None:
+            parameters = {
+                "positions": self.model.positions,
+                "rotation": self.model.rotation,
+                "scale": self.model.scale,
+                "density": self.model.density,
+                "features_albedo": self.model.features_albedo,
+                "features_specular": self.model.features_specular,
+            }
+        else:
+            parameters = parameters_fn()
+        params = tuple(parameters.items())
         for name, param in params:
             if param.grad is None:
                 continue
@@ -5246,15 +5994,19 @@ class Trainer3DGRUT:
             return
 
         writer = self.tracking.writer
-        parameters: tuple[tuple[str, torch.nn.Parameter], ...] = (
-            ("positions", self.model.positions),
-            ("rotation", self.model.rotation),
-            ("scale", self.model.scale),
-            ("density", self.model.density),
-            ("features_albedo", self.model.features_albedo),
-            ("features_specular", self.model.features_specular),
-        )
-        for parameter_name, parameter in parameters:
+        parameters_fn = getattr(self.model, "diagnostic_parameters", None)
+        if parameters_fn is None:
+            parameters = {
+                "positions": self.model.positions,
+                "rotation": self.model.rotation,
+                "scale": self.model.scale,
+                "density": self.model.density,
+                "features_albedo": self.model.features_albedo,
+                "features_specular": self.model.features_specular,
+            }
+        else:
+            parameters = parameters_fn()
+        for parameter_name, parameter in parameters.items():
             stats = _gradient_tensor_stats(
                 parameter,
                 f"train/grad/{parameter_name}",
@@ -5299,9 +6051,113 @@ class Trainer3DGRUT:
         if self.conf.strategy.method != "GSStrategy":
             msg = "The geometry-only pass currently requires GSStrategy."
             raise ValueError(msg)
-        if not bool(self.conf.loss.get("use_depth", False)) or float(self.conf.loss.get("lambda_depth", 0.0)) <= 0.0:
+        use_interval_evidence = bool(
+            self.native_ray_evidence is not None
+            and config.get(
+                "use_native_ray_interval_transmittance",
+                False,
+            )
+        )
+        if (
+            not use_interval_evidence
+            and (
+                not bool(self.conf.loss.get("use_depth", False))
+                or float(
+                    self.conf.loss.get("lambda_depth", 0.0)
+                )
+                <= 0.0
+            )
+        ):
             msg = "The geometry-only pass requires a positive depth loss."
             raise ValueError(msg)
+        if self.native_ray_evidence is not None:
+            if use_interval_evidence:
+                if bool(
+                    self.conf.loss.get(
+                        "use_depth_free_space",
+                        False,
+                    )
+                ) or bool(
+                    self.conf.loss.get(
+                        "use_depth_occupancy",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "Exact native-ray interval evidence cannot be "
+                        "combined with surrogate free-space or endpoint "
+                        "losses."
+                    )
+                if not bool(
+                    self.conf.render.splat.get(
+                        "signed_ray_depth",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "Native-ray interval evidence requires signed "
+                        "half-ray depth."
+                    )
+                if bool(
+                    self.conf.render.gaussian_dropout.get(
+                        "enabled",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "Native-ray interval evidence requires Gaussian "
+                        "dropout to be disabled."
+                    )
+                for key in (
+                    "lambda_native_ray_free_prefix",
+                    "lambda_native_ray_return_window",
+                ):
+                    value = float(config.get(key, 0.0))
+                    if not math.isfinite(value) or value <= 0.0:
+                        raise ValueError(
+                            f"geometry_only_pass.{key} must be positive."
+                        )
+                probability_floor = float(
+                    config.get(
+                        "native_ray_interval_probability_floor",
+                        1e-6,
+                    )
+                )
+                if not 0.0 < probability_floor < 0.5:
+                    raise ValueError(
+                        "Native-ray interval probability floor must be "
+                        "in (0, 0.5)."
+                    )
+            else:
+                if not bool(
+                    self.conf.loss.get(
+                        "depth_normalize_by_opacity",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "Native-ray depth regression requires "
+                        "conditional depth."
+                    )
+                if not bool(
+                    self.conf.loss.get(
+                        "use_depth_free_space",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "Native-ray evidence requires free-space loss."
+                    )
+                if not bool(
+                    self.conf.loss.get(
+                        "use_depth_occupancy",
+                        False,
+                    )
+                ):
+                    raise ValueError(
+                        "Native-ray evidence requires occupied-endpoint "
+                        "loss."
+                    )
         if self.camera_residual is not None:
             msg = "The geometry-only pass cannot optimize camera residuals."
             raise ValueError(msg)
@@ -5397,6 +6253,88 @@ class Trainer3DGRUT:
                 )
                 raise RuntimeError(msg)
 
+    def _native_ray_interval_evidence(
+        self,
+        *,
+        geometry_batch: Batch,
+        full_outputs: dict[str, torch.Tensor],
+        global_step: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Render exact free-prefix and return-window evidence."""
+        if geometry_batch.depth_gt is None:
+            raise ValueError(
+                "Native-ray interval evidence requires depth_gt."
+            )
+        if geometry_batch.mask is None:
+            raise ValueError(
+                "Native-ray interval evidence requires a valid-ray mask."
+            )
+        if geometry_batch.range_return_weight is None:
+            raise ValueError(
+                "Native-ray interval evidence requires return weights."
+            )
+        depth = geometry_batch.depth_gt
+        absolute_margin = float(
+            self.conf.loss.get(
+                "depth_free_space_absolute_margin_m",
+                0.05,
+            )
+        )
+        relative_margin = float(
+            self.conf.loss.get(
+                "depth_free_space_relative_margin",
+                0.02,
+            )
+        )
+        margin = torch.maximum(
+            torch.full_like(depth, absolute_margin),
+            relative_margin * depth,
+        )
+        minimum_depth = float(
+            self.conf.loss.get("depth_min_m", 0.05)
+        )
+        lower_distance = torch.clamp(
+            depth - margin,
+            min=minimum_depth,
+        )
+        upper_distance = depth + margin
+        lower_batch = shift_ray_origins(
+            geometry_batch,
+            lower_distance,
+        )
+        upper_batch = shift_ray_origins(
+            geometry_batch,
+            upper_distance,
+        )
+        lower_outputs = self.model(
+            lower_batch,
+            train=True,
+            frame_id=global_step,
+        )
+        upper_outputs = self.model(
+            upper_batch,
+            train=True,
+            frame_id=global_step,
+        )
+        return interval_transmittance_losses(
+            full_opacity=full_outputs["pred_opacity"],
+            after_lower_opacity=lower_outputs["pred_opacity"],
+            after_upper_opacity=upper_outputs["pred_opacity"],
+            valid_mask=geometry_batch.mask,
+            return_weight=geometry_batch.range_return_weight,
+            probability_floor=float(
+                self.conf.loss.geometry_only_pass.get(
+                    "native_ray_interval_probability_floor",
+                    1e-6,
+                )
+            ),
+        )
+
     def _run_geometry_only_pass(
         self,
         *,
@@ -5408,20 +6346,84 @@ class Trainer3DGRUT:
         optimizer = self._initialize_geometry_only_optimizer()
         self._validate_geometry_only_parameter_identity(optimizer)
         self.model.build_acc(rebuild=False)
+        geometry_batch = gpu_batch
+        if self.native_ray_evidence is not None:
+            exposure_index = int(
+                getattr(gpu_batch, "sequence_idx", -1)
+            )
+            if exposure_index < 0:
+                raise ValueError(
+                    "Native-ray geometry requires a non-negative "
+                    "training sequence index."
+                )
+            geometry_batch = self.native_ray_evidence.sample(
+                exposure_index=exposure_index,
+                global_step=global_step,
+                device=self.device,
+                dtype=gpu_batch.rgb_gt.dtype,
+            )
         with torch.cuda.nvtx.range(f"train_{global_step}_geometry_fwd"):
             outputs = self.model(
-                gpu_batch,
+                geometry_batch,
                 train=True,
                 frame_id=global_step,
             )
-            outputs = collapse_blur_samples(outputs, gpu_batch)
-            losses = self.get_losses(gpu_batch, outputs)
-            valid_count = int(losses["depth_valid_count"].detach().item())
+            outputs = collapse_blur_samples(
+                outputs,
+                geometry_batch,
+            )
+            interval_metrics = None
+            geometry_config = self.conf.loss.geometry_only_pass
+            use_interval_evidence = bool(
+                geometry_config.get(
+                    "use_native_ray_interval_transmittance",
+                    False,
+                )
+            )
+            if use_interval_evidence:
+                interval_metrics = (
+                    self._native_ray_interval_evidence(
+                        geometry_batch=geometry_batch,
+                        full_outputs=outputs,
+                        global_step=global_step,
+                    )
+                )
+                (
+                    free_prefix_loss,
+                    return_window_loss,
+                    _prefix_violation,
+                    _window_violation,
+                ) = interval_metrics
+                if geometry_batch.mask is None:
+                    raise ValueError(
+                        "Native-ray interval evidence requires a mask."
+                    )
+                valid_count = int(
+                    (geometry_batch.mask > 0.5).sum().detach().item()
+                )
+                geometry_loss = (
+                    float(
+                        geometry_config.lambda_native_ray_free_prefix
+                    )
+                    * free_prefix_loss
+                    + float(
+                        geometry_config.lambda_native_ray_return_window
+                    )
+                    * return_window_loss
+                )
+            else:
+                losses = self.get_losses(geometry_batch, outputs)
+                valid_count = int(
+                    losses["depth_valid_count"].detach().item()
+                )
+                geometry_loss = losses["geometry_loss"]
         if valid_count == 0:
             return False
-        geometry_loss = losses["depth_loss"]
         if not torch.isfinite(geometry_loss):
-            msg = f"Non-finite geometry-only depth loss at step {global_step}."
+            msg = (
+                "Non-finite geometry-only evidence loss at step "
+                f"{global_step}."
+            )
             raise FloatingPointError(msg)
         with torch.cuda.nvtx.range(f"train_{global_step}_geometry_bwd"):
             geometry_loss.backward()
@@ -5430,7 +6432,7 @@ class Trainer3DGRUT:
             self.model.optimizer.zero_grad()
         if self.conf.enable_writer:
             self.tracking.writer.add_scalar(
-                "train/loss/geometry_only_depth",
+                "train/loss/geometry_only_evidence",
                 float(geometry_loss.detach().item()),
                 global_step,
             )
@@ -5439,6 +6441,33 @@ class Trainer3DGRUT:
                 valid_count,
                 global_step,
             )
+            if interval_metrics is not None:
+                (
+                    free_prefix_loss,
+                    return_window_loss,
+                    prefix_violation,
+                    window_violation,
+                ) = interval_metrics
+                self.tracking.writer.add_scalar(
+                    "train/loss/native_ray_free_prefix",
+                    float(free_prefix_loss.detach().item()),
+                    global_step,
+                )
+                self.tracking.writer.add_scalar(
+                    "train/loss/native_ray_return_window",
+                    float(return_window_loss.detach().item()),
+                    global_step,
+                )
+                self.tracking.writer.add_scalar(
+                    "train/native_ray_prefix_monotonic_violation",
+                    float(prefix_violation.detach().item()),
+                    global_step,
+                )
+                self.tracking.writer.add_scalar(
+                    "train/native_ray_window_monotonic_violation",
+                    float(window_violation.detach().item()),
+                    global_step,
+                )
         return True
 
     @torch.cuda.nvtx.range("run_train_iter")
@@ -5453,6 +6482,33 @@ class Trainer3DGRUT:
         camera_residual_freeze = self.camera_residual is not None and bool(
             conf.camera_residual.get("freeze_gaussians", False)
         )
+        acquisition_appearance = getattr(
+            self.model,
+            "acquisition_appearance",
+            None,
+        )
+        acquisition_visibility = getattr(
+            self.model,
+            "acquisition_visibility",
+            None,
+        )
+        surface_acquisition_spline = getattr(
+            self.model,
+            "surface_acquisition_spline",
+            None,
+        )
+        gaussian_track_acquisition = getattr(
+            self.model,
+            "gaussian_track_acquisition",
+            None,
+        )
+        if (
+            acquisition_appearance is not None
+            or acquisition_visibility is not None
+            or surface_acquisition_spline is not None
+            or gaussian_track_acquisition is not None
+        ):
+            self.strategy.suspend()
 
         # Freeze Gaussians and suspend strategy for correction-only phases.
         if camera_residual_freeze or (
@@ -5495,15 +6551,50 @@ class Trainer3DGRUT:
                     self.post_processing,
                     outputs,
                     gpu_batch,
-                    training=True,
+                    training=not bool(
+                        conf.post_processing.get(
+                            "frozen_inference_during_training",
+                            False,
+                        )
+                    ),
                     camera_idx_override=self._post_processing_camera_idx(gpu_batch),
                 )
 
         # Compute the losses of a single batch
         with torch.cuda.nvtx.range(f"train_{global_step}_loss"):
             batch_losses = self.get_losses(gpu_batch, outputs)
+            model_regularization = getattr(
+                self.model,
+                "get_regularization_loss",
+                None,
+            )
+            if model_regularization is not None:
+                model_reg_loss = model_regularization()
+                batch_losses["total_loss"] = (
+                    batch_losses["total_loss"] + model_reg_loss
+                )
+                batch_losses["model_reg_loss"] = model_reg_loss
+            contextual_regularization = getattr(
+                self.model,
+                "get_contextual_regularization_loss",
+                None,
+            )
+            if contextual_regularization is not None:
+                contextual_reg_loss = contextual_regularization(gpu_batch)
+                batch_losses["total_loss"] = (
+                    batch_losses["total_loss"]
+                    + contextual_reg_loss
+                )
+                batch_losses["contextual_model_reg_loss"] = (
+                    contextual_reg_loss
+                )
             # Add post-processing regularization loss
-            if self.post_processing is not None:
+            if self.post_processing is not None and not bool(
+                conf.post_processing.get(
+                    "frozen_inference_during_training",
+                    False,
+                )
+            ):
                 post_processing_reg_loss = self.post_processing.get_regularization_loss()
                 batch_losses["total_loss"] = batch_losses["total_loss"] + post_processing_reg_loss
                 batch_losses["post_processing_reg_loss"] = post_processing_reg_loss

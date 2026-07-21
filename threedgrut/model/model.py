@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -28,11 +30,24 @@ from threedgrut.datasets.protocols import Batch
 from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
 from threedgrut.export import PLYExporter
 from threedgrut.export.base import ExportableModel
+from threedgrut.model.acquisition_appearance import (
+    SH_DC_NORMALIZATION,
+    AcquisitionAppearance,
+    AcquisitionGaussianView,
+)
+from threedgrut.model.acquisition_visibility import AcquisitionVisibility
 from threedgrut.model.geometry import (
     SurfaceAlignedPCAConfig,
     k_nearest_neighbors,
     nearest_neighbor_dist_cpuKD,
     surface_aligned_pca_initialize,
+)
+from threedgrut.model.gaussian_track_acquisition import (
+    GaussianTrackAcquisition,
+    load_gaussian_track_ids,
+)
+from threedgrut.model.surface_acquisition_spline import (
+    SurfaceAcquisitionSpline,
 )
 from threedgrut.optimizers import SelectiveAdam, VisibilityDecayedAdam
 from threedgrut.utils.logger import logger
@@ -51,11 +66,46 @@ SCENE_EXTENT_MIN = 1e-6
 SCENE_EXTENT_MAX_SAMPLES = 1_000_000
 GABOR_CARRIER_NUM_TERMS = 3
 GABOR_CARRIER_EXTRA_COEFFS = GABOR_CARRIER_NUM_TERMS + 3
+HERMITE_CARRIER_EXTRA_COEFFS = 2
 SIREN_CARRIER_INPUT_DIM = 5
 SIREN_CARRIER_DEFAULT_HIDDEN_DIM = 6
+PROTECTED_GAUSSIAN_PREFIX_VERSION = 1
+PROTECTED_GEOMETRY_NAMES = ("positions", "rotation", "scale")
 
 
-def _validated_surface_aligned_pca_config(
+def tensor_prefix_sha256(
+    tensor: torch.Tensor,
+    prefix_count: int,
+) -> str:
+    """Hash a contiguous tensor prefix for immutable-geometry checks."""
+    if prefix_count < 0 or prefix_count > tensor.shape[0]:
+        raise ValueError(
+            "Protected prefix count is outside the tensor: "
+            f"{prefix_count} for shape {tuple(tensor.shape)}."
+        )
+    prefix = tensor[:prefix_count].detach().contiguous().cpu().numpy()
+    return hashlib.sha256(prefix.tobytes()).hexdigest()
+
+
+def zero_tensor_prefix_gradient(
+    gradient: torch.Tensor,
+    *,
+    prefix_count: int,
+) -> torch.Tensor:
+    """Return a gradient with the protected row prefix zeroed."""
+    if prefix_count == 0:
+        return gradient
+    if prefix_count < 0 or prefix_count > gradient.shape[0]:
+        raise ValueError(
+            "Protected prefix count is outside the gradient: "
+            f"{prefix_count} for shape {tuple(gradient.shape)}."
+        )
+    masked = gradient.clone()
+    masked[:prefix_count] = 0
+    return masked
+
+
+def validated_surface_aligned_pca_config(
     initialization_conf: DictConfig,
     points: torch.Tensor,
     observer_points: torch.Tensor,
@@ -169,13 +219,45 @@ def _gabor_carrier_enabled(conf) -> bool:
     return bool(conf.model.get("use_gabor_carrier", False))
 
 
+def _hermite_carrier_enabled(conf) -> bool:
+    return bool(conf.model.get("use_hermite_carrier", False))
+
+
 def _siren_carrier_enabled(conf) -> bool:
     return bool(conf.model.get("use_siren_carrier", False))
 
 
+def _acquisition_appearance_enabled(conf) -> bool:
+    appearance_conf = conf.model.get("acquisition_appearance", {})
+    return bool(appearance_conf.get("enabled", False))
+
+
+def _acquisition_visibility_enabled(conf) -> bool:
+    visibility_conf = conf.model.get("acquisition_visibility", {})
+    return bool(visibility_conf.get("enabled", False))
+
+
+def _surface_acquisition_spline_enabled(conf) -> bool:
+    spline_conf = conf.model.get("surface_acquisition_spline", {})
+    return bool(spline_conf.get("enabled", False))
+
+
+def _gaussian_track_acquisition_enabled(conf) -> bool:
+    track_conf = conf.model.get("gaussian_track_acquisition", {})
+    return bool(track_conf.get("enabled", False))
+
+
 def _validate_carrier_config(conf) -> None:
-    if _gabor_carrier_enabled(conf) and _siren_carrier_enabled(conf):
-        raise ValueError("model.use_gabor_carrier and model.use_siren_carrier are " "mutually exclusive.")
+    enabled = (
+        _gabor_carrier_enabled(conf),
+        _hermite_carrier_enabled(conf),
+        _siren_carrier_enabled(conf),
+    )
+    if sum(enabled) > 1:
+        raise ValueError(
+            "model.use_gabor_carrier, model.use_hermite_carrier, and "
+            "model.use_siren_carrier are mutually exclusive."
+        )
 
 
 def _gabor_carrier_coeffs(conf) -> int:
@@ -185,6 +267,12 @@ def _gabor_carrier_coeffs(conf) -> int:
     if num_terms != GABOR_CARRIER_NUM_TERMS:
         raise ValueError("model.gabor_num_terms currently supports exactly 3 terms; " f"got {num_terms}.")
     return GABOR_CARRIER_EXTRA_COEFFS
+
+
+def _hermite_carrier_coeffs(conf) -> int:
+    if not _hermite_carrier_enabled(conf):
+        return 0
+    return HERMITE_CARRIER_EXTRA_COEFFS
 
 
 def _siren_carrier_hidden_dim(conf) -> int:
@@ -218,7 +306,11 @@ def siren_carrier_coeffs(conf: DictConfig) -> int:
 
 def _carrier_specular_dim(conf) -> int:
     _validate_carrier_config(conf)
-    return 3 * (_gabor_carrier_coeffs(conf) + siren_carrier_coeffs(conf))
+    return 3 * (
+        _gabor_carrier_coeffs(conf)
+        + _hermite_carrier_coeffs(conf)
+        + siren_carrier_coeffs(conf)
+    )
 
 
 def _initial_gabor_carrier_tail(
@@ -244,6 +336,20 @@ def _initial_gabor_carrier_tail(
     tail[:, 9:12] = frequency * torch.cos(angles)[None, :]
     tail[:, 12:15] = frequency * torch.sin(angles)[None, :]
     return tail
+
+
+def _initial_hermite_carrier_tail(
+    *,
+    num_gaussians: int,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    conf,
+) -> torch.Tensor:
+    return torch.zeros(
+        (num_gaussians, 3 * _hermite_carrier_coeffs(conf)),
+        dtype=dtype,
+        device=device,
+    )
 
 
 def initial_siren_carrier_tail(
@@ -339,6 +445,13 @@ def _initial_carrier_tail(
             dtype=dtype,
             conf=conf,
         )
+    if _hermite_carrier_enabled(conf):
+        return _initial_hermite_carrier_tail(
+            num_gaussians=num_gaussians,
+            device=device,
+            dtype=dtype,
+            conf=conf,
+        )
     if _siren_carrier_enabled(conf):
         return initial_siren_carrier_tail(
             num_gaussians=num_gaussians,
@@ -393,6 +506,15 @@ def _subsample_initial_points(
 
 class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     """ """
+
+    @property
+    def supports_static_export(self) -> bool:
+        return (
+            self.acquisition_appearance is None
+            and self.acquisition_visibility is None
+            and self.surface_acquisition_spline is None
+            and self.gaussian_track_acquisition is None
+        )
 
     @property
     def num_gaussians(self):
@@ -502,6 +624,35 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         if self.feature_type == "sh":
             model_params["features_albedo"] = self.features_albedo
             model_params["features_specular"] = self.features_specular
+        if self.acquisition_appearance is not None:
+            model_params["acquisition_appearance"] = (
+                self.acquisition_appearance.state_dict()
+            )
+        if self.acquisition_visibility is not None:
+            model_params["acquisition_visibility"] = (
+                self.acquisition_visibility.state_dict()
+            )
+        if self.surface_acquisition_spline is not None:
+            model_params["surface_acquisition_spline"] = (
+                self.surface_acquisition_spline.state_dict()
+            )
+        if self.gaussian_track_acquisition is not None:
+            model_params["gaussian_track_acquisition"] = (
+                self.gaussian_track_acquisition.state_dict()
+            )
+        if self.protected_gaussian_count:
+            actual_hashes = self._protected_geometry_hashes()
+            expected_hashes = self._protected_prefix_metadata.get(
+                "geometry_sha256"
+            )
+            if expected_hashes != actual_hashes:
+                raise RuntimeError(
+                    "Protected Gaussian prefix geometry changed before "
+                    "checkpoint save."
+                )
+            model_params["protected_gaussian_prefix"] = dict(
+                self._protected_prefix_metadata
+            )
         return model_params
 
     def __init__(self, conf, scene_extent=None):
@@ -535,6 +686,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         self.conf = conf
         self.scene_extent = scene_extent
+        self.acquisition_appearance: AcquisitionAppearance | None = None
+        self.acquisition_visibility: AcquisitionVisibility | None = None
+        self.surface_acquisition_spline: (
+            SurfaceAcquisitionSpline | None
+        ) = None
+        self.gaussian_track_acquisition: (
+            GaussianTrackAcquisition | None
+        ) = None
         self.positions_gradient_norm = None
         # Per-attribute per-gaussian gradient L2 norms, populated each
         # training step by Trainer3DGRUT._compute_per_gaussian_grad_norms.
@@ -575,6 +734,112 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # State of gradients of Gaussian parameters
         self._gaussians_frozen = False
         self._resume_lr_scale = 1.0
+        self.protected_gaussian_count = 0
+        self._protected_prefix_metadata: dict[str, object] = {}
+        self._protected_gradient_handles: list[
+            torch.utils.hooks.RemovableHandle
+        ] = []
+
+    def _protected_geometry_hashes(self) -> dict[str, str]:
+        return {
+            name: tensor_prefix_sha256(
+                getattr(self, name),
+                self.protected_gaussian_count,
+            )
+            for name in PROTECTED_GEOMETRY_NAMES
+        }
+
+    def _load_protected_prefix_metadata(
+        self,
+        checkpoint: dict[str, object],
+    ) -> None:
+        metadata = checkpoint.get("protected_gaussian_prefix")
+        if metadata is None:
+            self.protected_gaussian_count = 0
+            self._protected_prefix_metadata = {}
+            self.refresh_protected_gradient_hooks()
+            return
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                "Protected Gaussian prefix metadata must be a mapping."
+            )
+        if metadata.get("version") != PROTECTED_GAUSSIAN_PREFIX_VERSION:
+            raise ValueError(
+                "Unsupported protected Gaussian prefix version: "
+                f"{metadata.get('version')!r}."
+            )
+        count = metadata.get("count")
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise ValueError(
+                "Protected Gaussian prefix count must be an integer."
+            )
+        if count <= 0 or count > self.num_gaussians:
+            raise ValueError(
+                "Protected Gaussian prefix count is outside the model: "
+                f"{count} for {self.num_gaussians} Gaussians."
+            )
+        expected_hashes = metadata.get("geometry_sha256")
+        if not isinstance(expected_hashes, dict):
+            raise ValueError(
+                "Protected Gaussian prefix geometry hashes are missing."
+            )
+        self.protected_gaussian_count = count
+        actual_hashes = self._protected_geometry_hashes()
+        for name in PROTECTED_GEOMETRY_NAMES:
+            expected = expected_hashes.get(name)
+            if not isinstance(expected, str) or expected != actual_hashes[name]:
+                raise ValueError(
+                    "Protected Gaussian prefix geometry hash mismatch for "
+                    f"{name}: expected {expected!r}, "
+                    f"got {actual_hashes[name]!r}."
+                )
+        self._protected_prefix_metadata = dict(metadata)
+        self.refresh_protected_gradient_hooks()
+
+    def refresh_protected_gradient_hooks(self) -> None:
+        for handle in getattr(self, "_protected_gradient_handles", []):
+            handle.remove()
+        self._protected_gradient_handles = []
+        protected_gaussian_count = int(
+            getattr(self, "protected_gaussian_count", 0)
+        )
+        if protected_gaussian_count == 0:
+            return
+        if protected_gaussian_count > self.num_gaussians:
+            raise RuntimeError(
+                "Protected Gaussian prefix exceeds current topology."
+            )
+        for name in PROTECTED_GEOMETRY_NAMES:
+            parameter = getattr(self, name)
+            if not parameter.requires_grad:
+                continue
+            handle = parameter.register_hook(
+                partial(
+                    zero_tensor_prefix_gradient,
+                    prefix_count=protected_gaussian_count,
+                )
+            )
+            self._protected_gradient_handles.append(handle)
+
+    def validate_protected_optimizer_state(self) -> None:
+        if self.protected_gaussian_count == 0 or self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            if group["name"] not in PROTECTED_GEOMETRY_NAMES:
+                continue
+            parameter = group["params"][0]
+            state = self.optimizer.state.get(parameter, {})
+            for key, value in state.items():
+                if key == "step" or not torch.is_tensor(value):
+                    continue
+                if value.ndim == 0 or value.shape[0] != self.num_gaussians:
+                    continue
+                prefix = value[: self.protected_gaussian_count]
+                if bool((prefix != 0).any()):
+                    raise ValueError(
+                        "Protected Gaussian optimizer state is nonzero for "
+                        f"{group['name']}.{key}."
+                    )
 
     @torch.no_grad()
     def build_acc(self, rebuild=True):
@@ -598,6 +863,239 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         self._gaussians_frozen = True
         logger.info("❄️ Gaussian parameters frozen")
+
+    def _initialize_acquisition_appearance(self) -> None:
+        if not _acquisition_appearance_enabled(self.conf):
+            self.acquisition_appearance = None
+            return
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError(
+                "Acquisition appearance requires optimizer.type=adam."
+            )
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError(
+                "Acquisition appearance screening requires both GUI modes "
+                "to be disabled."
+            )
+        if self.num_gaussians <= 0:
+            raise ValueError(
+                "Acquisition appearance requires initialized Gaussians."
+            )
+        existing = self.acquisition_appearance
+        if (
+            existing is not None
+            and existing.direction_raw.shape[0] == self.num_gaussians
+        ):
+            return
+        appearance_conf = self.conf.model.acquisition_appearance
+        self.acquisition_appearance = AcquisitionAppearance(
+            num_gaussians=self.num_gaussians,
+            num_cameras=int(appearance_conf.num_cameras),
+            num_knots=int(appearance_conf.num_knots),
+            min_sequence_idx=int(appearance_conf.min_sequence_idx),
+            max_sequence_idx=int(appearance_conf.max_sequence_idx),
+            max_rgb_delta=float(appearance_conf.max_rgb_delta),
+            magnitude_regularization=float(
+                appearance_conf.magnitude_regularization
+            ),
+            curvature_regularization=float(
+                appearance_conf.curvature_regularization
+            ),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+            rank=int(appearance_conf.rank),
+        )
+
+    def _initialize_acquisition_visibility(self) -> None:
+        if not _acquisition_visibility_enabled(self.conf):
+            self.acquisition_visibility = None
+            return
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError(
+                "Acquisition visibility requires optimizer.type=adam."
+            )
+        if str(self.conf.model.density_activation) != "sigmoid":
+            raise ValueError(
+                "Acquisition visibility requires sigmoid density activation "
+                "so its bounded correction is an opacity-logit delta."
+            )
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError(
+                "Acquisition visibility screening requires both GUI modes "
+                "to be disabled."
+            )
+        if self.num_gaussians <= 0:
+            raise ValueError(
+                "Acquisition visibility requires initialized Gaussians."
+            )
+        existing = self.acquisition_visibility
+        if (
+            existing is not None
+            and existing.response_raw.shape[0] == self.num_gaussians
+        ):
+            return
+        visibility_conf = self.conf.model.acquisition_visibility
+        self.acquisition_visibility = AcquisitionVisibility(
+            num_gaussians=self.num_gaussians,
+            num_cameras=int(visibility_conf.num_cameras),
+            num_knots=int(visibility_conf.num_knots),
+            min_sequence_idx=int(visibility_conf.min_sequence_idx),
+            max_sequence_idx=int(visibility_conf.max_sequence_idx),
+            max_logit_delta=float(visibility_conf.max_logit_delta),
+            response_sparsity_regularization=float(
+                visibility_conf.response_sparsity_regularization
+            ),
+            magnitude_regularization=float(
+                visibility_conf.magnitude_regularization
+            ),
+            curvature_regularization=float(
+                visibility_conf.curvature_regularization
+            ),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+            rank=int(visibility_conf.rank),
+        )
+
+    def _initialize_surface_acquisition_spline(self) -> None:
+        if not _surface_acquisition_spline_enabled(self.conf):
+            self.surface_acquisition_spline = None
+            return
+        if _acquisition_appearance_enabled(
+            self.conf
+        ) or _acquisition_visibility_enabled(self.conf):
+            raise ValueError(
+                "Surface acquisition spline is mutually exclusive with "
+                "the scene-global acquisition treatments."
+            )
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError(
+                "Surface acquisition spline requires optimizer.type=adam."
+            )
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError(
+                "Surface acquisition spline screening requires both GUI "
+                "modes to be disabled."
+            )
+        if self.num_gaussians <= 0:
+            raise ValueError(
+                "Surface acquisition spline requires initialized Gaussians."
+            )
+        existing = self.surface_acquisition_spline
+        if (
+            existing is not None
+            and existing.direction_raw.shape[0] == self.num_gaussians
+        ):
+            return
+        spline_conf = self.conf.model.surface_acquisition_spline
+        self.surface_acquisition_spline = SurfaceAcquisitionSpline(
+            num_gaussians=self.num_gaussians,
+            num_cameras=int(spline_conf.num_cameras),
+            num_knots=int(spline_conf.num_knots),
+            min_sequence_idx=int(spline_conf.min_sequence_idx),
+            max_sequence_idx=int(spline_conf.max_sequence_idx),
+            max_rgb_delta=float(spline_conf.max_rgb_delta),
+            magnitude_regularization=float(
+                spline_conf.magnitude_regularization
+            ),
+            curvature_regularization=float(
+                spline_conf.curvature_regularization
+            ),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+            rank=int(spline_conf.rank),
+        )
+
+    def _initialize_gaussian_track_acquisition(self) -> None:
+        if not _gaussian_track_acquisition_enabled(self.conf):
+            self.gaussian_track_acquisition = None
+            return
+        if _surface_acquisition_spline_enabled(self.conf):
+            raise ValueError(
+                "Gaussian-track acquisition is mutually exclusive with "
+                "the per-Gaussian surface acquisition spline."
+            )
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError(
+                "Gaussian-track acquisition requires optimizer.type=adam."
+            )
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError(
+                "Gaussian-track acquisition screening requires both GUI "
+                "modes to be disabled."
+            )
+        if self.num_gaussians <= 0:
+            raise ValueError(
+                "Gaussian-track acquisition requires initialized Gaussians."
+            )
+        existing = self.gaussian_track_acquisition
+        if (
+            existing is not None
+            and existing.gaussian_track_ids.shape[0] == self.num_gaussians
+        ):
+            return
+        track_conf = self.conf.model.gaussian_track_acquisition
+        track_ids = load_gaussian_track_ids(
+            path=str(track_conf.track_ids_path),
+            expected_sha256=str(track_conf.track_ids_sha256),
+            num_gaussians=self.num_gaussians,
+            device=self.positions.device,
+        )
+        self.gaussian_track_acquisition = GaussianTrackAcquisition(
+            gaussian_track_ids=track_ids,
+            num_cameras=int(track_conf.num_cameras),
+            num_knots=int(track_conf.num_knots),
+            min_sequence_idx=int(track_conf.min_sequence_idx),
+            max_sequence_idx=int(track_conf.max_sequence_idx),
+            max_rgb_delta=float(track_conf.max_rgb_delta),
+            magnitude_regularization=float(
+                track_conf.magnitude_regularization
+            ),
+            curvature_regularization=float(
+                track_conf.curvature_regularization
+            ),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+        )
+
+    def get_regularization_loss(self) -> torch.Tensor:
+        loss = self.positions.sum() * 0.0
+        if self.acquisition_appearance is not None:
+            loss = (
+                loss
+                + self.acquisition_appearance.get_regularization_loss()
+            )
+        if self.acquisition_visibility is not None:
+            loss = (
+                loss
+                + self.acquisition_visibility.get_regularization_loss()
+            )
+        return loss
+
+    def get_contextual_regularization_loss(
+        self,
+        batch: Batch,
+    ) -> torch.Tensor:
+        loss = self.positions.sum() * 0.0
+        camera_idx = getattr(batch, "post_processing_camera_idx", -1)
+        if int(camera_idx) < 0:
+            camera_idx = batch.camera_idx
+        if self.surface_acquisition_spline is not None:
+            loss = (
+                loss
+                + self.surface_acquisition_spline.get_local_regularization_loss(
+                    camera_idx=camera_idx,
+                    sequence_idx=batch.sequence_idx,
+                )
+            )
+        if self.gaussian_track_acquisition is not None:
+            loss = (
+                loss
+                + self.gaussian_track_acquisition.get_local_regularization_loss(
+                    camera_idx=camera_idx,
+                    sequence_idx=batch.sequence_idx,
+                )
+            )
+        return loss
 
     def validate_fields(self):
         num_gaussians = self.num_gaussians
@@ -672,7 +1170,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
         if file_pts.shape[0] != original_points:
             logger.info("Subsampled COLMAP initialization points " f"from {original_points} to {file_pts.shape[0]}")
-        surface_aligned_pca_config = _validated_surface_aligned_pca_config(
+        surface_aligned_pca_config = validated_surface_aligned_pca_config(
             self.conf.initialization,
             file_pts,
             observer_pts,
@@ -933,6 +1431,74 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = checkpoint["density"]
         self.features_albedo = checkpoint["features_albedo"]
         self.features_specular = torch.nn.Parameter(self._with_carrier_tail(checkpoint["features_specular"]))
+        self._initialize_acquisition_appearance()
+        self._initialize_acquisition_visibility()
+        self._initialize_surface_acquisition_spline()
+        self._initialize_gaussian_track_acquisition()
+        appearance_state = checkpoint.get("acquisition_appearance")
+        if appearance_state is not None:
+            if self.acquisition_appearance is None:
+                raise ValueError(
+                    "Checkpoint contains acquisition appearance state but "
+                    "the representation is disabled."
+                )
+            self.acquisition_appearance.load_state_dict(
+                appearance_state,
+                strict=True,
+            )
+        elif self.acquisition_appearance is not None:
+            logger.info(
+                "Initializing zero-output acquisition appearance from a "
+                "legacy Gaussian checkpoint."
+            )
+        visibility_state = checkpoint.get("acquisition_visibility")
+        if visibility_state is not None:
+            if self.acquisition_visibility is None:
+                raise ValueError(
+                    "Checkpoint contains acquisition visibility state but "
+                    "the representation is disabled."
+                )
+            self.acquisition_visibility.load_state_dict(
+                visibility_state,
+                strict=True,
+            )
+        elif self.acquisition_visibility is not None:
+            logger.info(
+                "Initializing zero-output acquisition visibility from a "
+                "legacy Gaussian checkpoint."
+            )
+        spline_state = checkpoint.get("surface_acquisition_spline")
+        if spline_state is not None:
+            if self.surface_acquisition_spline is None:
+                raise ValueError(
+                    "Checkpoint contains surface acquisition spline state "
+                    "but the representation is disabled."
+                )
+            self.surface_acquisition_spline.load_state_dict(
+                spline_state,
+                strict=True,
+            )
+        elif self.surface_acquisition_spline is not None:
+            logger.info(
+                "Initializing zero-output surface acquisition spline from "
+                "a legacy Gaussian checkpoint."
+            )
+        track_state = checkpoint.get("gaussian_track_acquisition")
+        if track_state is not None:
+            if self.gaussian_track_acquisition is None:
+                raise ValueError(
+                    "Checkpoint contains Gaussian-track acquisition state "
+                    "but the representation is disabled."
+                )
+            self.gaussian_track_acquisition.load_state_dict(
+                track_state,
+                strict=True,
+            )
+        elif self.gaussian_track_acquisition is not None:
+            logger.info(
+                "Initializing zero-output Gaussian-track acquisition from "
+                "a parent checkpoint."
+            )
         if "rotation_activation" not in self.__dict__:
             self.rotation_activation = get_activation_function("normalize")
         self.n_active_features = checkpoint["n_active_features"]
@@ -950,9 +1516,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
 
         self.background.load_state_dict(checkpoint["background"])
+        self._load_protected_prefix_metadata(checkpoint)
         if setup_optimizer:
             self.set_optimizable_parameters()
             self.setup_optimizer(state_dict=checkpoint["optimizer"])
+            self.validate_protected_optimizer_state()
         self.validate_fields()
 
     def init_from_lidar(self, point_cloud, observer_pts):
@@ -1203,16 +1771,73 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
     def set_optimizable_parameters(self):
-        self.density.requires_grad = bool(self.conf.model.optimize_density)
-        self.features_albedo.requires_grad = bool(self.conf.model.optimize_features_albedo)
-        self.features_specular.requires_grad = bool(self.conf.model.optimize_features_specular)
-        self.rotation.requires_grad = bool(self.conf.model.optimize_rotation)
-        self.scale.requires_grad = bool(self.conf.model.optimize_scale)
-        self.positions.requires_grad = bool(self.conf.model.optimize_position)
+        self._initialize_acquisition_appearance()
+        self._initialize_acquisition_visibility()
+        self._initialize_surface_acquisition_spline()
+        self._initialize_gaussian_track_acquisition()
+        freeze_for_appearance = bool(
+            _acquisition_appearance_enabled(self.conf)
+            and self.conf.model.acquisition_appearance.get(
+                "freeze_base_gaussians",
+                True,
+            )
+        )
+        freeze_for_visibility = bool(
+            _acquisition_visibility_enabled(self.conf)
+            and self.conf.model.acquisition_visibility.get(
+                "freeze_base_gaussians",
+                True,
+            )
+        )
+        freeze_for_surface_spline = bool(
+            _surface_acquisition_spline_enabled(self.conf)
+            and self.conf.model.surface_acquisition_spline.get(
+                "freeze_base_gaussians",
+                True,
+            )
+        )
+        freeze_for_gaussian_tracks = bool(
+            _gaussian_track_acquisition_enabled(self.conf)
+            and self.conf.model.gaussian_track_acquisition.get(
+                "freeze_parent",
+                True,
+            )
+        )
+        freeze_base = (
+            freeze_for_appearance
+            or freeze_for_visibility
+            or freeze_for_surface_spline
+            or freeze_for_gaussian_tracks
+        )
+        if freeze_for_gaussian_tracks:
+            if self.acquisition_appearance is not None:
+                self.acquisition_appearance.requires_grad_(False)
+            if self.acquisition_visibility is not None:
+                self.acquisition_visibility.requires_grad_(False)
+        self.density.requires_grad = bool(
+            self.conf.model.optimize_density and not freeze_base
+        )
+        self.features_albedo.requires_grad = bool(
+            self.conf.model.optimize_features_albedo and not freeze_base
+        )
+        self.features_specular.requires_grad = bool(
+            self.conf.model.optimize_features_specular and not freeze_base
+        )
+        self.rotation.requires_grad = bool(
+            self.conf.model.optimize_rotation and not freeze_base
+        )
+        self.scale.requires_grad = bool(
+            self.conf.model.optimize_scale and not freeze_base
+        )
+        self.positions.requires_grad = bool(
+            self.conf.model.optimize_position and not freeze_base
+        )
+        self.refresh_protected_gradient_hooks()
 
     def update_optimizable_parameters(self, optimizable_tensors: dict[str, torch.Tensor]):
         for name, value in optimizable_tensors.items():
             setattr(self, name, value)
+        self.refresh_protected_gradient_hooks()
 
     def increase_num_active_features(self) -> None:
         self.n_active_features = min(
@@ -1251,7 +1876,74 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         Returns:
             A dictionary containing the output of the model
         """
-        return self.renderer.render(self, batch, train, frame_id)
+        if (
+            self.acquisition_appearance is None
+            and self.acquisition_visibility is None
+            and self.surface_acquisition_spline is None
+            and self.gaussian_track_acquisition is None
+        ):
+            return self.renderer.render(self, batch, train, frame_id)
+        camera_idx = getattr(batch, "post_processing_camera_idx", -1)
+        if int(camera_idx) < 0:
+            camera_idx = batch.camera_idx
+        density = self.get_density()
+        if self.acquisition_visibility is not None:
+            density_logit_delta = (
+                self.acquisition_visibility.logit_delta(
+                    camera_idx=camera_idx,
+                    sequence_idx=batch.sequence_idx,
+                )
+            )
+            density = self.density_activation(
+                self.density + density_logit_delta
+            )
+        if self.surface_acquisition_spline is not None:
+            view = self.surface_acquisition_spline.materialize(
+                positions=self.positions,
+                rotation=self.get_rotation(),
+                scale=self.get_scale(),
+                density=density,
+                features_albedo=self.features_albedo,
+                features_specular=self.features_specular,
+                background=self.background,
+                n_active_features=self.n_active_features,
+                camera_idx=camera_idx,
+                sequence_idx=batch.sequence_idx,
+            )
+        else:
+            albedo = self.features_albedo
+            if self.acquisition_appearance is not None:
+                albedo = (
+                    albedo
+                    + self.acquisition_appearance.rgb_delta(
+                        camera_idx=camera_idx,
+                        sequence_idx=batch.sequence_idx,
+                    )
+                    / SH_DC_NORMALIZATION
+                )
+            if self.gaussian_track_acquisition is not None:
+                albedo = (
+                    albedo
+                    + self.gaussian_track_acquisition.rgb_delta(
+                        camera_idx=camera_idx,
+                        sequence_idx=batch.sequence_idx,
+                    )
+                    / SH_DC_NORMALIZATION
+                )
+            features = torch.cat(
+                (albedo, self.features_specular),
+                dim=1,
+            )
+            view = AcquisitionGaussianView(
+                positions=self.positions,
+                rotation=self.get_rotation(),
+                scale=self.get_scale(),
+                density=density,
+                features=features.contiguous(),
+                background=self.background,
+                n_active_features=self.n_active_features,
+            )
+        return self.renderer.render(view, batch, train, frame_id)
 
     def trace(self, rays_o, rays_d, T_to_world=None):
         """Traces the model with the given rays. This method is a convenience method for ray-traced inference mode.

@@ -17,8 +17,73 @@ import math
 import os
 
 import torch
+from omegaconf import DictConfig
 
 from threedgrut.utils import jit
+
+
+def carrier_settings(
+    conf: DictConfig,
+) -> tuple[bool, bool, bool, int, int]:
+    """Return validated native carrier flags and dimensions."""
+    gabor_enabled = bool(conf.model.get("use_gabor_carrier", False))
+    hermite_enabled = bool(conf.model.get("use_hermite_carrier", False))
+    siren_enabled = bool(conf.model.get("use_siren_carrier", False))
+    if sum((gabor_enabled, hermite_enabled, siren_enabled)) > 1:
+        raise ValueError(
+            "model.use_gabor_carrier, model.use_hermite_carrier, and "
+            "model.use_siren_carrier are mutually exclusive."
+        )
+    gabor_num_terms = int(conf.model.get("gabor_num_terms", 3))
+    if gabor_enabled and gabor_num_terms != 3:
+        raise ValueError(
+            "model.gabor_num_terms currently supports exactly 3 terms; "
+            f"got {gabor_num_terms}."
+        )
+    siren_hidden_dim = int(conf.model.get("siren_hidden_dim", 6))
+    if siren_enabled and siren_hidden_dim <= 0:
+        raise ValueError(
+            "model.siren_hidden_dim must be positive; got "
+            f"{siren_hidden_dim}."
+        )
+    return (
+        gabor_enabled,
+        hermite_enabled,
+        siren_enabled,
+        gabor_num_terms,
+        siren_hidden_dim,
+    )
+
+
+def particle_radiance_width(conf: DictConfig) -> int:
+    """Return the flattened native radiance row width for this config."""
+    radiance_sh_coeffs = (
+        conf.render.particle_radiance_sph_degree + 1
+    ) ** 2
+    (
+        gabor_enabled,
+        hermite_enabled,
+        siren_enabled,
+        gabor_num_terms,
+        siren_hidden_dim,
+    ) = carrier_settings(conf)
+    gabor_coeffs = gabor_num_terms + 3 if gabor_enabled else 0
+    hermite_coeffs = 2 if hermite_enabled else 0
+    siren_bias_coeffs = (siren_hidden_dim + 2) // 3
+    siren_coeffs = (
+        (2 * siren_hidden_dim)
+        + siren_bias_coeffs
+        + siren_hidden_dim
+        + 1
+        if siren_enabled
+        else 0
+    )
+    return 3 * (
+        radiance_sh_coeffs
+        + gabor_coeffs
+        + hermite_coeffs
+        + siren_coeffs
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -46,35 +111,19 @@ def setup_3dgut(conf):
     ut_delta = math.sqrt(ut_alpha * ut_alpha * (ut_d + ut_kappa))
 
     radiance_sh_coeffs = (conf.render.particle_radiance_sph_degree + 1) ** 2
-    gabor_enabled = bool(conf.model.get("use_gabor_carrier", False))
-    siren_enabled = bool(conf.model.get("use_siren_carrier", False))
-    if gabor_enabled and siren_enabled:
-        raise ValueError(
-            "model.use_gabor_carrier and model.use_siren_carrier are "
-            "mutually exclusive."
-        )
-    gabor_num_terms = int(conf.model.get("gabor_num_terms", 3))
-    if gabor_enabled and gabor_num_terms != 3:
-        raise ValueError(
-            "model.gabor_num_terms currently supports exactly 3 terms; "
-            f"got {gabor_num_terms}."
-        )
-    gabor_coeffs = gabor_num_terms + 3 if gabor_enabled else 0
-    siren_hidden_dim = int(conf.model.get("siren_hidden_dim", 6))
-    if siren_enabled and siren_hidden_dim <= 0:
-        raise ValueError(
-            "model.siren_hidden_dim must be positive; got "
-            f"{siren_hidden_dim}."
-        )
-    siren_bias_coeffs = (siren_hidden_dim + 2) // 3
-    siren_coeffs = (
-        (2 * siren_hidden_dim) + siren_bias_coeffs + siren_hidden_dim + 1
-        if siren_enabled
-        else 0
-    )
-    radiance_coeffs = radiance_sh_coeffs + gabor_coeffs + siren_coeffs
-    per_ray_particle_features = gabor_enabled or siren_enabled or bool(
-        conf.render.splat.get("per_ray_particle_features", False)
+    (
+        gabor_enabled,
+        hermite_enabled,
+        siren_enabled,
+        gabor_num_terms,
+        siren_hidden_dim,
+    ) = carrier_settings(conf)
+    radiance_coeffs = particle_radiance_width(conf) // 3
+    per_ray_particle_features = (
+        gabor_enabled
+        or hermite_enabled
+        or siren_enabled
+        or bool(conf.render.splat.get("per_ray_particle_features", False))
     )
 
     defines = [
@@ -83,6 +132,7 @@ def setup_3dgut(conf):
         f"-DPARTICLE_RADIANCE_GABOR_ENABLED={to_cpp_bool(gabor_enabled)}",
         f"-DPARTICLE_RADIANCE_GABOR_NUM_TERMS={gabor_num_terms}",
         f"-DPARTICLE_RADIANCE_GABOR_MAX_FREQUENCY={float(conf.model.get('gabor_max_frequency', 4.0))}",
+        f"-DPARTICLE_RADIANCE_HERMITE_ENABLED={to_cpp_bool(hermite_enabled)}",
         f"-DPARTICLE_RADIANCE_SIREN_ENABLED={to_cpp_bool(siren_enabled)}",
         f"-DPARTICLE_RADIANCE_SIREN_HIDDEN_DIM={siren_hidden_dim}",
         f"-DPARTICLE_RADIANCE_SIREN_OMEGA={float(conf.model.get('siren_omega', 30.0))}",
@@ -99,6 +149,7 @@ def setup_3dgut(conf):
         f"-DGAUSSIAN_N_ROLLING_SHUTTER_ITERATIONS={conf.render.splat.n_rolling_shutter_iterations}",
         f"-DGAUSSIAN_K_BUFFER_SIZE={conf.render.splat.k_buffer_size}",
         f"-DGAUSSIAN_GLOBAL_Z_ORDER={to_cpp_bool(conf.render.splat.global_z_order)}",
+        f"-DGAUSSIAN_SIGNED_RAY_DEPTH={to_cpp_bool(conf.render.splat.get('signed_ray_depth', False))}",
         f"-DGAUSSIAN_PER_RAY_PARTICLE_FEATURES={to_cpp_bool(per_ray_particle_features)}",
         f"-DFINE_GRAINED_LOAD_BALANCING={to_cpp_bool(getattr(conf.render.splat, 'fine_grained_load_balancing', False))}",
         # -- Unscented Transform --

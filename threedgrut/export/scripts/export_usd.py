@@ -35,6 +35,11 @@ from pathlib import Path
 import torch
 
 from threedgrut.export import NuRecExporter, USDExporter
+from threedgrut.model.factory import (
+    GaussianRepresentation,
+    checkpoint_representation,
+    create_gaussian_model,
+)
 from threedgrut.utils.logger import logger
 
 
@@ -144,8 +149,6 @@ Examples:
 
 def load_model_from_checkpoint(checkpoint_path: str):
     """Load a 3DGRUT model from checkpoint."""
-    from threedgrut.model.model import MixtureOfGaussians
-
     logger.info(f"Loading checkpoint from {checkpoint_path}")
 
     # weights_only=False needed for checkpoints containing numpy arrays (PyTorch 2.6+)
@@ -156,9 +159,18 @@ def load_model_from_checkpoint(checkpoint_path: str):
         raise ValueError("Checkpoint does not contain 'config' key")
 
     conf = checkpoint["config"]
+    if checkpoint_representation(checkpoint) != GaussianRepresentation.MIXTURE:
+        raise RuntimeError(
+            "View-conditioned anchor checkpoints require an explicit "
+            "static bake before USD export."
+        )
 
     # Create model from configuration
-    model = MixtureOfGaussians(conf, scene_extent=checkpoint.get("scene_extent"))
+    model = create_gaussian_model(
+        conf,
+        scene_extent=checkpoint.get("scene_extent"),
+        checkpoint=checkpoint,
+    )
 
     # Load model parameters from checkpoint (without setting up optimizer)
     model.init_from_checkpoint(checkpoint, setup_optimizer=False)

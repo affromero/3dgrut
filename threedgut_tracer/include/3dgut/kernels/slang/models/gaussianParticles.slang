@@ -174,8 +174,14 @@ struct Parameters : IDifferentiable {
     float3 canonicalRayOrigin,
     float3 canonicalRayDirection,
     float3 scale) {
-    const float3 grds = scale * canonicalRayDirection * dot(canonicalRayDirection, -1 * canonicalRayOrigin);
-    return sqrt(dot(grds, grds));
+    const float closestT = dot(
+        canonicalRayDirection,
+        -1 * canonicalRayOrigin);
+    const float metricScale = length(
+        scale * canonicalRayDirection);
+    return SignedRayDepth
+        ? closestT * metricScale
+        : abs(closestT) * metricScale;
 }
 
 [BackwardDifferentiable][ForceInline] float3 canonicalRayNormal<let Surfel : bool>(
