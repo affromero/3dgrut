@@ -7,16 +7,19 @@ against numerical gradients (central finite differences on ray_ori / ray_dir).
 
 from __future__ import annotations
 
-import torch
+import os
+
 import numpy as np
+import pytest
+import torch
+from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
+from threedgut_tracer.setup_3dgut import setup_3dgut
+from threedgut_tracer.tracer import Tracer
 
 
 def _build_jit_config() -> OmegaConf:
     """Load the full 3DGUT config via Hydra compose."""
-    import os
-    from hydra import compose, initialize_config_dir
-
     config_dir = os.path.join(os.path.dirname(__file__), "..", "configs")
     config_dir = os.path.abspath(config_dir)
 
@@ -31,8 +34,6 @@ def test_ray_gradient_finite_differences():
     device = torch.device("cuda")
     conf = _build_jit_config()
 
-    from threedgut_tracer.setup_3dgut import setup_3dgut
-
     plugin = setup_3dgut(conf)
     conf_dict = OmegaConf.to_container(conf)
 
@@ -40,7 +41,7 @@ def test_ray_gradient_finite_differences():
 
     H, W = 16, 16
     N_PARTICLES = 32
-    SH_DIM = 4  # degree 1: 4 coeffs per channel
+    SH_DIM = 16  # compiled degree 3: 16 coefficients per channel
 
     torch.manual_seed(42)
 
@@ -73,9 +74,9 @@ def test_ray_gradient_finite_differences():
         plugin.ShutterType.ROLLING_TOP_TO_BOTTOM,
         [W / 2.0, H / 2.0],  # principal point
         [W / 2.0, W / 2.0],  # focal length
-        [0.0] * 6,           # radial coeffs
-        [0.0, 0.0],          # tangential coeffs
-        [0.0] * 4,           # thin prism coeffs
+        [0.0] * 6,  # radial coeffs
+        [0.0, 0.0],  # tangential coeffs
+        [0.0] * 4,  # thin prism coeffs
     )
 
     start_ts = 0
@@ -110,11 +111,32 @@ def test_ray_gradient_finite_differences():
     ray_dir_test = ray_dir.clone().requires_grad_(True)
 
     result = raster.trace(
-        0, 1,
-        particle_density, particle_radiance,
-        ray_ori_test.contiguous(), ray_dir_test.contiguous(),
-        ray_time, sensor_params, start_ts, end_ts, start_pose, end_pose,
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori_test.contiguous(),
+        ray_dir_test.contiguous(),
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
     )
+    assert len(result) == 8
+    projected_conic_opacity = result[5]
+    projected_tiles_count = result[7].reshape(-1)
+    assert projected_conic_opacity.shape == (N_PARTICLES, 4)
+    on_screen = projected_tiles_count > 0
+    assert on_screen.any()
+    observed_conics = projected_conic_opacity[on_screen]
+    assert torch.isfinite(observed_conics).all()
+    determinant = observed_conics[:, 0] * observed_conics[:, 2] - observed_conics[:, 1].square()
+    assert (observed_conics[:, 0] > 0.0).all()
+    assert (observed_conics[:, 2] > 0.0).all()
+    assert (determinant > 0.0).all()
+    assert (observed_conics[:, 3] > 0.0).all()
     radiance_density = result[0]
     loss = radiance_density[..., :3].sum()
 
@@ -125,12 +147,68 @@ def test_ray_gradient_finite_differences():
     hit_dist_grad = torch.zeros_like(hit_dist)
 
     density_grd, radiance_grd, ori_grd, dir_grd = raster.trace_bwd(
-        0, 1,
-        particle_density, particle_radiance,
-        ray_ori_test, ray_dir_test, ray_time,
-        sensor_params, start_ts, end_ts, start_pose, end_pose,
-        radiance_density, radiance_density_grad,
-        hit_dist, hit_dist_grad,
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori_test,
+        ray_dir_test,
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
+        radiance_density,
+        radiance_density_grad,
+        hit_dist,
+        hit_dist_grad,
+    )
+
+    diagnostic_result = raster.trace(
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori_test.contiguous(),
+        ray_dir_test.contiguous(),
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
+    )
+    absolute_position_gradient = torch.zeros(
+        (N_PARTICLES, 3),
+        device=device,
+    )
+    diagnostic_density_grd, _, _, _ = raster.trace_bwd_with_abs(
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori_test,
+        ray_dir_test,
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
+        diagnostic_result[0],
+        radiance_density_grad,
+        diagnostic_result[1],
+        hit_dist_grad,
+        absolute_position_gradient,
+    )
+    torch.testing.assert_close(diagnostic_density_grd, density_grd)
+    assert bool((absolute_position_gradient > 0).any())
+    assert bool(
+        (
+            absolute_position_gradient + 1e-5
+            >= diagnostic_density_grd[:, :3].abs()
+        ).all()
     )
 
     print(f"ori_grd shape: {ori_grd.shape}, max abs: {ori_grd.abs().max().item():.6f}")
@@ -144,9 +222,19 @@ def test_ray_gradient_finite_differences():
     # Finite difference validation: pick pixels with highest alpha (confirmed visible)
     eps = 1e-4
     fwd_result = raster.trace(
-        0, 1, particle_density, particle_radiance,
-        ray_ori.contiguous(), ray_dir.contiguous(), ray_time,
-        sensor_params, start_ts, end_ts, start_pose, end_pose)
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori.contiguous(),
+        ray_dir.contiguous(),
+        ray_time,
+        sensor_params,
+        start_ts,
+        end_ts,
+        start_pose,
+        end_pose,
+    )
     fwd_alpha = fwd_result[0][..., 3]  # [H, W]
     topk_flat = fwd_alpha.flatten().topk(min(10, H * W)).indices
     test_pixels = [(idx.item() // W, idx.item() % W) for idx in topk_flat]
@@ -174,7 +262,9 @@ def test_ray_gradient_finite_differences():
                     rel_err = abs(an_grad - fd_grad) / max(abs(fd_grad), abs(an_grad))
                     max_rel_error = max(max_rel_error, rel_err)
                     status = "OK" if rel_err < 0.05 else "MISMATCH"
-                    print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}")
+                    print(
+                        f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}"
+                    )
                 else:
                     print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} FD~0")
 
@@ -202,7 +292,9 @@ def test_ray_gradient_finite_differences():
                     rel_err = abs(an_grad - fd_grad) / max(abs(fd_grad), abs(an_grad))
                     max_rel_error_dir = max(max_rel_error_dir, rel_err)
                     status = "OK" if rel_err < 0.05 else "MISMATCH"
-                    print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}")
+                    print(
+                        f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} rel_err={rel_err:.4f} {status}"
+                    )
                 else:
                     print(f"  pixel ({py},{px}) dim {dim}: analytical={an_grad:.6f} fd={fd_grad:.6f} FD~0")
 
@@ -210,7 +302,124 @@ def test_ray_gradient_finite_differences():
 
     passed = n_compared > 0 and n_compared_dir > 0 and max_rel_error < 0.1 and max_rel_error_dir < 0.1
     print(f"\n{'PASSED' if passed else 'FAILED'}: ray gradient finite-difference test")
-    return passed
+    assert passed
+
+
+def test_trace_rejects_noncontiguous_native_tensor() -> None:
+    """Reject temporary-copy pointer hazards before launching CUDA kernels."""
+    device = torch.device("cuda")
+    conf = _build_jit_config()
+
+    plugin = setup_3dgut(conf)
+    raster = plugin.SplatRaster(OmegaConf.to_container(conf))
+    particle_density = torch.zeros((1, 12), device=device)
+    particle_density[:, 3] = 10.0
+    particle_density[:, 4] = 1.0
+    particle_density[:, 8:11] = 0.1
+    particle_radiance = torch.zeros((1, 48), device=device)
+    ray_origin = torch.zeros((1, 2, 2, 3), device=device)
+    ray_direction = torch.ones(
+        (1, 2, 2, 3),
+        device=device,
+    ).transpose(1, 2)
+    assert not ray_direction.is_contiguous()
+    ray_time = torch.zeros(
+        (1, 2, 2, 1),
+        dtype=torch.long,
+        device=device,
+    )
+    sensor_params = plugin.fromOpenCVPinholeCameraModelParameters(
+        [2, 2],
+        plugin.ShutterType.GLOBAL,
+        [1.0, 1.0],
+        [1.0, 1.0],
+        [0.0] * 6,
+        [0.0, 0.0],
+        [0.0] * 4,
+    )
+    pose = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]],
+        device=device,
+    )
+
+    with pytest.raises(RuntimeError, match="must be contiguous"):
+        raster.trace(
+            0,
+            0,
+            particle_density,
+            particle_radiance,
+            ray_origin,
+            ray_direction,
+            ray_time,
+            sensor_params,
+            0,
+            0,
+            pose,
+            pose,
+        )
+
+
+def test_trace_rejects_short_compiled_radiance_buffer() -> None:
+    """Reject buffers whose row stride is shorter than the compiled SH layout."""
+    device = torch.device("cuda")
+    conf = _build_jit_config()
+
+    plugin = setup_3dgut(conf)
+    raster = plugin.SplatRaster(OmegaConf.to_container(conf))
+    particle_density = torch.zeros((1, 12), device=device)
+    particle_density[:, 3] = 10.0
+    particle_density[:, 4] = 1.0
+    particle_density[:, 8:11] = 0.1
+    particle_radiance = torch.zeros((1, 3), device=device)
+    ray_origin = torch.zeros((1, 2, 2, 3), device=device)
+    ray_direction = torch.ones((1, 2, 2, 3), device=device)
+    ray_time = torch.zeros(
+        (1, 2, 2, 1),
+        dtype=torch.long,
+        device=device,
+    )
+    sensor_params = plugin.fromOpenCVPinholeCameraModelParameters(
+        [2, 2],
+        plugin.ShutterType.GLOBAL,
+        [1.0, 1.0],
+        [1.0, 1.0],
+        [0.0] * 6,
+        [0.0, 0.0],
+        [0.0] * 4,
+    )
+    pose = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]],
+        device=device,
+    )
+
+    with pytest.raises(RuntimeError, match="compiled radiance width 48"):
+        raster.trace(
+            0,
+            0,
+            particle_density,
+            particle_radiance,
+            ray_origin,
+            ray_direction,
+            ray_time,
+            sensor_params,
+            0,
+            0,
+            pose,
+            pose,
+        )
+
+
+def test_progressive_sh_padding_preserves_active_gradients() -> None:
+    """Inactive compiled SH bands are zero without severing active gradients."""
+    active = torch.randn((4, 12), requires_grad=True)
+
+    padded = Tracer._pad_particle_radiance(active, compiled_width=48)
+
+    assert padded.shape == (4, 48)
+    torch.testing.assert_close(padded[:, :12], active)
+    torch.testing.assert_close(padded[:, 12:], torch.zeros((4, 36)))
+    padded.sum().backward()
+    torch.testing.assert_close(active.grad, torch.ones_like(active))
 
 
 if __name__ == "__main__":

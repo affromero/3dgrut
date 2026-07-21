@@ -546,11 +546,22 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     }
 
     template <bool synchedThread = true>
-    __forceinline__ __device__ void processHitBwdUpdateDensityGradient(uint32_t particleIdx, DensityRawParameters& densityRawParameters, uint32_t tileThreadIdx) {
+    __forceinline__ __device__ void processHitBwdUpdateDensityGradient(
+        uint32_t particleIdx,
+        DensityRawParameters& densityRawParameters,
+        uint32_t tileThreadIdx,
+        tcnn::vec3* particlePositionGradientAbsPtr = nullptr) {
         if constexpr (synchedThread) {
+            float absolutePositionX = fabsf(densityRawParameters.position.x);
+            float absolutePositionY = fabsf(densityRawParameters.position.y);
+            float absolutePositionZ = fabsf(densityRawParameters.position.z);
+
             // Perform warp reduction
 #pragma unroll
             for (int mask = 1; mask < warpSize; mask *= 2) {
+                absolutePositionX += __shfl_xor_sync(0xffffffff, absolutePositionX, mask);
+                absolutePositionY += __shfl_xor_sync(0xffffffff, absolutePositionY, mask);
+                absolutePositionZ += __shfl_xor_sync(0xffffffff, absolutePositionZ, mask);
                 densityRawParameters.position.x += __shfl_xor_sync(0xffffffff, densityRawParameters.position.x, mask);
                 densityRawParameters.position.y += __shfl_xor_sync(0xffffffff, densityRawParameters.position.y, mask);
                 densityRawParameters.position.z += __shfl_xor_sync(0xffffffff, densityRawParameters.position.z, mask);
@@ -566,6 +577,17 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
 
             // First thread in the warp performs the atomic add
             if ((tileThreadIdx & (warpSize - 1)) == 0) {
+                if (particlePositionGradientAbsPtr != nullptr) {
+                    atomicAdd(
+                        &particlePositionGradientAbsPtr[particleIdx].x,
+                        absolutePositionX);
+                    atomicAdd(
+                        &particlePositionGradientAbsPtr[particleIdx].y,
+                        absolutePositionY);
+                    atomicAdd(
+                        &particlePositionGradientAbsPtr[particleIdx].z,
+                        absolutePositionZ);
+                }
                 atomicAdd(&m_densityRawParameters.gradPtr[particleIdx].position.x, densityRawParameters.position.x);
                 atomicAdd(&m_densityRawParameters.gradPtr[particleIdx].position.y, densityRawParameters.position.y);
                 atomicAdd(&m_densityRawParameters.gradPtr[particleIdx].position.z, densityRawParameters.position.z);
@@ -579,6 +601,17 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                 atomicAdd(&m_densityRawParameters.gradPtr[particleIdx].scale.z, densityRawParameters.scale.z);
             }
         } else {
+            if (particlePositionGradientAbsPtr != nullptr) {
+                atomicAdd(
+                    &particlePositionGradientAbsPtr[particleIdx].x,
+                    fabsf(densityRawParameters.position.x));
+                atomicAdd(
+                    &particlePositionGradientAbsPtr[particleIdx].y,
+                    fabsf(densityRawParameters.position.y));
+                atomicAdd(
+                    &particlePositionGradientAbsPtr[particleIdx].z,
+                    fabsf(densityRawParameters.position.z));
+            }
             atomicAdd(&m_densityRawParameters.gradPtr[particleIdx].position.x, densityRawParameters.position.x);
             atomicAdd(&m_densityRawParameters.gradPtr[particleIdx].position.y, densityRawParameters.position.y);
             atomicAdd(&m_densityRawParameters.gradPtr[particleIdx].position.z, densityRawParameters.position.z);

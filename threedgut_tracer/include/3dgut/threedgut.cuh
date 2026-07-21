@@ -76,7 +76,7 @@ struct TGUTProjectionParams {
     static constexpr bool RequireAllSigmaPoints    = GAUSSIAN_UT_REQUIRE_ALL_SIGMA_POINTS_VALID;
 };
 
-static_assert(TGUTProjectionParams::RequireAllSigmaPoints == false, "RequireAllSigmaPoints must be false");
+static_assert(TGUTProjectionParams::RequireAllSigmaPoints, "RequireAllSigmaPoints must be true");
 
 #include <3dgut/kernels/cuda/renderers/gutProjector.cuh>
 

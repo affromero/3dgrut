@@ -17,7 +17,7 @@
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, List
+from typing import List
 
 import numpy as np
 import torch
@@ -26,9 +26,6 @@ from plyfile import PlyData, PlyElement
 from threedgrut.export.accessor import GaussianAttributes, GaussianExportAccessor
 from threedgrut.export.base import ExportableModel, ModelExporter
 from threedgrut.utils.logger import logger
-
-if TYPE_CHECKING:
-    from threedgrut.export.partition import PartitionResult
 
 
 class PLYExporter(ModelExporter):
@@ -94,6 +91,7 @@ class PLYExporter(ModelExporter):
         )
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, "vertex")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         PlyData([el]).write(str(output_path))
 
     @torch.no_grad()

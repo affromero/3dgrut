@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Analytic positional carrier residuals (Gabor / per-particle SIREN).
+"""Analytic positional carrier residuals (Gabor / Hermite / per-particle SIREN).
 
 Carrier parameters are packed after the SH coefficients in
 ``features_specular``; the tracer evaluates them per-ray on the canonical
@@ -26,6 +26,7 @@ from omegaconf import DictConfig
 
 GABOR_CARRIER_NUM_TERMS = 3
 GABOR_CARRIER_EXTRA_COEFFS = GABOR_CARRIER_NUM_TERMS + 3
+HERMITE_CARRIER_EXTRA_COEFFS = 2
 SIREN_CARRIER_INPUT_DIM = 5
 SIREN_CARRIER_DEFAULT_HIDDEN_DIM = 6
 
@@ -34,15 +35,24 @@ def gabor_carrier_enabled(conf) -> bool:
     return bool(conf.model.get("use_gabor_carrier", False))
 
 
+def hermite_carrier_enabled(conf) -> bool:
+    return bool(conf.model.get("use_hermite_carrier", False))
+
+
 def siren_carrier_enabled(conf) -> bool:
     return bool(conf.model.get("use_siren_carrier", False))
 
 
 def validate_carrier_config(conf) -> None:
-    if gabor_carrier_enabled(conf) and siren_carrier_enabled(conf):
+    enabled = (
+        gabor_carrier_enabled(conf),
+        hermite_carrier_enabled(conf),
+        siren_carrier_enabled(conf),
+    )
+    if sum(enabled) > 1:
         raise ValueError(
-            "model.use_gabor_carrier and model.use_siren_carrier are "
-            "mutually exclusive."
+            "model.use_gabor_carrier, model.use_hermite_carrier, and "
+            "model.use_siren_carrier are mutually exclusive."
         )
 
 
@@ -56,6 +66,12 @@ def gabor_carrier_coeffs(conf) -> int:
             f"got {num_terms}."
         )
     return GABOR_CARRIER_EXTRA_COEFFS
+
+
+def hermite_carrier_coeffs(conf) -> int:
+    if not hermite_carrier_enabled(conf):
+        return 0
+    return HERMITE_CARRIER_EXTRA_COEFFS
 
 
 def siren_carrier_hidden_dim(conf) -> int:
@@ -92,7 +108,25 @@ def siren_carrier_coeffs(conf: DictConfig) -> int:
 
 def carrier_specular_dim(conf) -> int:
     validate_carrier_config(conf)
-    return 3 * (gabor_carrier_coeffs(conf) + siren_carrier_coeffs(conf))
+    return 3 * (
+        gabor_carrier_coeffs(conf)
+        + hermite_carrier_coeffs(conf)
+        + siren_carrier_coeffs(conf)
+    )
+
+
+def initial_hermite_carrier_tail(
+    *,
+    num_gaussians: int,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    conf,
+) -> torch.Tensor:
+    return torch.zeros(
+        (num_gaussians, 3 * hermite_carrier_coeffs(conf)),
+        dtype=dtype,
+        device=device,
+    )
 
 
 def initial_gabor_carrier_tail(
@@ -217,6 +251,13 @@ def initial_carrier_tail(
     validate_carrier_config(conf)
     if gabor_carrier_enabled(conf):
         return initial_gabor_carrier_tail(
+            num_gaussians=num_gaussians,
+            device=device,
+            dtype=dtype,
+            conf=conf,
+        )
+    if hermite_carrier_enabled(conf):
+        return initial_hermite_carrier_tail(
             num_gaussians=num_gaussians,
             device=device,
             dtype=dtype,

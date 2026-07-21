@@ -20,8 +20,10 @@ splat: # 3DGUT-specific settings
   ut_beta: 2.0
   ut_kappa: 0.0
   ut_in_image_margin_factor: 0.1
-  ut_require_all_sigma_points_valid: false
+  ut_require_all_sigma_points_valid: true
   # rendering
   k_buffer_size: 0  # 0 means unsorted
   global_z_order: true
+  signed_ray_depth: false
+  per_ray_particle_features: false
   fine_grained_load_balancing: false

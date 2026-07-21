@@ -12,6 +12,88 @@ densify:
   relative_size_threshold: 0.01 # Gaussians larger than relative_size_threshold * scene_extent will be split not cloned. Called percent_dense in 3DGS with default value 0.01
   split:
     n_gaussians: 2 # Hardcoded to 2 in 3DGS
+  # Replace each ordinary two-child random split with a deterministic
+  # three-node Gauss-Hermite mixture. beta is the retained variance fraction
+  # on the selected parent axis; 0.390625 keeps the incumbent 0.625 child
+  # standard deviation while preserving mixture moments through degree five.
+  # This arm requires ordinary, unmodified candidate selection.
+  moment_preserving_split:
+    enabled: false
+    beta: 0.390625
+  # Pixel-GS-style evidence weighting using 3DGUT's exact intersected-tile
+  # count as the available coverage proxy. This is not a count of final
+  # contributing pixels: it weights each view's existing distance-normalized
+  # position-gradient norm by intersected tiles, then divides by total tiles.
+  # Default disabled preserves the upstream per-visible-view average.
+  tile_coverage_weighted_gradient:
+    enabled: false
+  # Diagnostic-only 3DGUT cancellation instrument. The CUDA backward pass
+  # accumulates the componentwise absolute value of every per-ray position
+  # gradient before the ordinary signed atomic reduction. This is the
+  # ray-traced analogue of AbsGS evidence, not the paper's raster-space 2D
+  # mean gradient. It does not alter gradients, optimizer state, topology, or
+  # rendering. Default disabled avoids the Nx3 telemetry allocation.
+  absolute_ray_gradient_diagnostics:
+    enabled: false
+    frequency: 10
+  # 3DGUT-native non-cancelling densification. Per-ray absolute position
+  # gradients are rescaled in every view to conserve the ordinary signed
+  # gradient's total densification mass, then accumulated through the existing
+  # view-average buffer. This redistributes a controlled dose toward
+  # cancellation-hidden Gaussians without changing the renderer or loss.
+  absolute_ray_gradient_densification:
+    enabled: false
+  # Causal clone-versus-split probe for 3DGUT. Ordinary signed-gradient clone
+  # eligibility is unchanged. A clone is rerouted through the existing split
+  # operation only when at least two observations in the current densification
+  # window jointly exhibit >0.5 native ray-gradient cancellation and a tight
+  # projected half-extent >8 px, and those joint observations are at least half
+  # of the row's valid native-gradient observations. The reroute ceiling fails
+  # closed rather than silently truncating the intervention.
+  cancellation_conditioned_split:
+    enabled: false
+    cancellation_threshold: 0.5
+    extent_px: 8.0
+    min_joint_observations: 2
+    min_joint_fraction: 0.5
+    max_reroute_fraction: 0.5
+  # Route otherwise-cloned Gaussians with a large on-screen 3DGUT support
+  # box through the existing split operation. max_px is the largest axis of
+  # the renderer's tight, opacity-bounded half-extent after covariance
+  # dilation and Mip opacity scaling. It is not an eigen-radius or an scale-shape
+  # native status value. Default disabled preserves the upstream decisions.
+  projected_extent_split:
+    enabled: false
+    max_px: 8.0
+  # Reroute a strict subset of otherwise-cloned Gaussians through the existing
+  # split operation only when the SAME camera observations have both a large
+  # covariance eigen-radius and positional gradient demand. The renderer
+  # exposes its existing inverse-covariance conic packet for this diagnostic;
+  # RGB and compositing are unchanged. The reroute ceiling is a fail-closed
+  # experiment guard, not a truncation policy.
+  covariance_gradient_split:
+    enabled: false
+    radius_px: 8.0
+    min_large_observations: 6
+    max_reroute_fraction: 0.22385751031338305
+    # Fail at the next densification boundary when invalid on-screen conic
+    # packets exceed 10 ppm in that accumulation window. Invalid packets are
+    # excluded from G+ and N+ but remain in the existing total denominator N.
+    max_invalid_fraction: 0.00001
+  # Isolated visibility-and-shape-derived topology arm for ordinary 3DGUT/Adam. Existing
+  # split eligibility remains unchanged. Among those candidates only rows with
+  # at least 32 per-iteration renderer visibility observations in the current
+  # densification window, strict physical anisotropy > 8, and largest scale
+  # > 0.01 world units use the deterministic largest-axis split. Repeated
+  # sampling of one image contributes repeated observations; this is not a
+  # distinct-frame count. Two child opacities preserve the parent's base-alpha
+  # algebra; displaced, rescaled kernels do not preserve arbitrary-ray
+  # transmittance. Default disabled preserves upstream topology.
+  scale_shape_split:
+    enabled: false
+    anisotropy_threshold: 8.0
+    min_largest_scale: 0.01
+    min_observations: 32
   # Field-angle-aware (solid-angle-weighted) densification. Screen-space
   # density control is blind to the fisheye projection Jacobian, so the
   # periphery (few pixels per steradian) is under-densified -> oversized,
@@ -71,3 +153,17 @@ prune_scale:
   start_iteration: -1
   end_iteration: -1
   threshold: 1.0
+
+# Non-finite / runaway-scale particle guard. A single Gaussian with a
+# non-finite position/rotation/scale/density, or a scale far beyond the
+# scene, yields a degenerate proxy AABB; OptiX traversal against such a
+# BVH can spin forever, freezing training at 100% GPU with no error.
+# When enabled, every optimizer step neutralizes non-finite particles in
+# place (origin, identity rotation, tiny scale), clamps scales above
+# max_world_size, and zeroes the affected optimizer-state rows so a
+# poisoned Adam moment cannot regrow the defect. A warning names the
+# count whenever anything is sanitized.
+# Default disabled -> byte-identical to upstream behaviour.
+scale_guard:
+  enabled: false
+  max_world_size: 10.0

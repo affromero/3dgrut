@@ -209,6 +209,18 @@ def _install_fake_ppisp_module(monkeypatch):
 class TestPLYExportImport:
     """Test PLY export from ExportableModel and import back."""
 
+    def test_ply_export_creates_missing_parent_directory(self):
+        """Test that export creates a configured nested output directory."""
+        model = MockGaussianModel(num_gaussians=10, sh_degree=3)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ply_path = Path(tmpdir) / "nested" / "exports" / "test.ply"
+            assert not ply_path.parent.exists()
+
+            PLYExporter().export(model, ply_path)
+
+            assert ply_path.is_file()
+
     def test_ply_export_import_positions(self):
         """Test that positions are preserved through PLY export/import."""
         model = MockGaussianModel(num_gaussians=10, sh_degree=3)
@@ -318,9 +330,7 @@ class TestPLYExportImport:
     def test_ply_export_import_extra_specular_slots(self):
         """Test that non-SH specular slots are preserved."""
         model = MockGaussianModel(num_gaussians=10, sh_degree=3)
-        extra_slots = torch.arange(
-            60, dtype=torch.float32, device=model.device
-        ).reshape(10, 6)
+        extra_slots = torch.arange(60, dtype=torch.float32, device=model.device).reshape(10, 6)
         model._specular = torch.cat((model._specular, extra_slots), dim=1)
 
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -80,6 +80,7 @@ public:
                          TFeatureDensityElem* featureDensityCudaPtr,
                          int* particlesVisibilityCudaPtr,
                          tcnn::vec2* particlesProjectedPositionCudaPtr,
+                         tcnn::vec4* particlesProjectedConicOpacityCudaPtr,
                          tcnn::vec2* particlesProjectedExtentCudaPtr,
                          int* particlesTilesCountCudaPtr,
                          Parameters& parameters,
@@ -95,6 +96,7 @@ public:
                           const float* featureDensityGradientCudaPtr,
                           tcnn::vec3* worldRayOriginGradientCudaPtr,
                           tcnn::vec3* worldRayDirectionGradientCudaPtr,
+                          tcnn::vec3* particlePositionGradientAbsCudaPtr,
                           Parameters& parameters,
                           int cudaDeviceIndex,
                           cudaStream_t cudaStream);

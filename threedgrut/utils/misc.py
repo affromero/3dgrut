@@ -32,6 +32,34 @@ def to_torch(data: npt.NDArray, device: str, dtype: Optional[torch.dtype] = None
     return torch.from_numpy(data).to(device=device, dtype=dtype)
 
 
+def seed_everything(seed: int) -> torch.Generator:
+    """Seed all RNGs for a reproducible run and return a seeded generator.
+
+    Seeds python ``random``, numpy, and torch (CPU + every visible CUDA
+    device), and enables cheap determinism flags. The returned
+    ``torch.Generator`` is meant to be handed to the training DataLoader so
+    its ``shuffle=True`` sampler and per-worker base seeds are reproducible.
+
+    Args:
+        seed: Base run seed (e.g. ``conf.seed_initialization``).
+
+    Returns:
+        A CPU ``torch.Generator`` already seeded with ``seed``.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Cheap, non-perf-destroying determinism knobs. Do NOT enable
+    # torch.use_deterministic_algorithms(True) here: several CUDA kernels in
+    # the splat path have no deterministic implementation and it would raise.
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+
 def to_np(x):
     """
     Really, definitely convert a torch tensor to a numpy array
@@ -64,7 +92,7 @@ def get_activation_function(activation_function: str, inverse=False) -> Callable
         return INVERSE_ACTIVATION_DICT[activation_function]
 
 
-def quaternion_to_so3(r):
+def quaternion_to_so3(r: torch.Tensor) -> torch.Tensor:
     norm = torch.sqrt(r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3])
 
     q = r / norm[:, None]
@@ -88,8 +116,123 @@ def quaternion_to_so3(r):
     return R
 
 
-def exponential_scheduler(lr_init, lr_final, max_steps=1000000, type=""):
-    def helper(step):
+def so3_to_quaternion_wxyz(rotation: torch.Tensor) -> torch.Tensor:
+    """Convert proper rotation matrices to canonical WXYZ quaternions.
+
+    The returned unit quaternion uses the same convention as
+    :func:`quaternion_to_so3`. Its sign is canonicalized by making the first
+    nonzero WXYZ component positive.
+    """
+    if rotation.ndim != 3 or rotation.shape[-2:] != (3, 3):
+        raise ValueError("Expected rotation matrices with shape [N, 3, 3], got " f"{tuple(rotation.shape)}")
+    if not rotation.is_floating_point():
+        raise ValueError("Rotation matrices must use a floating-point dtype")
+
+    m00 = rotation[:, 0, 0]
+    m01 = rotation[:, 0, 1]
+    m02 = rotation[:, 0, 2]
+    m10 = rotation[:, 1, 0]
+    m11 = rotation[:, 1, 1]
+    m12 = rotation[:, 1, 2]
+    m20 = rotation[:, 2, 0]
+    m21 = rotation[:, 2, 1]
+    m22 = rotation[:, 2, 2]
+
+    component_magnitudes = torch.sqrt(
+        torch.clamp_min(
+            torch.stack(
+                (
+                    1.0 + m00 + m11 + m22,
+                    1.0 + m00 - m11 - m22,
+                    1.0 - m00 + m11 - m22,
+                    1.0 - m00 - m11 + m22,
+                ),
+                dim=1,
+            ),
+            0.0,
+        )
+    )
+    candidates = torch.stack(
+        (
+            torch.stack(
+                (
+                    component_magnitudes[:, 0].square(),
+                    m21 - m12,
+                    m02 - m20,
+                    m10 - m01,
+                ),
+                dim=1,
+            ),
+            torch.stack(
+                (
+                    m21 - m12,
+                    component_magnitudes[:, 1].square(),
+                    m10 + m01,
+                    m02 + m20,
+                ),
+                dim=1,
+            ),
+            torch.stack(
+                (
+                    m02 - m20,
+                    m10 + m01,
+                    component_magnitudes[:, 2].square(),
+                    m12 + m21,
+                ),
+                dim=1,
+            ),
+            torch.stack(
+                (
+                    m10 - m01,
+                    m02 + m20,
+                    m12 + m21,
+                    component_magnitudes[:, 3].square(),
+                ),
+                dim=1,
+            ),
+        ),
+        dim=1,
+    )
+    denominator = 2.0 * component_magnitudes.clamp_min(torch.finfo(rotation.dtype).eps)
+    candidates = candidates / denominator[:, :, None]
+    best_candidate = torch.argmax(component_magnitudes, dim=1)
+    row_indices = torch.arange(rotation.shape[0], device=rotation.device)
+    quaternion = candidates[row_indices, best_candidate]
+    quaternion = torch.nn.functional.normalize(quaternion, dim=1)
+
+    sign = torch.ones(
+        quaternion.shape[0],
+        dtype=quaternion.dtype,
+        device=quaternion.device,
+    )
+    unresolved = torch.ones(
+        quaternion.shape[0],
+        dtype=torch.bool,
+        device=quaternion.device,
+    )
+    for component_index in range(4):
+        component = quaternion[:, component_index]
+        selected = unresolved & (component != 0.0)
+        sign = torch.where(selected & (component < 0.0), -sign, sign)
+        unresolved = unresolved & ~selected
+    return quaternion * sign[:, None]
+
+
+def exponential_scheduler(
+    lr_init: float,
+    lr_final: float,
+    max_steps: int = 1000000,
+    type: str = "",
+) -> Callable[[int], float]:
+    lr_init = float(lr_init)
+    lr_final = float(lr_final)
+    max_steps = max(int(max_steps), 1)
+    if not np.isfinite(lr_init) or not np.isfinite(lr_final):
+        raise ValueError(f"Invalid exponential scheduler LR endpoints: {lr_init}, {lr_final}")
+    if lr_init < 0.0 or lr_final < 0.0:
+        raise ValueError("Exponential scheduler requires non-negative LR endpoints: " f"{lr_init}, {lr_final}")
+
+    def helper(step: int) -> float:
         t = np.clip(step / max_steps, 0, 1)
         log_lerp = np.exp(np.log(lr_init) * (1 - t) + np.log(lr_final) * t)
         return log_lerp
@@ -150,7 +293,8 @@ def jet_map(map: torch.Tensor, max_val: float) -> torch.Tensor:
 
 def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb):
     timestamp = datetime.now().strftime("%d%m_%H%M%S")
-    run_name = f"{object_name}-" + timestamp
+    name_prefix = f"{experiment_name}-{object_name}" if experiment_name else object_name
+    run_name = f"{name_prefix}-{timestamp}"
 
     assert out_dir is not None, "Output directory must be specified"
     out_dir = os.path.join(out_dir, experiment_name) if experiment_name else out_dir
@@ -160,12 +304,19 @@ def create_summary_writer(conf, object_name, out_dir, experiment_name, use_wandb
         import wandb
 
         wandb.login()
-        wandb.init(
+        wandb_run_id = getattr(conf, "wandb_run_id", "")
+        wandb_resume = getattr(conf, "wandb_resume", "allow")
+        wandb_resume_kwargs = {"id": wandb_run_id, "resume": wandb_resume} if wandb_run_id else {}
+        wandb_group = getattr(conf, "wandb_group", "") or experiment_name
+        wandb_run = wandb.init(
             config=OmegaConf.to_container(DictConfig(conf)),
             project=conf.wandb_project,
-            group=experiment_name,
+            group=wandb_group,
             name=run_name,
+            **wandb_resume_kwargs,
         )
+        wandb_run.define_metric("train/iteration")
+        wandb_run.define_metric("*", step_metric="train/iteration")
         wandb.tensorboard.patch(root_logdir=out_dir, save=False)
 
     writer = SummaryWriter(log_dir=out_dir)

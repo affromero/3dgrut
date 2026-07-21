@@ -69,15 +69,27 @@ inline void* voidDataPtr(torch::Tensor& tensor) {
     if (tensor.size(0) == 0) {
         return nullptr;
     }
+    TORCH_CHECK(
+        tensor.is_contiguous(),
+        "3DGUT native tensors must be contiguous; got shape ",
+        tensor.sizes(),
+        " with strides ",
+        tensor.strides(),
+        ".");
+    TORCH_CHECK(
+        tensor.is_cuda(),
+        "3DGUT native tensors must reside on CUDA; got device ",
+        tensor.device(),
+        ".");
     switch (tensor.scalar_type()) {
     case torch::kFloat32:
-        return tensor.contiguous().data_ptr<float>();
+        return tensor.data_ptr<float>();
     case torch::kHalf:
-        return tensor.contiguous().data_ptr<torch::Half>();
+        return tensor.data_ptr<torch::Half>();
     case torch::kInt32:
-        return tensor.contiguous().data_ptr<int32_t>();
+        return tensor.data_ptr<int32_t>();
     case torch::kInt64:
-        return tensor.contiguous().data_ptr<int64_t>();
+        return tensor.data_ptr<int64_t>();
     // case torch::kUInt32:
     //     return tensor.contiguous().data_ptr<uint32_t>();
     // case torch::kUInt64:
@@ -95,6 +107,147 @@ torch::Tensor particleRadianceKernelTensor(const torch::Tensor& particleRadiance
     return particleRadiance.scalar_type() == torch::kFloat32 ? particleRadiance.contiguous()
                                                              : particleRadiance.to(torch::kFloat32).contiguous();
 #endif
+}
+
+void validateCudaTensor(
+    const torch::Tensor& tensor,
+    const char* name,
+    c10::ScalarType scalarType,
+    int cudaDeviceIndex) {
+    TORCH_CHECK(
+        tensor.is_cuda(),
+        name,
+        " must reside on CUDA; got ",
+        tensor.device(),
+        ".");
+    TORCH_CHECK(
+        tensor.get_device() == cudaDeviceIndex,
+        name,
+        " must share CUDA device ",
+        cudaDeviceIndex,
+        "; got ",
+        tensor.device(),
+        ".");
+    TORCH_CHECK(
+        tensor.scalar_type() == scalarType,
+        name,
+        " has dtype ",
+        tensor.scalar_type(),
+        "; expected ",
+        scalarType,
+        ".");
+    TORCH_CHECK(
+        tensor.is_contiguous(),
+        name,
+        " must be contiguous; got shape ",
+        tensor.sizes(),
+        " with strides ",
+        tensor.strides(),
+        ".");
+}
+
+void validateTraceInputs(
+    int numActiveFeatures,
+    const torch::Tensor& particleDensity,
+    const torch::Tensor& particleRadiance,
+    const torch::Tensor& rayOrigin,
+    const torch::Tensor& rayDirection,
+    const torch::Tensor& rayTimestamp,
+    const torch::Tensor& sensorsStartPose,
+    const torch::Tensor& sensorsEndPose) {
+    TORCH_CHECK(
+        rayOrigin.is_cuda(),
+        "rayOrigin must reside on CUDA before selecting a stream.");
+    const int cudaDeviceIndex = rayOrigin.get_device();
+    validateCudaTensor(
+        rayOrigin, "rayOrigin", torch::kFloat32, cudaDeviceIndex);
+    validateCudaTensor(
+        rayDirection, "rayDirection", torch::kFloat32, cudaDeviceIndex);
+    validateCudaTensor(
+        rayTimestamp, "rayTimestamp", torch::kInt64, cudaDeviceIndex);
+    validateCudaTensor(
+        particleDensity,
+        "particleDensity",
+        torch::kFloat32,
+        cudaDeviceIndex);
+    validateCudaTensor(
+        particleRadiance,
+        "particleRadiance",
+        torch::kFloat32,
+        cudaDeviceIndex);
+    TORCH_CHECK(
+        sensorsStartPose.scalar_type() == torch::kFloat32 &&
+            sensorsStartPose.is_contiguous(),
+        "sensorsStartPose must be contiguous float32; got ",
+        sensorsStartPose.scalar_type(),
+        " with strides ",
+        sensorsStartPose.strides(),
+        ".");
+    TORCH_CHECK(
+        sensorsEndPose.scalar_type() == torch::kFloat32 &&
+            sensorsEndPose.is_contiguous(),
+        "sensorsEndPose must be contiguous float32; got ",
+        sensorsEndPose.scalar_type(),
+        " with strides ",
+        sensorsEndPose.strides(),
+        ".");
+
+    TORCH_CHECK(
+        rayOrigin.dim() == 4 && rayOrigin.size(0) == 1 &&
+            rayOrigin.size(3) == 3,
+        "rayOrigin must have shape [1, H, W, 3], got ",
+        rayOrigin.sizes(),
+        ".");
+    TORCH_CHECK(
+        rayDirection.sizes() == rayOrigin.sizes(),
+        "rayDirection must match rayOrigin shape ",
+        rayOrigin.sizes(),
+        "; got ",
+        rayDirection.sizes(),
+        ".");
+    TORCH_CHECK(
+        rayTimestamp.dim() == 4 &&
+            rayTimestamp.size(0) == rayOrigin.size(0) &&
+            rayTimestamp.size(1) == rayOrigin.size(1) &&
+            rayTimestamp.size(2) == rayOrigin.size(2) &&
+            rayTimestamp.size(3) == 1,
+        "rayTimestamp must have shape [1, H, W, 1] matching the rays; got ",
+        rayTimestamp.sizes(),
+        ".");
+    TORCH_CHECK(
+        particleDensity.dim() == 2 && particleDensity.size(1) == 12,
+        "particleDensity must have shape [N, 12], got ",
+        particleDensity.sizes(),
+        ".");
+    TORCH_CHECK(
+        particleRadiance.dim() == 2 &&
+            particleRadiance.size(0) == particleDensity.size(0),
+        "particleRadiance must have shape [N, C] matching particleDensity; "
+        "got ",
+        particleRadiance.sizes(),
+        ".");
+    TORCH_CHECK(
+        numActiveFeatures >= 0,
+        "numActiveFeatures cannot be negative.");
+    const int expectedRadianceWidth =
+        3 * PARTICLE_RADIANCE_NUM_COEFFS;
+    TORCH_CHECK(
+        particleRadiance.size(1) == expectedRadianceWidth,
+        "particleRadiance width ",
+        particleRadiance.size(1),
+        " does not match the compiled radiance width ",
+        expectedRadianceWidth,
+        ".");
+    TORCH_CHECK(
+        sensorsStartPose.numel() == 7,
+        "sensorsStartPose must contain one seven-value pose, got ",
+        sensorsStartPose.sizes(),
+        ".");
+    TORCH_CHECK(
+        sensorsEndPose.numel() == 7,
+        "sensorsEndPose must contain one seven-value pose, got ",
+        sensorsEndPose.sizes(),
+        ".");
 }
 
 using DeviceQueueHandle = uint64_t;
@@ -180,7 +333,7 @@ SplatRaster::SplatRaster(const nlohmann::json& config)
 SplatRaster::~SplatRaster(void) {
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
                    torch::Tensor particleDensity,
                    torch::Tensor particleRadiance,
@@ -193,6 +346,15 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
                    torch::Tensor sensorsStartPose,
                    torch::Tensor sensorsEndPose) {
 
+    validateTraceInputs(
+        numActiveFeatures,
+        particleDensity,
+        particleRadiance,
+        rayOrigin,
+        rayDirection,
+        rayTimestamp,
+        sensorsStartPose,
+        sensorsEndPose);
     const int cudaDeviceIndex = rayOrigin.get_device();
     cudaStream_t cudaStream   = at::cuda::getCurrentCUDAStream(cudaDeviceIndex);
 
@@ -209,13 +371,14 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
     const torch::TensorOptions featureOpts = opts;
 #endif
 
-    torch::Tensor rayRadianceDensity     = torch::zeros({height, width, static_cast<int64_t>(RAY_FEATURE_DIM + 1)}, featureOpts);
-    torch::Tensor rayHitDistance         = torch::ones({height, width, 1}, opts).multiply(1e06f);
-    torch::Tensor rayHitCount            = torch::zeros({height, width, 1}, opts);
-    torch::Tensor particleVisibility     = torch::zeros({numParticles, 1}, opts);
-    torch::Tensor particleProjectedPosition = torch::zeros({numParticles, 2}, opts);
-    torch::Tensor particleProjectedExtent   = torch::zeros({numParticles, 2}, opts);
-    torch::Tensor particleTilesCount        = torch::zeros(
+    torch::Tensor rayRadianceDensity            = torch::zeros({height, width, static_cast<int64_t>(RAY_FEATURE_DIM + 1)}, featureOpts);
+    torch::Tensor rayHitDistance                = torch::ones({height, width, 1}, opts).multiply(1e06f);
+    torch::Tensor rayHitCount                   = torch::zeros({height, width, 1}, opts);
+    torch::Tensor particleVisibility            = torch::zeros({numParticles, 1}, opts);
+    torch::Tensor particleProjectedPosition     = torch::zeros({numParticles, 2}, opts);
+    torch::Tensor particleProjectedConicOpacity = torch::zeros({numParticles, 4}, opts);
+    torch::Tensor particleProjectedExtent       = torch::zeros({numParticles, 2}, opts);
+    torch::Tensor particleTilesCount            = torch::zeros(
         {numParticles, 1},
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
     torch::Tensor particleRadianceKernel = particleRadianceKernelTensor(particleRadiance);
@@ -253,6 +416,7 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         reinterpret_cast<TFeatureDensityElem*>(voidDataPtr(rayRadianceDensity)),
         reinterpret_cast<int*>(voidDataPtr(particleVisibility)),
         reinterpret_cast<tcnn::vec2*>(voidDataPtr(particleProjectedPosition)),
+        reinterpret_cast<tcnn::vec4*>(voidDataPtr(particleProjectedConicOpacity)),
         reinterpret_cast<tcnn::vec2*>(voidDataPtr(particleProjectedExtent)),
         reinterpret_cast<int*>(voidDataPtr(particleTilesCount)),
         m_parameters,
@@ -265,12 +429,13 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         timer->stop();
     }
 
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
         rayRadianceDensity,
         rayHitDistance,
         rayHitCount,
         particleVisibility,
         particleProjectedPosition,
+        particleProjectedConicOpacity,
         particleProjectedExtent,
         particleTilesCount);
 }
@@ -287,12 +452,61 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
                       TTimestamp endTimestamp,
                       torch::Tensor sensorsStartPose,
                       torch::Tensor sensorsEndPose,
-                      // Gradients
                       torch::Tensor rayRadianceDensity,
                       torch::Tensor rayRadianceDensityGradient,
                       torch::Tensor rayHitDistance,
                       torch::Tensor rayHitDistanceGradient) {
+    torch::Tensor particlePositionGradientAbs = torch::empty(
+        {0, 3},
+        particleDensity.options());
+    return traceBwdWithAbs(
+        frameNumber,
+        numActiveFeatures,
+        particleDensity,
+        particleRadiance,
+        rayOrigin,
+        rayDirection,
+        rayTimestamp,
+        sensorModel,
+        startTimestamp,
+        endTimestamp,
+        sensorsStartPose,
+        sensorsEndPose,
+        rayRadianceDensity,
+        rayRadianceDensityGradient,
+        rayHitDistance,
+        rayHitDistanceGradient,
+        particlePositionGradientAbs);
+}
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+SplatRaster::traceBwdWithAbs(uint32_t frameNumber, int numActiveFeatures,
+                      torch::Tensor particleDensity,
+                      torch::Tensor particleRadiance,
+                      torch::Tensor rayOrigin,
+                      torch::Tensor rayDirection,
+                      torch::Tensor rayTimestamp,
+                      TSensorModel sensorModel,
+                      TTimestamp startTimestamp,
+                      TTimestamp endTimestamp,
+                      torch::Tensor sensorsStartPose,
+                      torch::Tensor sensorsEndPose,
+                      // Gradients
+                      torch::Tensor rayRadianceDensity,
+                      torch::Tensor rayRadianceDensityGradient,
+                      torch::Tensor rayHitDistance,
+                      torch::Tensor rayHitDistanceGradient,
+                      torch::Tensor particlePositionGradientAbs) {
+
+    validateTraceInputs(
+        numActiveFeatures,
+        particleDensity,
+        particleRadiance,
+        rayOrigin,
+        rayDirection,
+        rayTimestamp,
+        sensorsStartPose,
+        sensorsEndPose);
     const int cudaDeviceIndex = rayOrigin.get_device();
     cudaStream_t cudaStream   = at::cuda::getCurrentCUDAStream(cudaDeviceIndex);
 
@@ -300,6 +514,77 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
     const int height = rayOrigin.size(1);
 
     const uint32_t numParticles = particleDensity.size(0);
+
+#if FEATURE_OUTPUT_HALF
+    const c10::ScalarType rayFeatureDtype = torch::kHalf;
+#else
+    const c10::ScalarType rayFeatureDtype = torch::kFloat32;
+#endif
+    validateCudaTensor(
+        rayRadianceDensity,
+        "rayRadianceDensity",
+        rayFeatureDtype,
+        cudaDeviceIndex);
+    validateCudaTensor(
+        rayRadianceDensityGradient,
+        "rayRadianceDensityGradient",
+        torch::kFloat32,
+        cudaDeviceIndex);
+    validateCudaTensor(
+        rayHitDistance,
+        "rayHitDistance",
+        torch::kFloat32,
+        cudaDeviceIndex);
+    validateCudaTensor(
+        rayHitDistanceGradient,
+        "rayHitDistanceGradient",
+        torch::kFloat32,
+        cudaDeviceIndex);
+    TORCH_CHECK(
+        rayRadianceDensity.dim() == 3 &&
+            rayRadianceDensity.size(0) == height &&
+            rayRadianceDensity.size(1) == width &&
+            rayRadianceDensity.size(2) == RAY_FEATURE_DIM + 1,
+        "rayRadianceDensity must have shape [H, W, RAY_FEATURE_DIM+1], got ",
+        rayRadianceDensity.sizes(),
+        ".");
+    TORCH_CHECK(
+        rayRadianceDensityGradient.sizes() ==
+            rayRadianceDensity.sizes(),
+        "rayRadianceDensityGradient must match rayRadianceDensity.");
+    TORCH_CHECK(
+        rayHitDistance.dim() == 3 &&
+            rayHitDistance.size(0) == height &&
+            rayHitDistance.size(1) == width &&
+            rayHitDistance.size(2) == 1,
+        "rayHitDistance must have shape [H, W, 1], got ",
+        rayHitDistance.sizes(),
+        ".");
+    TORCH_CHECK(
+        rayHitDistanceGradient.sizes() == rayHitDistance.sizes(),
+        "rayHitDistanceGradient must match rayHitDistance.");
+
+    TORCH_CHECK(
+        particlePositionGradientAbs.numel() == 0 ||
+            (particlePositionGradientAbs.dim() == 2 &&
+             particlePositionGradientAbs.size(0) == numParticles &&
+             particlePositionGradientAbs.size(1) == 3),
+        "particlePositionGradientAbs must be empty or have shape [",
+        numParticles,
+        ", 3], got ",
+        particlePositionGradientAbs.sizes());
+    TORCH_CHECK(
+        particlePositionGradientAbs.scalar_type() == torch::kFloat32,
+        "particlePositionGradientAbs must use float32.");
+    TORCH_CHECK(
+        particlePositionGradientAbs.is_cuda(),
+        "particlePositionGradientAbs must be a CUDA tensor.");
+    TORCH_CHECK(
+        particlePositionGradientAbs.get_device() == cudaDeviceIndex,
+        "particlePositionGradientAbs must share the ray CUDA device.");
+    TORCH_CHECK(
+        particlePositionGradientAbs.is_contiguous(),
+        "particlePositionGradientAbs must be contiguous.");
 
     const torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
 
@@ -353,6 +638,7 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
         reinterpret_cast<const float*>(voidDataPtr(rayRadianceDensityGradient)),
         rayBackpropagation ? reinterpret_cast<tcnn::vec3*>(voidDataPtr(rayOriginGradient)) : nullptr,
         rayBackpropagation ? reinterpret_cast<tcnn::vec3*>(voidDataPtr(rayDirectionGradient)) : nullptr,
+        reinterpret_cast<tcnn::vec3*>(voidDataPtr(particlePositionGradientAbs)),
         m_parameters, cudaDeviceIndex, cudaStream);
 
     CUDA_CHECK_LAST(m_logger);

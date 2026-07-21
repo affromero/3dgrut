@@ -206,9 +206,7 @@ struct GUTProjector : Params, UTParams {
                 projectedSigmaPoints[0])) {
             numValidPoints++;
         }
-        particleProjCenter = projectedSigmaPoints[0] * (Lambda / (UTParams::D + Lambda));
 
-        constexpr float weightI = 1.f / (2.f * (UTParams::D + Lambda));
 #pragma unroll
         for (int i = 0; i < UTParams::D; ++i) {
             const tcnn::vec3 delta = UTParams::Delta * particleScale[i] * particleRotation[i]; ///< CHECK : column or row ?
@@ -222,7 +220,6 @@ struct GUTProjector : Params, UTParams {
                     projectedSigmaPoints[i + 1])) {
                 numValidPoints++;
             }
-            particleProjCenter += weightI * projectedSigmaPoints[i + 1];
 
             if (threedgut::projectPointWithShutter<UTParams::NRollingShutterIterations>(
                     particleMean - delta,
@@ -233,15 +230,17 @@ struct GUTProjector : Params, UTParams {
                     projectedSigmaPoints[i + 1 + UTParams::D])) {
                 numValidPoints++;
             }
-            particleProjCenter += weightI * projectedSigmaPoints[i + 1 + UTParams::D];
         }
 
-        if constexpr (UTParams::RequireAllSigmaPoints) {
-            if (numValidPoints < (2 * UTParams::D + 1)) {
-                return false;
-            }
-        } else if (numValidPoints == 0) {
+        if (numValidPoints < (2 * UTParams::D + 1)) {
             return false;
+        }
+
+        particleProjCenter = projectedSigmaPoints[0] * (Lambda / (UTParams::D + Lambda));
+        constexpr float weightI = 1.f / (2.f * (UTParams::D + Lambda));
+#pragma unroll
+        for (int i = 1; i < 2 * UTParams::D + 1; ++i) {
+            particleProjCenter += weightI * projectedSigmaPoints[i];
         }
 
         // Equirectangular seam handling: sigma points straddling the +-180 deg

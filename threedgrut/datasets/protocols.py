@@ -30,7 +30,9 @@ class Batch:
     rgb_gt: Optional[torch.Tensor] = None
     depth_gt: Optional[torch.Tensor] = None  # [B, H, W, 1] metric axial depth (m)
     depth_ray_z: Optional[torch.Tensor] = None  # [B, H, W, 1] |ray_z| in camera space
+    range_return_weight: Optional[torch.Tensor] = None  # [B, H, W, 1] per-pixel loss weight
     mask: Optional[torch.Tensor] = None
+    sky_mask: Optional[torch.Tensor] = None
     intrinsics: Optional[list] = None
     intrinsics_OpenCVPinholeCameraModelParameters: Optional[dict] = None
     intrinsics_OpenCVFisheyeCameraModelParameters: Optional[dict] = None
@@ -39,7 +41,10 @@ class Batch:
     intrinsics_EquirectCameraModelParameters: Optional[dict] = None
     # Camera/frame indices for post-processing
     camera_idx: int = -1  # 0-based camera index
+    post_processing_camera_idx: int = -1  # physical-camera index
     frame_idx: int = -1  # 0-based frame index (global across split)
+    sequence_idx: int = -1  # Parsed scanner sequence index from image name
+    image_path: str = ""  # Source image path for logging and diagnostics
     # Pixel coordinates for post-processing
     pixel_coords: Optional[torch.Tensor] = None  # [B, H, W, 2] (x, y) with +0.5 center offset
     # Exposure prior from EXIF metadata (mean-normalized log2 exposure [1], None if unavailable)
@@ -58,6 +63,9 @@ class Batch:
         if self.depth_ray_z is not None:
             assert self.depth_ray_z.ndim == 4, "depth_ray_z must be a 4D tensor [B, H, W, 1]"
             assert self.depth_ray_z.shape[0] == batch_size, "depth_ray_z must have the same batch size"
+        if self.range_return_weight is not None:
+            assert self.range_return_weight.ndim == 4, "range_return_weight must be a 4D tensor [B, H, W, 1]"
+            assert self.range_return_weight.shape[0] == batch_size, "range_return_weight must have the same batch size"
         if self.mask is not None:
             assert self.mask.ndim == 4, "mask must be a 3D tensor [B, H, W, 1]"
             assert self.mask.shape[0] == batch_size, "mask must have the same batch size"
@@ -83,6 +91,10 @@ class BoundedMultiViewDataset(Protocol):
 
     def get_observer_points(self) -> np.ndarray:
         """TODO"""
+        ...
+
+    def get_image_names(self) -> list[str]:
+        """Return exact image identities after split and exclusion filters."""
         ...
 
     def get_poses(self) -> np.ndarray:

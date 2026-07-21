@@ -74,6 +74,7 @@ export_usd:
   frames_per_second: 1.0
 
 model:
+  representation: gaussian_mixture
   density_activation: sigmoid
   scale_activation: exp
   default_density: 0.1
@@ -91,6 +92,7 @@ model:
   use_gabor_carrier: false
   gabor_num_terms: 3
   gabor_max_frequency: 4.0
+  use_hermite_carrier: false
   use_siren_carrier: false
   siren_hidden_dim: 6
   siren_omega: 30.0
@@ -98,6 +100,69 @@ model:
   siren_init_seed: 20260626
   siren_init_scale: 0.2
   siren_output_init_scale: 0.0
+  # Held-out-predictive B2G appearance state. Each Gaussian owns two bounded
+  # RGB response directions; each physical camera owns two global temporal
+  # coefficient splines. Zero temporal knots preserve the input checkpoint
+  # exactly. This continuation representation requires fixed topology and an
+  # explicit bake before static export.
+  acquisition_appearance:
+    enabled: false
+    rank: 2
+    num_cameras: 3
+    num_knots: 32
+    min_sequence_idx: 7
+    max_sequence_idx: 278
+    max_rgb_delta: 0.25
+    magnitude_regularization: 0.01
+    curvature_regularization: 0.05
+    freeze_base_gaussians: true
+  # Held-out-predictive B2G fragment ownership. Each Gaussian owns four
+  # bounded opacity-logit responses; each physical camera owns four smooth
+  # temporal coefficient splines. Zero spatial responses preserve the input
+  # checkpoint exactly even though the temporal bases break factorization
+  # symmetry. This correction requires sigmoid density activation.
+  acquisition_visibility:
+    enabled: false
+    rank: 4
+    num_cameras: 3
+    num_knots: 32
+    min_sequence_idx: 7
+    max_sequence_idx: 278
+    max_logit_delta: 4.0
+    response_sparsity_regularization: 0.001
+    magnitude_regularization: 0.01
+    curvature_regularization: 0.05
+    freeze_base_gaussians: true
+  # Faithful surface-local realization of the source-validated acquisition
+  # model. Each Gaussian and physical camera own independent rank-two
+  # coefficient knots. Held-out acquisition states interpolate only their
+  # registered lower and upper knots.
+  surface_acquisition_spline:
+    enabled: false
+    rank: 2
+    num_cameras: 3
+    num_knots: 32
+    min_sequence_idx: 7
+    max_sequence_idx: 278
+    max_rgb_delta: 0.25
+    magnitude_regularization: 0.01
+    curvature_regularization: 0.05
+    freeze_base_gaussians: true
+  # Source-cross-validated B2G appearance state shared by persistent
+  # native-LiDAR region-cells. Track zero is an immutable abstention state.
+  # The track map is stored in checkpoints and must match the fixed topology.
+  gaussian_track_acquisition:
+    enabled: false
+    track_ids_path: ""
+    track_ids_sha256: ""
+    num_cameras: 3
+    num_knots: 32
+    min_sequence_idx: 7
+    max_sequence_idx: 278
+    max_rgb_delta: 0.15
+    magnitude_regularization: 0.01
+    curvature_regularization: 0.10
+    freeze_parent: true
   progressive_training:
     init_n_features: 0 # sh: initial sh deg | mlp: num of dims initially unmasked
     max_n_features: 3 # sh: maximum sh deg | mlp: total num of dims finally unmasked
@@ -137,15 +202,52 @@ model:
     name: background-color # one of [skip-background, background-color]
     color: black # one of [black, white, random] needs to be defined if name == background-color
 
+  anchor_field:
+    source_manifest_path: ""
+    fold_contract_sha256: ""
+    voxel_size_m: 0.15
+    offsets_per_anchor: 4
+    feature_dim: 32
+    hidden_dim: 64
+    max_offset_fraction: 0.5
+    initial_scale_fraction: 0.15
+    min_scale_fraction: 0.02
+    max_scale_fraction: 0.35
+    coverage_scale_fraction: 0.45
+    coverage_max_scale_fraction: 0.75
+    coverage_initial_density: 0.03
+    coverage_max_density: 0.12
+    detail_initial_density: 0.10
+    # Exact transfer of the supported B2G view-local structural treatment.
+    # The gate is opt-in and applies only to residual surface anchors.
+    use_view_local_residual_gate: false
+    view_local_clearance_radius_m: 1.0
+    # Source DC can remain fixed or receive a bounded, view-independent delta.
+    dc_mode: frozen_source
+    dc_delta_max_sh: 1.77245385
+    dc_lr: 0.0025
+    # One isotropic coverage child plus three thin surface detail children is
+    # the controlled hybrid treatment. all_surface reproduces the earlier
+    # all-child thinning arm; free leaves every child unconstrained.
+    covariance_mode: free
+    optimization_mode: full
+    normal_scale_fraction: 0.02
+    feature_lr: 0.0025
+    geometry_lr: 0.001
+    appearance_lr: 0.0025
+
   print_stats: true
 
 checkpoint:
   iterations: ${int_list:[ 7000, 30000 ]}
 
 optimizer:
-  type: adam # We only support adam and selective_adam for now
+  type: adam # adam, selective_adam, or visibility_decayed_adam
   lr: 0.0
+  betas: [0.9, 0.999]
   eps: 1.e-15
+  resume_lr_scale: 1.0
+  scale_position_lr_by_scene_extent: true
   params:
     positions:
       lr: 0.00016 # 3DGS value: 0.00016 initial and decayed to 0.0000016
@@ -157,6 +259,14 @@ optimizer:
       lr: ${div:${optimizer.params.features_albedo.lr},20} # 3DGS value 20x smaller than lr of features_albedo
     features:
       lr: 0.015
+    acquisition_appearance:
+      lr: 0.0025
+    acquisition_visibility:
+      lr: 0.0025
+    surface_acquisition_spline:
+      lr: 0.0025
+    gaussian_track_acquisition:
+      lr: 0.0025
     rotation:
       lr: 0.001 # 3DGS value: 0.001
     scale:
@@ -189,6 +299,14 @@ loss:
   use_ssim: true
   lambda_ssim: 0.2
 
+  use_camera_loss_weights: false
+  camera_loss_weights: []
+  # Per-image loss weights: JSON mapping image basename -> weight,
+  # multiplied into the training loss alongside camera_loss_weights.
+  # Eval/validation metrics are never weighted.
+  use_image_loss_weights: false
+  image_loss_weights_path: ""
+
   use_opacity: false
   lambda_opacity: 0.0
 
@@ -199,16 +317,96 @@ loss:
   # geometry to cure floater/leakage in weakly-constrained regions).
   use_depth: false
   lambda_depth: 0.0
-  depth_loss_type: log_l1  # log_l1 | relative_l1
-  depth_min_m: 0.05  # ignore depths below this (metres) on both pred and GT
+  depth_loss_type: log_l1
+  depth_apply_rgb_mask: true
+  depth_min_m: 0.05
+  # The tracer returns a premultiplied first depth moment. Opt in to the
+  # conditional hit estimate E[t | hit] = pred_dist / pred_opacity.
+  depth_normalize_by_opacity: false
+  depth_opacity_floor: 0.0001
+  # Moravec-Elfes range evidence: empty before the measured endpoint and
+  # occupied at the endpoint. The free-space term is a first-moment surrogate,
+  # not exact prefix transmittance.
+  use_depth_free_space: false
+  lambda_depth_free_space: 0.0
+  depth_free_space_absolute_margin_m: 0.05
+  depth_free_space_relative_margin: 0.02
+  use_depth_occupancy: false
+  lambda_depth_occupancy: 0.0
+  # Optional second forward/backward pass for sparse measured depth. The
+  # image pass remains ordinary Adam and excludes depth; this pass owns
+  # independent row-sparse moments for position, opacity, rotation, and scale.
+  # It must begin after every topology or density mutation has ended.
+  geometry_only_pass:
+    enabled: false
+    start_iteration: 15001
+    frequency: 1
+    learning_rate_scale: 1.0
+    # Optional authenticated train-only native range rays. When configured,
+    # the independent pass traces scanner-relative rays from a representative
+    # camera frame instead of projected camera-depth endpoints.
+    native_ray_evidence_folder: ""
+    native_ray_evidence_manifest_sha256: ""
+    native_ray_sample_count: 16384
+    native_ray_seed: 20260718
+    # SplatRaster first projects particles into image tiles. Native bearings
+    # therefore occupy their true full-sphere pixels instead of an unordered
+    # 1xN list whose pinhole culling would silently omit measured endpoints.
+    native_ray_equirect_width: 256
+    native_ray_equirect_height: 128
+    use_native_ray_interval_transmittance: false
+    lambda_native_ray_free_prefix: 0.05
+    lambda_native_ray_return_window: 0.005
+    native_ray_interval_probability_floor: 1.0e-6
+
+  # rim-gated geometric prior (persistent ray-distance constraint at theta>rim)
+  use_rim_depth: false
+  lambda_rim: 0.0
+  rim_theta_min_deg: 60.0
+  rim_centre_band_deg: 40.0
+  rim_centre_anchor: true
+  rim_detach_affine: false  # diagnostic: detach the centre-anchor fit so the loss cannot co-adapt the eval calibration (isolates the metric artifact)
+
+  # high-frequency appearance loss on the clean fisheye rim band
+  use_rim_hf: false
+  lambda_rim_hf: 0.0
+  rim_hf_theta_min_deg: 60.0
+  rim_hf_theta_max_deg: 80.0
+  rim_hf_kernel_size: 7
+  rim_hf_sigma: 1.5
+  rim_hf_loss_type: charbonnier
+  rim_hf_charbonnier_epsilon: 0.01
+
+  # MV-DINO multi-view-consistent feature rim loss.
+  use_mvdino_rim: false
+  lambda_mvdino_rim: 0.0
+  mvdino_model_name: dinov2_reg
+  mvdino_rim_theta_min_deg: 60.0
+  mvdino_rim_theta_max_deg: 80.0
+  mvdino_exp_dir: null
+  mvdino_warmup_iters: 3000
+  mvdino_use_rim_crops: false
+  mvdino_n_crops: 8
+  mvdino_crop_px: 518
+  mvdino_use_anyup: false
+  mvdino_anyup_res: 512
 
 # Post-processing configuration
 post_processing:
-  # null | "ppisp" | "linear-to-srgb" | "luminance_affine"
-  method: null
-  # "dataset": one bucket per dataset camera; "single_physical_camera":
-  # fold all frames into one bucket (dataset splits one physical camera).
+  method: null # Possible values: null, "ppisp", "luminance_affine"
+  # Preserve a restored post-processing module as a differentiable, fixed
+  # novel-view transform while another representation branch is trained.
+  # No per-frame latent is consulted and no post-processing optimizer exists.
+  frozen_inference_during_training: false
+  # Mapping used only by post-processing modules. Rendering still uses
+  # dataset intrinsics. Use "single_physical_camera" for monocular video
+  # COLMAP bundles whose frame-specific intrinsics create many camera_id rows.
   camera_index_mode: dataset
+  # Optional launch-contract guard for recipes with a known physical rig.
+  expected_num_cameras: null
+  # Optional ordered physical-camera names for a sealed rig contract.
+  expected_camera_names: null
+  resume_lr_scale: 1.0
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.
   use_controller: true
@@ -216,6 +414,22 @@ post_processing:
   # When > 0, enables distillation mode: Gaussians and PPISP params are frozen,
   # only the controller is trained for these additional steps.
   n_distillation_steps: 5000
+  # Opt-in held-out-predictive local affine controller. It consumes rendered
+  # RGB and physical-camera identity, has no per-frame lookup, and is active
+  # only with the PPISP controller during frozen-geometry distillation.
+  use_multiscale_controller: false
+  # Add render ray distance, opacity, and train-normalized camera pose.
+  # This requires GLOBAL shutter, camera-space rays, and no camera residual.
+  multiscale_use_view_context: false
+  multiscale_coarse_grid_size: 4
+  multiscale_fine_grid_size: 16
+  multiscale_coarse_max_log_gain: 0.04
+  multiscale_coarse_max_bias: 0.02
+  multiscale_fine_max_log_gain: 0.02
+  multiscale_fine_max_bias: 0.01
+  multiscale_magnitude_regularization: 0.01
+  multiscale_total_variation_regularization: 0.01
+  multiscale_init_seed: 20260717
   # Luminance affine parameters. Camera-only correction is the default;
   # frame residuals are optional and strongly regularized.
   lr: 0.001

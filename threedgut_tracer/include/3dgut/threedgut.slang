@@ -21,6 +21,7 @@ namespace gaussianParticle
     static const float MinParticleAlpha = GAUSSIAN_PARTICLE_MIN_ALPHA;
     static const bool EnableNormal = false;
     static const bool Surfel = false;
+    static const bool SignedRayDepth = GAUSSIAN_SIGNED_RAY_DEPTH;
 };
 
 #include <3dgut/kernels/slang/models/gaussianParticles.slang>

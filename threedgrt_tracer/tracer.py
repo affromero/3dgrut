@@ -205,12 +205,33 @@ class Tracer:
 
     def build_acc(self, gaussians, rebuild=True):
         with torch.cuda.nvtx.range(f"build-bvh-full-build-{rebuild}"):
-            allow_bvh_update = (
-                self.conf.render.max_consecutive_bvh_update > 1
-            ) and not self.conf.render.particle_kernel_density_clamping
+            # THREEDGRUT_BVH_REFIT=1: allow BVH refit (UPDATE) between true
+            # rebuilds even under density clamping. Each full rebuild is a
+            # stochastic draw against the driver-side
+            # [INTERNAL_TRAVERSAL_STACK_OVERFLOW]; refit recomputes AABBs
+            # from the current parameters but preserves tree topology, so a
+            # known-good tree stays good and the dice are only rolled when
+            # the particle set actually changes (densify/prune resizes).
+            refit_env = os.environ.get("THREEDGRUT_BVH_REFIT", "0") == "1"
+            clamping_forces_rebuild = (
+                self.conf.render.particle_kernel_density_clamping
+                and not refit_env
+            )
+            allow_bvh_update = refit_env or (
+                (self.conf.render.max_consecutive_bvh_update > 1)
+                and not self.conf.render.particle_kernel_density_clamping
+            )
+            # A refit is only valid against a tree built over the same
+            # particle set: force a rebuild on the first build and on any
+            # count change (resize paths that bypass rebuild=True).
+            num_gaussians = int(gaussians.num_gaussians)
+            count_changed = (
+                getattr(self, "_last_built_num", -1) != num_gaussians
+            )
             rebuild_bvh = (
                 rebuild
-                or self.conf.render.particle_kernel_density_clamping
+                or clamping_forces_rebuild
+                or count_changed
                 or self.num_update_bvh >= self.conf.render.max_consecutive_bvh_update
             )
             self.tracer_wrapper.build_bvh(
@@ -222,6 +243,7 @@ class Tracer:
                 allow_bvh_update,
             )
             self.num_update_bvh = 0 if rebuild_bvh else self.num_update_bvh + 1
+            self._last_built_num = num_gaussians
 
     def render(self, gaussians, gpu_batch: Batch, train=False, frame_id=0):
         num_gaussians = gaussians.num_gaussians
@@ -253,11 +275,95 @@ class Tracer:
             self.timings["forward_render"] = self.frame_timer.timing()
 
         return {
-            "pred_features": pred_features,
+            "pred_rgb": pred_features,
             "pred_opacity": pred_opacity,
             "pred_dist": pred_dist,
             "pred_normals": torch.nn.functional.normalize(pred_normals, dim=3),
             "hits_count": hits_count,
             "frame_time_ms": self.frame_timer.timing() if self.frame_timer is not None else 0.0,
             "mog_visibility": mog_visibility,
+        }
+
+    @torch.no_grad()
+    def render_diagnostic(
+        self,
+        gaussians,
+        gpu_batch: Batch,
+        frame_id: int = 0,
+        features_override=None,
+        sph_degree_override=None,
+    ):
+        """No-grad diagnostic render bypassing _Autograd, accepting overrides.
+
+        Used by the live GUI for gradient render modes: substitutes a
+        per-particle scalar-derived feature tensor and (optionally) forces
+        `sph_degree=0` so only band-0 SH evaluates. Does not affect training.
+        """
+        mog_pos = gaussians.positions.contiguous()
+        mog_rot = gaussians.get_rotation().contiguous()
+        mog_scl = gaussians.get_scale().contiguous()
+        mog_dns = gaussians.get_density().contiguous()
+        mog_sph = (
+            features_override.contiguous()
+            if features_override is not None
+            else gaussians.get_features().contiguous()
+        )
+        sph_degree = (
+            sph_degree_override
+            if sph_degree_override is not None
+            else gaussians.n_active_features
+        )
+
+        particle_density = torch.concat(
+            [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
+        )
+
+        (
+            pred_rgb,
+            pred_opacity,
+            pred_dist,
+            pred_normals,
+            hits_count,
+            _mog_visibility,
+        ) = self.tracer_wrapper.trace(
+            frame_id,
+            gpu_batch.T_to_world.contiguous(),
+            gpu_batch.rays_ori.contiguous(),
+            gpu_batch.rays_dir.contiguous(),
+            particle_density,
+            mog_sph,
+            Tracer.RenderOpts.DEFAULT,
+            sph_degree,
+            self.conf.render.min_transmittance,
+        )
+
+        pred_rgb, pred_opacity = gaussians.background(
+            gpu_batch.T_to_world.contiguous(),
+            gpu_batch.rays_dir.contiguous(),
+            pred_rgb,
+            pred_opacity,
+            False,
+        )
+
+        return {
+            "pred_rgb": pred_rgb,
+            "pred_opacity": pred_opacity,
+            "pred_dist": pred_dist[:, :, :, 0:1],
+            "pred_normals": torch.nn.functional.normalize(pred_normals, dim=3),
+            "hits_count": hits_count,
+        }
+
+    def get_bvh_stats(self) -> dict:
+        """Return per-build BVH stats from the OptiX tracer wrapper as a plain dict."""
+        try:
+            s = self.tracer_wrapper.get_bvh_stats()
+        except AttributeError:
+            return {}
+        return {
+            "last_build_time_ms": float(s.last_build_time_ms),
+            "primitive_count": int(s.primitive_count),
+            "gas_buffer_bytes": int(s.gas_buffer_bytes),
+            "gas_buffer_tmp_bytes": int(s.gas_buffer_tmp_bytes),
+            "g_prim_aabb_bytes": int(s.g_prim_aabb_bytes),
+            "last_build_was_full_rebuild": bool(s.last_build_was_full_rebuild),
         }

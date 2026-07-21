@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import copy
+import json
 import os
 from typing import Optional
 
@@ -27,12 +28,14 @@ from ncore.data import (
     ShutterType,
 )
 from PIL import Image
+from scipy.spatial.transform import Rotation, Slerp
 from torch.utils.data import Dataset
 
 from threedgrut.utils.logger import logger
 
 from .colmap_gsplat import normalize_world_space, scene_scale
 from .protocols import Batch, BoundedMultiViewDataset, DatasetVisualization
+from .rs_rays import build_rs_world_rays
 from .utils import (
     compute_fisheye_max_angle,
     create_camera_visualization,
@@ -50,12 +53,36 @@ from .utils import (
 )
 
 
+_CANONICAL_FLAT_PHYSICAL_CAMERA_NAMES = ("front", "left", "right")
+_SOFT_MASK_CONTRACT_FILENAME = "soft_training_masks.json"
+_SOFT_MASK_SEMANTICS = "solid_angle_partition_of_unity_loss_weight_v1"
+
+
 def _read_rgb_image_array(image_path: str) -> np.ndarray:
     """Read an image as uint8 RGB, dropping alpha channels if present."""
     with Image.open(image_path) as image:
         if image.mode != "RGB":
             image = image.convert("RGB")
         return np.array(image, copy=True)
+
+
+def _interp_c2w_knots(slerp, rel_stamps, translations, query_stamps):
+    """Interpolate camera-to-world matrices from knot poses.
+
+    Args:
+        slerp: scipy Slerp over the knot rotations.
+        rel_stamps: [J] knot stamps (seconds, relative to the frame stamp).
+        translations: [J, 3] knot camera centers.
+        query_stamps: [Q] query stamps within the knot span.
+
+    Returns:
+        [Q, 4, 4] camera-to-world matrices.
+    """
+    matrices = np.repeat(np.eye(4)[None], len(query_stamps), axis=0)
+    matrices[:, :3, :3] = slerp(query_stamps).as_matrix()
+    for axis in range(3):
+        matrices[:, axis, 3] = np.interp(query_stamps, rel_stamps, translations[:, axis])
+    return matrices
 
 
 def _get_relative_paths(path_dir: str) -> list[str]:
@@ -133,9 +160,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         camera_ids: Optional[list[int]] = None,
         normalize_world_space: bool = False,
         gsplat_image_downscale: bool = False,
+        sky_mask_folder: Optional[str] = None,
         train_exclude_image_list_path=None,
+        train_focus_image_list_path: Optional[str] = None,
+        train_focus_image_weight: float = 1.0,
         holdout_image_list_path=None,
         depth_folder: Optional[str] = None,
+        shutter_type: str = "GLOBAL",
+        rs_ray_injection: bool = False,
+        blur_samples: int = 1,
     ):
         self.path = path
         self.device = device
@@ -149,10 +182,27 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.normalize_world_space = bool(normalize_world_space)
         self.gsplat_image_downscale = gsplat_image_downscale
         self.world_normalization_transform = np.eye(4, dtype=np.float32)
-        self.train_exclude_image_list_path = train_exclude_image_list_path
-        self.holdout_image_list_path = holdout_image_list_path
+        self.sky_mask_folder = sky_mask_folder
         self.depth_folder = depth_folder
         self.depth_paths = None
+        self.train_exclude_image_list_path = train_exclude_image_list_path
+        self.train_focus_image_list_path = train_focus_image_list_path
+        self.holdout_image_list_path = holdout_image_list_path
+        self.shutter_type = ShutterType[shutter_type].name
+        self.rs_ray_injection = rs_ray_injection
+        self.blur_samples = int(blur_samples)
+        self.preserve_soft_training_masks = self._validate_soft_training_mask_contract()
+        if self.blur_samples < 1:
+            raise ValueError(f"blur_samples must be >= 1, got {self.blur_samples}.")
+        if self.blur_samples > 1 and not rs_ray_injection:
+            raise ValueError(
+                "blur_samples > 1 requires the 3dgrt ray-injection path "
+                "(rs_ray_injection=True); the UT splat path has no "
+                "exposure-time sampling."
+            )
+        self.train_focus_image_weight = float(train_focus_image_weight)
+        if self.train_focus_image_weight <= 0.0:
+            raise ValueError(f"train_focus_image_weight must be positive, got {self.train_focus_image_weight}")
 
         # Worker-based GPU cache for multiprocessing compatibility
         self._worker_gpu_cache = {}
@@ -173,6 +223,8 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # This is needed for post-processing which expects 0-based camera indices
         sorted_camera_ids = sorted(self.cam_intrinsics.keys())
         self._camera_id_to_idx = {cam_id: idx for idx, cam_id in enumerate(sorted_camera_ids)}
+        physical_camera_keys = sorted({self._post_processing_camera_key(extr) for extr in self.cam_extrinsics})
+        self._post_processing_camera_key_to_idx = {key: idx for idx, key in enumerate(physical_camera_keys)}
 
         self.n_frames = len(self.cam_extrinsics)
         self.load_camera_data()
@@ -217,15 +269,18 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         self.cam_extrinsics = [self.cam_extrinsics[i] for i in np.where(indices)[0]]
         self.poses = self.poses[indices].astype(np.float32)
+        if self.poses_end is not None:
+            self.poses_end = self.poses_end[indices].astype(np.float32)
 
         # numpy str array of image paths and mask paths
         self.image_paths = self.image_paths[indices]
         self.mask_paths = self.mask_paths[indices]
+        if self.sky_mask_paths is not None:
+            self.sky_mask_paths = self.sky_mask_paths[indices]
         if self.depth_paths is not None:
             self.depth_paths = self.depth_paths[indices]
 
         self.camera_centers = self.camera_centers[indices]
-        self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
 
         # Apply split indices to EXIF exposures
         if self._all_exif_exposures is not None:
@@ -238,6 +293,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         if self.split == "train":
             self.apply_train_exclude_image_list()
+
+        # Train-only exclusions must be applied before scene normalization.
+        # Otherwise embargoed or outer-holdout camera poses influence the
+        # scene extent and position learning-rate scale of an inner-fold run.
+        self.center, self.length_scale, self.scene_bbox = (
+            self.compute_spatial_extents()
+        )
+        _, diagonal = get_center_and_diag(self.camera_centers)
+        self.cameras_extent = diagonal * 1.1
 
         # Update the number of frames to only include the samples from the split
         self.n_frames = self.poses.shape[0]
@@ -287,8 +351,12 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         logger.info(f"Excluded {dropped} train images from {self.train_exclude_image_list_path}")
         self.cam_extrinsics = [extrinsic for extrinsic, keep_item in zip(self.cam_extrinsics, keep) if keep_item]
         self.poses = self.poses[keep].astype(np.float32)
+        if self.poses_end is not None:
+            self.poses_end = self.poses_end[keep].astype(np.float32)
         self.image_paths = self.image_paths[keep]
         self.mask_paths = self.mask_paths[keep]
+        if self.sky_mask_paths is not None:
+            self.sky_mask_paths = self.sky_mask_paths[keep]
         if self.depth_paths is not None:
             self.depth_paths = self.depth_paths[keep]
         self.camera_centers = self.camera_centers[keep]
@@ -333,6 +401,55 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             cameras_intrinsic_file = os.path.join(self.path, "sparse/0", "cameras.txt")
             self.cam_extrinsics = read_colmap_extrinsics_text(cameras_extrinsic_file)
             self.cam_intrinsics = read_colmap_intrinsics_text(cameras_intrinsic_file)
+
+        # Optional per-frame shutter END poses for rolling-shutter studies.
+        # sparse/0/images_end.txt uses the images.txt format and holds the
+        # END (t=+0.5) pose per frame, keyed by image name; absent -> global.
+        end_file = os.path.join(self.path, "sparse/0", "images_end.txt")
+        if os.path.exists(end_file):
+            self._end_pose_by_name = {e.name: e for e in read_colmap_extrinsics_text(end_file)}
+        else:
+            self._end_pose_by_name = None
+
+        # Exposure-trajectory blur sampling: sparse/0/pose_knots.json holds
+        # per-frame camera-to-world knot poses on stamps relative to each
+        # frame's capture stamp. K (start, end) pose pairs per frame are
+        # precomputed here — sample k starts at offset (k+0.5)/K * t_exp and,
+        # under a ROLLING shutter, ends one readout later — and the fetch
+        # path turns each pair into one RS ray bundle ([K, H, W, 3] total);
+        # the trainer averages the K renders before any loss.
+        self._blur_pose_pairs = None
+        if self.blur_samples > 1:
+            knots_file = os.path.join(self.path, "sparse/0", "pose_knots.json")
+            if not os.path.exists(knots_file):
+                raise FileNotFoundError(
+                    f"blur_samples={self.blur_samples} requires {knots_file}; "
+                    "emit it with `hilti_ingest colmapize` (pose-knot sidecar)."
+                )
+            with open(knots_file, "r", encoding="utf-8") as f:
+                knots = json.load(f)
+            readout_s = float(knots["readout_s"])
+            rel_stamps = np.asarray(knots["knot_stamps_rel_s"], dtype=np.float64)
+            rolling = self.shutter_type != ShutterType.GLOBAL.name
+            self._blur_pose_pairs = {}
+            for name, frame in knots["frames"].items():
+                t_exp = float(frame["t_exp_s"])
+                offsets = (np.arange(self.blur_samples, dtype=np.float64) + 0.5) / self.blur_samples * t_exp
+                last_query = offsets[-1] + (readout_s if rolling else 0.0)
+                if last_query > rel_stamps[-1]:
+                    raise ValueError(
+                        f"pose_knots.json span [0, {rel_stamps[-1]:.4f}]s does "
+                        f"not cover sample offset {last_query:.4f}s for "
+                        f"'{name}'; re-emit knots with a larger t_exp margin."
+                    )
+                slerp = Slerp(
+                    rel_stamps,
+                    Rotation.from_quat(np.asarray(frame["c2w_q_xyzw"], dtype=np.float64)),
+                )
+                translations = np.asarray(frame["c2w_t"], dtype=np.float64)
+                starts = _interp_c2w_knots(slerp, rel_stamps, translations, offsets)
+                ends = _interp_c2w_knots(slerp, rel_stamps, translations, offsets + readout_s) if rolling else starts
+                self._blur_pose_pairs[name] = torch.tensor(np.stack([starts, ends], axis=1), dtype=torch.float32)
 
     def _camera_names_by_id(self) -> dict[int, str]:
         sorted_camera_ids = sorted(self.cam_intrinsics.keys())
@@ -399,6 +516,103 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     def get_images_folder(self):
         downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
         return f"images{downsample_suffix}"
+
+    def get_masks_folder(self):
+        downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
+        return f"masks{downsample_suffix}"
+
+    def get_sky_masks_folder(self):
+        if self.sky_mask_folder is not None:
+            return self.sky_mask_folder
+        downsample_suffix = "" if self.downsample_factor == 1 else f"_{self.downsample_factor}"
+        return f"sky_masks{downsample_suffix}"
+
+    def resolve_mask_path(self, image_path, image_name):
+        colmap_mask_path = os.path.join(self.path, self.get_masks_folder(), image_name)
+        if os.path.exists(colmap_mask_path):
+            return colmap_mask_path
+        return os.path.splitext(image_path)[0] + "_mask.png"
+
+    def _validate_soft_training_mask_contract(self) -> bool:
+        contract_path = os.path.join(
+            self.path,
+            _SOFT_MASK_CONTRACT_FILENAME,
+        )
+        if not os.path.isfile(contract_path):
+            return False
+        with open(contract_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != 1
+            or payload.get("mask_semantics") != _SOFT_MASK_SEMANTICS
+            or payload.get("intended_split") != "training_only"
+        ):
+            raise ValueError(
+                "Invalid soft training-mask contract: "
+                f"{contract_path}"
+            )
+        return True
+
+    @staticmethod
+    def _normalize_training_mask(
+        mask: torch.Tensor,
+        *,
+        preserve_soft_weights: bool,
+    ) -> torch.Tensor:
+        normalized = mask / 255.0
+        if preserve_soft_weights:
+            return normalized.to(torch.float32)
+        return (normalized > 0.5).to(torch.float32)
+
+    def resolve_sky_mask_path(self, image_name):
+        return os.path.join(self.path, self.get_sky_masks_folder(), image_name)
+
+    def resolve_depth_path(self, image_name):
+        if self.depth_folder is None:
+            return ""
+        depth_stem = os.path.splitext(image_name)[0] + ".npy"
+        direct = os.path.join(self.path, self.depth_folder, depth_stem)
+        if os.path.exists(direct):
+            return direct
+        flat_stem = os.path.splitext(os.path.basename(image_name))[0]
+        camera_name, separator, frame_name = flat_stem.rpartition("_")
+        if separator and camera_name and frame_name.isdigit():
+            candidate = os.path.join(
+                self.path,
+                self.depth_folder,
+                camera_name,
+                "depth",
+                f"{frame_name}.npy",
+            )
+            if os.path.exists(candidate):
+                return candidate
+        parts = image_name.replace("\\", "/").split("/")
+        if len(parts) >= 2:
+            camera_name = parts[-2]
+            frame_name = os.path.splitext(parts[-1])[0] + ".npy"
+            candidate = os.path.join(
+                self.path,
+                self.depth_folder,
+                camera_name,
+                "depth_zext",
+                frame_name,
+            )
+            if os.path.exists(candidate):
+                return candidate
+        return direct
+
+    def load_b2g_camera_rotations(self):
+        metadata_path = os.path.join(self.path, "b2g_camera_models.json")
+        if not os.path.exists(metadata_path):
+            return {}
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        cameras = metadata.get("cameras", {})
+        return {
+            int(camera_id): int(camera.get("image_rotation_quadrants_cw", 0)) % 4
+            for camera_id, camera in cameras.items()
+        }
 
     def load_camera_data(self):
         """
@@ -521,7 +735,10 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 radial_coeffs=radial_coeffs,
                 resolution=resolution,
                 max_angle=max_angle,
-                shutter_type=ShutterType.GLOBAL,
+                # Inherit the configured shutter (dataset.shutter_type) so a
+                # ROLLING fisheye scene consumes images_end.txt; the other
+                # camera creators keep GLOBAL until they need RS support.
+                shutter_type=ShutterType[self.shutter_type],
             )
             camera_model = ncore.sensors.CameraModel.from_parameters(params, device="cpu", dtype=torch.float32)
             int_pixel_coords = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
@@ -537,7 +754,138 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 pixel_coords,
             )
 
+        def rational_project_xy(x, y, params):
+            fx, fy, cx, cy = params[:4]
+            b1, b2, b3 = params[4:7]
+            d1, d2, d3 = params[7:10]
+            a1, a2 = params[10:12]
+            p1, p2 = params[12:14]
+            skew = params[14]
+            r2 = x * x + y * y
+            r4 = r2 * r2
+            r6 = r4 * r2
+            numerator = 1.0 + b1 * r2 + b2 * r4 + b3 * r6
+            denominator = 1.0 + d1 * r2 + d2 * r4 + d3 * r6
+            denominator = np.where(np.abs(denominator) > 1e-12, denominator, 1.0)
+            radial = numerator / denominator
+            affine = 1.0 + a1 * r2 + a2 * r4
+            x_distorted = x * radial + affine * (p2 * (r2 + 2.0 * x * x) + 2.0 * p1 * x * y)
+            y_distorted = y * radial + affine * (p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y)
+            u = fx * x_distorted + skew * y_distorted + cx
+            v = fy * y_distorted + cy
+            return u, v
+
+        def invert_rational_pixels(u, v, params, num_iterations=8):
+            fx, fy, cx, cy = params[:4]
+            skew = params[14]
+            y_distorted = (v - cy) / fy
+            x_distorted = (u - cx - skew * y_distorted) / fx
+            x = x_distorted.copy()
+            y = y_distorted.copy()
+            eps = 1e-5
+
+            for _ in range(num_iterations):
+                pred_u, pred_v = rational_project_xy(x, y, params)
+                residual_u = pred_u - u
+                residual_v = pred_v - v
+
+                pred_u_dx, pred_v_dx = rational_project_xy(x + eps, y, params)
+                pred_u_dy, pred_v_dy = rational_project_xy(x, y + eps, params)
+                j00 = (pred_u_dx - pred_u) / eps
+                j10 = (pred_v_dx - pred_v) / eps
+                j01 = (pred_u_dy - pred_u) / eps
+                j11 = (pred_v_dy - pred_v) / eps
+                determinant = j00 * j11 - j01 * j10
+                valid = np.abs(determinant) > 1e-12
+                delta_x = np.zeros_like(x)
+                delta_y = np.zeros_like(y)
+                delta_x[valid] = (j11[valid] * residual_u[valid] - j01[valid] * residual_v[valid]) / determinant[valid]
+                delta_y[valid] = (-j10[valid] * residual_u[valid] + j00[valid] * residual_v[valid]) / determinant[valid]
+                x -= delta_x
+                y -= delta_y
+            return x, y
+
+        def stored_to_native_pixels(u_stored, v_stored, w, h, rotation):
+            if rotation == 1:
+                return v_stored, (w - 1.0) - u_stored
+            if rotation == 2:
+                return (w - 1.0) - u_stored, (h - 1.0) - v_stored
+            if rotation == 3:
+                return (h - 1.0) - v_stored, u_stored
+            return u_stored, v_stored
+
+        def native_resolution(w, h, rotation):
+            if rotation % 2 == 1:
+                return h, w
+            return w, h
+
+        def create_rational_camera(params, w, h, rotation):
+            u_stored = np.tile(np.arange(w) + 0.5, h)
+            v_stored = (np.arange(h) + 0.5).repeat(w)
+            u_native, v_native = stored_to_native_pixels(u_stored, v_stored, w, h, rotation)
+            native_w, native_h = native_resolution(w, h, rotation)
+            out_shape = (1, h, w, 3)
+            x, y = invert_rational_pixels(u_native, v_native, params)
+            ray_lookat = np.stack((x, y, np.ones_like(x)), axis=-1)
+            rays_d_cam = ray_lookat / np.linalg.norm(ray_lookat, axis=-1, keepdims=True)
+            rays_o_cam = np.zeros_like(rays_d_cam)
+            pixel_coords = create_pixel_coords(w, h)
+            params_dict = {
+                "resolution": np.array([w, h], dtype=np.uint64),
+                "native_resolution": np.array([native_w, native_h], dtype=np.uint64),
+                "image_rotation_quadrants_cw": int(rotation),
+                "shutter_type": ShutterType.GLOBAL.name,
+                "principal_point": params[2:4].astype(np.float32),
+                "focal_length": params[:2].astype(np.float32),
+                "numerator_coeffs": params[4:7].astype(np.float32),
+                "denominator_coeffs": params[7:10].astype(np.float32),
+                "affine_coeffs": params[10:12].astype(np.float32),
+                "tangential_coeffs": params[12:14].astype(np.float32),
+                "skew": float(params[14]),
+            }
+            return (
+                params_dict,
+                torch.tensor(rays_o_cam, dtype=torch.float32).reshape(out_shape),
+                torch.tensor(rays_d_cam, dtype=torch.float32).reshape(out_shape),
+                "RationalCameraModelParameters",
+                pixel_coords,
+            )
+
+        def create_equirect_camera(w, h):
+            # Full-sphere equirectangular rays in the [right, down, forward]
+            # camera frame (matches the CUDA projectPoint and the COLMAP poses
+            # loaded without a coordinate flip). Parameter-free beyond (w, h).
+            out_shape = (1, h, w, 3)
+            cols = np.tile(np.arange(w) + 0.5, h)
+            rows = (np.arange(h) + 0.5).repeat(w)
+            phi = (1.0 - 2.0 * cols / w) * np.pi
+            theta = (1.0 - 2.0 * rows / h) * (np.pi / 2.0)
+            cos_theta = np.cos(theta)
+            rays = np.stack(
+                [
+                    -cos_theta * np.sin(phi),
+                    -np.sin(theta),
+                    cos_theta * np.cos(phi),
+                ],
+                axis=-1,
+            )
+            rays = rays / np.linalg.norm(rays, axis=-1, keepdims=True)
+            rays_o_cam = np.zeros_like(rays)
+            pixel_coords = create_pixel_coords(w, h)
+            params_dict = {
+                "resolution": np.array([w, h], dtype=np.uint64),
+                "shutter_type": self.shutter_type,
+            }
+            return (
+                params_dict,
+                torch.tensor(rays_o_cam, dtype=torch.float32).reshape(out_shape),
+                torch.tensor(rays, dtype=torch.float32).reshape(out_shape),
+                "EquirectCameraModelParameters",
+                pixel_coords,
+            )
+
         cam_id_to_image_name = {extr.camera_id: extr.name for extr in self.cam_extrinsics}
+        b2g_camera_rotations = self.load_b2g_camera_rotations()
 
         for intr in self.cam_intrinsics.values():
             full_width = intr.width
@@ -635,17 +983,33 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                     params[:4] *= image_scale[[0, 1, 0, 1]]
                 self.intrinsics[intr.id] = create_fisheye_camera(params, width, height)
 
+            elif intr.model == "RATIONAL":
+                params = copy.deepcopy(intr.params)
+                params[:4] = params[:4] / scaling_factor
+                rotation = b2g_camera_rotations.get(intr.id, 0)
+                self.intrinsics[intr.id] = create_rational_camera(params, width, height, rotation)
+
+            elif intr.model in (
+                "EQUIRECTANGULAR",
+                "SPHERICAL",
+                "OPENCV_SPHERICAL",
+            ):
+                self.intrinsics[intr.id] = create_equirect_camera(width, height)
+
             else:
                 assert False, (
                     f"Colmap camera model '{intr.model}' not handled: supported camera models are "
-                    "PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, and OPENCV_FISHEYE."
+                    "PINHOLE, SIMPLE_PINHOLE, SIMPLE_RADIAL, RADIAL, OPENCV, FULL_OPENCV, OPENCV_FISHEYE, "
+                    "RATIONAL, EQUIRECTANGULAR, SPHERICAL, and OPENCV_SPHERICAL."
                 )
 
         # Load poses and paths
         self.poses = []
         self.image_paths = []
         self.mask_paths = []
+        self.sky_mask_paths = [] if self.sky_mask_folder is not None else None
         self.depth_paths = [] if self.depth_folder is not None else None
+        self.poses_end = [] if self._end_pose_by_name is not None else None
 
         cam_centers = []
         for extr in logger.track(
@@ -663,12 +1027,24 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             self.poses.append(C2W)
             cam_centers.append(C2W[:3, 3])
 
+            if self.poses_end is not None:
+                end_extr = self._end_pose_by_name.get(extr.name)
+                if end_extr is None:
+                    raise ValueError(f"images_end.txt has no END pose for '{extr.name}'.")
+                W2C_end = np.zeros((4, 4), dtype=np.float32)
+                W2C_end[:3, 3] = np.array(end_extr.tvec)
+                W2C_end[:3, :3] = qvec_to_so3(end_extr.qvec)
+                W2C_end[3, 3] = 1.0
+                self.poses_end.append(np.linalg.inv(W2C_end))
+
             if self.gsplat_image_downscale:
                 image_path = os.path.join(image_dir, colmap_to_image[extr.name])
             else:
                 image_path = os.path.join(self.path, self.get_images_folder(), extr.name)
             self.image_paths.append(image_path)
-            self.mask_paths.append(os.path.splitext(image_path)[0] + "_mask.png")
+            self.mask_paths.append(self.resolve_mask_path(image_path, extr.name))
+            if self.sky_mask_paths is not None:
+                self.sky_mask_paths.append(self.resolve_sky_mask_path(extr.name))
             if self.depth_paths is not None:
                 self.depth_paths.append(self.resolve_depth_path(extr.name))
 
@@ -677,39 +1053,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.cameras_extent = diagonal * 1.1
 
         self.poses = np.stack(self.poses)
+        if self.poses_end is not None:
+            self.poses_end = np.stack(self.poses_end)
 
         self.image_paths = np.stack(self.image_paths, dtype=str)
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
+        if self.sky_mask_paths is not None:
+            self.sky_mask_paths = np.stack(self.sky_mask_paths, dtype=str)
         if self.depth_paths is not None:
             self.depth_paths = np.stack(self.depth_paths, dtype=str)
-
-    def resolve_depth_path(self, image_name: str) -> str:
-        """Resolve the metric-depth sidecar (.npy) for a COLMAP image name.
-
-        Tries ``<depth_folder>/<image_stem>.npy`` first, then a per-camera
-        ``<depth_folder>/<camera>/depth_zext/<frame>.npy`` layout. Returns the
-        primary candidate (may be missing) so __getitem__ can raise loudly.
-        """
-        if self.depth_folder is None:
-            return ""
-        depth_stem = os.path.splitext(image_name)[0] + ".npy"
-        direct = os.path.join(self.path, self.depth_folder, depth_stem)
-        if os.path.exists(direct):
-            return direct
-        parts = image_name.replace("\\", "/").split("/")
-        if len(parts) >= 2:
-            camera_name = parts[-2]
-            frame_name = os.path.splitext(parts[-1])[0] + ".npy"
-            candidate = os.path.join(
-                self.path,
-                self.depth_folder,
-                camera_name,
-                "depth_zext",
-                frame_name,
-            )
-            if os.path.exists(candidate):
-                return candidate
-        return direct
 
     def _lazy_worker_intrinsics_cache(self):
         """Create intrinsics cache for a specific worker."""
@@ -770,6 +1122,10 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     def get_world_normalization_transform(self) -> np.ndarray:
         return self.world_normalization_transform.copy()
 
+    def get_image_names(self) -> list[str]:
+        """Return image identities after holdout and train exclusions."""
+        return [extrinsic.name for extrinsic in self.cam_extrinsics]
+
     def get_poses(self) -> np.ndarray:
         """Get camera poses as 4x4 transformation matrices.
 
@@ -797,6 +1153,43 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         """
         colmap_camera_id = self.cam_extrinsics[frame_idx].camera_id
         return self._camera_id_to_idx[colmap_camera_id]
+
+    @staticmethod
+    def _post_processing_camera_key(extrinsic) -> str:
+        """Return the physical camera key for appearance post-processing."""
+        normalized_name = extrinsic.name.replace("\\", "/")
+        parent, path_separator, basename = normalized_name.rpartition("/")
+        stem = basename.rsplit(".", 1)[0]
+        camera_name, separator, frame_token = stem.rpartition("_")
+        if separator and camera_name in _CANONICAL_FLAT_PHYSICAL_CAMERA_NAMES and frame_token.isdigit():
+            return camera_name
+        if path_separator and parent:
+            parent_camera_name = parent.rsplit("/", 1)[-1]
+            if parent_camera_name in _CANONICAL_FLAT_PHYSICAL_CAMERA_NAMES:
+                return parent_camera_name
+            return parent
+        return f"camera_id_{extrinsic.camera_id}"
+
+    def get_post_processing_camera_idx(self, frame_idx: int) -> int:
+        """Return the physical-camera index for PPISP-style corrections."""
+        key = self._post_processing_camera_key(self.cam_extrinsics[frame_idx])
+        return self._post_processing_camera_key_to_idx[key]
+
+    def get_post_processing_frames_per_camera(self) -> list[int]:
+        """Return split frame counts grouped by physical camera."""
+        counts = [0] * len(self._post_processing_camera_key_to_idx)
+        for extr in self.cam_extrinsics:
+            key = self._post_processing_camera_key(extr)
+            counts[self._post_processing_camera_key_to_idx[key]] += 1
+        return counts
+
+    def get_post_processing_camera_names(self) -> list[str]:
+        """Return physical-camera names in post-processing index order."""
+        ordered_keys = sorted(
+            self._post_processing_camera_key_to_idx.items(),
+            key=lambda item: item[1],
+        )
+        return [key for key, _ in ordered_keys]
 
     def get_frames_per_camera(self) -> list[int]:
         """Return list of frame counts per camera.
@@ -842,6 +1235,28 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     def __len__(self) -> int:
         return self.n_frames
 
+    @staticmethod
+    def _first_scalar(value):
+        if torch.is_tensor(value):
+            return value.reshape(-1)[0].item()
+        if isinstance(value, np.ndarray):
+            return value.reshape(-1)[0].item()
+        if isinstance(value, (list, tuple)):
+            return ColmapDataset._first_scalar(value[0])
+        return value
+
+    @staticmethod
+    def _sequence_idx_from_path(image_path: str) -> int:
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        digits = ""
+        for char in reversed(stem):
+            if not char.isdigit():
+                break
+            digits = char + digits
+        if not digits:
+            return -1
+        return int(digits)
+
     @torch.cuda.nvtx.range("colmap_dataset::_getitem")
     def __getitem__(self, idx) -> dict:
         # Load image and get its actual dimensions
@@ -855,13 +1270,28 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "pose": torch.tensor(self.poses[idx]).unsqueeze(0),
             "intr": self.get_intrinsics_idx(idx),
             "camera_idx": self.get_camera_idx(idx),
+            "post_processing_camera_idx": self.get_post_processing_camera_idx(idx),
             "frame_idx": idx,
+            "sequence_idx": self._sequence_idx_from_path(self.image_paths[idx]),
+            "image_path": self.image_paths[idx],
         }
+
+        if self.poses_end is not None:
+            output_dict["pose_end"] = torch.tensor(self.poses_end[idx]).unsqueeze(0)
 
         # Only add mask to dictionary if it exists
         if os.path.exists(mask_path := self.mask_paths[idx]):
             mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, actual_h, actual_w, 1)
             output_dict["mask"] = mask
+
+        if self.sky_mask_paths is not None:
+            sky_mask_path = self.sky_mask_paths[idx]
+            if not os.path.exists(sky_mask_path):
+                raise FileNotFoundError(f"Sky mask sidecar not found: {sky_mask_path}")
+            sky_mask = torch.from_numpy(np.array(Image.open(sky_mask_path).convert("L"))).reshape(
+                1, actual_h, actual_w, 1
+            )
+            output_dict["sky_mask"] = sky_mask
 
         # Metric-depth sidecar (must match the training-image resolution)
         if self.depth_paths is not None:
@@ -888,6 +1318,42 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         return output_dict
 
+    def build_blur_bundles(self, image_name, rays_dir):
+        """Build the K exposure-time ray bundles for one frame.
+
+        Used by the train fetch path and by post-hoc parity evaluation
+        (rendering a checkpoint WITH the blur forward model applied).
+
+        Args:
+            image_name: Frame key as in images.txt (e.g. ``cam0/x.jpg``).
+            rays_dir: ``[1, H, W, 3]`` camera-space bearings for the
+                frame's camera model.
+
+        Returns:
+            ``(rays_ori, rays_dir)`` world-space bundles, each
+            ``[K, H, W, 3]``.
+        """
+        if self._blur_pose_pairs is None:
+            raise RuntimeError(
+                "build_blur_bundles needs blur_samples > 1 (no pose-knot " "pairs were loaded for this dataset)."
+            )
+        pairs = self._blur_pose_pairs.get(image_name)
+        if pairs is None:
+            raise KeyError(
+                f"pose_knots.json has no entry for '{image_name}'; re-emit " "the knot sidecar for this scene."
+            )
+        bundle_oris = []
+        bundle_dirs = []
+        for k in range(pairs.shape[0]):
+            ori_k, dir_k = build_rs_world_rays(
+                rays_dir,
+                pairs[k, 0].to(self.device),
+                pairs[k, 1].to(self.device),
+            )
+            bundle_oris.append(ori_k)
+            bundle_dirs.append(dir_k)
+        return torch.cat(bundle_oris, dim=0), torch.cat(bundle_dirs, dim=0)
+
     def get_gpu_batch_with_intrinsics(self, batch):
         """Add the intrinsics to the batch and move data to GPU."""
 
@@ -909,21 +1375,85 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "rays_dir": rays_dir,
             "T_to_world": pose,
             f"intrinsics_{camera_name}": camera_params_dict,
-            "camera_idx": batch["camera_idx"][0].item(),
-            "frame_idx": batch["frame_idx"][0].item(),
+            "camera_idx": int(self._first_scalar(batch["camera_idx"])),
+            "post_processing_camera_idx": int(self._first_scalar(batch["post_processing_camera_idx"])),
+            "frame_idx": int(self._first_scalar(batch["frame_idx"])),
+            "sequence_idx": int(self._first_scalar(batch["sequence_idx"])),
+            "image_path": batch["image_path"][0],
             "pixel_coords": pixel_coords,
         }
 
-        if "mask" in batch:
-            mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
-            mask = (mask > 0.5).to(torch.float32)
-            sample["mask"] = mask
+        sample["depth_ray_z"] = torch.abs(rays_dir[..., 2:3])
 
         if "depth_gt" in batch:
-            sample["depth_gt"] = batch["depth_gt"][0].to(self.device, non_blocking=True)
-            # Preserve camera-space |ray_z| before any world-ray injection so
-            # depth loss compares axial camera depth, not ray distance.
-            sample["depth_ray_z"] = torch.abs(rays_dir[..., 2:3])
+            depth_gt = batch["depth_gt"][0].to(self.device, non_blocking=True)
+            sample["depth_gt"] = depth_gt
+
+        if "pose_end" in batch:
+            sample["T_to_world_end"] = batch["pose_end"][0].to(self.device, non_blocking=True)
+        # A ROLLING shutter MUST carry a distinct END pose; otherwise the
+        # kernel collapses to global shutter (RS1 == RS0) with no warning.
+        shutter = camera_params_dict.get("shutter_type", ShutterType.GLOBAL.name)
+        if shutter != ShutterType.GLOBAL.name:
+            end = sample.get("T_to_world_end")
+            if end is None or torch.allclose(end, pose, atol=1e-6):
+                raise ValueError(
+                    f"shutter_type={shutter} but T_to_world_end is missing or "
+                    "equal to T_to_world; rolling-shutter training would "
+                    "silently no-op to global shutter. Provide distinct "
+                    "per-frame END poses via images_end.txt."
+                )
+
+        # 3dgrt RAY path: the equirect camera model lives only in the UT tracer,
+        # so the ray path needs EXPLICIT per-pixel world rays. GLOBAL = single
+        # pose; ROLLING = per-row interpolation (true per-pixel rolling shutter,
+        # no per-Gaussian single-pose approximation). Identity world transform
+        # makes the tracer's rayToWorld a pure passthrough. The UT splat path
+        # keeps the camera model + shutter_type instead.
+        if self.rs_ray_injection:
+            if self._blur_pose_pairs is not None and self.split == "train":
+                # Exposure-trajectory blur: K time-sampled RS bundles per
+                # frame, stacked on dim 0 (the OptiX launch treats dim 0 as
+                # depth, so the K bundles trace in one launch). The trainer
+                # averages the K renders BEFORE the loss.
+                name = "/".join(batch["image_path"][0].replace("\\", "/").split("/")[-2:])
+                rays_ori_k, rays_dir_k = self.build_blur_bundles(name, rays_dir)
+                sample["rays_ori"] = rays_ori_k
+                sample["rays_dir"] = rays_dir_k
+            else:
+                # GLOBAL must stay global-naive: only a ROLLING shutter
+                # consumes the END pose. rs_ray_injection is gated on
+                # method==3dgrt (not on shutter), so without this guard an
+                # images_end.txt present in scene_rs would silently feed
+                # per-row END poses into a GLOBAL run too -- making RS0
+                # (global-naive) identical to RS1 (rolling) and contaminating
+                # the whole RS0-vs-RS1 ablation.
+                rs_end = sample.get("T_to_world_end") if shutter != ShutterType.GLOBAL.name else None
+                if rs_end is None:
+                    rs_end = pose
+                rays_ori_w, rays_dir_w = build_rs_world_rays(rays_dir, pose, rs_end)
+                sample["rays_ori"] = rays_ori_w
+                sample["rays_dir"] = rays_dir_w
+            # Identity world transform = pure passthrough (rays are already
+            # world-space). Keep the [1, 4, 4] shape the non-injected path
+            # uses so downstream rayToWorld handling is unchanged.
+            sample["T_to_world"] = torch.eye(4, device=self.device, dtype=pose.dtype).unsqueeze(0)
+            sample["rays_in_world_space"] = True
+
+        if "mask" in batch:
+            mask = self._normalize_training_mask(
+                batch["mask"][0].to(self.device, non_blocking=True),
+                preserve_soft_weights=(
+                    self.preserve_soft_training_masks
+                    and self.split == "train"
+                ),
+            )
+            sample["mask"] = mask
+
+        if "sky_mask" in batch:
+            sky_mask = batch["sky_mask"][0].to(self.device, non_blocking=True) / 255.0
+            sky_mask = (sky_mask > 0.5).to(torch.float32)
+            sample["sky_mask"] = sky_mask
 
         # Add exposure prior from EXIF if available (move to GPU)
         if "exposure" in batch and batch["exposure"][0] is not None:

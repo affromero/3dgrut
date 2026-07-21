@@ -2,3 +2,14 @@ method: colmap
 observation_scale_factor: 0.01
 use_observation_points: true
 num_points: 0  # 0 = uncapped; >0 deterministically subsamples dense bundles
+surface_aligned_pca:
+  enabled: false
+  num_support_points: 32
+  max_neighbor_radius_m: 0.25
+  max_normal_to_mid_ratio: 0.25
+  min_mid_to_max_ratio: 0.10
+  min_mid_eigenvalue_m2: 1.0e-12
+  min_thickness_ratio: 0.125
+  query_chunk_size: 65536
+  expected_point_count: null
+  expected_observer_count: null

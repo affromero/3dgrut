@@ -13,11 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
+from omegaconf import DictConfig
 from plyfile import PlyData
 
 import threedgrt_tracer
@@ -27,14 +30,28 @@ from threedgrut.datasets.protocols import Batch
 from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
 from threedgrut.export import PLYExporter
 from threedgrut.export.base import ExportableModel
+from threedgrut.model.acquisition_appearance import (
+    SH_DC_NORMALIZATION,
+    AcquisitionAppearance,
+    AcquisitionGaussianView,
+)
+from threedgrut.model.acquisition_visibility import AcquisitionVisibility
 from threedgrut.model.carriers import carrier_specular_dim, initial_carrier_tail
 from threedgrut.model.features import Features
+from threedgrut.model.gaussian_track_acquisition import (
+    GaussianTrackAcquisition,
+    load_gaussian_track_ids,
+)
 from threedgrut.model.geometry import (
-    apply_points_transform,
+    SurfaceAlignedPCAConfig,
     k_nearest_neighbors,
     nearest_neighbor_dist_cpuKD,
+    surface_aligned_pca_initialize,
 )
-from threedgrut.optimizers import SelectiveAdam
+from threedgrut.model.surface_acquisition_spline import (
+    SurfaceAcquisitionSpline,
+)
+from threedgrut.optimizers import SelectiveAdam, VisibilityDecayedAdam
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import (
     get_activation_function,
@@ -46,6 +63,200 @@ from threedgrut.utils.misc import (
     to_torch,
 )
 from threedgrut.utils.render import RGB2SH
+
+SCENE_EXTENT_MIN = 1e-6
+SCENE_EXTENT_MAX_SAMPLES = 1_000_000
+PROTECTED_GAUSSIAN_PREFIX_VERSION = 1
+PROTECTED_GEOMETRY_NAMES = ("positions", "rotation", "scale")
+
+
+def tensor_prefix_sha256(
+    tensor: torch.Tensor,
+    prefix_count: int,
+) -> str:
+    """Hash a contiguous tensor prefix for immutable-geometry checks."""
+    if prefix_count < 0 or prefix_count > tensor.shape[0]:
+        raise ValueError(
+            "Protected prefix count is outside the tensor: "
+            f"{prefix_count} for shape {tuple(tensor.shape)}."
+        )
+    prefix = tensor[:prefix_count].detach().contiguous().cpu().numpy()
+    return hashlib.sha256(prefix.tobytes()).hexdigest()
+
+
+def zero_tensor_prefix_gradient(
+    gradient: torch.Tensor,
+    *,
+    prefix_count: int,
+) -> torch.Tensor:
+    """Return a gradient with the protected row prefix zeroed."""
+    if prefix_count == 0:
+        return gradient
+    if prefix_count < 0 or prefix_count > gradient.shape[0]:
+        raise ValueError(
+            "Protected prefix count is outside the gradient: "
+            f"{prefix_count} for shape {tuple(gradient.shape)}."
+        )
+    masked = gradient.clone()
+    masked[:prefix_count] = 0
+    return masked
+
+
+def validated_surface_aligned_pca_config(
+    initialization_conf: DictConfig,
+    points: torch.Tensor,
+    observer_points: torch.Tensor,
+) -> SurfaceAlignedPCAConfig | None:
+    surface_conf = initialization_conf.get("surface_aligned_pca")
+    if surface_conf is None or not bool(surface_conf.get("enabled", False)):
+        return None
+
+    method = str(initialization_conf.get("method", ""))
+    if method != "colmap":
+        raise ValueError(
+            "initialization.surface_aligned_pca requires " "initialization.method=colmap; " f"got {method!r}"
+        )
+    if not bool(initialization_conf.get("use_observation_points", False)):
+        raise ValueError(
+            "initialization.surface_aligned_pca requires "
+            "use_observation_points=true; local-neighbor incumbent scaling "
+            "is not supported"
+        )
+    if (
+        observer_points.ndim != 2
+        or observer_points.shape[1] != 3
+        or observer_points.shape[0] == 0
+        or not bool(torch.isfinite(observer_points).all())
+    ):
+        raise ValueError(
+            "initialization.surface_aligned_pca requires nonempty finite " "observer points with shape [N, 3]"
+        )
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(
+            "initialization.surface_aligned_pca requires COLMAP points " f"with shape [N, 3]; got {tuple(points.shape)}"
+        )
+
+    num_support_points_value = float(surface_conf.get("num_support_points", 0))
+    query_chunk_size_value = float(surface_conf.get("query_chunk_size", 0))
+    if not np.isfinite(num_support_points_value) or not num_support_points_value.is_integer():
+        raise ValueError("surface_aligned_pca.num_support_points must be a finite integer")
+    if not np.isfinite(query_chunk_size_value) or not query_chunk_size_value.is_integer():
+        raise ValueError("surface_aligned_pca.query_chunk_size must be a finite integer")
+    num_support_points = int(num_support_points_value)
+    query_chunk_size = int(query_chunk_size_value)
+    max_neighbor_radius_m = float(surface_conf.get("max_neighbor_radius_m", 0.0))
+    max_normal_to_mid_ratio = float(surface_conf.get("max_normal_to_mid_ratio", 0.0))
+    min_mid_to_max_ratio = float(surface_conf.get("min_mid_to_max_ratio", 0.0))
+    min_mid_eigenvalue_m2 = float(surface_conf.get("min_mid_eigenvalue_m2", 0.0))
+    min_thickness_ratio = float(surface_conf.get("min_thickness_ratio", 0.0))
+    if num_support_points < 3:
+        raise ValueError("surface_aligned_pca.num_support_points must be at least 3")
+    if points.shape[0] < num_support_points:
+        raise ValueError(
+            "surface_aligned_pca requires at least " f"{num_support_points} COLMAP points; got {points.shape[0]}"
+        )
+    if query_chunk_size <= 0:
+        raise ValueError("surface_aligned_pca.query_chunk_size must be positive")
+    positive_parameters = (
+        ("max_neighbor_radius_m", max_neighbor_radius_m),
+        ("max_normal_to_mid_ratio", max_normal_to_mid_ratio),
+        ("min_mid_to_max_ratio", min_mid_to_max_ratio),
+        ("min_mid_eigenvalue_m2", min_mid_eigenvalue_m2),
+    )
+    for parameter_name, parameter_value in positive_parameters:
+        if not np.isfinite(parameter_value) or parameter_value <= 0.0:
+            raise ValueError(
+                f"surface_aligned_pca.{parameter_name} must be finite and " f"positive; got {parameter_value}"
+            )
+    if max_normal_to_mid_ratio > 1.0:
+        raise ValueError("surface_aligned_pca.max_normal_to_mid_ratio must be at most 1")
+    if min_mid_to_max_ratio > 1.0:
+        raise ValueError("surface_aligned_pca.min_mid_to_max_ratio must be at most 1")
+    if not np.isfinite(min_thickness_ratio) or min_thickness_ratio <= 0.0 or min_thickness_ratio > 1.0:
+        raise ValueError(
+            "surface_aligned_pca.min_thickness_ratio must be finite and in " f"(0, 1]; got {min_thickness_ratio}"
+        )
+
+    expected_counts = (
+        (
+            "expected_point_count",
+            surface_conf.get("expected_point_count"),
+            points.shape[0],
+        ),
+        (
+            "expected_observer_count",
+            surface_conf.get("expected_observer_count"),
+            observer_points.shape[0],
+        ),
+    )
+    for count_name, configured_count, actual_count in expected_counts:
+        if configured_count is None:
+            continue
+        expected_count_value = float(configured_count)
+        if not np.isfinite(expected_count_value) or not expected_count_value.is_integer() or expected_count_value < 0.0:
+            raise ValueError(f"surface_aligned_pca.{count_name} must be null or a " "non-negative integer")
+        expected_count = int(expected_count_value)
+        if expected_count != actual_count:
+            raise ValueError(
+                f"surface_aligned_pca {count_name} mismatch: expected " f"{expected_count}, got {actual_count}"
+            )
+
+    return SurfaceAlignedPCAConfig(
+        num_support_points=num_support_points,
+        max_neighbor_radius_m=max_neighbor_radius_m,
+        max_normal_to_mid_ratio=max_normal_to_mid_ratio,
+        min_mid_to_max_ratio=min_mid_to_max_ratio,
+        min_mid_eigenvalue_m2=min_mid_eigenvalue_m2,
+        min_thickness_ratio=min_thickness_ratio,
+        query_chunk_size=query_chunk_size,
+    )
+
+
+def _acquisition_appearance_enabled(conf) -> bool:
+    appearance_conf = conf.model.get("acquisition_appearance", {})
+    return bool(appearance_conf.get("enabled", False))
+
+
+def _acquisition_visibility_enabled(conf) -> bool:
+    visibility_conf = conf.model.get("acquisition_visibility", {})
+    return bool(visibility_conf.get("enabled", False))
+
+
+def _surface_acquisition_spline_enabled(conf) -> bool:
+    spline_conf = conf.model.get("surface_acquisition_spline", {})
+    return bool(spline_conf.get("enabled", False))
+
+
+def _gaussian_track_acquisition_enabled(conf) -> bool:
+    track_conf = conf.model.get("gaussian_track_acquisition", {})
+    return bool(track_conf.get("enabled", False))
+
+
+def _sample_point_rows(points: torch.Tensor) -> torch.Tensor:
+    """Return a bounded deterministic row sample for extent estimates."""
+    if points.shape[0] <= SCENE_EXTENT_MAX_SAMPLES:
+        return points
+    step = (points.shape[0] + SCENE_EXTENT_MAX_SAMPLES - 1) // SCENE_EXTENT_MAX_SAMPLES
+    return points[::step]
+
+
+def _estimate_scene_extent_from_points(points: torch.Tensor) -> float:
+    """Estimate a nonzero scene scale from point geometry."""
+    sampled = _sample_point_rows(points.detach().float())
+    finite_mask = torch.isfinite(sampled).all(dim=1)
+    if not finite_mask.any():
+        return 1.0
+
+    sampled = sampled[finite_mask]
+    center = sampled.median(dim=0).values
+    radius = torch.linalg.norm(sampled - center[None, :], dim=1).median()
+    if torch.isfinite(radius) and radius.item() > SCENE_EXTENT_MIN:
+        return float(radius.item() * 1.1)
+
+    bbox_diagonal = torch.linalg.norm(sampled.max(dim=0).values - sampled.min(dim=0).values)
+    if torch.isfinite(bbox_diagonal) and bbox_diagonal.item() > SCENE_EXTENT_MIN:
+        return float(bbox_diagonal.item() * 0.1)
+    return 1.0
 
 
 def _subsample_initial_points(
@@ -65,6 +276,15 @@ def _subsample_initial_points(
 
 class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     """ """
+
+    @property
+    def supports_static_export(self) -> bool:
+        return (
+            self.acquisition_appearance is None
+            and self.acquisition_visibility is None
+            and self.surface_acquisition_spline is None
+            and self.gaussian_track_acquisition is None
+        )
 
     @property
     def num_gaussians(self):
@@ -199,6 +419,21 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         elif self.feature_type == Features.Type.NHT:
             model_params["features"] = self.features
 
+        if self.acquisition_appearance is not None:
+            model_params["acquisition_appearance"] = self.acquisition_appearance.state_dict()
+        if self.acquisition_visibility is not None:
+            model_params["acquisition_visibility"] = self.acquisition_visibility.state_dict()
+        if self.surface_acquisition_spline is not None:
+            model_params["surface_acquisition_spline"] = self.surface_acquisition_spline.state_dict()
+        if self.gaussian_track_acquisition is not None:
+            model_params["gaussian_track_acquisition"] = self.gaussian_track_acquisition.state_dict()
+        if self.protected_gaussian_count:
+            actual_hashes = self._protected_geometry_hashes()
+            expected_hashes = self._protected_prefix_metadata.get("geometry_sha256")
+            if expected_hashes != actual_hashes:
+                raise RuntimeError("Protected Gaussian prefix geometry changed before checkpoint save.")
+            model_params["protected_gaussian_prefix"] = dict(self._protected_prefix_metadata)
+
         return model_params
 
     def __init__(self, conf, scene_extent=None):
@@ -207,6 +442,15 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # Store config early - needed for feature type detection
         self.conf = conf
         self.scene_extent = scene_extent
+        self.acquisition_appearance: AcquisitionAppearance | None = None
+        self.acquisition_visibility: AcquisitionVisibility | None = None
+        self.surface_acquisition_spline: SurfaceAcquisitionSpline | None = None
+        self.gaussian_track_acquisition: GaussianTrackAcquisition | None = None
+        # Per-attribute per-gaussian gradient L2 norms, populated each
+        # training step by Trainer3DGRUT._compute_per_gaussian_grad_norms.
+        # Consumed by the live GUI for grad-mode visualization. Empty in
+        # inference-only loading.
+        self._last_grad_norms: dict[str, torch.Tensor] = {}
 
         sh_degree = conf.model.progressive_training.max_n_features
         render_sph_degree = conf.render.particle_radiance_sph_degree
@@ -305,6 +549,97 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         # State of gradients of Gaussian parameters
         self._gaussians_frozen = False
+        self._resume_lr_scale = 1.0
+        self.protected_gaussian_count = 0
+        self._protected_prefix_metadata: dict[str, object] = {}
+        self._protected_gradient_handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    def _protected_geometry_hashes(self) -> dict[str, str]:
+        return {
+            name: tensor_prefix_sha256(
+                getattr(self, name),
+                self.protected_gaussian_count,
+            )
+            for name in PROTECTED_GEOMETRY_NAMES
+        }
+
+    def _load_protected_prefix_metadata(
+        self,
+        checkpoint: dict[str, object],
+    ) -> None:
+        metadata = checkpoint.get("protected_gaussian_prefix")
+        if metadata is None:
+            self.protected_gaussian_count = 0
+            self._protected_prefix_metadata = {}
+            self.refresh_protected_gradient_hooks()
+            return
+        if not isinstance(metadata, dict):
+            raise ValueError("Protected Gaussian prefix metadata must be a mapping.")
+        if metadata.get("version") != PROTECTED_GAUSSIAN_PREFIX_VERSION:
+            raise ValueError(f"Unsupported protected Gaussian prefix version: {metadata.get('version')!r}.")
+        count = metadata.get("count")
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise ValueError("Protected Gaussian prefix count must be an integer.")
+        if count <= 0 or count > self.num_gaussians:
+            raise ValueError(
+                "Protected Gaussian prefix count is outside the model: "
+                f"{count} for {self.num_gaussians} Gaussians."
+            )
+        expected_hashes = metadata.get("geometry_sha256")
+        if not isinstance(expected_hashes, dict):
+            raise ValueError("Protected Gaussian prefix geometry hashes are missing.")
+        self.protected_gaussian_count = count
+        actual_hashes = self._protected_geometry_hashes()
+        for name in PROTECTED_GEOMETRY_NAMES:
+            expected = expected_hashes.get(name)
+            if not isinstance(expected, str) or expected != actual_hashes[name]:
+                raise ValueError(
+                    "Protected Gaussian prefix geometry hash mismatch for "
+                    f"{name}: expected {expected!r}, got {actual_hashes[name]!r}."
+                )
+        self._protected_prefix_metadata = dict(metadata)
+        self.refresh_protected_gradient_hooks()
+
+    def refresh_protected_gradient_hooks(self) -> None:
+        for handle in getattr(self, "_protected_gradient_handles", []):
+            handle.remove()
+        self._protected_gradient_handles = []
+        protected_gaussian_count = int(getattr(self, "protected_gaussian_count", 0))
+        if protected_gaussian_count == 0:
+            return
+        if protected_gaussian_count > self.num_gaussians:
+            raise RuntimeError("Protected Gaussian prefix exceeds current topology.")
+        for name in PROTECTED_GEOMETRY_NAMES:
+            parameter = getattr(self, name)
+            if not parameter.requires_grad:
+                continue
+            handle = parameter.register_hook(
+                partial(
+                    zero_tensor_prefix_gradient,
+                    prefix_count=protected_gaussian_count,
+                )
+            )
+            self._protected_gradient_handles.append(handle)
+
+    def validate_protected_optimizer_state(self) -> None:
+        if self.protected_gaussian_count == 0 or self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            if group["name"] not in PROTECTED_GEOMETRY_NAMES:
+                continue
+            parameter = group["params"][0]
+            state = self.optimizer.state.get(parameter, {})
+            for key, value in state.items():
+                if key == "step" or not torch.is_tensor(value):
+                    continue
+                if value.ndim == 0 or value.shape[0] != self.num_gaussians:
+                    continue
+                prefix = value[: self.protected_gaussian_count]
+                if bool((prefix != 0).any()):
+                    raise ValueError(
+                        "Protected Gaussian optimizer state is nonzero for "
+                        f"{group['name']}.{key}."
+                    )
 
     @torch.no_grad()
     def build_acc(self, rebuild=True):
@@ -333,6 +668,166 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self._gaussians_frozen = True
         logger.info("❄️ [Distillation] Gaussian parameters frozen")
 
+    def _initialize_acquisition_appearance(self) -> None:
+        if not _acquisition_appearance_enabled(self.conf):
+            self.acquisition_appearance = None
+            return
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError("Acquisition appearance requires optimizer.type=adam.")
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError("Acquisition appearance screening requires both GUI modes to be disabled.")
+        if self.num_gaussians <= 0:
+            raise ValueError("Acquisition appearance requires initialized Gaussians.")
+        existing = self.acquisition_appearance
+        if existing is not None and existing.direction_raw.shape[0] == self.num_gaussians:
+            return
+        appearance_conf = self.conf.model.acquisition_appearance
+        self.acquisition_appearance = AcquisitionAppearance(
+            num_gaussians=self.num_gaussians,
+            num_cameras=int(appearance_conf.num_cameras),
+            num_knots=int(appearance_conf.num_knots),
+            min_sequence_idx=int(appearance_conf.min_sequence_idx),
+            max_sequence_idx=int(appearance_conf.max_sequence_idx),
+            max_rgb_delta=float(appearance_conf.max_rgb_delta),
+            magnitude_regularization=float(appearance_conf.magnitude_regularization),
+            curvature_regularization=float(appearance_conf.curvature_regularization),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+            rank=int(appearance_conf.rank),
+        )
+
+    def _initialize_acquisition_visibility(self) -> None:
+        if not _acquisition_visibility_enabled(self.conf):
+            self.acquisition_visibility = None
+            return
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError("Acquisition visibility requires optimizer.type=adam.")
+        if str(self.conf.model.density_activation) != "sigmoid":
+            raise ValueError(
+                "Acquisition visibility requires sigmoid density activation "
+                "so its bounded correction is an opacity-logit delta."
+            )
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError("Acquisition visibility screening requires both GUI modes to be disabled.")
+        if self.num_gaussians <= 0:
+            raise ValueError("Acquisition visibility requires initialized Gaussians.")
+        existing = self.acquisition_visibility
+        if existing is not None and existing.response_raw.shape[0] == self.num_gaussians:
+            return
+        visibility_conf = self.conf.model.acquisition_visibility
+        self.acquisition_visibility = AcquisitionVisibility(
+            num_gaussians=self.num_gaussians,
+            num_cameras=int(visibility_conf.num_cameras),
+            num_knots=int(visibility_conf.num_knots),
+            min_sequence_idx=int(visibility_conf.min_sequence_idx),
+            max_sequence_idx=int(visibility_conf.max_sequence_idx),
+            max_logit_delta=float(visibility_conf.max_logit_delta),
+            response_sparsity_regularization=float(visibility_conf.response_sparsity_regularization),
+            magnitude_regularization=float(visibility_conf.magnitude_regularization),
+            curvature_regularization=float(visibility_conf.curvature_regularization),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+            rank=int(visibility_conf.rank),
+        )
+
+    def _initialize_surface_acquisition_spline(self) -> None:
+        if not _surface_acquisition_spline_enabled(self.conf):
+            self.surface_acquisition_spline = None
+            return
+        if _acquisition_appearance_enabled(self.conf) or _acquisition_visibility_enabled(self.conf):
+            raise ValueError(
+                "Surface acquisition spline is mutually exclusive with the scene-global acquisition treatments."
+            )
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError("Surface acquisition spline requires optimizer.type=adam.")
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError("Surface acquisition spline screening requires both GUI modes to be disabled.")
+        if self.num_gaussians <= 0:
+            raise ValueError("Surface acquisition spline requires initialized Gaussians.")
+        existing = self.surface_acquisition_spline
+        if existing is not None and existing.direction_raw.shape[0] == self.num_gaussians:
+            return
+        spline_conf = self.conf.model.surface_acquisition_spline
+        self.surface_acquisition_spline = SurfaceAcquisitionSpline(
+            num_gaussians=self.num_gaussians,
+            num_cameras=int(spline_conf.num_cameras),
+            num_knots=int(spline_conf.num_knots),
+            min_sequence_idx=int(spline_conf.min_sequence_idx),
+            max_sequence_idx=int(spline_conf.max_sequence_idx),
+            max_rgb_delta=float(spline_conf.max_rgb_delta),
+            magnitude_regularization=float(spline_conf.magnitude_regularization),
+            curvature_regularization=float(spline_conf.curvature_regularization),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+            rank=int(spline_conf.rank),
+        )
+
+    def _initialize_gaussian_track_acquisition(self) -> None:
+        if not _gaussian_track_acquisition_enabled(self.conf):
+            self.gaussian_track_acquisition = None
+            return
+        if _surface_acquisition_spline_enabled(self.conf):
+            raise ValueError(
+                "Gaussian-track acquisition is mutually exclusive with "
+                "the per-Gaussian surface acquisition spline."
+            )
+        if str(self.conf.optimizer.type) != "adam":
+            raise ValueError("Gaussian-track acquisition requires optimizer.type=adam.")
+        if bool(self.conf.with_gui) or bool(self.conf.with_viser_gui):
+            raise ValueError("Gaussian-track acquisition screening requires both GUI modes to be disabled.")
+        if self.num_gaussians <= 0:
+            raise ValueError("Gaussian-track acquisition requires initialized Gaussians.")
+        existing = self.gaussian_track_acquisition
+        if existing is not None and existing.gaussian_track_ids.shape[0] == self.num_gaussians:
+            return
+        track_conf = self.conf.model.gaussian_track_acquisition
+        track_ids = load_gaussian_track_ids(
+            path=str(track_conf.track_ids_path),
+            expected_sha256=str(track_conf.track_ids_sha256),
+            num_gaussians=self.num_gaussians,
+            device=self.positions.device,
+        )
+        self.gaussian_track_acquisition = GaussianTrackAcquisition(
+            gaussian_track_ids=track_ids,
+            num_cameras=int(track_conf.num_cameras),
+            num_knots=int(track_conf.num_knots),
+            min_sequence_idx=int(track_conf.min_sequence_idx),
+            max_sequence_idx=int(track_conf.max_sequence_idx),
+            max_rgb_delta=float(track_conf.max_rgb_delta),
+            magnitude_regularization=float(track_conf.magnitude_regularization),
+            curvature_regularization=float(track_conf.curvature_regularization),
+            device=self.positions.device,
+            dtype=self.positions.dtype,
+        )
+
+    def get_regularization_loss(self) -> torch.Tensor:
+        loss = self.positions.sum() * 0.0
+        if self.acquisition_appearance is not None:
+            loss = loss + self.acquisition_appearance.get_regularization_loss()
+        if self.acquisition_visibility is not None:
+            loss = loss + self.acquisition_visibility.get_regularization_loss()
+        return loss
+
+    def get_contextual_regularization_loss(
+        self,
+        batch: Batch,
+    ) -> torch.Tensor:
+        loss = self.positions.sum() * 0.0
+        camera_idx = getattr(batch, "post_processing_camera_idx", -1)
+        if int(camera_idx) < 0:
+            camera_idx = batch.camera_idx
+        if self.surface_acquisition_spline is not None:
+            loss = loss + self.surface_acquisition_spline.get_local_regularization_loss(
+                camera_idx=camera_idx,
+                sequence_idx=batch.sequence_idx,
+            )
+        if self.gaussian_track_acquisition is not None:
+            loss = loss + self.gaussian_track_acquisition.get_local_regularization_loss(
+                camera_idx=camera_idx,
+                sequence_idx=batch.sequence_idx,
+            )
+        return loss
+
     def validate_fields(self):
         num_gaussians = self.num_gaussians
         assert self.positions.shape == (num_gaussians, 3)
@@ -352,7 +847,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self,
         root_path: str,
         observer_pts,
-        points_transform: np.ndarray | torch.Tensor | None = None,
     ):
         # Special case for scannetpp dataset
         if self.conf.dataset.type == "scannetpp":
@@ -391,8 +885,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 file_pts = torch.tensor(file_pts, dtype=torch.float32, device=self.device)
                 file_rgb = torch.tensor(file_rgb, dtype=torch.uint8, device=self.device)
 
-        file_pts = apply_points_transform(file_pts, points_transform)
-
         assert file_rgb.dtype == torch.uint8, "Expecting RGB values to be in [0, 255] range"
         max_points = int(self.conf.initialization.get("num_points", 0))
         original_points = file_pts.shape[0]
@@ -404,19 +896,29 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
         if file_pts.shape[0] != original_points:
             logger.info(f"Subsampled COLMAP initialization points from {original_points} to {file_pts.shape[0]}")
-        self.default_initialize_from_points(
+
+        surface_aligned_pca_config = validated_surface_aligned_pca_config(
+            self.conf.initialization,
             file_pts,
             observer_pts,
-            file_rgb,
-            use_observer_pts=self.conf.initialization.use_observation_points,
         )
+        if surface_aligned_pca_config is None:
+            self.default_initialize_from_points(
+                file_pts,
+                observer_pts,
+                file_rgb,
+                use_observer_pts=self.conf.initialization.use_observation_points,
+            )
+        else:
+            self.default_initialize_from_points(
+                file_pts,
+                observer_pts,
+                file_rgb,
+                use_observer_pts=True,
+                surface_aligned_pca_config=surface_aligned_pca_config,
+            )
 
-    def init_from_fused_point_cloud(
-        self,
-        pc_path: str,
-        observer_pts,
-        points_transform: np.ndarray | torch.Tensor | None = None,
-    ):
+    def init_from_fused_point_cloud(self, pc_path: str, observer_pts):
         """
         Initialize gaussians from an fused point cloud PLY file.
         Similar to init_from_colmap but loads from a given PLY file instead of sparse/0/points3D.txt
@@ -424,7 +926,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         Args:
             pc_path: Path to the PLY point cloud file
             observer_pts: Observer points tensor for scale initialization
-            points_transform: Optional transform from point-cloud coordinates to model world coordinates
         """
         logger.info(f"Loading fused point cloud from {pc_path}...")
 
@@ -446,7 +947,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # Convert to torch tensors
         file_pts = torch.tensor(xyz, dtype=torch.float32, device=self.device)
         file_rgb = torch.tensor(rgb, dtype=torch.uint8, device=self.device)
-        file_pts = apply_points_transform(file_pts, points_transform)
 
         logger.info(f"Loaded {len(file_pts)} points from accumulated point cloud")
 
@@ -730,14 +1230,65 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         else:
             raise ValueError(f"Unknown feature_type in checkpoint: {checkpoint_feature_type}")
 
+        # Acquisition arms are per-Gaussian; initialize against the just-loaded
+        # topology before restoring their optional state dicts.
+        self._initialize_acquisition_appearance()
+        self._initialize_acquisition_visibility()
+        self._initialize_surface_acquisition_spline()
+        self._initialize_gaussian_track_acquisition()
+        appearance_state = checkpoint.get("acquisition_appearance")
+        if appearance_state is not None:
+            if self.acquisition_appearance is None:
+                raise ValueError(
+                    "Checkpoint contains acquisition appearance state but the representation is disabled."
+                )
+            self.acquisition_appearance.load_state_dict(appearance_state, strict=True)
+        elif self.acquisition_appearance is not None:
+            logger.info("Initializing zero-output acquisition appearance from a legacy Gaussian checkpoint.")
+        visibility_state = checkpoint.get("acquisition_visibility")
+        if visibility_state is not None:
+            if self.acquisition_visibility is None:
+                raise ValueError(
+                    "Checkpoint contains acquisition visibility state but the representation is disabled."
+                )
+            self.acquisition_visibility.load_state_dict(visibility_state, strict=True)
+        elif self.acquisition_visibility is not None:
+            logger.info("Initializing zero-output acquisition visibility from a legacy Gaussian checkpoint.")
+        spline_state = checkpoint.get("surface_acquisition_spline")
+        if spline_state is not None:
+            if self.surface_acquisition_spline is None:
+                raise ValueError(
+                    "Checkpoint contains surface acquisition spline state but the representation is disabled."
+                )
+            self.surface_acquisition_spline.load_state_dict(spline_state, strict=True)
+        elif self.surface_acquisition_spline is not None:
+            logger.info("Initializing zero-output surface acquisition spline from a legacy Gaussian checkpoint.")
+        track_state = checkpoint.get("gaussian_track_acquisition")
+        if track_state is not None:
+            if self.gaussian_track_acquisition is None:
+                raise ValueError(
+                    "Checkpoint contains Gaussian-track acquisition state but the representation is disabled."
+                )
+            self.gaussian_track_acquisition.load_state_dict(track_state, strict=True)
+        elif self.gaussian_track_acquisition is not None:
+            logger.info("Initializing zero-output Gaussian-track acquisition from a parent checkpoint.")
+
         if self.progressive_training:
-            self.feature_dim_increase_interval = checkpoint["feature_dim_increase_interval"]
-            self.feature_dim_increase_step = checkpoint["feature_dim_increase_step"]
+            self.feature_dim_increase_interval = checkpoint.get(
+                "feature_dim_increase_interval",
+                self.feature_dim_increase_interval,
+            )
+            self.feature_dim_increase_step = checkpoint.get(
+                "feature_dim_increase_step",
+                self.feature_dim_increase_step,
+            )
 
         self.background.load_state_dict(checkpoint["background"])
+        self._load_protected_prefix_metadata(checkpoint)
         if setup_optimizer:
             self.set_optimizable_parameters()
             self.setup_optimizer(state_dict=checkpoint["optimizer"])
+            self.validate_protected_optimizer_state()
         self.validate_fields()
 
     def init_from_lidar(self, point_cloud, observer_pts):
@@ -746,7 +1297,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         Observer points can be any set locations that observation came from.
         Camera centers, ray source points, etc. They are used to estimate initial scales.
         """
-        logger.info(f"Initializing based on lidar point cloud ...")
+        logger.info("Initializing based on lidar point cloud ...")
 
         self.default_initialize_from_points(
             point_cloud.xyz_end.to(device=self.device),
@@ -755,7 +1306,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             use_observer_pts=self.conf.initialization.use_observation_points,
         )
 
-    def default_initialize_from_points(self, pts, observer_pts, colors=None, use_observer_pts=True):
+    def default_initialize_from_points(
+        self,
+        pts,
+        observer_pts,
+        colors=None,
+        use_observer_pts=True,
+        surface_aligned_pca_config: SurfaceAlignedPCAConfig | None = None,
+    ):
         """
         Given an Nx3 array of points (and optionally Nx3 rgb colors),
         initialize default values for the other parameters of the model
@@ -768,6 +1326,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         N = pts.shape[0]
         positions = pts
+        self.ensure_scene_extent_from_points(positions)
 
         # Random rotations
         rots = torch.rand((N, 4), dtype=dtype, device=self.device, generator=rng)
@@ -784,7 +1343,24 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         observation_scale = observation_scale * self.conf.model.default_scale_factor
 
-        scales = self.scale_activation_inv(observation_scale)[:, None].repeat(1, 3)
+        if surface_aligned_pca_config is None:
+            scales = self.scale_activation_inv(observation_scale)[:, None].repeat(1, 3)
+        else:
+            incumbent_physical_scales = observation_scale[:, None].repeat(1, 3)
+            surface_result = surface_aligned_pca_initialize(
+                pts,
+                incumbent_physical_scales,
+                rots,
+                surface_aligned_pca_config,
+            )
+            rots = surface_result.raw_rotations_wxyz
+            scales = self.scale_activation_inv(surface_result.physical_scales)
+            audit = surface_result.audit
+            logger.info(f"Surface-aligned PCA initialization audit: {audit}")
+
+        # set colors, random if they weren't given
+        if colors is None:
+            colors = torch.randint(0, 256, (N, 3), dtype=torch.uint8, device=self.device, generator=rng)
 
         # set density as a constant
         opacities = self.density_activation_inv(
@@ -796,12 +1372,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
         )
 
-        # set colors, random if they weren't given
-        if colors is None:
-            colors = torch.randint(0, 256, (N, 3), dtype=torch.uint8, device=self.device, generator=rng)
-
-        # Initialize features based on feature_type
-        if self.feature_type == Features.Type.SH:
+        # Initialize features based on feature_type. Default to SH for
+        # partially-constructed callers that predate the NHT feature split.
+        feature_type = getattr(self, "feature_type", Features.Type.SH)
+        if feature_type == Features.Type.SH:
             features_albedo = to_torch(RGB2SH(to_np(colors.float() / 255.0)), device=self.device)
             num_specular_dims = self._specular_feature_dim()
             features_specular = torch.zeros((N, num_specular_dims))
@@ -813,7 +1387,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                     dtype=features_specular.dtype,
                     conf=self.conf,
                 )
-        elif self.feature_type == Features.Type.NHT:
+        elif feature_type == Features.Type.NHT:
             init_min = float(getattr(self.conf.model.nht_features, "init_min", -5.0))
             init_max = float(getattr(self.conf.model.nht_features, "init_max", 5.0))
             features = (
@@ -827,10 +1401,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.scale = torch.nn.Parameter(scales.to(dtype=dtype, device=self.device))
         self.density = torch.nn.Parameter(opacities.to(dtype=dtype, device=self.device))
 
-        if self.feature_type == Features.Type.SH:
+        if feature_type == Features.Type.SH:
             self.features_albedo = torch.nn.Parameter(features_albedo.to(dtype=dtype, device=self.device))
             self.features_specular = torch.nn.Parameter(features_specular.to(dtype=dtype, device=self.device))
-        elif self.feature_type == Features.Type.NHT:
+        elif feature_type == Features.Type.NHT:
             self.features = torch.nn.Parameter(features.to(dtype=dtype, device=self.device))
 
         self.set_optimizable_parameters()
@@ -862,26 +1436,60 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 if module.requires_grad:
                     params.append({"params": [module], "name": name, **args})
 
+        optimizer_betas = tuple(float(beta) for beta in self.conf.optimizer.get("betas", (0.9, 0.999)))
+        if len(optimizer_betas) != 2:
+            raise ValueError("optimizer.betas must contain exactly two values")
+
         if self.conf.optimizer.type == "adam":
             self.optimizer = torch.optim.Adam(
-                params, lr=self.conf.optimizer.lr, eps=self.conf.optimizer.eps, fused=True
+                params,
+                lr=self.conf.optimizer.lr,
+                betas=optimizer_betas,
+                eps=self.conf.optimizer.eps,
             )
-            logger.info("🔆 Using fused Adam optimizer")
+            logger.info("🔆 Using Adam optimizer")
         elif self.conf.optimizer.type == "selective_adam":
             self.optimizer = SelectiveAdam(params, lr=self.conf.optimizer.lr, eps=self.conf.optimizer.eps)
             logger.info("🔆 Using Selective Adam optimizer")
+        elif self.conf.optimizer.type == "visibility_decayed_adam":
+            self.optimizer = VisibilityDecayedAdam(
+                params,
+                lr=self.conf.optimizer.lr,
+                betas=optimizer_betas,
+                eps=self.conf.optimizer.eps,
+            )
+            logger.info("Using visibility-decayed Adam optimizer")
         else:
             raise ValueError(f"Unknown optimizer type: {self.conf.optimizer.type}")
 
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "positions":
+            if param_group["name"] == "positions" and bool(
+                self.conf.optimizer.get("scale_position_lr_by_scene_extent", True)
+            ):
                 param_group["lr"] *= self.scene_extent  # Multiply the position lr by the scene scale
 
         self.setup_scheduler()
 
         # When loading from the checkpoint also load the state dict
         if state_dict is not None:
-            self.optimizer.load_state_dict(state_dict)
+            try:
+                self.optimizer.load_state_dict(state_dict)
+            except ValueError as exc:
+                raise ValueError(
+                    "Cannot restore Gaussian optimizer state without changing the resume contract."
+                ) from exc
+            self._apply_resume_lr_scale()
+
+    def _apply_resume_lr_scale(self) -> None:
+        scale = float(self.conf.optimizer.get("resume_lr_scale", 1.0))
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError(f"optimizer.resume_lr_scale must be finite and positive; got {scale}")
+        self._resume_lr_scale = scale
+        if scale == 1.0:
+            return
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = float(param_group["lr"]) * scale
+        logger.info(f"🔆 Scaled resumed optimizer learning rates by {scale:g}")
 
     def setup_scheduler(self):
         self.schedulers = {}
@@ -893,10 +1501,17 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 continue
             if args.type is None:
                 continue
-            if name == "positions":
+            if args.type == "skip":
+                self.schedulers[name] = get_scheduler(args.type)()
+            elif name == "positions":
+                position_lr_scale = (
+                    self.scene_extent
+                    if bool(self.conf.optimizer.get("scale_position_lr_by_scene_extent", True))
+                    else 1.0
+                )
                 self.schedulers[name] = get_scheduler(args.type)(
-                    lr_init=args.lr_init * self.scene_extent,
-                    lr_final=args.lr_final * self.scene_extent,
+                    lr_init=args.lr_init * position_lr_scale,
+                    lr_final=args.lr_final * position_lr_scale,
                     max_steps=args.max_steps,
                 )
             elif name == "features":
@@ -914,32 +1529,93 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             if param_group["name"] in self.schedulers:
                 lr = self.schedulers[param_group["name"]](step)
                 if lr is not None:
+                    lr = float(lr) * self._resume_lr_scale
+                    if not np.isfinite(float(lr)):
+                        raise ValueError(f"Non-finite scheduler LR for {param_group['name']} at step {step}: {lr}")
                     param_group["lr"] = lr
 
-    def set_optimizable_parameters(self):
-        if not self.conf.model.optimize_density:
-            self.density.requires_grad = False
-        if not self.conf.model.optimize_rotation:
-            self.rotation.requires_grad = False
-        if not self.conf.model.optimize_scale:
-            self.scale.requires_grad = False
-        if not self.conf.model.optimize_position:
-            self.positions.requires_grad = False
+    def ensure_scene_extent_from_points(self, points: torch.Tensor) -> None:
+        """Use point geometry when camera-center extent is degenerate.
 
-        # Handle feature optimization based on feature_type
-        if self.feature_type == Features.Type.SH:
-            if not self.conf.model.optimize_features_albedo:
-                self.features_albedo.requires_grad = False
-            if not self.conf.model.optimize_features_specular:
-                self.features_specular.requires_grad = False
-        elif self.feature_type == Features.Type.NHT:
+        A centered / near-stationary rig (e.g. a 360 panorama capture) yields
+        a camera-derived extent ~0 even though the scene has real scale. An
+        extent that is tiny *relative to* the point-cloud radius is degenerate
+        and would freeze the position LR (``lr * scene_extent``), so fall back
+        to the geometry-derived radius. The check is scale-invariant, so a
+        genuine multi-view rig (camera extent ~ scene radius) keeps its
+        camera-derived extent; only a stationary/centered rig triggers the
+        fallback.
+        """
+        point_extent = _estimate_scene_extent_from_points(points)
+        if self.scene_extent is not None:
+            scene_extent = float(self.scene_extent)
+            if np.isfinite(scene_extent) and scene_extent > SCENE_EXTENT_MIN and scene_extent >= 0.05 * point_extent:
+                return
+
+        self.scene_extent = point_extent
+        logger.warning(
+            "Camera-derived scene extent is degenerate; using point-cloud "
+            f"fallback scene_extent={self.scene_extent:.6f}"
+        )
+
+    def set_optimizable_parameters(self):
+        self._initialize_acquisition_appearance()
+        self._initialize_acquisition_visibility()
+        self._initialize_surface_acquisition_spline()
+        self._initialize_gaussian_track_acquisition()
+        freeze_for_appearance = bool(
+            _acquisition_appearance_enabled(self.conf)
+            and self.conf.model.acquisition_appearance.get("freeze_base_gaussians", True)
+        )
+        freeze_for_visibility = bool(
+            _acquisition_visibility_enabled(self.conf)
+            and self.conf.model.acquisition_visibility.get("freeze_base_gaussians", True)
+        )
+        freeze_for_surface_spline = bool(
+            _surface_acquisition_spline_enabled(self.conf)
+            and self.conf.model.surface_acquisition_spline.get("freeze_base_gaussians", True)
+        )
+        freeze_for_gaussian_tracks = bool(
+            _gaussian_track_acquisition_enabled(self.conf)
+            and self.conf.model.gaussian_track_acquisition.get("freeze_parent", True)
+        )
+        freeze_base = (
+            freeze_for_appearance
+            or freeze_for_visibility
+            or freeze_for_surface_spline
+            or freeze_for_gaussian_tracks
+        )
+        if freeze_for_gaussian_tracks:
+            if self.acquisition_appearance is not None:
+                self.acquisition_appearance.requires_grad_(False)
+            if self.acquisition_visibility is not None:
+                self.acquisition_visibility.requires_grad_(False)
+
+        self.density.requires_grad = bool(self.conf.model.optimize_density and not freeze_base)
+        self.rotation.requires_grad = bool(self.conf.model.optimize_rotation and not freeze_base)
+        self.scale.requires_grad = bool(self.conf.model.optimize_scale and not freeze_base)
+        self.positions.requires_grad = bool(self.conf.model.optimize_position and not freeze_base)
+
+        # Handle feature optimization based on feature_type. Default to SH for
+        # partially-constructed callers that predate the NHT feature split.
+        feature_type = getattr(self, "feature_type", Features.Type.SH)
+        if feature_type == Features.Type.SH:
+            self.features_albedo.requires_grad = bool(
+                self.conf.model.optimize_features_albedo and not freeze_base
+            )
+            self.features_specular.requires_grad = bool(
+                self.conf.model.optimize_features_specular and not freeze_base
+            )
+        elif feature_type == Features.Type.NHT:
             # For learned features, check if optimize_features config exists
-            if not self.conf.model.optimize_features:
-                self.features.requires_grad = False
+            self.features.requires_grad = bool(self.conf.model.optimize_features and not freeze_base)
+
+        self.refresh_protected_gradient_hooks()
 
     def update_optimizable_parameters(self, optimizable_tensors: dict[str, torch.Tensor]):
         for name, value in optimizable_tensors.items():
             setattr(self, name, value)
+        self.refresh_protected_gradient_hooks()
 
     def increase_num_active_features(self) -> None:
         self.n_active_features = min(self.max_n_features, self.n_active_features + self.feature_dim_increase_step)
@@ -971,7 +1647,67 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         Returns:
             A dictionary containing the output of the model
         """
-        return self.renderer.render(self, batch, train, frame_id)
+        if (
+            self.acquisition_appearance is None
+            and self.acquisition_visibility is None
+            and self.surface_acquisition_spline is None
+            and self.gaussian_track_acquisition is None
+        ):
+            return self.renderer.render(self, batch, train, frame_id)
+        camera_idx = getattr(batch, "post_processing_camera_idx", -1)
+        if int(camera_idx) < 0:
+            camera_idx = batch.camera_idx
+        density = self.get_density()
+        if self.acquisition_visibility is not None:
+            density_logit_delta = self.acquisition_visibility.logit_delta(
+                camera_idx=camera_idx,
+                sequence_idx=batch.sequence_idx,
+            )
+            density = self.density_activation(self.density + density_logit_delta)
+        if self.surface_acquisition_spline is not None:
+            view = self.surface_acquisition_spline.materialize(
+                positions=self.positions,
+                rotation=self.get_rotation(),
+                scale=self.get_scale(),
+                density=density,
+                features_albedo=self.features_albedo,
+                features_specular=self.features_specular,
+                background=self.background,
+                n_active_features=self.n_active_features,
+                camera_idx=camera_idx,
+                sequence_idx=batch.sequence_idx,
+            )
+        else:
+            albedo = self.features_albedo
+            if self.acquisition_appearance is not None:
+                albedo = (
+                    albedo
+                    + self.acquisition_appearance.rgb_delta(
+                        camera_idx=camera_idx,
+                        sequence_idx=batch.sequence_idx,
+                    )
+                    / SH_DC_NORMALIZATION
+                )
+            if self.gaussian_track_acquisition is not None:
+                albedo = (
+                    albedo
+                    + self.gaussian_track_acquisition.rgb_delta(
+                        camera_idx=camera_idx,
+                        sequence_idx=batch.sequence_idx,
+                    )
+                    / SH_DC_NORMALIZATION
+                )
+            features = torch.cat((albedo, self.features_specular), dim=1)
+            view = AcquisitionGaussianView(
+                positions=self.positions,
+                rotation=self.get_rotation(),
+                scale=self.get_scale(),
+                density=density,
+                features=features.contiguous(),
+                background=self.background,
+                n_active_features=self.n_active_features,
+            )
+        return self.renderer.render(view, batch, train, frame_id)
 
     def trace(self, rays_o, rays_d, T_to_world=None):
         """Traces the model with the given rays. This method is a convenience method for ray-traced inference mode.
@@ -985,6 +1721,34 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             T_to_world = torch.eye(4, dtype=rays_o.dtype, device=rays_o.device)[None]
         inputs = Batch(T_to_world=T_to_world, rays_ori=rays_o, rays_dir=rays_d)
         return self.renderer.render(self, inputs)
+
+    def get_bvh_stats(self) -> dict:
+        """Forward to the configured backend renderer; empty dict if unavailable."""
+        try:
+            return self.renderer.get_bvh_stats()
+        except AttributeError:
+            return {}
+
+    @torch.no_grad()
+    def render_diagnostic(
+        self,
+        gpu_batch: Batch,
+        features_override=None,
+        sph_degree_override=None,
+    ) -> dict[str, torch.Tensor]:
+        """No-grad diagnostic render dispatching to the configured backend.
+
+        Used by GUIs for visualization modes (gradient heatmaps etc.) where
+        per-particle SH features are overridden by a scalar-derived color and
+        the SH degree is forced to 0 so only band-0 evaluates. Bypasses the
+        training autograd graph entirely; no training math is affected.
+        """
+        return self.renderer.render_diagnostic(
+            self,
+            gpu_batch,
+            features_override=features_override,
+            sph_degree_override=sph_degree_override,
+        )
 
     @torch.no_grad()
     def export_ply(self, mogt_path: str):

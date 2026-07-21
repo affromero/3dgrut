@@ -18,6 +18,7 @@ from enum import IntEnum
 from threedgrut.model.carriers import (
     carrier_specular_dim,
     gabor_carrier_enabled,
+    hermite_carrier_enabled,
     siren_carrier_enabled,
 )
 
@@ -60,8 +61,12 @@ class Features:
 
     @property
     def carriers_enabled(self):
-        """True when a Gabor or SIREN carrier extends the SH radiance."""
-        return gabor_carrier_enabled(self._conf) or siren_carrier_enabled(self._conf)
+        """True when a Gabor, Hermite, or SIREN carrier extends the SH radiance."""
+        return (
+            gabor_carrier_enabled(self._conf)
+            or hermite_carrier_enabled(self._conf)
+            or siren_carrier_enabled(self._conf)
+        )
 
     @property
     def transform_type(self):

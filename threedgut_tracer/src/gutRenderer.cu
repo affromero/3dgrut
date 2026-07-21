@@ -246,6 +246,7 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                                                         TFeatureDensityElem* featureDensityCudaPtr,
                                                         int* particlesVisibilityCudaPtr,
                                                         vec2* particlesProjectedPositionCudaPtr,
+                                                        vec4* particlesProjectedConicOpacityCudaPtr,
                                                         vec2* particlesProjectedExtentCudaPtr,
                                                         int* particlesTilesCountCudaPtr,
                                                         Parameters& parameters,
@@ -307,6 +308,16 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                 cudaStream),
             m_logger);
     }
+    if (particlesProjectedConicOpacityCudaPtr != nullptr) {
+        CUDA_CHECK_RETURN(
+            cudaMemcpyAsync(
+                particlesProjectedConicOpacityCudaPtr,
+                m_forwardContext->particlesProjectedConicOpacity.data(),
+                numParticles * sizeof(vec4),
+                cudaMemcpyDeviceToDevice,
+                cudaStream),
+            m_logger);
+    }
     if (particlesProjectedExtentCudaPtr != nullptr) {
         CUDA_CHECK_RETURN(
             cudaMemcpyAsync(
@@ -352,7 +363,19 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                         cudaMemcpyDeviceToHost,
                         cudaStream),
         m_logger);
-    cudaStreamSynchronize(cudaStream);
+    CUDA_CHECK_RETURN(cudaStreamSynchronize(cudaStream), m_logger);
+
+    const uint64_t maxParticleTileIntersections =
+        static_cast<uint64_t>(numParticles) * tileGrid.x * tileGrid.y;
+    if (numParticleTileIntersections > maxParticleTileIntersections) {
+        RETURN_ERROR(
+            m_logger,
+            ErrorCode::Runtime,
+            "Projected particle/tile intersection count %u exceeds the "
+            "geometric upper bound %llu",
+            numParticleTileIntersections,
+            static_cast<unsigned long long>(maxParticleTileIntersections));
+    }
 
     if (numParticleTileIntersections == 0) {
         return Status();
@@ -463,6 +486,7 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
                                                          const float* featureDensityGradientCudaPtr,
                                                          vec3* worldRayOriginGradientCudaPtr,    // TODO: not implemented yet
                                                          vec3* worldRayDirectionGradientCudaPtr, // TODO: not implemented yet
+                                                         vec3* particlePositionGradientAbsCudaPtr,
                                                          Parameters& parameters,
                                                          int cudaDeviceIndex,
                                                          cudaStream_t cudaStream) {
@@ -524,6 +548,7 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
             (tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacityGradient.data(),
             (float*)m_forwardContext->particlesGlobalDepthGradient.data(),
             (float*)m_forwardContext->particlesPrecomputedFeaturesGradient.data(),
+            particlePositionGradientAbsCudaPtr,
             parameters.m_dptrGradientsBuffer);
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
     }

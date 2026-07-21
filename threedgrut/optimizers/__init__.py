@@ -25,6 +25,9 @@
 
 import torch
 
+from threedgrut.optimizers.sparse_geometry_adam import SparseGeometryAdam
+from threedgrut.optimizers.visibility_decayed_adam import VisibilityDecayedAdam
+
 _optimizer_plugin = None
 
 

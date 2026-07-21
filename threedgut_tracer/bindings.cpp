@@ -152,6 +152,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(pybind11::init<const nlohmann::json&>())
         .def("trace", &SplatRaster::trace)
         .def("trace_bwd", &SplatRaster::traceBwd)
+        .def("trace_bwd_with_abs", &SplatRaster::traceBwdWithAbs)
         .def("collect_times", &SplatRaster::collectTimes);
 
     py::enum_<threedgut::CameraModelParameters::ShutterType>(m, "ShutterType")

@@ -31,6 +31,7 @@ static const int RadianceNumSphCoefficients = PARTICLE_RADIANCE_NUM_SH_COEFFS;
 static const bool GaborEnabled = PARTICLE_RADIANCE_GABOR_ENABLED;
 static const int GaborNumTerms = PARTICLE_RADIANCE_GABOR_NUM_TERMS;
 static const float GaborMaxFrequency = PARTICLE_RADIANCE_GABOR_MAX_FREQUENCY;
+static const bool HermiteEnabled = PARTICLE_RADIANCE_HERMITE_ENABLED;
 static const bool SirenEnabled = PARTICLE_RADIANCE_SIREN_ENABLED;
 static const int SirenHiddenDim = PARTICLE_RADIANCE_SIREN_HIDDEN_DIM;
 static const float SirenOmega = PARTICLE_RADIANCE_SIREN_OMEGA;
@@ -123,6 +124,16 @@ vector<float, Dim> radianceFromParameters(float3 incidentDirection,
                 exp(-TwoPiSquared * (fx * fx + fy * fy)) * cos(phase);
             radiance += amplitude * (cos(carrierPhase) - dc);
         }
+        radiance = max(radiance, vector<float, Dim>(0));
+    }
+    if (HermiteEnabled)
+    {
+        const int carrierOffset = RadianceNumSphCoefficients;
+        const vector<float, Dim> slopeU =
+            parameters.sphCoefficients[carrierOffset];
+        const vector<float, Dim> slopeV =
+            parameters.sphCoefficients[carrierOffset + 1];
+        radiance += slopeU * localUv.x + slopeV * localUv.y;
         radiance = max(radiance, vector<float, Dim>(0));
     }
     if (SirenEnabled)
