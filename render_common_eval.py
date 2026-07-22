@@ -52,6 +52,7 @@ from threedgrut.render import (
     configure_luminance_affine_sequence_metadata,
     configure_ppisp_camera_only_diagnostic,
     load_checkpoint_post_processing,
+    upgrade_legacy_checkpoint_config,
 )
 
 
@@ -259,7 +260,7 @@ def main() -> None:
     checkpoint_path = os.path.abspath(args.checkpoint)
     checkpoint_sha256 = _sha256_of_file(checkpoint_path)
     checkpoint = torch.load(checkpoint_path, weights_only=False)
-    conf = checkpoint["config"]
+    conf = upgrade_legacy_checkpoint_config(checkpoint["config"])
     original_training_bundle = str(conf.path)
     # Score every arm on the SAME held-out cameras + GT, GLOBAL shutter.
     conf.path = args.eval_bundle

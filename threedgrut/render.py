@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torchvision
 from torchmetrics import PeakSignalNoiseRatio
+from omegaconf import OmegaConf
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -68,6 +69,35 @@ _CHECKPOINT_CAMERA_FRAME_COUNTS_ATTR = "_hax_checkpoint_camera_frame_counts"
 _CHECKPOINT_CAMERA_INDEX_MODE_ATTR = "_hax_checkpoint_camera_index_mode"
 _RESTORATION_MANIFEST_ATTR = "_hax_restoration_manifest"
 _RUNTIME_POLICY_ATTR = "_hax_runtime_policy"
+
+
+def upgrade_legacy_checkpoint_config(conf):
+    """Return a checkpoint config merged over today's defaults.
+
+    Checkpoints trained before newer config keys existed (feature_type,
+    particle-feature knobs, NHT controls, ...) must stay loadable
+    everywhere a checkpoint config is consumed. When the marker key
+    `model.feature_type` is absent, merge the checkpoint config over the
+    current base + render-group defaults so missing keys resolve to
+    legacy-equivalent values while every trained value wins.
+    """
+    if OmegaConf.select(conf, "model.feature_type") is not None:
+        return conf
+    configs_dir = Path(__file__).resolve().parents[1] / "configs"
+    defaults = OmegaConf.load(configs_dir / "base_gs.yaml")
+    method = OmegaConf.select(conf, "render.method") or "3dgut"
+    # mirror the hydra group chain: 3dgut.yaml inherits 3dgrt.yaml
+    render_conf = OmegaConf.load(configs_dir / "render" / "3dgrt.yaml")
+    if method != "3dgrt":
+        render_conf = OmegaConf.merge(
+            render_conf,
+            OmegaConf.load(configs_dir / "render" / f"{method}.yaml"),
+        )
+    render_conf.pop("defaults", None)
+    render_defaults = OmegaConf.create(
+        {"render": OmegaConf.to_container(render_conf)}
+    )
+    return OmegaConf.merge(defaults, render_defaults, conf)
 
 
 def _validated_camera_keys(
@@ -351,7 +381,7 @@ def load_checkpoint_post_processing(
     if checkpoint_camera_keys is not None and checkpoint_camera_index_mode is None:
         raise ValueError("Checkpoint has durable camera keys/counts but no camera index " "mode.")
 
-    conf = checkpoint["config"]
+    conf = upgrade_legacy_checkpoint_config(checkpoint["config"])
     method = conf.post_processing.method
     controller_manifest = None
     if method == "ppisp":
@@ -1364,30 +1394,8 @@ class Renderer:
         checkpoint = torch.load(checkpoint_path, weights_only=False)
         global_step = checkpoint["global_step"]
 
-        conf = checkpoint["config"]
+        conf = upgrade_legacy_checkpoint_config(checkpoint["config"])
         original_training_bundle = str(conf.path)
-        # Pre-2.0 checkpoints embed configs without the keys 2.0 requires
-        # (feature_type, particle-feature knobs, ...). Merge the checkpoint
-        # config over today's defaults so new keys get legacy-equivalent
-        # defaults while every trained value wins where present.
-        from omegaconf import OmegaConf
-
-        _configs_dir = Path(__file__).resolve().parents[1] / "configs"
-        if OmegaConf.select(conf, "model.feature_type") is None:
-            defaults = OmegaConf.load(_configs_dir / "base_gs.yaml")
-            method = OmegaConf.select(conf, "render.method") or "3dgut"
-            # mirror the hydra group chain: 3dgut.yaml inherits 3dgrt.yaml
-            render_conf = OmegaConf.load(_configs_dir / "render" / "3dgrt.yaml")
-            if method != "3dgrt":
-                render_conf = OmegaConf.merge(
-                    render_conf,
-                    OmegaConf.load(_configs_dir / "render" / f"{method}.yaml"),
-                )
-            render_conf.pop("defaults", None)
-            render_defaults = OmegaConf.create(
-                {"render": OmegaConf.to_container(render_conf)}
-            )
-            conf = OmegaConf.merge(defaults, render_defaults, conf)
         # overrides
         if conf["render"]["method"] == "3dgrt":
             conf["render"]["particle_kernel_density_clamping"] = True
