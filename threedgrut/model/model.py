@@ -472,7 +472,9 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = torch.nn.Parameter(torch.empty([0, 1]))  # Density of each Gaussian [n_gaussians, 1]
 
         # Feature type configuration - determine feature storage mode
-        self.feature_type = Features.Type.from_string(self.conf.model.feature_type)
+        self.feature_type = Features.Type.from_string(
+            self.conf.model.get("feature_type", "sh")
+        )
 
         primitive_type = (getattr(conf.render, "primitive_type", None) or "").lower()
         if self.feature_type == Features.Type.NHT and primitive_type == "trisurfel":

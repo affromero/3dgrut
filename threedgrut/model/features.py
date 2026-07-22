@@ -75,7 +75,7 @@ class Features:
         feature_type stays "sh" in the config when carriers are enabled (they
         are an SH-mode extension); only the compiled feature head differs.
         """
-        base = Features.Type.from_string(self._conf.model.feature_type)
+        base = Features.Type.from_string(self._conf.model.get("feature_type", "sh"))
         if base == Features.Type.SH and self.carriers_enabled:
             return Features.Type.SH_CARRIER
         if base != Features.Type.SH and self.carriers_enabled:
@@ -85,7 +85,7 @@ class Features:
     @property
     def activation_type(self):
         """Feature activation type from nht_features.activation.type."""
-        feature_type = self._conf.model.feature_type.lower()
+        feature_type = self._conf.model.get("feature_type", "sh").lower()
         if feature_type != "nht":
             return Features.ActivationType.NONE
         v = getattr(self._conf.model.nht_features, "activation", None)
@@ -115,7 +115,7 @@ class Features:
     @property
     def interpolation_type(self):
         """CENTER (none/barycentric) or BEZIER."""
-        feature_type = self._conf.model.feature_type.lower()
+        feature_type = self._conf.model.get("feature_type", "sh").lower()
         if feature_type != "nht":
             return Features.InterpolationType.CENTER
         v = getattr(self._conf.model.nht_features, "interpolation_type", "none").lower()
@@ -130,7 +130,7 @@ class Features:
     @property
     def interpolation_support(self):
         """CENTER, TETRAHEDRA (gaussian), or TRIANGLE (trisurfel)."""
-        feature_type = self._conf.model.feature_type.lower()
+        feature_type = self._conf.model.get("feature_type", "sh").lower()
         if feature_type != "nht":
             return Features.InterpolationSupport.CENTER
         v = getattr(self._conf.model.nht_features, "interpolation_type", "none").lower()
@@ -148,7 +148,7 @@ class Features:
     @property
     def num_interpolation_points(self):
         """1 for center support, 4 for barycentric (tetrahedra or trisurfel)."""
-        feature_type = self._conf.model.feature_type.lower()
+        feature_type = self._conf.model.get("feature_type", "sh").lower()
         if feature_type != "nht":
             return 1
         if self.interpolation_support == Features.InterpolationSupport.CENTER:
@@ -158,7 +158,7 @@ class Features:
     @property
     def particle_feature_dim(self):
         """Total feature dim per particle (buffer stride). For NHT = nht_features.dim."""
-        feature_type = self._conf.model.feature_type.lower()
+        feature_type = self._conf.model.get("feature_type", "sh").lower()
         if feature_type == "sh":
             sh_degree = self._conf.model.progressive_training.max_n_features
             return 3 * ((sh_degree + 1) ** 2) + carrier_specular_dim(self._conf)
@@ -169,7 +169,7 @@ class Features:
     @property
     def interp_point_feature_dim(self):
         """Per-interpolation-point feature dim before activation."""
-        feature_type = self._conf.model.feature_type.lower()
+        feature_type = self._conf.model.get("feature_type", "sh").lower()
         if feature_type != "nht":
             return 3
         return self._conf.model.nht_features.dim // self.num_interpolation_points
@@ -177,7 +177,7 @@ class Features:
     @property
     def ray_feature_dim(self):
         """Per-ray feature dim after optional harmonic expansion."""
-        feature_type = self._conf.model.feature_type.lower()
+        feature_type = self._conf.model.get("feature_type", "sh").lower()
         if feature_type == "sh":
             return 3  # RGB output
         elif feature_type == "nht":
