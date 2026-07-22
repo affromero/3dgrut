@@ -14,6 +14,7 @@ eval/
 extra_info/
 
 debug_**
+/tea_debug.log
 
 utils/ngc/grid_search_configs
 
