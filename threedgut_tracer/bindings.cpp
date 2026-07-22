@@ -151,6 +151,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<SplatRaster>(m, "SplatRaster")
         .def(pybind11::init<const nlohmann::json&>())
         .def("trace", &SplatRaster::trace)
+        .def(
+            "trace_with_responsibility",
+            &SplatRaster::traceWithResponsibility)
         .def("trace_bwd", &SplatRaster::traceBwd)
         .def("trace_bwd_with_abs", &SplatRaster::traceBwdWithAbs)
         .def("collect_times", &SplatRaster::collectTimes);

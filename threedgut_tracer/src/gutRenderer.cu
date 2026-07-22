@@ -249,6 +249,10 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
                                                         vec4* particlesProjectedConicOpacityCudaPtr,
                                                         vec2* particlesProjectedExtentCudaPtr,
                                                         int* particlesTilesCountCudaPtr,
+                                                        const float* rayDiagnosticCudaPtr,
+                                                        float* particlesResponsibilityCudaPtr,
+                                                        float* particlesDiagnosticResponsibilityCudaPtr,
+                                                        float* particlesDiagnosticWeightedSumCudaPtr,
                                                         Parameters& parameters,
                                                         int cudaDeviceIndex,
                                                         cudaStream_t cudaStream) {
@@ -452,6 +456,10 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
             (const tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacity.data(),
             (const float*)m_forwardContext->particlesGlobalDepth.data(),
             (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
+            rayDiagnosticCudaPtr,
+            particlesResponsibilityCudaPtr,
+            particlesDiagnosticResponsibilityCudaPtr,
+            particlesDiagnosticWeightedSumCudaPtr,
             parameters.m_dptrParametersBuffer,
             tcnn::uvec2{tileGrid.x, tileGrid.y});
 #else
@@ -469,6 +477,10 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
             (const tcnn::vec4*)m_forwardContext->particlesProjectedConicOpacity.data(),
             (const float*)m_forwardContext->particlesGlobalDepth.data(),
             (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
+            rayDiagnosticCudaPtr,
+            particlesResponsibilityCudaPtr,
+            particlesDiagnosticResponsibilityCudaPtr,
+            particlesDiagnosticWeightedSumCudaPtr,
             parameters.m_dptrParametersBuffer);
 #endif
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);

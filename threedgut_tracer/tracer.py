@@ -595,6 +595,78 @@ class Tracer:
             "hits_count": hits_count,
         }
 
+    @torch.no_grad()
+    def render_responsibility(
+        self,
+        gaussians,
+        gpu_batch: Batch,
+        ray_diagnostic: torch.Tensor,
+        frame_id: int = 0,
+    ) -> dict[str, torch.Tensor]:
+        """Accumulate exact T*alpha ownership for one per-ray diagnostic.
+
+        NaN values mark rays that are outside the metric's sampling domain.
+        The native renderer returns the unnormalised ownership denominator and
+        the diagnostic-weighted numerator for every Gaussian.
+        """
+        rays_o = gpu_batch.rays_ori
+        rays_d = gpu_batch.rays_dir
+        if ray_diagnostic.shape != rays_o.shape[1:3]:
+            raise ValueError(
+                "ray_diagnostic must have shape [H, W] matching the batch; "
+                f"got {tuple(ray_diagnostic.shape)} for {tuple(rays_o.shape)}."
+            )
+        if ray_diagnostic.dtype != torch.float32:
+            raise TypeError(
+                "ray_diagnostic must use float32 so native responsibility "
+                f"accumulation is exact; got {ray_diagnostic.dtype}."
+            )
+        ray_diagnostic = ray_diagnostic.to(device=rays_o.device).contiguous()
+
+        sensor, poses = Tracer.__create_camera_parameters(gpu_batch)
+        particle_density = torch.concat(
+            [
+                gaussians.positions.contiguous(),
+                gaussians.get_density().contiguous(),
+                gaussians.get_rotation().contiguous(),
+                gaussians.get_scale().contiguous(),
+                torch.zeros_like(gaussians.get_density()),
+            ],
+            dim=1,
+        ).contiguous()
+        particle_radiance = self._pad_particle_radiance(
+            gaussians.get_features(),
+            particle_radiance_width(self.conf),
+        ).contiguous()
+        ray_time = (
+            torch.ones(
+                (rays_o.shape[0], rays_o.shape[1], rays_o.shape[2], 1),
+                device=rays_o.device,
+                dtype=torch.long,
+            )
+            * poses.timestamps_us[0]
+        )
+        outputs = self.tracer_wrapper.trace_with_responsibility(
+            frame_id,
+            gaussians.n_active_features,
+            particle_density,
+            particle_radiance,
+            rays_o.contiguous(),
+            rays_d.contiguous(),
+            ray_time.contiguous(),
+            sensor,
+            poses.timestamps_us[0],
+            poses.timestamps_us[1],
+            poses.T_world_sensors[0],
+            poses.T_world_sensors[1],
+            ray_diagnostic,
+        )
+        return {
+            "responsibility": outputs[8].squeeze(-1),
+            "diagnostic_responsibility": outputs[9].squeeze(-1),
+            "diagnostic_weighted_sum": outputs[10].squeeze(-1),
+        }
+
     def get_bvh_stats(self) -> dict:
         """3DGUT uses SplatRaster (no OptiX BVH) — return empty stats."""
         return {}

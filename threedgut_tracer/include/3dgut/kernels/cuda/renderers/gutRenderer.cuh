@@ -93,6 +93,10 @@ __global__ void render(threedgut::RenderParameters params,
                        const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
                        const float* __restrict__ particlesGlobalDepthPtr,
                        const float* __restrict__ particlesPrecomputedFeaturesPtr,
+                       const float* __restrict__ rayDiagnosticPtr,
+                       float* __restrict__ particlesResponsibilityPtr,
+                       float* __restrict__ particlesDiagnosticResponsibilityPtr,
+                       float* __restrict__ particlesDiagnosticWeightedSumPtr,
                        const uint64_t* __restrict__ parameterMemoryHandles) {
 
     auto ray = initializeRay<TGUTRenderer::TRayPayload>(
@@ -106,7 +110,17 @@ __global__ void render(threedgut::RenderParameters params,
                        particlesProjectedConicOpacityPtr,
                        particlesGlobalDepthPtr,
                        particlesPrecomputedFeaturesPtr,
-                       {parameterMemoryHandles});
+                       {parameterMemoryHandles},
+                       nullptr,
+                       nullptr,
+                       nullptr,
+                       nullptr,
+                       nullptr,
+                       {},
+                       rayDiagnosticPtr,
+                       particlesResponsibilityPtr,
+                       particlesDiagnosticResponsibilityPtr,
+                       particlesDiagnosticWeightedSumPtr);
 
     // TGUTModel::eval(params, ray, {parameterMemoryHandles});
 
@@ -129,6 +143,10 @@ __global__ void renderBalanced(threedgut::RenderParameters params,
                                const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
                                const float* __restrict__ particlesGlobalDepthPtr,
                                const float* __restrict__ particlesPrecomputedFeaturesPtr,
+                               const float* __restrict__ rayDiagnosticPtr,
+                               float* __restrict__ particlesResponsibilityPtr,
+                               float* __restrict__ particlesDiagnosticResponsibilityPtr,
+                               float* __restrict__ particlesDiagnosticWeightedSumPtr,
                                const uint64_t* __restrict__ parameterMemoryHandles,
                                const tcnn::uvec2 tileGrid) {
 
@@ -201,6 +219,10 @@ __global__ void renderBalanced(threedgut::RenderParameters params,
                                                    particlesProjectedConicOpacityPtr,
                                                    particlesGlobalDepthPtr,
                                                    particlesPrecomputedFeaturesPtr,
+                                                   rayDiagnosticPtr,
+                                                   particlesResponsibilityPtr,
+                                                   particlesDiagnosticResponsibilityPtr,
+                                                   particlesDiagnosticWeightedSumPtr,
                                                    originalTile,
                                                    tileGrid,
                                                    laneId, // warp lane for parallel processing

@@ -333,18 +333,21 @@ SplatRaster::SplatRaster(const nlohmann::json& config)
 SplatRaster::~SplatRaster(void) {
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
-                   torch::Tensor particleDensity,
-                   torch::Tensor particleRadiance,
-                   torch::Tensor rayOrigin,
-                   torch::Tensor rayDirection,
-                   torch::Tensor rayTimestamp,
-                   TSensorModel sensorModel,
-                   TTimestamp startTimestamp,
-                   TTimestamp endTimestamp,
-                   torch::Tensor sensorsStartPose,
-                   torch::Tensor sensorsEndPose) {
+SplatRaster::TraceWithResponsibilityResult
+SplatRaster::traceWithResponsibilityImpl(
+    uint32_t frameNumber,
+    int numActiveFeatures,
+    torch::Tensor particleDensity,
+    torch::Tensor particleRadiance,
+    torch::Tensor rayOrigin,
+    torch::Tensor rayDirection,
+    torch::Tensor rayTimestamp,
+    TSensorModel sensorModel,
+    TTimestamp startTimestamp,
+    TTimestamp endTimestamp,
+    torch::Tensor sensorsStartPose,
+    torch::Tensor sensorsEndPose,
+    torch::Tensor rayDiagnostic) {
 
     validateTraceInputs(
         numActiveFeatures,
@@ -360,6 +363,20 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
 
     const int width  = rayOrigin.size(2);
     const int height = rayOrigin.size(1);
+
+    if (rayDiagnostic.defined()) {
+        validateCudaTensor(
+            rayDiagnostic,
+            "rayDiagnostic",
+            torch::kFloat32,
+            cudaDeviceIndex);
+        TORCH_CHECK(
+            rayDiagnostic.dim() == 2 && rayDiagnostic.size(0) == height &&
+                rayDiagnostic.size(1) == width,
+            "rayDiagnostic must have shape [H, W] matching the rays; got ",
+            rayDiagnostic.sizes(),
+            ".");
+    }
 
     const uint32_t numParticles = particleDensity.size(0);
 
@@ -381,6 +398,14 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
     torch::Tensor particleTilesCount            = torch::zeros(
         {numParticles, 1},
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    torch::Tensor particleResponsibility = torch::empty({0, 1}, opts);
+    torch::Tensor particleDiagnosticResponsibility = torch::empty({0, 1}, opts);
+    torch::Tensor particleDiagnosticWeightedSum = torch::empty({0, 1}, opts);
+    if (rayDiagnostic.defined()) {
+        particleResponsibility = torch::zeros({numParticles, 1}, opts);
+        particleDiagnosticResponsibility = torch::zeros({numParticles, 1}, opts);
+        particleDiagnosticWeightedSum = torch::zeros({numParticles, 1}, opts);
+    }
     torch::Tensor particleRadianceKernel = particleRadianceKernelTensor(particleRadiance);
 
     m_parameters.values.numParticles               = numParticles;
@@ -419,6 +444,19 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         reinterpret_cast<tcnn::vec4*>(voidDataPtr(particleProjectedConicOpacity)),
         reinterpret_cast<tcnn::vec2*>(voidDataPtr(particleProjectedExtent)),
         reinterpret_cast<int*>(voidDataPtr(particleTilesCount)),
+        rayDiagnostic.defined()
+            ? reinterpret_cast<const float*>(voidDataPtr(rayDiagnostic))
+            : nullptr,
+        rayDiagnostic.defined()
+            ? reinterpret_cast<float*>(voidDataPtr(particleResponsibility))
+            : nullptr,
+        rayDiagnostic.defined()
+            ? reinterpret_cast<float*>(
+                  voidDataPtr(particleDiagnosticResponsibility))
+            : nullptr,
+        rayDiagnostic.defined()
+            ? reinterpret_cast<float*>(voidDataPtr(particleDiagnosticWeightedSum))
+            : nullptr,
         m_parameters,
         cudaDeviceIndex,
         cudaStream);
@@ -429,7 +467,7 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         timer->stop();
     }
 
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+    return TraceWithResponsibilityResult(
         rayRadianceDensity,
         rayHitDistance,
         rayHitCount,
@@ -437,7 +475,79 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         particleProjectedPosition,
         particleProjectedConicOpacity,
         particleProjectedExtent,
-        particleTilesCount);
+        particleTilesCount,
+        particleResponsibility,
+        particleDiagnosticResponsibility,
+        particleDiagnosticWeightedSum);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
+                   torch::Tensor particleDensity,
+                   torch::Tensor particleRadiance,
+                   torch::Tensor rayOrigin,
+                   torch::Tensor rayDirection,
+                   torch::Tensor rayTimestamp,
+                   TSensorModel sensorModel,
+                   TTimestamp startTimestamp,
+                   TTimestamp endTimestamp,
+                   torch::Tensor sensorsStartPose,
+                   torch::Tensor sensorsEndPose) {
+    auto result = traceWithResponsibilityImpl(
+        frameNumber,
+        numActiveFeatures,
+        particleDensity,
+        particleRadiance,
+        rayOrigin,
+        rayDirection,
+        rayTimestamp,
+        sensorModel,
+        startTimestamp,
+        endTimestamp,
+        sensorsStartPose,
+        sensorsEndPose,
+        torch::Tensor());
+    return {
+        std::get<0>(result),
+        std::get<1>(result),
+        std::get<2>(result),
+        std::get<3>(result),
+        std::get<4>(result),
+        std::get<5>(result),
+        std::get<6>(result),
+        std::get<7>(result)};
+}
+
+SplatRaster::TraceWithResponsibilityResult
+SplatRaster::traceWithResponsibility(
+    uint32_t frameNumber,
+    int numActiveFeatures,
+    torch::Tensor particleDensity,
+    torch::Tensor particleRadiance,
+    torch::Tensor rayOrigin,
+    torch::Tensor rayDirection,
+    torch::Tensor rayTimestamp,
+    TSensorModel sensorModel,
+    TTimestamp startTimestamp,
+    TTimestamp endTimestamp,
+    torch::Tensor sensorsStartPose,
+    torch::Tensor sensorsEndPose,
+    torch::Tensor rayDiagnostic) {
+    return traceWithResponsibilityImpl(
+        frameNumber,
+        numActiveFeatures,
+        particleDensity,
+        particleRadiance,
+        rayOrigin,
+        rayDirection,
+        rayTimestamp,
+        sensorModel,
+        startTimestamp,
+        endTimestamp,
+        sensorsStartPose,
+        sensorsEndPose,
+        rayDiagnostic);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

@@ -153,7 +153,11 @@ struct GUTKBufferRenderer : Params {
         const HitParticle& hitParticle,
         const Particles& particles,
         const TFeaturesVec* __restrict__ particleFeatures,
-        TFeaturesVec* __restrict__ particleFeaturesGradient) {
+        TFeaturesVec* __restrict__ particleFeaturesGradient,
+        const float* __restrict__ rayDiagnosticPtr,
+        float* __restrict__ particlesResponsibilityPtr,
+        float* __restrict__ particlesDiagnosticResponsibilityPtr,
+        float* __restrict__ particlesDiagnosticWeightedSumPtr) {
 
         if constexpr (Backward) {
             float hitAlphaGrad               = 0.f;
@@ -203,6 +207,20 @@ struct GUTKBufferRenderer : Params {
                                               hitParticle.hitT,
                                               ray.hitT);
 
+            if (particlesResponsibilityPtr != nullptr && hitWeight > 0.0f) {
+                atomicAdd(
+                    &particlesResponsibilityPtr[hitParticle.idx], hitWeight);
+                const float diagnostic = rayDiagnosticPtr[ray.idx];
+                if (isfinite(diagnostic)) {
+                    atomicAdd(
+                        &particlesDiagnosticResponsibilityPtr[hitParticle.idx],
+                        hitWeight);
+                    atomicAdd(
+                        &particlesDiagnosticWeightedSumPtr[hitParticle.idx],
+                        hitWeight * diagnostic);
+                }
+            }
+
             // `if constexpr` branches so the SH specialization of Hit (which
             // has no `canonicalIntersection` member) is not instantiated with
             // a missing field reference.
@@ -240,7 +258,11 @@ struct GUTKBufferRenderer : Params {
                                        float* __restrict__ /*particlesGlobalDepthGradPtr*/                = nullptr,
                                        float* __restrict__ particlesPrecomputedFeaturesGradPtr            = nullptr,
                                        tcnn::vec3* __restrict__ particlePositionGradientAbsPtr             = nullptr,
-                                       threedgut::MemoryHandles parametersGradient                        = {}) {
+                                       threedgut::MemoryHandles parametersGradient                        = {},
+                                       const float* __restrict__ rayDiagnosticPtr                          = nullptr,
+                                       float* __restrict__ particlesResponsibilityPtr                      = nullptr,
+                                       float* __restrict__ particlesDiagnosticResponsibilityPtr            = nullptr,
+                                       float* __restrict__ particlesDiagnosticWeightedSumPtr               = nullptr) {
 
         using namespace threedgut;
 
@@ -268,7 +290,10 @@ struct GUTKBufferRenderer : Params {
                                   particlePositionGradientAbsPtr);
         } else {
             evalKBuffer(ray, particles, tileParticleRangeIndices, tileNumBlocksToProcess, tileNumParticlesToProcess, tileThreadIdx,
-                        sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer);
+                        sortedTileParticleIdxPtr, particleFeaturesBuffer, particleFeaturesGradientBuffer,
+                        rayDiagnosticPtr, particlesResponsibilityPtr,
+                        particlesDiagnosticResponsibilityPtr,
+                        particlesDiagnosticWeightedSumPtr);
         }
     }
 
@@ -281,7 +306,11 @@ struct GUTKBufferRenderer : Params {
                                               const uint32_t tileThreadIdx,
                                               const uint32_t* __restrict__ sortedTileParticleIdxPtr,
                                               const TFeaturesVec* __restrict__ particleFeaturesBuffer,
-                                              TFeaturesVec* __restrict__ particleFeaturesGradientBuffer) {
+                                              TFeaturesVec* __restrict__ particleFeaturesGradientBuffer,
+                                              const float* __restrict__ rayDiagnosticPtr,
+                                              float* __restrict__ particlesResponsibilityPtr,
+                                              float* __restrict__ particlesDiagnosticResponsibilityPtr,
+                                              float* __restrict__ particlesDiagnosticWeightedSumPtr) {
         using namespace threedgut;
         __shared__ PrefetchedParticleData prefetchedParticlesData[GUTParameters::Tiling::BlockSize];
 
@@ -335,7 +364,11 @@ struct GUTKBufferRenderer : Params {
                                            hitParticleKBuffer.closestHit(hitParticle),
                                            particles,
                                            particleFeaturesBuffer,
-                                           particleFeaturesGradientBuffer);
+                                           particleFeaturesGradientBuffer,
+                                           rayDiagnosticPtr,
+                                           particlesResponsibilityPtr,
+                                           particlesDiagnosticResponsibilityPtr,
+                                           particlesDiagnosticWeightedSumPtr);
                     }
                     hitParticleKBuffer.insert(hitParticle);
                 }
@@ -348,7 +381,11 @@ struct GUTKBufferRenderer : Params {
                                    hitParticleKBuffer[Params::KHitBufferSize - hitParticleKBuffer.numHits() + i],
                                    particles,
                                    particleFeaturesBuffer,
-                                   particleFeaturesGradientBuffer);
+                                   particleFeaturesGradientBuffer,
+                                   rayDiagnosticPtr,
+                                   particlesResponsibilityPtr,
+                                   particlesDiagnosticResponsibilityPtr,
+                                   particlesDiagnosticWeightedSumPtr);
             }
         }
     }
@@ -364,6 +401,10 @@ struct GUTKBufferRenderer : Params {
         const tcnn::vec4* __restrict__ particlesProjectedConicOpacityPtr,
         const float* __restrict__ particlesGlobalDepthPtr,
         const float* __restrict__ particlesPrecomputedFeaturesPtr,
+        const float* __restrict__ rayDiagnosticPtr,
+        float* __restrict__ particlesResponsibilityPtr,
+        float* __restrict__ particlesDiagnosticResponsibilityPtr,
+        float* __restrict__ particlesDiagnosticWeightedSumPtr,
         const tcnn::uvec2& tile,
         const tcnn::uvec2& tileGrid,
         const int laneId,
@@ -415,11 +456,12 @@ struct GUTKBufferRenderer : Params {
             float hitT                      = 0.0f;
             TFeaturesVec hitFeatures        = TFeaturesVec::zero();
             bool validHit                   = false;
+            uint32_t particleIdx            = GUTParameters::InvalidParticleIdx;
 
             // Step 1: Each thread tests one Gaussian intersection
             if (j < tileNumParticlesToProcess) {
                 const uint32_t toProcessSortedIndex = tileParticleRangeIndices.x + j;
-                const uint32_t particleIdx          = sortedTileParticleIdxPtr[toProcessSortedIndex];
+                particleIdx = sortedTileParticleIdxPtr[toProcessSortedIndex];
 
                 if (particleIdx != GUTParameters::InvalidParticleIdx) {
                     auto densityParams = particles.fetchDensityParameters(particleIdx);
@@ -491,6 +533,19 @@ struct GUTKBufferRenderer : Params {
                 float prefixTransmittance   = (laneId > 0) ? (localTransmittance / (1.0f - hitAlpha)) : 1.0f;
                 float particleTransmittance = ray.transmittance * prefixTransmittance;
                 float hitWeight             = hitAlpha * particleTransmittance;
+
+                if (particlesResponsibilityPtr != nullptr && hitWeight > 0.0f) {
+                    atomicAdd(&particlesResponsibilityPtr[particleIdx], hitWeight);
+                    const float diagnostic = rayDiagnosticPtr[ray.idx];
+                    if (isfinite(diagnostic)) {
+                        atomicAdd(
+                            &particlesDiagnosticResponsibilityPtr[particleIdx],
+                            hitWeight);
+                        atomicAdd(
+                            &particlesDiagnosticWeightedSumPtr[particleIdx],
+                            hitWeight * diagnostic);
+                    }
+                }
 
                 // Compute weighted contributions
                 for (int featIdx = 0; featIdx < Particles::RayFeatureDim; ++featIdx) {

@@ -83,6 +83,10 @@ public:
                          tcnn::vec4* particlesProjectedConicOpacityCudaPtr,
                          tcnn::vec2* particlesProjectedExtentCudaPtr,
                          int* particlesTilesCountCudaPtr,
+                         const float* rayDiagnosticCudaPtr,
+                         float* particlesResponsibilityCudaPtr,
+                         float* particlesDiagnosticResponsibilityCudaPtr,
+                         float* particlesDiagnosticWeightedSumCudaPtr,
                          Parameters& parameters,
                          int cudaDeviceIndex,
                          cudaStream_t cudaStream);

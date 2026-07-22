@@ -23,11 +23,25 @@
 
 #include <deque>
 #include <string>
+#include <tuple>
 
 using TTimestamp = int64_t;
 
 class SplatRaster final {
 private:
+    using TraceWithResponsibilityResult = std::tuple<
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor,
+        torch::Tensor>;
+
     uint8_t m_logLevel;
     threedgut::Logger m_logger;
 
@@ -42,6 +56,21 @@ private:
 
     const size_t m_maxNumTimers = 256; // We only keep the most recent 256 timers
     std::deque<std::shared_ptr<CudaTimer>> m_timers;
+
+    TraceWithResponsibilityResult traceWithResponsibilityImpl(
+        uint32_t frameNumber,
+        int numActiveFeatures,
+        torch::Tensor particleDensity,
+        torch::Tensor particleRadiance,
+        torch::Tensor rayOrigin,
+        torch::Tensor rayDirection,
+        torch::Tensor rayTimestamp,
+        threedgut::TSensorModel sensor,
+        TTimestamp startTimestamp,
+        TTimestamp endTimestamp,
+        torch::Tensor sensorsStartPose,
+        torch::Tensor sensorsEndPose,
+        torch::Tensor rayDiagnostic);
 
 public:
     SplatRaster(const nlohmann::json& config);
@@ -63,6 +92,20 @@ public:
           TTimestamp endTimestamp,
           torch::Tensor sensorsStartPose,
           torch::Tensor sensorsEndPose);
+
+    TraceWithResponsibilityResult
+    traceWithResponsibility(uint32_t frameNumber, int numActiveFeatures,
+                            torch::Tensor particleDensity,
+                            torch::Tensor particleRadiance,
+                            torch::Tensor rayOrigin,
+                            torch::Tensor rayDirection,
+                            torch::Tensor rayTimestamp,
+                            threedgut::TSensorModel sensor,
+                            TTimestamp startTimestamp,
+                            TTimestamp endTimestamp,
+                            torch::Tensor sensorsStartPose,
+                            torch::Tensor sensorsEndPose,
+                            torch::Tensor rayDiagnostic);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     traceBwd(uint32_t frameNumber, int numActiveFeatures,

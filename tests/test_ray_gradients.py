@@ -422,5 +422,79 @@ def test_progressive_sh_padding_preserves_active_gradients() -> None:
     torch.testing.assert_close(active.grad, torch.ones_like(active))
 
 
+def test_responsibility_matches_composited_opacity() -> None:
+    """The native diagnostic accumulator must use the renderer T*alpha."""
+    device = torch.device("cuda")
+    conf = _build_jit_config()
+    plugin = setup_3dgut(conf)
+    raster = plugin.SplatRaster(OmegaConf.to_container(conf))
+
+    height, width = 16, 16
+    particle_density = torch.zeros(32, 12, device=device)
+    torch.manual_seed(42)
+    for index in range(len(particle_density)):
+        particle_density[index, :3] = torch.randn(3, device=device) * 0.3
+        particle_density[index, 3] = 10.0
+        particle_density[index, 4] = 1.0
+        particle_density[index, 8:11] = 0.15
+    particle_radiance = torch.zeros(32, 48, device=device)
+    ray_ori = torch.zeros(1, height, width, 3, device=device)
+    ray_ori[..., 2] = 2.0
+    ray_dir = torch.zeros_like(ray_ori)
+    for y in range(height):
+        for x in range(width):
+            direction = torch.tensor(
+                [(x - width / 2) / width, (y - height / 2) / height, -1.0],
+                device=device,
+            )
+            ray_dir[0, y, x] = direction / direction.norm()
+    ray_timestamp = torch.zeros(
+        1,
+        height,
+        width,
+        1,
+        dtype=torch.long,
+        device=device,
+    )
+    sensor = plugin.fromOpenCVPinholeCameraModelParameters(
+        [width, height],
+        plugin.ShutterType.GLOBAL,
+        [width / 2.0, height / 2.0],
+        [width / 2.0, width / 2.0],
+        [0.0] * 6,
+        [0.0, 0.0],
+        [0.0] * 4,
+    )
+    pose = torch.tensor(
+        [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]],
+        device=device,
+    )
+    result = raster.trace_with_responsibility(
+        0,
+        1,
+        particle_density,
+        particle_radiance,
+        ray_ori,
+        ray_dir,
+        ray_timestamp,
+        sensor,
+        0,
+        0,
+        pose,
+        pose,
+        torch.ones(height, width, device=device),
+    )
+
+    composited_opacity = result[0][..., 3].sum()
+    responsibility = result[8].sum()
+    diagnostic_responsibility = result[9].sum()
+    weighted = result[10].sum()
+    assert torch.isfinite(responsibility)
+    assert responsibility > 0.0
+    assert torch.allclose(responsibility, composited_opacity, atol=1e-5)
+    assert torch.allclose(diagnostic_responsibility, responsibility, atol=1e-5)
+    assert torch.allclose(weighted, responsibility, atol=1e-5)
+
+
 if __name__ == "__main__":
     test_ray_gradient_finite_differences()

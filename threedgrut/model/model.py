@@ -1753,6 +1753,19 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
     @torch.no_grad()
+    def render_responsibility(
+        self,
+        gpu_batch: Batch,
+        ray_diagnostic: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Return exact native T*alpha ownership for a sampled ray field."""
+        return self.renderer.render_responsibility(
+            self,
+            gpu_batch,
+            ray_diagnostic,
+        )
+
+    @torch.no_grad()
     def export_ply(self, mogt_path: str):
         exporter = PLYExporter()
         exporter.export(self, Path(mogt_path))
