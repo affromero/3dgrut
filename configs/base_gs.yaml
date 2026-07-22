@@ -1,8 +1,8 @@
 defaults:
-  - _self_
-  - /strategy: gs
-  - override hydra/hydra_logging: disabled
-  - override hydra/job_logging: disabled
+- _self_
+- /strategy: gs
+- override hydra/hydra_logging: disabled
+- override hydra/job_logging: disabled
 
 path: ???
 seed_initialization: 42  # seed for rng in model initialization
@@ -30,6 +30,9 @@ writer:
   max_num_hits: 128
   log_image_views: ${int_list:[ 0, 13, 27, 43, 78 ]}
 
+  eval_image_count: 5
+  eval_image_group_size: 5
+  footprint_sample_count: 200000
 export_ply:
   enabled: false
   path: ""
@@ -37,7 +40,7 @@ import_ply:
   enabled: false
   path: ""
   init_global_step: 0
-  
+
 export_usd:
   enabled: false
   path: ""
@@ -57,17 +60,17 @@ export_usd:
   ppisp-integration-mode: spg-runtime
   # Optional fixed PPISP camera/frame. sh-optimized defaults unset values to 0;
   # spg-runtime keeps dynamic per-camera/per-frame behavior when unset.
-  ppisp-reference-camera-id: null
-  ppisp-reference-frame-id: null
+  ppisp-reference-camera-id:
+  ppisp-reference-frame-id:
   # Achromatic PPISP responsivity default authored on spg-runtime SPG shaders.
   # To rescale asset radiance by k while preserving the PPISP input magnitude,
   # set scene-radiance-scale: k and ppisp-responsivity: 1/k.
   ppisp-responsivity: 1.0
   # null = auto-export controllers when the PPISP checkpoint has them.
   # true = require controller export; false = force static/time-sampled fallback.
-  enable-ppisp-controller-export: null
+  enable-ppisp-controller-export:
   # Number of optimizer steps for sh-optimized export. null uses the default (3000).
-  sh-optimization-num-iterations: null
+  sh-optimization-num-iterations:
   # Multiplicative scale applied to exported SH radiance.
   scene-radiance-scale: 1.0
   # USD timeCodesPerSecond; time codes are bare frame indices so this sets playback speed
@@ -169,6 +172,7 @@ model:
     increase_frequency: 1000 # unmask more feature dimensions every N global steps
     increase_step: 1 # sh: how many degrees unmasked per step | mlp: how many dims unmasked per step
 
+    feature_type: "sh"
   nht_features:
     dim: 48
     init_min: -1.5707963267948966
@@ -241,6 +245,9 @@ model:
 checkpoint:
   iterations: ${int_list:[ 7000, 30000 ]}
 
+  keep_step_checkpoints: true
+  save_last_on_validation: false
+  save_best_on_validation: false
 optimizer:
   type: adam # adam, selective_adam, or visibility_decayed_adam
   lr: 0.0
@@ -292,7 +299,7 @@ scheduler:
 loss:
   use_l1: true
   lambda_l1: 0.8
-  
+
   use_l2: false
   lambda_l2: 1.0
 
@@ -383,7 +390,7 @@ loss:
   mvdino_model_name: dinov2_reg
   mvdino_rim_theta_min_deg: 60.0
   mvdino_rim_theta_max_deg: 80.0
-  mvdino_exp_dir: null
+  mvdino_exp_dir:
   mvdino_warmup_iters: 3000
   mvdino_use_rim_crops: false
   mvdino_n_crops: 8
@@ -392,8 +399,13 @@ loss:
   mvdino_anyup_res: 512
 
 # Post-processing configuration
+  l1_loss_type: absolute
+  charbonnier_epsilon: 0.01
+  erp_latitude_weighting: false
+  use_sky_opacity: false
+  lambda_sky_opacity: 0.0
 post_processing:
-  method: null # Possible values: null, "ppisp", "luminance_affine"
+  method:      # Possible values: null, "ppisp", "luminance_affine"
   # Preserve a restored post-processing module as a differentiable, fixed
   # novel-view transform while another representation branch is trained.
   # No per-frame latent is consulted and no post-processing optimizer exists.
@@ -403,9 +415,9 @@ post_processing:
   # COLMAP bundles whose frame-specific intrinsics create many camera_id rows.
   camera_index_mode: dataset
   # Optional launch-contract guard for recipes with a known physical rig.
-  expected_num_cameras: null
+  expected_num_cameras:
   # Optional ordered physical-camera names for a sealed rig contract.
-  expected_camera_names: null
+  expected_camera_names:
   resume_lr_scale: 1.0
   # Enable the controller for predicting per-frame corrections for novel views.
   # When false, zero corrections are used for novel views.
@@ -459,7 +471,7 @@ post_processing:
   temporal_reg_lambda: 0.50
 
 hydra:
-  output_subdir: null
+  output_subdir:
   job:
     chdir: false
   run:
@@ -491,3 +503,50 @@ camera_residual:
     per_view: false
     target_image_names: ""
     exit_after: true
+viser_port: 8080
+wandb_group: ""
+wandb_run_id: ""
+wandb_resume: "allow"
+validate_final: true
+validate_only: false
+diagnostics:
+  parquet_enabled: true     # Write per-step metrics to {output_dir}/diagnostics.parquet
+  parquet_flush_steps: 100  # Flush row groups every N steps
+  snapshot_frequency: 500   # Save render/residual/grad_positions PNGs every N steps (0 disables)
+  snapshot_camera_index: 0  # Which train camera to render snapshots from
+  snapshot_resolution: 256  # Thumbnail edge length
+  snapshot_include_gt: true  # Include GT RGB when the train batch exposes it
+  snapshot_contact_sheet_enabled: true  # Log GT/render/residual/grad in one PNG
+  snapshot_grad_enabled: false  # Grad panels are sparse; opt in when needed
+  snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
+  snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
+  validation_metrics_enabled: true  # Compute full validation diagnostics beyond PSNR/loss.
+  training_metrics_enabled: true  # Compute comparable train-split diagnostics at validation checkpoints.
+  training_metrics_max_views: 64  # Cap train-split eval views; 0 evaluates every train view.
+  loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
+  loss_volume_voxel_size_m: 0.1
+  loss_volume_view_stride: 4
+  loss_volume_pixel_stride: 8
+early_stopping:
+  enabled: false
+  metric: masked_psnr_if_available
+  patience: 3
+  min_delta: 0.0
+  min_step: 0
+  min_score: 0.0
+  min_score_after_step: 0
+  restore_best_on_end: true
+
+camera_intrinsics_audit:
+  enabled: false
+  camera_indices: [0, 2]
+  max_views_per_camera: 8
+  focal_delta_fraction: 0.002
+  principal_delta_px: 2.0
+  skew_delta_px: 0.5
+  numerator_delta: 0.005
+  denominator_delta: 0.005
+  affine_delta: 0.001
+  tangential_delta: 0.001
+  exit_after: true
+
