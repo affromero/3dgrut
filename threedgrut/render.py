@@ -1384,6 +1384,7 @@ class Renderer:
         model=None,
         computes_extra_metrics=True,
         split="val",
+        holdout_image_list_path=None,
     ):
         """Loads checkpoint for test path.
         If path is stated, it will override the test path in checkpoint.
@@ -1396,6 +1397,8 @@ class Renderer:
 
         conf = upgrade_legacy_checkpoint_config(checkpoint["config"])
         original_training_bundle = str(conf.path)
+        if holdout_image_list_path is not None:
+            conf.dataset.holdout_image_list_path = holdout_image_list_path
         # overrides
         if conf["render"]["method"] == "3dgrt":
             conf["render"]["particle_kernel_density_clamping"] = True

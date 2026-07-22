@@ -10,6 +10,7 @@ import render_common_eval
 import pytest
 import torch
 from omegaconf import OmegaConf
+from threedgrut import render as render_module
 from threedgrut.datasets.dataset_colmap import ColmapDataset
 from threedgrut.post_processing import LuminanceAffine
 from threedgrut.post_processing.predictive_multiscale_ppisp import (
@@ -35,6 +36,60 @@ class _RendererFactory:
     def from_preloaded_model(model: object, **kwargs: object) -> object:
         _RendererFactory.calls.append((model, kwargs))
         return object()
+
+
+def test_renderer_checkpoint_applies_holdout_whitelist_before_dataset_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicit render whitelist must enter config before Renderer init."""
+    config = OmegaConf.create(
+        {
+            "path": "source_bundle",
+            "experiment_name": "test",
+            "model": {"feature_type": "sh"},
+            "dataset": {},
+            "render": {"method": "3dgut"},
+            "post_processing": {"method": "none"},
+        }
+    )
+    checkpoint = {"global_step": 3, "config": config}
+    received: dict[str, object] = {}
+
+    class _Model:
+        def build_acc(self) -> None:
+            return None
+
+    def fake_init(self: Renderer, **kwargs: object) -> None:
+        del self
+        received.update(kwargs)
+
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: checkpoint)
+    monkeypatch.setattr(
+        render_module,
+        "_sha256_of_file",
+        lambda path: "0" * 64,
+    )
+    monkeypatch.setattr(
+        render_module,
+        "create_summary_writer",
+        lambda *args, **kwargs: (None, "out", "run"),
+    )
+    monkeypatch.setattr(
+        render_module,
+        "load_checkpoint_post_processing",
+        lambda checkpoint: None,
+    )
+    monkeypatch.setattr(Renderer, "__init__", fake_init)
+
+    Renderer.from_checkpoint(
+        "checkpoint.pt",
+        "out",
+        model=_Model(),
+        holdout_image_list_path="canonical_train.txt",
+    )
+
+    conf = received["conf"]
+    assert conf.dataset.holdout_image_list_path == "canonical_train.txt"
 
 
 class _RecordingPostProcessing(torch.nn.Module):
