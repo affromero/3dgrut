@@ -33,6 +33,12 @@ if __name__ == "__main__":
         action="store_false",
         help="If set, extra image metrics will not be computed [True by default]",
     )
+    parser.add_argument(
+        "--split",
+        default="val",
+        choices=("train", "val"),
+        help="Dataset split to render. Defaults to val.",
+    )
     args = parser.parse_args()
 
     renderer = Renderer.from_checkpoint(
@@ -41,6 +47,7 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         save_gt=args.save_gt,
         computes_extra_metrics=args.compute_extra_metrics,
+        split=args.split,
     )
 
     renderer.render_all()
