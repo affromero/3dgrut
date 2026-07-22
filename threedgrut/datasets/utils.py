@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import math
+import multiprocessing
 import platform
 import struct
 from dataclasses import dataclass
@@ -690,6 +691,18 @@ def configure_dataloader_for_platform(dataloader_kwargs: dict) -> dict:
         # On Windows with multiprocessing, add worker initialization function
         if platform.system() == "Windows" and kwargs["num_workers"] > 0:
             kwargs["worker_init_fn"] = worker_init_fn
+
+        # Fork workers inherit the parent's "CUDA initialized" flag with a
+        # broken context; torch's own worker seeding (torch.manual_seed in
+        # _worker_loop) then issues an accelerator-wide manual_seed_all and
+        # aborts with "CUDA error: initialization error" — intermittently,
+        # because it races the parent's lazy-init callback queue. Spawned
+        # workers start CUDA-clean, so the seeding defers safely;
+        # persistent_workers amortizes the slower spawn startup.
+        if kwargs["num_workers"] > 0 and platform.system() != "Windows":
+            kwargs["multiprocessing_context"] = multiprocessing.get_context(
+                "spawn"
+            )
 
     return kwargs
 
