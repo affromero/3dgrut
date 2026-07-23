@@ -92,6 +92,42 @@ def native_render_evidence_maps(
     }
 
 
+@jaxtyped(typechecker=beartype)
+def native_contributor_ray_fields(
+    *,
+    accumulated_alpha: Float[torch.Tensor, "batch height width 1"],
+    depth_variance: Float[torch.Tensor, "batch height width 1"],
+    hit_count: Float[torch.Tensor, "batch height width 1"],
+) -> dict[str, Float[torch.Tensor, "batch height width 1"]]:
+    """Return ray fields with an unambiguous ``T*alpha`` 3D reduction.
+
+    The exporter maps each returned ``q`` to Gaussians as
+    ``sum_(view,pixel) T_i * alpha_i * q``. These are contributor exposures,
+    not intrinsic per-Gaussian depth variance or hit count. Invalid
+    conditional-depth pixels carry zero ambiguity exposure.
+    """
+    if (
+        accumulated_alpha.shape != depth_variance.shape
+        or accumulated_alpha.shape != hit_count.shape
+    ):
+        raise ValueError("Native contributor-ray field shapes must match.")
+    return {
+        "heldout_native_ownership": torch.ones_like(accumulated_alpha),
+        "depth_ambiguity_exposure": torch.nan_to_num(
+            depth_variance,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ),
+        "hit_congestion_exposure": torch.nan_to_num(
+            hit_count,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ),
+    }
+
+
 def _mask_like(
     mask: torch.Tensor | None,
     image: torch.Tensor,

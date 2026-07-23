@@ -56,6 +56,7 @@ from .utils import (
 _CANONICAL_FLAT_PHYSICAL_CAMERA_NAMES = ("front", "left", "right")
 _SOFT_MASK_CONTRACT_FILENAME = "soft_training_masks.json"
 _SOFT_MASK_SEMANTICS = "solid_angle_partition_of_unity_loss_weight_v1"
+_MASK_VALIDITY_MODES = {"binary_threshold", "nonzero"}
 
 
 def _read_rgb_image_array(image_path: str) -> np.ndarray:
@@ -166,6 +167,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         train_focus_image_weight: float = 1.0,
         holdout_image_list_path=None,
         depth_folder: Optional[str] = None,
+        mask_validity_mode: str = "binary_threshold",
         shutter_type: str = "GLOBAL",
         rs_ray_injection: bool = False,
         blur_samples: int = 1,
@@ -184,6 +186,13 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.world_normalization_transform = np.eye(4, dtype=np.float32)
         self.sky_mask_folder = sky_mask_folder
         self.depth_folder = depth_folder
+        self.mask_validity_mode = str(mask_validity_mode)
+        if self.mask_validity_mode not in _MASK_VALIDITY_MODES:
+            raise ValueError(
+                "mask_validity_mode must be one of "
+                f"{sorted(_MASK_VALIDITY_MODES)}, got "
+                f"{self.mask_validity_mode!r}."
+            )
         self.depth_paths = None
         self.train_exclude_image_list_path = train_exclude_image_list_path
         self.train_focus_image_list_path = train_focus_image_list_path
@@ -559,10 +568,13 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         mask: torch.Tensor,
         *,
         preserve_soft_weights: bool,
+        validity_mode: str,
     ) -> torch.Tensor:
         normalized = mask / 255.0
         if preserve_soft_weights:
             return normalized.to(torch.float32)
+        if validity_mode == "nonzero":
+            return (mask > 0).to(torch.float32)
         return (normalized > 0.5).to(torch.float32)
 
     def resolve_sky_mask_path(self, image_name):
@@ -1447,6 +1459,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                     self.preserve_soft_training_masks
                     and self.split == "train"
                 ),
+                validity_mode=self.mask_validity_mode,
             )
             sample["mask"] = mask
 

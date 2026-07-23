@@ -9,13 +9,16 @@ from plyfile import PlyData, PlyElement
 
 from render_error_splats import (
     DEFAULT_VISIBILITY_THRESHOLD,
+    _counterfactual_cohorts,
     _scene_relative_path,
+    _suppressed_density_cohort,
 )
 from threedgrut.error_attribution import (
     ErrorAttributionAccumulator,
     ErrorAttributionMetric,
     ErrorAttributionParameter,
     attribution_loss,
+    native_contributor_ray_fields,
     native_render_evidence_maps,
     recolor_gaussian_ply,
 )
@@ -44,9 +47,50 @@ class _TwoPixelModel(torch.nn.Module):
         self.features_albedo = torch.nn.Parameter(torch.zeros((1, 1)))
 
 
+class _DensityModel(torch.nn.Module):
+    """Minimal density parameter surface for intervention tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.density = torch.nn.Parameter(torch.tensor([[1.0], [2.0], [3.0]]))
+
+
 def test_error_splat_export_preserves_full_scene_by_default() -> None:
     """Default error colors retain every source Gaussian's opacity."""
     assert DEFAULT_VISIBILITY_THRESHOLD == 0.0
+
+
+def test_counterfactual_cohorts_have_ranked_and_deterministic_controls() -> None:
+    """Counterfactual controls retain the requested cohort size."""
+    scores = torch.tensor([0.2, 0.9, 0.1, 0.5])
+
+    cohorts = _counterfactual_cohorts(scores, cohort_size=2)
+
+    assert cohorts["top_density_sensitivity"].tolist() == [3, 1]
+    assert cohorts["low_density_sensitivity"].tolist() == [2, 0]
+    assert cohorts["random_control"].numel() == 2
+    assert torch.equal(cohorts["random_control"], _counterfactual_cohorts(
+        scores,
+        cohort_size=2,
+    )["random_control"])
+
+
+def test_density_suppression_is_restored_after_intervention() -> None:
+    """A counterfactual export does not leave the trained model mutated."""
+    model = _DensityModel()
+    original = model.density.detach().clone()
+
+    with _suppressed_density_cohort(
+        model,
+        torch.tensor([0, 2]),
+        suppression_logit=-20.0,
+    ):
+        assert torch.equal(
+            model.density.detach().reshape(-1),
+            torch.tensor([-20.0, 2.0, -20.0]),
+        )
+
+    assert torch.equal(model.density.detach(), original)
 
 
 def test_masked_mae_excludes_invalid_pixels() -> None:
@@ -124,6 +168,28 @@ def test_native_evidence_recovers_conditional_depth_variance() -> None:
     assert evidence["expected_depth"][0, 0, 0, 0].item() == pytest.approx(2.0)
     assert evidence["depth_variance"][0, 0, 0, 0].item() == pytest.approx(6.0)
     assert torch.isnan(evidence["expected_depth"][0, 0, 1, 0])
+
+
+def test_native_contributor_fields_zero_unsupported_depth_variance() -> None:
+    """A 3D ray exposure omits undefined conditional-depth pixels."""
+    fields = native_contributor_ray_fields(
+        accumulated_alpha=torch.tensor([[[[0.5], [0.0]]]]),
+        depth_variance=torch.tensor([[[[6.0], [torch.nan]]]]),
+        hit_count=torch.tensor([[[[2.0], [0.0]]]]),
+    )
+
+    assert torch.equal(
+        fields["heldout_native_ownership"],
+        torch.ones((1, 1, 2, 1)),
+    )
+    assert torch.equal(
+        fields["depth_ambiguity_exposure"],
+        torch.tensor([[[[6.0], [0.0]]]]),
+    )
+    assert torch.equal(
+        fields["hit_congestion_exposure"],
+        torch.tensor([[[[2.0], [0.0]]]]),
+    )
 
 
 def test_recolor_preserves_geometry_and_zeros_view_dependent_color(

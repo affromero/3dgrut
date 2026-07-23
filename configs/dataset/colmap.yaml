@@ -10,6 +10,9 @@ camera_ids: null    # Optional COLMAP numeric camera id filter, e.g. [2]
 load_exif: true  # Load EXIF exposure data from JPEG images for post-processing
 sky_mask_folder: null
 depth_folder: null  # Optional metric depth sidecars (.npy) for geometry supervision
+# binary_threshold preserves the historical 128/255 foreground convention.
+# nonzero treats every nonzero projective support value as valid.
+mask_validity_mode: binary_threshold
 train_exclude_image_list_path: null
 train_focus_image_list_path: null
 train_focus_image_weight: 1.0

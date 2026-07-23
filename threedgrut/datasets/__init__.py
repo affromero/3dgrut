@@ -103,6 +103,9 @@ def make(name: str, config, ray_jitter):
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
+                mask_validity_mode=config.dataset.get(
+                    "mask_validity_mode", "binary_threshold"
+                ),
                 train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
                 holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
             )
@@ -117,6 +120,9 @@ def make(name: str, config, ray_jitter):
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
+                mask_validity_mode=config.dataset.get(
+                    "mask_validity_mode", "binary_threshold"
+                ),
                 train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
                 holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
             )
@@ -237,6 +243,9 @@ def make_test(name: str, config):
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
+                mask_validity_mode=config.dataset.get(
+                    "mask_validity_mode", "binary_threshold"
+                ),
                 train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
                 holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
             )

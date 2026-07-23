@@ -54,10 +54,17 @@ def test_reload_resets_stale_world_transform_when_normalization_is_disabled(monk
     dataset._all_exif_exposures = None
     dataset.test_split_interval = 0
     dataset.split = "train"
+    dataset.holdout_image_list_path = None
+    dataset.train_exclude_image_list_path = None
+    dataset.poses_end = None
+    dataset.sky_mask_paths = None
+    dataset.depth_paths = None
 
     def load_intrinsics_and_extrinsics() -> None:
         dataset.cam_intrinsics = {3: object()}
-        dataset.cam_extrinsics = [SimpleNamespace(camera_id=3)]
+        dataset.cam_extrinsics = [
+            SimpleNamespace(camera_id=3, name="front/frame.png")
+        ]
 
     def load_camera_data() -> None:
         dataset.poses = np.eye(4, dtype=np.float32)[None]
@@ -87,3 +94,21 @@ def test_world_transform_getter_returns_a_copy() -> None:
     result[0, 0] = 9.0
 
     assert dataset.world_normalization_transform[0, 0] == 1.0
+
+
+def test_nonzero_mask_validity_keeps_projective_support_values() -> None:
+    mask = torch.tensor([[0, 127, 255]], dtype=torch.uint8)
+
+    preserved = ColmapDataset._normalize_training_mask(
+        mask,
+        preserve_soft_weights=False,
+        validity_mode="nonzero",
+    )
+    historical = ColmapDataset._normalize_training_mask(
+        mask,
+        preserve_soft_weights=False,
+        validity_mode="binary_threshold",
+    )
+
+    assert preserved.tolist() == [[0.0, 1.0, 1.0]]
+    assert historical.tolist() == [[0.0, 0.0, 1.0]]
