@@ -216,6 +216,7 @@ class Tracer:
                 ray_features_density,
                 ray_hit_distance,
                 ray_hit_count,
+                ray_hit_distance_squared,
                 mog_visibility,
                 mog_projected_position,
                 mog_projected_conic_opacity,
@@ -253,11 +254,16 @@ class Tracer:
             ctx.sensor_params = sensor_params
             ctx.sensor_poses = sensor_poses
             ctx.tracer_wrapper = tracer_wrapper
+            # The second depth moment is native diagnostic evidence. Training
+            # differentiates the first depth moment only, so do not expose a
+            # silently incomplete second-moment backward path.
+            ctx.mark_non_differentiable(ray_hit_distance_squared)
 
             return (
                 ray_features_density.float(),  # always fp32 to caller; fp16 saved in ctx for trace_bwd
                 ray_hit_distance,
                 ray_hit_count,
+                ray_hit_distance_squared,
                 mog_visibility,
                 mog_projected_position,
                 mog_projected_conic_opacity,
@@ -271,6 +277,7 @@ class Tracer:
             ray_features_density_grd,  # always fp32 (gradient buffer is never fp16)
             ray_hit_distance_grd,
             ray_hit_count_grd_UNUSED,
+            ray_hit_distance_squared_grd_UNUSED,
             mog_visibility_grd_UNUSED,
             mog_projected_position_grd_UNUSED,
             mog_projected_conic_opacity_grd_UNUSED,
@@ -454,6 +461,7 @@ class Tracer:
                 pred_features_alpha,
                 pred_dist,
                 hits_count,
+                pred_dist_squared,
                 mog_visibility,
                 mog_projected_position,
                 mog_projected_conic_opacity,
@@ -481,6 +489,7 @@ class Tracer:
             pred_features = pred_features_alpha[..., :ray_feature_dim].unsqueeze(0).contiguous()
             pred_opacity = pred_features_alpha[..., ray_feature_dim:].unsqueeze(0).contiguous()
             pred_dist = pred_dist.unsqueeze(0).contiguous()
+            pred_dist_squared = pred_dist_squared.unsqueeze(0).contiguous()
             hits_count = hits_count.unsqueeze(0).contiguous()
 
             timings = self.tracer_wrapper.collect_times()
@@ -489,6 +498,7 @@ class Tracer:
             "pred_rgb": pred_features,
             "pred_opacity": pred_opacity,
             "pred_dist": pred_dist,
+            "pred_dist_squared": pred_dist_squared,
             "pred_normals": torch.nn.functional.normalize(torch.ones_like(pred_features), dim=3),
             "hits_count": hits_count,
             "frame_time_ms": timings["forward_render"] if "forward_render" in timings else 0.0,
@@ -554,11 +564,12 @@ class Tracer:
             ray_radiance_density,
             ray_hit_distance,
             ray_hit_count,
-            _mog_visibility,
-            _mog_projected_position,
-            _mog_projected_conic_opacity,
-            _mog_projected_extent,
-            _mog_tiles_count,
+            ray_hit_distance_squared,
+            mog_visibility,
+            mog_projected_position,
+            mog_projected_conic_opacity,
+            mog_projected_extent,
+            mog_tiles_count,
         ) = self.tracer_wrapper.trace(
             frame_id,
             n_active_features,
@@ -577,6 +588,7 @@ class Tracer:
         pred_rgb = ray_radiance_density[..., :3].unsqueeze(0).contiguous()
         pred_opacity = ray_radiance_density[..., 3:].unsqueeze(0).contiguous()
         pred_dist = ray_hit_distance.unsqueeze(0).contiguous()
+        pred_dist_squared = ray_hit_distance_squared.unsqueeze(0).contiguous()
         hits_count = ray_hit_count.unsqueeze(0).contiguous()
 
         pred_rgb, pred_opacity = gaussians.background(
@@ -591,8 +603,14 @@ class Tracer:
             "pred_rgb": pred_rgb,
             "pred_opacity": pred_opacity,
             "pred_dist": pred_dist,
+            "pred_dist_squared": pred_dist_squared,
             "pred_normals": torch.nn.functional.normalize(torch.ones_like(pred_rgb), dim=3),
             "hits_count": hits_count,
+            "mog_visibility": mog_visibility,
+            "mog_projected_position": mog_projected_position,
+            "mog_projected_conic_opacity": mog_projected_conic_opacity,
+            "mog_projected_extent": mog_projected_extent,
+            "mog_tiles_count": mog_tiles_count,
         }
 
     @torch.no_grad()
@@ -662,9 +680,9 @@ class Tracer:
             ray_diagnostic,
         )
         return {
-            "responsibility": outputs[8].squeeze(-1),
-            "diagnostic_responsibility": outputs[9].squeeze(-1),
-            "diagnostic_weighted_sum": outputs[10].squeeze(-1),
+            "responsibility": outputs[9].squeeze(-1),
+            "diagnostic_responsibility": outputs[10].squeeze(-1),
+            "diagnostic_weighted_sum": outputs[11].squeeze(-1),
         }
 
     def get_bvh_stats(self) -> dict:

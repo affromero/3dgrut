@@ -28,6 +28,7 @@ struct RayPayload {
     tcnn::vec3 direction;
     tcnn::vec2 tMinMax;
     float hitT;
+    float hitT2;
     float transmittance;
     enum {
         Default = 0,
@@ -87,6 +88,7 @@ __device__ __inline__ RayPayloadT initializeRay(const threedgut::RenderParameter
     }
     ray.idx           = x + params.resolution.x * y;
     ray.hitT          = 0.0f;
+    ray.hitT2         = 0.0f;
     ray.transmittance = 1.0f;
     ray.features      = tcnn::vec<RayPayloadT::FeatDim>::zero();
 
@@ -137,6 +139,7 @@ __device__ __inline__ RayPayloadT initializeRayPerPixel(const threedgut::RenderP
 
     ray.idx           = pixel.x + params.resolution.x * pixel.y;
     ray.hitT          = 0.0f;
+    ray.hitT2         = 0.0f;
     ray.transmittance = 1.0f;
     ray.features      = tcnn::vec<RayPayloadT::FeatDim>::zero();
 
@@ -163,6 +166,7 @@ __device__ __inline__ void finalizeRay(const TRayPayload& ray,
                                        const tcnn::vec3* __restrict__ sensorRayOriginPtr,
                                        float* __restrict__ worldCountPtr,
                                        float* __restrict__ worldHitDistancePtr,
+                                       float* __restrict__ worldHitDistanceSquaredPtr,
                                        TFeatureDensityElem* __restrict__ featureDensityPtr,
                                        const tcnn::mat4x3& sensorToWorldTransform) {
     if (!ray.isValid()) {
@@ -186,6 +190,7 @@ __device__ __inline__ void finalizeRay(const TRayPayload& ray,
 #endif
 
     worldHitDistancePtr[ray.idx] = ray.hitT;
+    worldHitDistanceSquaredPtr[ray.idx] = ray.hitT2;
 
 #if GAUSSIAN_ENABLE_HIT_COUNT
     worldCountPtr[ray.idx] = (float)ray.hitN;

@@ -19,6 +19,8 @@ from enum import StrEnum
 import numpy as np
 import torch
 import torch.nn.functional as F
+from beartype import beartype
+from jaxtyping import Float, jaxtyped
 from plyfile import PlyData, PlyElement
 
 from threedgrut.model.losses import ssim
@@ -48,6 +50,46 @@ class ErrorAttributionParameter(StrEnum):
     SCALE = "scale"
     ROTATION = "rotation"
     OPACITY = "density"
+
+
+@jaxtyped(typechecker=beartype)
+def native_render_evidence_maps(
+    *,
+    accumulated_alpha: Float[torch.Tensor, "batch height width 1"],
+    depth_moment: Float[torch.Tensor, "batch height width 1"],
+    depth_squared_moment: Float[torch.Tensor, "batch height width 1"],
+    hit_count: Float[torch.Tensor, "batch height width 1"],
+    opacity_floor: float = 1e-4,
+) -> dict[str, Float[torch.Tensor, "batch height width 1"]]:
+    """Recover conditional depth statistics from native render moments.
+
+    ``pred_dist`` and ``pred_dist_squared`` are front-to-back premultiplied
+    moments, respectively ``sum_i w_i z_i`` and ``sum_i w_i z_i^2``.  The
+    renderer's alpha is ``sum_i w_i``.  Dividing only where alpha has support
+    produces conditional hit-depth mean and variance; unsupported pixels are
+    marked NaN rather than assigned a fictitious depth.
+    """
+    if not 0.0 < opacity_floor < 1.0:
+        raise ValueError("opacity_floor must be in (0, 1).")
+    if (
+        accumulated_alpha.shape != depth_moment.shape
+        or accumulated_alpha.shape != depth_squared_moment.shape
+        or accumulated_alpha.shape != hit_count.shape
+    ):
+        raise ValueError("Native evidence moment shapes must match alpha.")
+    alpha = accumulated_alpha.clamp(0.0, 1.0)
+    supported = alpha >= opacity_floor
+    safe_alpha = alpha.clamp_min(opacity_floor)
+    expected_depth = depth_moment / safe_alpha
+    expected_depth_squared = depth_squared_moment / safe_alpha
+    depth_variance = (expected_depth_squared - expected_depth.square()).clamp_min(0.0)
+    nan = torch.full_like(expected_depth, torch.nan)
+    return {
+        "accumulated_alpha": alpha,
+        "expected_depth": torch.where(supported, expected_depth, nan),
+        "depth_variance": torch.where(supported, depth_variance, nan),
+        "hit_count": hit_count,
+    }
 
 
 def _mask_like(

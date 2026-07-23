@@ -16,6 +16,7 @@ from threedgrut.error_attribution import (
     ErrorAttributionMetric,
     ErrorAttributionParameter,
     attribution_loss,
+    native_render_evidence_maps,
     recolor_gaussian_ply,
 )
 
@@ -108,6 +109,21 @@ def test_component_probes_do_not_cancel_opposing_pixel_gradients() -> None:
 
     assert losses["mse"] == pytest.approx(1.0)
     assert accumulator.rms_scores()["mse:features_albedo"].item() > 0.0
+
+
+def test_native_evidence_recovers_conditional_depth_variance() -> None:
+    """Second moments yield variance only where native alpha has support."""
+    evidence = native_render_evidence_maps(
+        accumulated_alpha=torch.tensor([[[[0.5], [0.0]]]]),
+        depth_moment=torch.tensor([[[[1.0], [0.0]]]]),
+        depth_squared_moment=torch.tensor([[[[5.0], [0.0]]]]),
+        hit_count=torch.tensor([[[[2.0], [0.0]]]]),
+    )
+
+    assert evidence["accumulated_alpha"][0, 0, 0, 0].item() == pytest.approx(0.5)
+    assert evidence["expected_depth"][0, 0, 0, 0].item() == pytest.approx(2.0)
+    assert evidence["depth_variance"][0, 0, 0, 0].item() == pytest.approx(6.0)
+    assert torch.isnan(evidence["expected_depth"][0, 0, 1, 0])
 
 
 def test_recolor_preserves_geometry_and_zeros_view_dependent_color(

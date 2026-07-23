@@ -124,9 +124,9 @@ def test_ray_gradient_finite_differences():
         start_pose,
         end_pose,
     )
-    assert len(result) == 8
-    projected_conic_opacity = result[5]
-    projected_tiles_count = result[7].reshape(-1)
+    assert len(result) == 9
+    projected_conic_opacity = result[6]
+    projected_tiles_count = result[8].reshape(-1)
     assert projected_conic_opacity.shape == (N_PARTICLES, 4)
     on_screen = projected_tiles_count > 0
     assert on_screen.any()
@@ -486,14 +486,23 @@ def test_responsibility_matches_composited_opacity() -> None:
     )
 
     composited_opacity = result[0][..., 3].sum()
-    responsibility = result[8].sum()
-    diagnostic_responsibility = result[9].sum()
-    weighted = result[10].sum()
+    alpha = result[0][..., 3]
+    depth_moment = result[1]
+    depth_squared_moment = result[3]
+    responsibility = result[9].sum()
+    diagnostic_responsibility = result[10].sum()
+    weighted = result[11].sum()
     assert torch.isfinite(responsibility)
     assert responsibility > 0.0
     assert torch.allclose(responsibility, composited_opacity, atol=1e-5)
     assert torch.allclose(diagnostic_responsibility, responsibility, atol=1e-5)
     assert torch.allclose(weighted, responsibility, atol=1e-5)
+    supported = alpha > 1e-5
+    supported_alpha = alpha[supported].unsqueeze(-1)
+    assert torch.all(
+        depth_squared_moment[supported] * supported_alpha
+        >= depth_moment[supported].square() - 1e-5
+    )
 
 
 if __name__ == "__main__":

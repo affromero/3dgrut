@@ -206,6 +206,7 @@ struct GUTKBufferRenderer : Params {
                                               ray.transmittance,
                                               hitParticle.hitT,
                                               ray.hitT);
+            ray.hitT2 += hitParticle.hitT * hitParticle.hitT * hitWeight;
 
             if (particlesResponsibilityPtr != nullptr && hitWeight > 0.0f) {
                 atomicAdd(
@@ -523,6 +524,7 @@ struct GUTKBufferRenderer : Params {
             // Step 5: Warp reduction for feature accumulation
             TFeaturesVec accumulatedFeatures = TFeaturesVec::zero();
             float accumulatedHitT            = 0.0f;
+            float accumulatedHitT2           = 0.0f;
             uint32_t accumulatedHitCount     = 0;
 
             // Only accumulate contributions before (and including) termination point
@@ -552,6 +554,7 @@ struct GUTKBufferRenderer : Params {
                     accumulatedFeatures[featIdx] = hitFeatures[featIdx] * hitWeight;
                 }
                 accumulatedHitT     = hitT * hitWeight;
+                accumulatedHitT2    = hitT * hitT * hitWeight;
                 accumulatedHitCount = (hitWeight > 0.0f) ? 1 : 0;
             }
 
@@ -564,6 +567,7 @@ struct GUTKBufferRenderer : Params {
 
             for (uint32_t offset = WarpSize / 2; offset > 0; offset >>= 1) {
                 accumulatedHitT += __shfl_down_sync(WarpMask, accumulatedHitT, offset);
+                accumulatedHitT2 += __shfl_down_sync(WarpMask, accumulatedHitT2, offset);
                 accumulatedHitCount += __shfl_down_sync(WarpMask, accumulatedHitCount, offset);
             }
 
@@ -573,6 +577,7 @@ struct GUTKBufferRenderer : Params {
                     ray.features[featIdx] += accumulatedFeatures[featIdx];
                 }
                 ray.hitT += accumulatedHitT;
+                ray.hitT2 += accumulatedHitT2;
                 ray.countHit(accumulatedHitCount);
             }
 

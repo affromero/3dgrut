@@ -391,6 +391,7 @@ SplatRaster::traceWithResponsibilityImpl(
     torch::Tensor rayRadianceDensity            = torch::zeros({height, width, static_cast<int64_t>(RAY_FEATURE_DIM + 1)}, featureOpts);
     torch::Tensor rayHitDistance                = torch::ones({height, width, 1}, opts).multiply(1e06f);
     torch::Tensor rayHitCount                   = torch::zeros({height, width, 1}, opts);
+    torch::Tensor rayHitDistanceSquared         = torch::zeros({height, width, 1}, opts);
     torch::Tensor particleVisibility            = torch::zeros({numParticles, 1}, opts);
     torch::Tensor particleProjectedPosition     = torch::zeros({numParticles, 2}, opts);
     torch::Tensor particleProjectedConicOpacity = torch::zeros({numParticles, 4}, opts);
@@ -438,6 +439,7 @@ SplatRaster::traceWithResponsibilityImpl(
         reinterpret_cast<const tcnn::vec3*>(voidDataPtr(rayDirection)),
         reinterpret_cast<float*>(voidDataPtr(rayHitCount)),
         reinterpret_cast<float*>(voidDataPtr(rayHitDistance)),
+        reinterpret_cast<float*>(voidDataPtr(rayHitDistanceSquared)),
         reinterpret_cast<TFeatureDensityElem*>(voidDataPtr(rayRadianceDensity)),
         reinterpret_cast<int*>(voidDataPtr(particleVisibility)),
         reinterpret_cast<tcnn::vec2*>(voidDataPtr(particleProjectedPosition)),
@@ -471,6 +473,7 @@ SplatRaster::traceWithResponsibilityImpl(
         rayRadianceDensity,
         rayHitDistance,
         rayHitCount,
+        rayHitDistanceSquared,
         particleVisibility,
         particleProjectedPosition,
         particleProjectedConicOpacity,
@@ -482,7 +485,8 @@ SplatRaster::traceWithResponsibilityImpl(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor>
 SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
                    torch::Tensor particleDensity,
                    torch::Tensor particleRadiance,
@@ -516,7 +520,8 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         std::get<4>(result),
         std::get<5>(result),
         std::get<6>(result),
-        std::get<7>(result)};
+        std::get<7>(result),
+        std::get<8>(result)};
 }
 
 SplatRaster::TraceWithResponsibilityResult

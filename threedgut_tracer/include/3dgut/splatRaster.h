@@ -40,6 +40,7 @@ private:
         torch::Tensor,
         torch::Tensor,
         torch::Tensor,
+        torch::Tensor,
         torch::Tensor>;
 
     uint8_t m_logLevel;
@@ -77,7 +78,7 @@ public:
 
     ~SplatRaster();
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     trace(uint32_t frameNumber, int numActiveFeatures,
           // Particles
           torch::Tensor particleDensity,
