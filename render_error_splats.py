@@ -26,10 +26,12 @@ from threedgrut.error_attribution import (
     ErrorAttributionAccumulator,
     ErrorAttributionMetric,
     ErrorAttributionParameter,
+    attribution_loss,
+    heldout_ownership_dominance,
     native_contributor_ray_fields,
     native_render_evidence_maps,
+    native_structural_gaussian_fields,
     recolor_gaussian_ply,
-    attribution_loss,
 )
 from threedgrut.model.factory import create_gaussian_model
 from threedgrut.render import POST_PROCESSING_EVAL_MODE_RAW
@@ -247,7 +249,7 @@ def _export_training_support_fields(
     scale_mode: str,
     visibility_threshold: float,
     maximum_views: int,
-) -> tuple[list[dict[str, object]], int, list[str]]:
+) -> tuple[list[dict[str, object]], int, list[str], torch.Tensor]:
     """Export exact native T*alpha training support for every Gaussian."""
     renderer = _build_renderer(
         checkpoint,
@@ -267,6 +269,11 @@ def _export_training_support_fields(
         device="cpu",
     )
     visible_view_count = torch.zeros_like(support)
+    narrow_view_coverage = torch.zeros(
+        (model.density.shape[0], 3),
+        dtype=torch.float32,
+        device="cpu",
+    )
     selected_names: list[str] = []
     logger.info(
         "Computing native per-Gaussian training support for "
@@ -287,6 +294,17 @@ def _export_training_support_fields(
         )["responsibility"].detach().float().cpu().reshape_as(support)
         support += responsibility
         visible_view_count += (responsibility > 0.0).float()
+        camera_center = gpu_batch.T_to_world[0, :3, 3].detach()
+        directions = camera_center.unsqueeze(0) - model.positions.detach()
+        directions = directions / torch.linalg.vector_norm(
+            directions,
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(torch.finfo(directions.dtype).eps)
+        narrow_view_coverage += (
+            responsibility.to(device=directions.device)
+            * directions
+        ).detach().float().cpu()
         selected_names.append(path_basename(str(gpu_batch.image_path)))
 
     field_specs = (
@@ -295,17 +313,30 @@ def _export_training_support_fields(
             "Training-ray support",
             support,
             "Exact sum over training rays of front-to-back T*alpha ownership.",
+            "coverage",
         ),
         (
             "training_view_count",
             "Training-view visibility",
             visible_view_count,
             "Number of training cameras with nonzero native T*alpha support.",
+            "coverage",
+        ),
+        (
+            "narrow_training_view_coverage",
+            "Narrow training-view coverage",
+            torch.linalg.vector_norm(narrow_view_coverage, dim=-1, keepdim=True)
+            / support.clamp_min(torch.finfo(support.dtype).eps),
+            "Native ownership-weighted resultant camera-direction magnitude "
+            "over training views. High means the Gaussian was seen from a "
+            "narrow angular range; it is an insufficient-view candidate, "
+            "not a visibility or geometry verdict.",
+            "structural_candidate",
         ),
     )
     ply_dir = path_join(output_dir, "ply")
     fields: list[dict[str, object]] = []
-    for field_id, label, scores, attribution in field_specs:
+    for field_id, label, scores, attribution, metric_id in field_specs:
         output_path = path_join(ply_dir, f"{field_id}.ply")
         statistics = recolor_gaussian_ply(
             source_path=source_ply,
@@ -319,7 +350,7 @@ def _export_training_support_fields(
             {
                 "id": field_id,
                 "label": label,
-                "metric_id": "coverage",
+                "metric_id": metric_id,
                 "parameter": field_id,
                 "artifact_kind": "ply",
                 "filename": path_relative_to(output_path, output_dir),
@@ -331,7 +362,7 @@ def _export_training_support_fields(
                 "attribution": attribution,
             }
         )
-    return fields, len(selected_names), selected_names
+    return fields, len(selected_names), selected_names, support
 
 
 def _counterfactual_cohorts(
@@ -722,7 +753,12 @@ def main() -> None:
             }
         )
 
-    training_fields, training_support_view_count, training_support_images = (
+    (
+        training_fields,
+        training_support_view_count,
+        training_support_images,
+        training_support_scores,
+    ) = (
         _export_training_support_fields(
             checkpoint=checkpoint,
             model=model,
@@ -737,6 +773,72 @@ def main() -> None:
         )
     )
     fields.extend(training_fields)
+    heldout_ownership = native_contributor_scores["heldout_native_ownership"]
+    mean_training_support = training_support_scores / max(
+        training_support_view_count,
+        1,
+    )
+    heldout_dominance = heldout_ownership_dominance(
+        heldout_ownership=heldout_ownership / max(len(selected_names), 1),
+        training_ownership=mean_training_support,
+    )
+    structural_fields = native_structural_gaussian_fields(
+        positions=model.positions.detach(),
+        covariances=model.get_covariance().detach(),
+        physical_scales=model.get_scale().detach(),
+    )
+    structural_specs = (
+        (
+            "scale_to_neighbor_spacing",
+            "Scale relative to neighbour spacing",
+            structural_fields["scale_to_neighbor_spacing"],
+            "Largest physical Gaussian standard deviation divided by nearest "
+            "centre spacing. High values flag oversized-footprint candidates "
+            "that should be tested by scale reduction or splitting.",
+        ),
+        (
+            "nearest_covariance_overlap",
+            "Nearest covariance overlap",
+            structural_fields["nearest_covariance_overlap"],
+            "Nearest-centre covariance-support overlap. High values are local "
+            "duplicate-layer candidates, not a duplicate-geometry conclusion.",
+        ),
+        (
+            "heldout_ownership_dominance",
+            "Held-out ownership dominance",
+            heldout_dominance,
+            "Bounded held-out ownership share H/(H+S), where H and S are "
+            "mean held-out and training T*alpha ownership. High values "
+            "identify view-specific contributions that merit checking for "
+            "insufficient observations or floaters.",
+        ),
+    )
+    for field_id, label, scores, attribution in structural_specs:
+        output_path = os.path.join(ply_dir, f"{field_id}.ply")
+        statistics = recolor_gaussian_ply(
+            source_path=source_ply,
+            output_path=output_path,
+            scores=scores.reshape(-1),
+            scale_mode=args.normalization,
+            expected_density=model.density,
+            visibility_threshold=args.visibility_threshold,
+        )
+        fields.append(
+            {
+                "id": field_id,
+                "label": label,
+                "metric_id": "structural_candidate",
+                "parameter": field_id,
+                "artifact_kind": "ply",
+                "filename": os.path.relpath(output_path, output_dir),
+                "artifact_sha256": _sha256(output_path),
+                "normalization": args.normalization,
+                "visibility_threshold": args.visibility_threshold,
+                "statistics": statistics,
+                "exact_localization": True,
+                "attribution": attribution,
+            }
+        )
     manifest = {
         "schema_version": 3,
         "source_checkpoint": _scene_relative_path(

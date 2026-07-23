@@ -24,6 +24,7 @@ from jaxtyping import Float, jaxtyped
 from plyfile import PlyData, PlyElement
 
 from threedgrut.model.losses import ssim
+from threedgrut.model.geometry import nearest_neighbors
 from threedgrut.utils.grad_viz import (
     scale_grad_norms,
     viridis_rgb_from_scalars,
@@ -126,6 +127,82 @@ def native_contributor_ray_fields(
             neginf=0.0,
         ),
     }
+
+
+@jaxtyped(typechecker=beartype)
+def native_structural_gaussian_fields(
+    *,
+    positions: Float[torch.Tensor, "gaussians 3"],
+    covariances: Float[torch.Tensor, "gaussians 3 3"],
+    physical_scales: Float[torch.Tensor, "gaussians 3"],
+) -> dict[str, Float[torch.Tensor, "gaussians 1"]]:
+    """Return geometry-only candidate fields with explicit limitations.
+
+    ``scale_to_neighbor_spacing`` compares a Gaussian's largest physical
+    standard deviation with the Euclidean distance to its nearest centre.
+    ``nearest_covariance_overlap`` is the Bhattacharyya-style zero-mean
+    overlap term ``exp(-0.5 delta^T (Sigma_i + Sigma_j)^-1 delta)`` for the
+    nearest centre.  The latter is a local redundant-layer candidate, not a
+    duplicate-geometry conclusion: it deliberately excludes appearance,
+    visibility, and multi-view intervention evidence.
+    """
+    count = positions.shape[0]
+    if count < 2:
+        raise ValueError("Structural Gaussian fields require at least two rows.")
+    if covariances.shape != (count, 3, 3):
+        raise ValueError("Covariances must have shape [gaussians, 3, 3].")
+    if physical_scales.shape != (count, 3):
+        raise ValueError("Physical scales must have shape [gaussians, 3].")
+    neighbor_indices = nearest_neighbors(positions.detach(), k=2).reshape(-1)
+    neighbor_positions = positions.index_select(0, neighbor_indices)
+    deltas = positions - neighbor_positions
+    spacing = torch.linalg.vector_norm(deltas, dim=-1, keepdim=True)
+    scale_ratio = physical_scales.max(dim=-1, keepdim=True).values / (
+        spacing.clamp_min(torch.finfo(positions.dtype).eps)
+    )
+    neighbor_covariances = covariances.index_select(0, neighbor_indices)
+    combined_covariance = covariances + neighbor_covariances
+    diagonal = combined_covariance.diagonal(dim1=-2, dim2=-1).mean(
+        dim=-1,
+        keepdim=True,
+    )
+    regularizer = diagonal.clamp_min(torch.finfo(positions.dtype).eps) * 1e-6
+    regularized = combined_covariance + torch.diag_embed(
+        regularizer.expand(-1, 3)
+    )
+    solved = torch.linalg.solve(regularized, deltas.unsqueeze(-1)).squeeze(-1)
+    mahalanobis = (deltas * solved).sum(dim=-1, keepdim=True).clamp_min(0.0)
+    return {
+        "scale_to_neighbor_spacing": scale_ratio,
+        "nearest_covariance_overlap": torch.exp(-0.5 * mahalanobis),
+    }
+
+
+@jaxtyped(typechecker=beartype)
+def heldout_ownership_dominance(
+    *,
+    heldout_ownership: Float[torch.Tensor, "gaussians 1"],
+    training_ownership: Float[torch.Tensor, "gaussians 1"],
+) -> Float[torch.Tensor, "gaussians 1"]:
+    """Return the bounded share of observation owned by held-out rays.
+
+    The score ``H / (H + S)`` is only bright where a Gaussian has actual
+    held-out ownership ``H`` and relatively little training ownership ``S``.
+    Unlike an unbounded ratio, unsupported rows cannot dominate the palette
+    merely because their denominator is nearly zero.
+    """
+    if heldout_ownership.shape != training_ownership.shape:
+        raise ValueError("Held-out and training ownership shapes must match.")
+    if heldout_ownership.ndim != 2 or heldout_ownership.shape[1] != 1:
+        raise ValueError("Ownership tensors must have shape [gaussians, 1].")
+    heldout = torch.nan_to_num(heldout_ownership, nan=0.0).clamp_min(0.0)
+    training = torch.nan_to_num(training_ownership, nan=0.0).clamp_min(0.0)
+    denominator = heldout + training
+    return torch.where(
+        denominator > 0.0,
+        heldout / denominator,
+        torch.zeros_like(denominator),
+    )
 
 
 def _mask_like(

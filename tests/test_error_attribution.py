@@ -18,8 +18,10 @@ from threedgrut.error_attribution import (
     ErrorAttributionMetric,
     ErrorAttributionParameter,
     attribution_loss,
+    heldout_ownership_dominance,
     native_contributor_ray_fields,
     native_render_evidence_maps,
+    native_structural_gaussian_fields,
     recolor_gaussian_ply,
 )
 
@@ -190,6 +192,35 @@ def test_native_contributor_fields_zero_unsupported_depth_variance() -> None:
         fields["hit_congestion_exposure"],
         torch.tensor([[[[2.0], [0.0]]]]),
     )
+
+
+def test_structural_fields_separate_spacing_and_covariance_overlap() -> None:
+    """Nearest-centre fields expose footprint and support overlap separately."""
+    positions = torch.tensor([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]])
+    covariance = torch.eye(3).repeat(2, 1, 1) * 0.01
+    scales = torch.tensor([[0.2, 0.1, 0.1], [0.2, 0.1, 0.1]])
+
+    fields = native_structural_gaussian_fields(
+        positions=positions,
+        covariances=covariance,
+        physical_scales=scales,
+    )
+
+    assert torch.allclose(
+        fields["scale_to_neighbor_spacing"],
+        torch.tensor([[2.0], [2.0]]),
+    )
+    assert torch.all(fields["nearest_covariance_overlap"] > 0.7)
+
+
+def test_heldout_ownership_dominance_is_bounded_and_zero_without_support() -> None:
+    """Held-out dominance cannot be inflated by a zero training denominator."""
+    score = heldout_ownership_dominance(
+        heldout_ownership=torch.tensor([[2.0], [0.0], [0.0]]),
+        training_ownership=torch.tensor([[2.0], [3.0], [0.0]]),
+    )
+
+    assert torch.allclose(score, torch.tensor([[0.5], [0.0], [0.0]]))
 
 
 def test_recolor_preserves_geometry_and_zeros_view_dependent_color(
