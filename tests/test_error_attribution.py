@@ -154,7 +154,7 @@ def test_component_probes_do_not_cancel_opposing_pixel_gradients() -> None:
     )
 
     assert losses["mse"] == pytest.approx(1.0)
-    assert accumulator.rms_scores()["mse:features_albedo"].item() > 0.0
+    assert accumulator.rms_scores()["mse:sh_dc_rgb"].item() > 0.0
 
 
 def test_native_evidence_recovers_conditional_depth_variance() -> None:

@@ -175,7 +175,7 @@ def _field_label(metric: str, parameter: str) -> str:
         "lowfreq_frac": "Doctor low-frequency residual",
     }
     parameter_labels = {
-        "features_albedo": "SH DC RGB coefficients",
+        "sh_dc_rgb": "SH DC RGB coefficients",
         "features_specular": "higher-order SH RGB coefficients",
         "positions": "position",
         "scale": "scale",

@@ -45,7 +45,7 @@ class ErrorAttributionMetric(StrEnum):
 class ErrorAttributionParameter(StrEnum):
     """Gaussian parameter lenses with physically distinct units."""
 
-    APPEARANCE = "features_albedo"
+    APPEARANCE = "sh_dc_rgb"
     VIEW_DEPENDENT = "features_specular"
     POSITION = "positions"
     SCALE = "scale"
@@ -421,10 +421,13 @@ class ErrorAttributionAccumulator:
     def _model_parameters(self) -> tuple[torch.nn.Parameter, ...]:
         values: list[torch.nn.Parameter] = []
         for parameter in self.parameters:
-            value = getattr(self.model, parameter.value)
+            model_attribute = {
+                ErrorAttributionParameter.APPEARANCE: "features_albedo",
+            }.get(parameter, parameter.value)
+            value = getattr(self.model, model_attribute)
             if not isinstance(value, torch.nn.Parameter):
                 raise TypeError(
-                    f"Model attribute {parameter.value!r} is not a parameter."
+                    f"Model attribute {model_attribute!r} is not a parameter."
                 )
             values.append(value)
         return tuple(values)
