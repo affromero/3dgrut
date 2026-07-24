@@ -23,6 +23,7 @@ from ncore.data import FThetaCameraModelParameters, ShutterType
 from omegaconf import OmegaConf
 
 from threedgrut.datasets.protocols import Batch
+from threedgrut.model.features import Features
 from threedgut_tracer.setup_3dgut import particle_radiance_width
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,7 @@ class Tracer:
             n_active_features,
             ray_ori,
             ray_dir,
+            camera_center,
             mog_pos,
             mog_rot,
             mog_scl,
@@ -222,6 +224,7 @@ class Tracer:
                 mog_projected_conic_opacity,
                 mog_projected_extent,
                 mog_tiles_count,
+                mog_accumulated_weight,
             ) = tracer_wrapper.trace(
                 frame_id,
                 n_active_features,
@@ -235,6 +238,9 @@ class Tracer:
                 sensor_poses.timestamps_us[1],
                 sensor_poses.T_world_sensors[0],
                 sensor_poses.T_world_sensors[1],
+            )
+            mog_projected_position_gradient = torch.zeros_like(
+                mog_projected_position
             )
 
             ctx.save_for_backward(
@@ -258,6 +264,9 @@ class Tracer:
             # differentiates the first depth moment only, so do not expose a
             # silently incomplete second-moment backward path.
             ctx.mark_non_differentiable(ray_hit_distance_squared)
+            ctx.mog_projected_position_gradient = (
+                mog_projected_position_gradient
+            )
 
             return (
                 ray_features_density.float(),  # always fp32 to caller; fp16 saved in ctx for trace_bwd
@@ -269,6 +278,8 @@ class Tracer:
                 mog_projected_conic_opacity,
                 mog_projected_extent,
                 mog_tiles_count,
+                mog_accumulated_weight,
+                mog_projected_position_gradient,
             )
 
         @staticmethod
@@ -283,6 +294,8 @@ class Tracer:
             mog_projected_conic_opacity_grd_UNUSED,
             mog_projected_extent_grd_UNUSED,
             mog_tiles_count_grd_UNUSED,
+            mog_accumulated_weight_grd_UNUSED,
+            mog_projected_position_gradient_grd_UNUSED,
         ):
             (
                 ray_ori,
@@ -311,6 +324,8 @@ class Tracer:
                 particle_features_grd,
                 ray_ori_grd,
                 ray_dir_grd,
+                camera_center_grd,
+                mog_projected_position_gradient,
             ) = ctx.tracer_wrapper.trace_bwd_with_abs(
                 frame_id,
                 n_active_features,
@@ -330,6 +345,10 @@ class Tracer:
                 ray_hit_distance_grd,
                 mog_abs_ray_position_grad,
             )
+            with torch.no_grad():
+                ctx.mog_projected_position_gradient.copy_(
+                    mog_projected_position_gradient
+                )
 
             mog_pos_grd, mog_dns_grd, mog_rot_grd, mog_scl_grd, _ = torch.split(
                 particle_density_grd, [3, 1, 4, 3, 1], dim=1
@@ -344,6 +363,7 @@ class Tracer:
                 None,  # n_active_features
                 ray_ori_grd,
                 ray_dir_grd,
+                camera_center_grd,
                 mog_pos_grd.contiguous(),
                 mog_rot_grd.contiguous(),
                 mog_scl_grd.contiguous(),
@@ -417,6 +437,16 @@ class Tracer:
         rays_o = gpu_batch.rays_ori
         rays_d = gpu_batch.rays_dir
 
+        if (
+            gpu_batch.T_to_world_end is not None
+            and gpu_batch.T_to_world.requires_grad
+        ):
+            raise RuntimeError(
+                "Differentiable precomputed camera-center radiance requires "
+                "a global-shutter pose."
+            )
+        camera_center = gpu_batch.T_to_world[0, :3, 3]
+
         sensor, poses = Tracer.__create_camera_parameters(gpu_batch)
 
         num_gaussians = gaussians.num_gaussians
@@ -467,12 +497,15 @@ class Tracer:
                 mog_projected_conic_opacity,
                 mog_projected_extent,
                 mog_tiles_count,
+                mog_accumulated_weight,
+                mog_projected_position_gradient,
             ) = Tracer._Autograd.apply(
                 self.tracer_wrapper,
                 frame_id,
                 gaussians.n_active_features,
                 rays_o.contiguous(),
                 rays_d.contiguous(),
+                camera_center,
                 gaussians.positions.contiguous(),
                 gaussians.get_rotation().contiguous(),
                 gaussians.get_scale().contiguous(),
@@ -492,6 +525,17 @@ class Tracer:
             pred_dist_squared = pred_dist_squared.unsqueeze(0).contiguous()
             hits_count = hits_count.unsqueeze(0).contiguous()
 
+            # SH output is RGB and must include the configured background.
+            # NHT output is latent and must reach its decoder unmodified.
+            if gaussians.feature_type == Features.Type.SH:
+                pred_features, pred_opacity = gaussians.background(
+                    gpu_batch.T_to_world.contiguous(),
+                    rays_d,
+                    pred_features,
+                    pred_opacity,
+                    train,
+                )
+
             timings = self.tracer_wrapper.collect_times()
 
         return {
@@ -509,6 +553,10 @@ class Tracer:
             "mog_tiles_count": mog_tiles_count,
             "mog_signed_ray_position_grad": mog_signed_ray_position_grad,
             "mog_abs_ray_position_grad": mog_abs_ray_position_grad,
+            "mog_accumulated_weight": mog_accumulated_weight,
+            "mog_projected_position_gradient": (
+                mog_projected_position_gradient
+            ),
         }
 
     @torch.no_grad()
@@ -570,6 +618,7 @@ class Tracer:
             mog_projected_conic_opacity,
             mog_projected_extent,
             mog_tiles_count,
+            _mog_accumulated_weight,
         ) = self.tracer_wrapper.trace(
             frame_id,
             n_active_features,

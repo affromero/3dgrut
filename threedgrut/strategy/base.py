@@ -20,6 +20,16 @@ import torch
 from threedgrut.model.model import MixtureOfGaussians
 
 
+PER_GAUSSIAN_PARAM_NAMES = [
+    "positions",
+    "density",
+    "features_albedo",
+    "features_specular",
+    "rotation",
+    "scale",
+]
+
+
 class BaseStrategy:
     def __init__(self, config, model: MixtureOfGaussians) -> None:
         self.conf = config
@@ -104,6 +114,13 @@ class BaseStrategy:
         """Callback function to get the strategy parameters."""
         return {}
 
+    def finalize_training(self) -> bool:
+        """Apply strategy mutations required before final evaluation."""
+        return self._finalize_training()
+
+    def _finalize_training(self) -> bool:
+        return False
+
     @torch.no_grad()
     def _update_param_with_optimizer(
         self,
@@ -118,11 +135,18 @@ class BaseStrategy:
                 and returns the new parameter.
             optimizer_fn: A function that takes the key of the optimizer state and the state value,
                 and returns the new state value.
-            names: A list of key names to update. If None, update all. Default: None.
+            names: A list of key names to update. If None, update all
+                per-Gaussian parameters.
         """
+        selected_names = (
+            PER_GAUSSIAN_PARAM_NAMES if names is None else names
+        )
+        point_count = self.model.positions.shape[0]
+        optimized_names: set[str] = set()
         for i, param_group in enumerate(self.model.optimizer.param_groups):
             name = param_group["name"]
-            if (names is None) or (name in names):
+            if name in selected_names:
+                optimized_names.add(name)
                 p = param_group["params"][0]
                 p_state = self.model.optimizer.state[p]
                 del self.model.optimizer.state[p]
@@ -136,4 +160,22 @@ class BaseStrategy:
                     self.model.optimizer.param_groups[i]["params"] = [p_new]
                     self.model.optimizer.state[p_new] = p_state
                     setattr(self.model, name, p_new)
-        self.model.refresh_protected_gradient_hooks()
+        if update_param_fn is not None:
+            for name in selected_names:
+                if name in optimized_names:
+                    continue
+                parameter = getattr(self.model, name, None)
+                if (
+                    not isinstance(parameter, torch.nn.Parameter)
+                    or parameter.ndim == 0
+                    or parameter.shape[0] != point_count
+                ):
+                    continue
+                setattr(self.model, name, update_param_fn(name, parameter))
+        refresh_hooks = getattr(
+            self.model,
+            "refresh_protected_gradient_hooks",
+            None,
+        )
+        if callable(refresh_hooks):
+            refresh_hooks()

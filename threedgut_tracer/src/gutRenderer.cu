@@ -502,6 +502,8 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
                                                          vec3* worldRayOriginGradientCudaPtr,    // TODO: not implemented yet
                                                          vec3* worldRayDirectionGradientCudaPtr, // TODO: not implemented yet
                                                          vec3* particlePositionGradientAbsCudaPtr,
+                                                         vec3* sensorWorldPositionGradientCudaPtr,
+                                                         vec2* particlesProjectedPositionGradientCudaPtr,
                                                          Parameters& parameters,
                                                          int cudaDeviceIndex,
                                                          cudaStream_t cudaStream) {
@@ -534,10 +536,8 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
             m_forwardContext->updateParticlesFeaturesGradientBuffer(numParticles * featuresDim(), cudaStream, m_logger));
     }
 
-    if (/*m_settings.renderMode == Settings::Splat*/ TGUTProjectorParams::BackwardProjection) {
-        CHECK_STATUS_RETURN(
-            m_forwardContext->updateParticlesProjectionGradientBuffers(numParticles, cudaStream, m_logger));
-    }
+    CHECK_STATUS_RETURN(
+        m_forwardContext->updateParticlesProjectionGradientBuffers(numParticles, cudaStream, m_logger));
 
     {
         const auto renderProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render-backward::render"};
@@ -568,6 +568,17 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
     }
 
+    if (particlesProjectedPositionGradientCudaPtr != nullptr) {
+        CUDA_CHECK_RETURN(
+            cudaMemcpyAsync(
+                particlesProjectedPositionGradientCudaPtr,
+                m_forwardContext->particlesProjectedPositionGradient.data(),
+                numParticles * sizeof(vec2),
+                cudaMemcpyDeviceToDevice,
+                cudaStream),
+            m_logger);
+    }
+
     if (!/*m_settings.perRayFeatures*/ TGUTRendererParams::PerRayParticleFeatures) {
         const auto projectProfile = DeviceLaunchesLogger::ScopePush{deviceLaunchesLogger, "render-backward::project"};
         ::projectBackward<<<div_round_up(numParticles, GUTParameters::Tiling::BlockSize), GUTParameters::Tiling::BlockSize, 0, cudaStream>>>(
@@ -586,7 +597,8 @@ threedgut::Status threedgut::GUTRenderer::renderBackward(const RenderParameters&
             (const float*)m_forwardContext->particlesGlobalDepthGradient.data(),
             (const float*)m_forwardContext->particlesPrecomputedFeatures.data(),
             (const float*)m_forwardContext->particlesPrecomputedFeaturesGradient.data(),
-            parameters.m_dptrGradientsBuffer);
+            parameters.m_dptrGradientsBuffer,
+            (tcnn::vec3*)sensorWorldPositionGradientCudaPtr);
         CUDA_CHECK_STREAM_RETURN(cudaStream, m_logger);
     }
 

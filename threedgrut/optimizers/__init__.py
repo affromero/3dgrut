@@ -27,6 +27,11 @@ import torch
 
 from threedgrut.optimizers.sparse_geometry_adam import SparseGeometryAdam
 from threedgrut.optimizers.visibility_decayed_adam import VisibilityDecayedAdam
+from threedgrut.optimizers.native_camera_adam import NativeCameraAdam
+from threedgrut.optimizers.visibility_selective_adam import (
+    FP16GlobalAdam,
+    VisibilitySelectiveAdam,
+)
 
 _optimizer_plugin = None
 
@@ -71,10 +76,12 @@ class SelectiveAdam(torch.optim.Adam):
         >>> N = 100
         >>> param = torch.randn(N, requires_grad=True)
         >>> optimizer = SelectiveAdam([param], eps=1e-8, betas=(0.9, 0.999))
-        >>> visibility_mask = torch.cat([torch.ones(50), torch.zeros(50)])  # Visible first half, hidden second half
+        >>> visibility_mask = torch.cat(
+        ...     [torch.ones(50), torch.zeros(50)]
+        ... )  # Visible first half, hidden second half
 
         >>> # Forward pass
-        >>> loss = torch.sum(param ** 2)
+        >>> loss = torch.sum(param**2)
 
         >>> # Backward pass
         >>> loss.backward()
@@ -90,14 +97,14 @@ class SelectiveAdam(torch.optim.Adam):
 
     @torch.no_grad()
     def step(self, visibility):
-
         for group in self.param_groups:
-
             lr = group["lr"]
             eps = group["eps"]
             beta1, beta2 = group["betas"]
 
-            assert len(group["params"]) == 1, "More than one tensor in group is not supported"
+            assert len(group["params"]) == 1, (
+                "More than one tensor in group is not supported"
+            )
 
             param = group["params"][0]
             if param.grad is None:
@@ -107,8 +114,12 @@ class SelectiveAdam(torch.optim.Adam):
             state = self.state[param]
             if len(state) == 0:
                 state["step"] = torch.tensor(0.0, dtype=torch.float32)
-                state["exp_avg"] = torch.zeros_like(param, memory_format=torch.preserve_format)
-                state["exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                state["exp_avg"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+                state["exp_avg_sq"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
 
             stored_state = self.state.get(param, None)
             exp_avg = stored_state["exp_avg"]

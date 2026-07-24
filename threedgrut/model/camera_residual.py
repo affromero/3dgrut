@@ -47,12 +47,19 @@ def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
 class CameraResidual(nn.Module):
     """Bounded local camera residual applied to ray origins/directions."""
 
+    checkpoint_format_version = 2
+    checkpoint_algorithm = "bounded_ray_residual"
+
     def __init__(
         self,
         *,
         num_cameras: int,
         num_images: int = 0,
         lr: float,
+        rotation_lr: float | None = None,
+        translation_lr: float | None = None,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1.0e-8,
         lr_end_fraction: float = 0.01,
         warmup_steps: int = 0,
         reg_lambda: float,
@@ -68,6 +75,10 @@ class CameraResidual(nn.Module):
     ) -> None:
         super().__init__()
         self.lr = lr
+        self.rotation_lr = lr if rotation_lr is None else rotation_lr
+        self.translation_lr = lr if translation_lr is None else translation_lr
+        self.betas = betas
+        self.eps = eps
         self.lr_end_fraction = lr_end_fraction
         self.warmup_steps = warmup_steps
         self.n_iterations = n_iterations
@@ -80,6 +91,7 @@ class CameraResidual(nn.Module):
         self.optimize_per_camera = optimize_per_camera
         self.optimize_per_image = optimize_per_image
         self.optimize_rolling_per_camera = optimize_rolling_per_camera
+        self._validate_optimizer_config()
         self.global_rotation_raw = nn.Parameter(torch.zeros(1, 3))
         self.global_translation_raw = nn.Parameter(torch.zeros(1, 3))
         self.camera_rotation_raw = nn.Parameter(torch.zeros(num_cameras, 3))
@@ -99,6 +111,45 @@ class CameraResidual(nn.Module):
         self.rolling_rotation_raw.requires_grad_(optimize_rolling_per_camera)
         self.rolling_translation_raw.requires_grad_(optimize_rolling_per_camera)
 
+    def _validate_optimizer_config(self) -> None:
+        values = {
+            "rotation_lr": self.rotation_lr,
+            "translation_lr": self.translation_lr,
+            "eps": self.eps,
+        }
+        for name, value in values.items():
+            if not torch.isfinite(torch.tensor(value)) or value <= 0.0:
+                raise ValueError(
+                    f"camera_residual.{name} must be finite and positive."
+                )
+        if len(self.betas) != 2:
+            raise ValueError(
+                "camera_residual.betas must contain exactly two values."
+            )
+        if any(beta < 0.0 or beta >= 1.0 for beta in self.betas):
+            raise ValueError("camera_residual.betas must be in [0, 1).")
+        if not 0.0 < self.lr_end_fraction <= 1.0:
+            raise ValueError(
+                "camera_residual.lr_end_fraction must be in (0, 1]."
+            )
+
+    def is_active(self, global_step: int) -> bool:
+        """Return whether pose parameters may affect or update this step."""
+        return global_step < 0 or global_step >= self.warmup_steps
+
+    def optimizer_group_manifest(self) -> tuple[tuple[str, ...], ...]:
+        """Return ordered parameter names for checkpoint compatibility."""
+        manifests = []
+        for suffix in ("rotation_raw", "translation_raw"):
+            names = tuple(
+                name
+                for name, parameter in self.named_parameters()
+                if name.endswith(suffix) and parameter.requires_grad
+            )
+            if names:
+                manifests.append(names)
+        return tuple(manifests)
+
     def _bounded(self, camera_idx: int, image_idx: int = -1) -> tuple[torch.Tensor, torch.Tensor]:
         rotation = torch.zeros(
             (1, 3),
@@ -114,6 +165,10 @@ class CameraResidual(nn.Module):
             translation = translation + self.camera_translation_raw[
                 camera_idx : camera_idx + 1
             ]
+        if self.optimize_per_image and image_idx >= self.image_rotation_raw.shape[0]:
+            raise ValueError(
+                f"Invalid source_frame_idx for CameraResidual: {image_idx}."
+            )
         if self.optimize_per_image and image_idx >= 0:
             rotation = rotation + self.image_rotation_raw[image_idx : image_idx + 1]
             translation = translation + self.image_translation_raw[
@@ -308,9 +363,13 @@ class CameraResidual(nn.Module):
         return rays_ori, rays_dir
 
     def forward(self, batch: Batch, global_step: int = -1) -> Batch:
-        if 0 <= global_step < self.warmup_steps:
+        if not self.is_active(global_step):
             return batch
-        image_idx = getattr(batch, "frame_idx", -1)
+        image_idx = getattr(batch, "source_frame_idx", -1)
+        if self.optimize_per_image and image_idx < 0:
+            raise ValueError(
+                f"Invalid source_frame_idx for CameraResidual: {image_idx}."
+            )
         rotation, translation = self._bounded(batch.camera_idx, image_idx)
         rotation_matrix = _axis_angle_to_matrix(rotation)[0]
         # Fisheye unprojection emits NaN directions for pixels outside the
@@ -355,11 +414,29 @@ class CameraResidual(nn.Module):
             )
         return loss
 
-    def create_optimizer(self) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
-        if not parameters:
+    def create_optimizer(
+        self,
+    ) -> tuple[
+        torch.optim.Optimizer,
+        torch.optim.lr_scheduler.LRScheduler,
+    ]:
+        manifests = self.optimizer_group_manifest()
+        if not manifests:
             raise ValueError("CameraResidual has no trainable parameters enabled.")
-        optimizer = torch.optim.Adam(parameters, lr=self.lr)
+        parameters_by_name = dict(self.named_parameters())
+        learning_rates = (self.rotation_lr, self.translation_lr)
+        parameter_groups = [
+            {
+                "params": [parameters_by_name[name] for name in manifest],
+                "lr": learning_rate,
+            }
+            for manifest, learning_rate in zip(manifests, learning_rates)
+        ]
+        optimizer = torch.optim.Adam(
+            parameter_groups,
+            betas=self.betas,
+            eps=self.eps,
+        )
         active_steps = max(1, self.n_iterations - self.warmup_steps)
         gamma = (self.lr_end_fraction) ** (1.0 / active_steps)
         scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
@@ -376,14 +453,43 @@ class CameraResidual(nn.Module):
             return 0.0
         return torch.stack(grad_values).max().item()
 
+    def _max_active_parameter_norm(
+        self,
+        *,
+        suffix: str,
+        scale: float,
+    ) -> float:
+        """Return the largest bounded norm for one residual family."""
+        norms = [
+            (torch.tanh(parameter) * scale).norm(dim=-1).max()
+            for name, parameter in self.named_parameters()
+            if name.endswith(suffix) and parameter.requires_grad
+        ]
+        if not norms:
+            return 0.0
+        return torch.stack(norms).max().item()
+
     def stats(self) -> dict[str, float]:
-        camera_idx = 0
-        rotation, translation = self._bounded(camera_idx)
-        rolling_rotation, rolling_translation = self._bounded_rolling(camera_idx)
         return {
-            "rotation_norm_rad": rotation.norm().item(),
-            "translation_norm_m": translation.norm().item(),
-            "rolling_rotation_norm_rad": rolling_rotation.norm().item(),
-            "rolling_translation_norm_m": rolling_translation.norm().item(),
+            "rotation_norm_rad": self._max_active_parameter_norm(
+                suffix="rotation_raw",
+                scale=self.max_rotation_rad,
+            ),
+            "translation_norm_m": self._max_active_parameter_norm(
+                suffix="translation_raw",
+                scale=self.max_translation_m,
+            ),
+            "rolling_rotation_norm_rad": (
+                self._max_active_parameter_norm(
+                    suffix="rolling_rotation_raw",
+                    scale=self.max_rolling_rotation_rad,
+                )
+            ),
+            "rolling_translation_norm_m": (
+                self._max_active_parameter_norm(
+                    suffix="rolling_translation_raw",
+                    scale=self.max_rolling_translation_m,
+                )
+            ),
             "max_abs_grad": self.max_abs_grad(),
         }

@@ -24,6 +24,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torchvision
+from omegaconf import DictConfig
 from torchmetrics import PeakSignalNoiseRatio
 from omegaconf import OmegaConf
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -32,6 +33,10 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import Batch
 from threedgrut.model.factory import create_gaussian_model
+from threedgrut.model.local_projection_field import LocalProjectionField
+from threedgrut.model.native_camera_extrinsics import (
+    NativeCameraExtrinsics,
+)
 from threedgrut.post_processing import (
     LuminanceAffine,
     MultiscalePPISPConfig,
@@ -776,6 +781,268 @@ def _resolve_post_processing_source(
     return source
 
 
+def _restore_local_projection_field(
+    checkpoint: dict,
+    *,
+    renderer: object,
+    device: torch.device,
+) -> tuple[LocalProjectionField, str] | None:
+    """Restore and bind a saved source-frame projection field for rendering."""
+    field_checkpoint = checkpoint.get("local_projection_field")
+    if field_checkpoint is None:
+        return None
+    if not isinstance(field_checkpoint, dict):
+        raise ValueError("Local projection field checkpoint state is invalid.")
+    if field_checkpoint.get("format_version") != (
+        LocalProjectionField.checkpoint_format_version
+    ):
+        raise ValueError(
+            "Local projection field checkpoint version is invalid."
+        )
+    if field_checkpoint.get("algorithm") != (
+        LocalProjectionField.checkpoint_algorithm
+    ):
+        raise ValueError(
+            "Local projection field checkpoint algorithm is invalid."
+        )
+    source_frame_manifest_hash = field_checkpoint.get(
+        "source_frame_manifest_hash"
+    )
+    if not isinstance(source_frame_manifest_hash, str) or not (
+        source_frame_manifest_hash
+    ):
+        raise ValueError(
+            "Local projection field checkpoint manifest is invalid."
+        )
+    module_state = field_checkpoint.get("module")
+    if not isinstance(module_state, dict):
+        raise ValueError("Local projection field module state is invalid.")
+    values = module_state.get("values")
+    if (
+        not torch.is_tensor(values)
+        or values.ndim != 4
+        or values.shape[-1] != 2
+        or values.dtype is not torch.float32
+    ):
+        raise ValueError("Local projection field values are invalid.")
+    field = LocalProjectionField(
+        num_source_frames=int(values.shape[0]),
+        grid_height=int(values.shape[1]),
+        grid_width=int(values.shape[2]),
+    )
+    try:
+        field.load_state_dict(module_state)
+    except RuntimeError as exc:
+        raise ValueError(
+            "Local projection field module state is invalid."
+        ) from exc
+    field.validate_state()
+    setter = getattr(renderer, "set_local_projection_field", None)
+    if not callable(setter):
+        raise RuntimeError(
+            "Checkpoint uses a local projection field, but the renderer does "
+            "not support it."
+        )
+    field = field.to(device)
+    setter(field)
+    return field, source_frame_manifest_hash
+
+
+def _validate_local_projection_field_dataset(
+    *,
+    field: LocalProjectionField,
+    source_frame_manifest_hash: str,
+    dataset: object,
+) -> None:
+    """Reject render datasets that cannot preserve field source-frame mapping."""
+    source_frame_count = getattr(dataset, "get_source_frame_count", None)
+    source_manifest = getattr(dataset, "get_source_frame_manifest_hash", None)
+    if not callable(source_frame_count) or not callable(source_manifest):
+        raise ValueError(
+            "Local projection field rendering requires stable source-frame "
+            "metadata."
+        )
+    if int(source_frame_count()) != field.num_source_frames:
+        raise ValueError("Local projection field source-frame count mismatch.")
+    if source_manifest() != source_frame_manifest_hash:
+        raise ValueError(
+            "Local projection field source-frame manifest mismatch."
+        )
+
+
+def _native_absolute_camera_rendering_enabled(conf: DictConfig) -> bool:
+    """Return whether checkpoint rendering owns native absolute cameras."""
+    camera_conf = conf.get("camera_residual")
+    if camera_conf is None:
+        return False
+    return bool(camera_conf.get("enabled", False)) and bool(
+        camera_conf.get("native_absolute_colmap", False)
+    )
+
+
+def _restore_native_camera_extrinsics(
+    checkpoint: dict[str, object],
+    *,
+    conf: DictConfig,
+    dataset: object,
+    device: torch.device,
+) -> NativeCameraExtrinsics | None:
+    """Restore native absolute camera poses for checkpoint rendering."""
+    if not _native_absolute_camera_rendering_enabled(conf):
+        return None
+    camera_checkpoint = checkpoint.get("camera_residual")
+    if camera_checkpoint is None:
+        msg = (
+            "Native absolute camera rendering requires camera_residual "
+            "checkpoint state."
+        )
+        raise ValueError(msg)
+    if not isinstance(camera_checkpoint, dict):
+        msg = "Native camera checkpoint state must be a dictionary."
+        raise TypeError(msg)
+    if camera_checkpoint.get("format_version") != (
+        NativeCameraExtrinsics.checkpoint_format_version
+    ):
+        msg = "Native camera checkpoint format version is invalid."
+        raise ValueError(msg)
+    if camera_checkpoint.get("algorithm") != (
+        NativeCameraExtrinsics.checkpoint_algorithm
+    ):
+        msg = "Native camera checkpoint algorithm is invalid."
+        raise ValueError(msg)
+    source_frame_manifest_hash = camera_checkpoint.get(
+        "source_frame_manifest_hash"
+    )
+    if not isinstance(source_frame_manifest_hash, str):
+        msg = "Native camera checkpoint manifest must be a string."
+        raise TypeError(msg)
+    if not source_frame_manifest_hash:
+        msg = "Native camera checkpoint manifest is invalid."
+        raise ValueError(msg)
+    source_extrinsics = getattr(
+        dataset,
+        "get_source_frame_colmap_extrinsics",
+        None,
+    )
+    source_manifest = getattr(
+        dataset,
+        "get_source_frame_manifest_hash",
+        None,
+    )
+    if not callable(source_extrinsics) or not callable(source_manifest):
+        msg = "Native camera rendering requires stable source-frame metadata."
+        raise TypeError(msg)
+    dataset_manifest_hash = source_manifest()
+    if dataset_manifest_hash != source_frame_manifest_hash:
+        msg = "Native camera checkpoint manifest mismatch."
+        raise ValueError(msg)
+    initial_qvecs, initial_tvecs = source_extrinsics()
+    camera_residual = NativeCameraExtrinsics(
+        initial_qvecs=torch.as_tensor(initial_qvecs, dtype=torch.float32),
+        initial_tvecs=torch.as_tensor(initial_tvecs, dtype=torch.float32),
+    )
+    if camera_checkpoint.get("optimizer_group_manifest") != (
+        camera_residual.optimizer_group_manifest()
+    ):
+        msg = "Native camera checkpoint optimizer-group manifest is invalid."
+        raise ValueError(msg)
+    module_state = camera_checkpoint.get("module")
+    if module_state is None:
+        msg = "Native camera checkpoint module state is missing."
+        raise ValueError(msg)
+    if not isinstance(module_state, dict):
+        msg = "Native camera checkpoint module state must be a dictionary."
+        raise TypeError(msg)
+    saved_initial_qvecs = module_state.get("initial_qvecs")
+    saved_initial_tvecs = module_state.get("initial_tvecs")
+    if not torch.is_tensor(saved_initial_qvecs) or not torch.is_tensor(
+        saved_initial_tvecs
+    ):
+        msg = "Native camera checkpoint initial poses must be tensors."
+        raise TypeError(msg)
+    expected_initial_qvecs = camera_residual.initial_qvecs
+    expected_initial_tvecs = camera_residual.initial_tvecs
+    if (
+        saved_initial_qvecs.shape != expected_initial_qvecs.shape
+        or saved_initial_tvecs.shape != expected_initial_tvecs.shape
+    ):
+        msg = (
+            "Native camera checkpoint initial-pose shape does not match the "
+            "render dataset."
+        )
+        raise ValueError(msg)
+    if not torch.allclose(
+        saved_initial_qvecs.detach().to(
+            device=expected_initial_qvecs.device,
+            dtype=expected_initial_qvecs.dtype,
+        ),
+        expected_initial_qvecs,
+        rtol=0.0,
+        atol=1.0e-6,
+    ) or not torch.allclose(
+        saved_initial_tvecs.detach().to(
+            device=expected_initial_tvecs.device,
+            dtype=expected_initial_tvecs.dtype,
+        ),
+        expected_initial_tvecs,
+        rtol=0.0,
+        atol=1.0e-6,
+    ):
+        msg = (
+            "Native camera checkpoint initial poses do not match the render "
+            "dataset."
+        )
+        raise ValueError(msg)
+    try:
+        camera_residual.load_state_dict(module_state, strict=True)
+    except RuntimeError as exc:
+        msg = (
+            "Native camera checkpoint state does not match the render dataset."
+        )
+        raise ValueError(msg) from exc
+    camera_residual.validate_state()
+    camera_residual = camera_residual.to(device)
+    camera_residual.eval()
+    return camera_residual
+
+
+def _apply_native_camera_extrinsics(
+    camera_residual: NativeCameraExtrinsics,
+    gpu_batch: Batch,
+    *,
+    global_step: int,
+) -> Batch:
+    """Apply restored native poses without accepting unindexed batches."""
+    if getattr(gpu_batch, "source_frame_idx", None) is None:
+        msg = (
+            "Native camera rendering requires source_frame_idx on every batch."
+        )
+        raise ValueError(msg)
+    return camera_residual(gpu_batch, global_step=global_step)
+
+
+def _use_known_frame_post_processing(
+    *,
+    conf: DictConfig,
+    post_processing: torch.nn.Module | None,
+    camera_residual: NativeCameraExtrinsics | None,
+) -> bool:
+    """Match trainer reconstruction scoring for eligible native checkpoints."""
+    configured = bool(
+        conf.post_processing.get("apply_known_frame_in_eval", False)
+    )
+    if camera_residual is None or post_processing is None:
+        return configured
+    if not bool(getattr(post_processing, "use_native_appearance_grid", False)):
+        return configured
+    if int(conf.dataset.test_split_interval) > 0:
+        return configured
+    holdout_path = conf.dataset.get("holdout_image_list_path")
+    if bool(str(holdout_path or "").strip()):
+        return configured
+    return True
+
+
 def _git_sha_and_dirty(repo_dir: str) -> tuple[str, bool]:
     """Return (HEAD sha, dirty) for the git repo containing ``repo_dir``.
 
@@ -944,6 +1211,10 @@ class Renderer:
         )
         self.train_exclude_image_list_sha256 = _sha256_of_file(
             self.train_exclude_image_list_path
+        )
+        self.camera_residual: NativeCameraExtrinsics | None = None
+        self._use_known_frame_post_processing = bool(
+            conf.post_processing.get("apply_known_frame_in_eval", False)
         )
 
         if conf.model.background.color == "black":
@@ -1418,6 +1689,11 @@ class Renderer:
             # Initialize the parameters from checkpoint
             model.init_from_checkpoint(checkpoint, setup_optimizer=False)
         model.build_acc()
+        restored_local_projection_field = _restore_local_projection_field(
+            checkpoint,
+            renderer=getattr(model, "renderer", None),
+            device=torch.device("cuda"),
+        )
 
         # Load post-processing if present in checkpoint. Linear-to-sRGB is a
         # global (non-per-camera) 2.0 transform that the checkpoint-contract
@@ -1475,7 +1751,7 @@ class Renderer:
                 feature_decoder.eval()
                 logger.info("🎨 Feature decoder loaded from checkpoint")
 
-        return Renderer(
+        renderer = Renderer(
             model=model,
             conf=conf,
             global_step=global_step,
@@ -1497,6 +1773,38 @@ class Renderer:
             original_training_bundle=original_training_bundle,
             split=split,
         )
+        if restored_local_projection_field is not None:
+            field, source_frame_manifest_hash = restored_local_projection_field
+            _validate_local_projection_field_dataset(
+                field=field,
+                source_frame_manifest_hash=source_frame_manifest_hash,
+                dataset=renderer.dataset,
+            )
+        if _native_absolute_camera_rendering_enabled(conf):
+            renderer.camera_residual = _restore_native_camera_extrinsics(
+                checkpoint,
+                conf=conf,
+                dataset=renderer.dataset,
+                device=torch.device("cuda"),
+            )
+        else:
+            renderer.camera_residual = None
+        use_known_frame = _use_known_frame_post_processing(
+            conf=conf,
+            post_processing=post_processing,
+            camera_residual=renderer.camera_residual,
+        )
+        if use_known_frame != getattr(
+            renderer,
+            "_use_known_frame_post_processing",
+            False,
+        ):
+            logger.info(
+                "Standalone native reconstruction rendering uses known "
+                "source-frame appearance to match trainer validation."
+            )
+        renderer._use_known_frame_post_processing = use_known_frame
+        return renderer
 
     @classmethod
     def from_preloaded_model(
@@ -1613,6 +1921,11 @@ class Renderer:
             sealed_batch,
             training=False,
             camera_idx_override=checkpoint_camera_index,
+            use_known_frame=getattr(
+                self,
+                "_use_known_frame_post_processing",
+                False,
+            ),
         )
 
     @torch.no_grad()
@@ -1663,6 +1976,12 @@ class Renderer:
 
             # Get the GPU-cached batch
             gpu_batch = self.dataset.get_gpu_batch_with_intrinsics(batch)
+            if self.camera_residual is not None:
+                gpu_batch = _apply_native_camera_extrinsics(
+                    self.camera_residual,
+                    gpu_batch,
+                    global_step=int(self.global_step),
+                )
 
             # Compute the outputs of a single batch
             outputs = self.model(gpu_batch)

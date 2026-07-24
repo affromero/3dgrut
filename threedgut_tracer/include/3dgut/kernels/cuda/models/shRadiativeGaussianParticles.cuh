@@ -158,7 +158,9 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                                                  const float3& canonicalIntersectionGrad,
                                                                  const tcnn::vec3* normal         = nullptr,
                                                                  tcnn::vec3* integratedNormal     = nullptr,
-                                                                 tcnn::vec3* integratedNormalGrad = nullptr
+                                                                 tcnn::vec3* integratedNormalGrad = nullptr,
+                                                                 tcnn::vec3* rayOriginGrad         = nullptr,
+                                                                 tcnn::vec3* rayDirectionGrad      = nullptr
 
     ) const {
         if constexpr (TDifferentiable) {
@@ -179,7 +181,9 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                                                  normal != nullptr,
                                                  normal == nullptr ? make_float3(0, 0, 0) : *reinterpret_cast<const float3*>(normal),
                                                  reinterpret_cast<float3*>(integratedNormal),
-                                                 reinterpret_cast<float3*>(integratedNormalGrad));
+                                                 reinterpret_cast<float3*>(integratedNormalGrad),
+                                                 reinterpret_cast<float3*>(rayOriginGrad),
+                                                 reinterpret_cast<float3*>(rayDirectionGrad));
         }
     }
 
@@ -226,9 +230,11 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
     }
 
     template <bool exclusiveGradient>
-    __forceinline__ __device__ void densityIncidentDirectionBwdToBuffer(uint32_t particlesIdx,
-                                                                        const tcnn::vec3& sourcePosition,
-                                                                        const tcnn::vec3& incidentDirectionGrad) {
+    __forceinline__ __device__ tcnn::vec3 densityIncidentDirectionBwdToBuffer(
+        uint32_t particlesIdx,
+        const tcnn::vec3& sourcePosition,
+        const tcnn::vec3& incidentDirectionGrad) {
+        tcnn::vec3 sourcePositionGradient = tcnn::vec3::zero();
         if constexpr (TDifferentiable) {
             particleDensityIncidentDirectionBwdToBuffer(
                 particlesIdx,
@@ -236,8 +242,10 @@ struct ShRadiativeGaussianVolumetricFeaturesParticles : Params, public ExtParams
                   reinterpret_cast<gaussianParticle_RawParameters_0*>(m_densityRawParameters.gradPtr),
                   exclusiveGradient}},
                 *reinterpret_cast<const float3*>(&sourcePosition),
-                *reinterpret_cast<const float3*>(&incidentDirectionGrad));
+                *reinterpret_cast<const float3*>(&incidentDirectionGrad),
+                reinterpret_cast<float3*>(&sourcePositionGradient));
         }
+        return sourcePositionGradient;
     }
 
     using TFeaturesVec = typename tcnn::vec<ExtParams::RayFeatureDim>;
