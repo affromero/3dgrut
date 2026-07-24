@@ -77,7 +77,9 @@ public:
 
     ~SplatRaster();
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               torch::Tensor>
     trace(uint32_t frameNumber, int numActiveFeatures,
           // Particles
           torch::Tensor particleDensity,
@@ -128,7 +130,8 @@ public:
              torch::Tensor rayHitDistance,
              torch::Tensor rayHitDistanceGradient);
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor>
     traceBwdWithAbs(uint32_t frameNumber, int numActiveFeatures,
              torch::Tensor particleDensity,
              torch::Tensor particleRadiance,

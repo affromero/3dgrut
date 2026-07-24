@@ -519,7 +519,7 @@ struct GUTProjector : Params, UTParams {
         }
     }
 
-    static inline __device__ void
+    static inline __device__ tcnn::vec3
     evalBackward(tcnn::uvec2 tileGrid,
                  uint32_t numParticles,
                  tcnn::ivec2 resolution,
@@ -534,30 +534,35 @@ struct GUTProjector : Params, UTParams {
                  const float* __restrict__ particlesPrecomputedFeaturesPtr,
                  const float* __restrict__ particlesPrecomputedFeaturesGradPtr,
                  threedgut::MemoryHandles parametersGradient) {
-        if constexpr (!Params::PerRayParticleFeatures) {
-
-            const uint32_t particleIdx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (particleIdx >= numParticles) {
-                return;
-            }
-            if (particlesTilesCountPtr[particleIdx] == 0) {
-                return;
-            }
-
-            Particles particles;
-            particles.initializeDensity(parameters);
-            particles.initializeDensityGradient(parametersGradient);
-            const tcnn::vec3 incidentDirection = tcnn::normalize(particles.fetchPosition(particleIdx) - sensorWorldPosition);
-            tcnn::vec3 incidentDirectionGrad   = tcnn::vec3(0.0f);
-
-            particles.initializeFeatures(parameters);
-            particles.initializeFeaturesGradient(parametersGradient);
-            particles.featuresBwdToBuffer<true>(particleIdx,
-                                                reinterpret_cast<const TFeaturesVec*>(particlesPrecomputedFeaturesGradPtr)[particleIdx],
-                                                incidentDirection,
-                                                incidentDirectionGrad);
-
-            particles.template densityIncidentDirectionBwdToBuffer<true>(particleIdx, sensorWorldPosition, incidentDirectionGrad);
+        if constexpr (Params::PerRayParticleFeatures) {
+            return tcnn::vec3::zero();
         }
+
+        const uint32_t particleIdx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (particleIdx >= numParticles) {
+            return tcnn::vec3::zero();
+        }
+        if (particlesTilesCountPtr[particleIdx] == 0) {
+            return tcnn::vec3::zero();
+        }
+
+        Particles particles;
+        particles.initializeDensity(parameters);
+        const tcnn::vec3 incidentDirection = tcnn::normalize(particles.fetchPosition(particleIdx) - sensorWorldPosition);
+
+        particles.initializeFeatures(parameters);
+        particles.initializeFeaturesGradient(parametersGradient);
+        tcnn::vec3 incidentDirectionGradient = tcnn::vec3::zero();
+        particles.featuresBwdToBuffer<true>(
+            particleIdx,
+            reinterpret_cast<const TFeaturesVec*>(
+                particlesPrecomputedFeaturesGradPtr)[particleIdx],
+            incidentDirection,
+            incidentDirectionGradient);
+        particles.initializeDensityGradient(parametersGradient);
+        return particles.template densityIncidentDirectionBwdToBuffer<true>(
+            particleIdx,
+            sensorWorldPosition,
+            incidentDirectionGradient);
     }
 };

@@ -185,6 +185,7 @@ def apply_post_processing(
     gpu_batch,
     training: bool = False,
     camera_idx_override: int | None = None,
+    use_known_frame: bool | None = None,
 ) -> dict:
     """Apply post-processing to rendered output.
 
@@ -203,18 +204,27 @@ def apply_post_processing(
     assert outputs["pred_rgb"].shape[0] == 1, "Post-processing requires batch_size=1"
 
     pred_rgb = outputs["pred_rgb"]
-    if camera_idx_override is not None:
-        camera_idx = camera_idx_override
-    else:
-        camera_idx = post_processing_camera_idx(
-            gpu_batch.camera_idx,
+    camera_idx = (
+        camera_idx_override
+        if camera_idx_override is not None
+        else post_processing_camera_idx(
+            getattr(gpu_batch, "post_processing_camera_idx", gpu_batch.camera_idx),
             getattr(
                 post_processing,
                 "camera_index_mode",
                 POST_PROCESSING_CAMERA_INDEX_DATASET,
             ),
         )
-    frame_idx = gpu_batch.frame_idx if training else -1
+    )
+    apply_known_frame = (
+        training if use_known_frame is None else use_known_frame
+    )
+    known_frame_idx = (
+        getattr(gpu_batch, "source_frame_idx", -1)
+        if getattr(post_processing, "use_native_appearance_grid", False)
+        else gpu_batch.frame_idx
+    )
+    frame_idx = known_frame_idx if apply_known_frame else -1
     sequence_idx = getattr(gpu_batch, "sequence_idx", -1)
     H, W = pred_rgb.shape[1], pred_rgb.shape[2]
 

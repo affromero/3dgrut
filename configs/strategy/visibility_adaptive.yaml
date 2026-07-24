@@ -1,0 +1,27 @@
+method: VisibilityAdaptiveStrategy
+
+print_stats: true
+max_gaussians: 14000000
+optimizer_visibility_source: renderer
+optimizer_visibility_min_rendered_weight: 0.0
+optimizer_visibility_min_color_gradient_norm: 0.0
+projected_size_source: rendered_weight
+projected_size_multiplier: 1.0
+weight_accumulation_multiplier: 1.0
+projected_gradient_proxy_mode: jacobian
+projected_gradient_proxy_scale: 0.8
+status_gradient_scale: 1.0
+topology_total_iterations: 0
+
+# The native host starts both fields at zero and writes 100 after one effective
+# image batch. VisibilityAdaptiveStrategy models that warmup gate explicitly.
+densify:
+  frequency: 100
+  start_iteration: 0
+  end_iteration: -1
+
+prune:
+  frequency: 100
+  start_iteration: 0
+  end_iteration: -1
+  density_threshold: 0.005

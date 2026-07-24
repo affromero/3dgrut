@@ -20,6 +20,30 @@ wandb_project: "3dgrt"
 test_last: true
 validate_first: false
 log_frequency: 1
+# Diagnostic substrate (AI-readable Parquet sidecar + future PNG snapshots).
+diagnostics:
+  gradient_stats_enabled: true
+  parquet_enabled: true     # Write per-step metrics to {output_dir}/diagnostics.parquet
+  parquet_flush_steps: 100  # Flush row groups every N steps
+  snapshot_frequency: 500   # Save render/residual/grad_positions PNGs every N steps (0 disables)
+  snapshot_camera_index: 0  # Which train camera to render snapshots from
+  snapshot_resolution: 256  # Thumbnail edge length
+  snapshot_include_gt: true  # Include GT RGB when the train batch exposes it
+  snapshot_contact_sheet_enabled: true  # Log GT/render/residual/grad in one PNG
+  snapshot_grad_enabled: false  # Grad panels are sparse; opt in when needed
+  snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
+  snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
+  native_gradient_probe_enabled: false
+  native_gradient_probe_dir: ""
+  native_gradient_probe_full_state: false
+  native_gradient_probe_optimizer_state: false
+  validation_metrics_enabled: true  # Compute full validation diagnostics beyond PSNR/loss.
+  training_metrics_enabled: true  # Compute comparable train-split diagnostics at validation checkpoints.
+  training_metrics_max_views: 64  # Cap train-split eval views; 0 evaluates every train view.
+  loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
+  loss_volume_voxel_size_m: 0.1
+  loss_volume_view_stride: 4
+  loss_volume_pixel_stride: 8
 compute_extra_metrics: true
 
 enable_frame_timings: false
@@ -41,6 +65,19 @@ import_ply:
   path: ""
   init_global_step: 0
 
+local_projection_field:
+  # Opt-in local screen-space field applied before native EWA tile creation.
+  enabled: false
+  grid_height: 12
+  grid_width: 12
+  lr: 0.001
+  betas: [0.8, 0.95]
+  eps: 2.e-5
+  shrinkage: 0.1
+  warmup_updates: 4
+  # Use activation_start_step >= 0 to override the full-pass hypothesis.
+  activation_start_step: -1
+  activation_full_passes: 1
 export_usd:
   enabled: false
   path: ""
@@ -86,6 +123,7 @@ model:
   optimize_features_albedo: true
   optimize_features_specular: true
   optimize_features: true
+  optimize_color_encoder: true
   optimize_position: true
   optimize_rotation: true
   optimize_scale: true
@@ -166,6 +204,10 @@ model:
     magnitude_regularization: 0.01
     curvature_regularization: 0.10
     freeze_parent: true
+  native_color_encoder:
+    enabled: false
+    latent_dim: 8
+    weight_init_std: 0.01
   progressive_training:
     init_n_features: 0 # sh: initial sh deg | mlp: num of dims initially unmasked
     max_n_features: 3 # sh: maximum sh deg | mlp: total num of dims finally unmasked
@@ -249,7 +291,7 @@ checkpoint:
   save_last_on_validation: false
   save_best_on_validation: false
 optimizer:
-  type: adam # adam, selective_adam, or visibility_decayed_adam
+  type: adam # adam, selective_adam, visibility_decayed_adam, or visibility_selective_adam
   lr: 0.0
   betas: [0.9, 0.999]
   eps: 1.e-15
@@ -262,8 +304,10 @@ optimizer:
       lr: 0.05 # 3DGS value: 0.05
     features_albedo:
       lr: 0.0025 # 3DGS value: 0.0025
+      eps: ${optimizer.eps}
     features_specular:
       lr: ${div:${optimizer.params.features_albedo.lr},20} # 3DGS value 20x smaller than lr of features_albedo
+      eps: ${optimizer.eps}
     features:
       lr: 0.015
     acquisition_appearance:
@@ -274,6 +318,10 @@ optimizer:
       lr: 0.0025
     gaussian_track_acquisition:
       lr: 0.0025
+    color_encoder:
+      lr: 0.001
+      betas: [0.9, 0.99]
+      eps: 1.e-10
     rotation:
       lr: 0.001 # 3DGS value: 0.001
     scale:
@@ -299,12 +347,47 @@ scheduler:
 loss:
   use_l1: true
   lambda_l1: 0.8
+  l1_loss_type: absolute
+  charbonnier_epsilon: 0.01
+  huber_delta: 0.1
+  use_fixed_image_loss_denominator: false
+  fixed_image_loss_min_valid_fraction: 0.8
+  # Inject a first-order loss through selected-layer depth buffers. The
+  # semantic labels and coefficients remain configurable for each dataset.
+  use_layered_depth_adjoint: false
+  layered_depth_adjoint_normalized_weight: 1.0
+  layered_depth_adjoint_semantic_label_remap_from: null
+  layered_depth_adjoint_semantic_label_remap_to: null
+  layered_depth_adjoint_primary_semantic_label: null
+  layered_depth_adjoint_primary_transparency_bias: 0.0
+  layered_depth_adjoint_secondary_semantic_label: null
+  layered_depth_adjoint_secondary_transparency_bias: 0.0
+  layered_depth_adjoint_transparency_target: 0.5
+  layered_depth_adjoint_transparency_gradient_scale: 0.2
+  layered_depth_adjoint_neighbor_gradient_scale: 0.1
+  layered_depth_adjoint_depth_transparency_threshold: 0.1
+  layered_depth_adjoint_depth_gradient_scale: 0.01
+  layered_depth_adjoint_depth_residual_delta: 0.1
+  # Scales the whole image loss before backward. This affects geometry and
+  # topology signals, so keep it at 1 unless intentionally running an ablation.
+  image_gradient_scale: 1.0
+  # Scales only radiance/color parameter gradients after topology bookkeeping.
+  radiance_gradient_scale: 1.0
+
+  # ErpGS-style distortion-aware latitude weighting of the RGB L1 term.
+  # When true AND the frame is equirectangular, the per-pixel L1 residual is
+  # weighted by a mean-1-normalized cos(latitude) map so the loss respects
+  # the true spherical sampling (poles are over-sampled in ERP). No-op on
+  # perspective/fisheye frames; SSIM is left unweighted.
+  erp_latitude_weighting: false
 
   use_l2: false
   lambda_l2: 1.0
 
   use_ssim: true
   lambda_ssim: 0.2
+  use_masked_ssim_same_padding: false
+  masked_ssim_require_full_valid_window: false
 
   use_camera_loss_weights: false
   camera_loss_weights: []
@@ -313,9 +396,13 @@ loss:
   # Eval/validation metrics are never weighted.
   use_image_loss_weights: false
   image_loss_weights_path: ""
+  camera_loss_weights_use_physical_camera: false
+  camera_loss_weights_image_only: false
 
   use_opacity: false
   lambda_opacity: 0.0
+  use_sky_opacity: false
+  lambda_sky_opacity: 0.0
 
   use_scale: false
   lambda_scale: 0.0
@@ -398,12 +485,24 @@ loss:
   mvdino_use_anyup: false
   mvdino_anyup_res: 512
 
-# Post-processing configuration
-  l1_loss_type: absolute
-  charbonnier_epsilon: 0.01
-  erp_latitude_weighting: false
-  use_sky_opacity: false
-  lambda_sky_opacity: 0.0
+# Independent LiDAR-ray optimization. Disabled by default because it requires
+# a timestamped LAS map and matching LiDAR trajectory.
+lidar_supervision:
+  enabled: false
+  map_path: ""
+  poses_path: ""
+  calibration_path: ""
+  # Explicit row-major transform from LAS/pose coordinates into the training
+  # reconstruction frame. Identity must be supplied explicitly when valid.
+  map_to_world_transform: []
+  rays_per_step: 4096
+  frequency: 1
+  lambda_range: 0.25
+  min_depth_m: 0.1
+  # Keep the established 3DGUT path unless an explicit native-parity run
+  # selects classic expected-depth splatting.
+  renderer: gut_hit_distance
+
 post_processing:
   method:      # Possible values: null, "ppisp", "luminance_affine"
   # Preserve a restored post-processing module as a differentiable, fixed
@@ -458,6 +557,29 @@ post_processing:
   radial_max_bias: 0.03
   radial_reg_lambda: 0.50
   use_residual_grid: false
+  use_frame_residual_grid: false
+  # Exact visibility-adaptive 33x33x8 per-image transform. This is exclusive with the
+  # other luminance-affine correction families above and below.
+  use_native_appearance_grid: false
+  # Native checkpoints store FP16 appearance parameters and Adam moments.
+  native_appearance_fp16: true
+  # Preserve a recovered native appearance field without persistent updates.
+  freeze_native_appearance: false
+  # Native appearance/extrinsic replay may be used in controlled training.
+  # Distortion replay and apply_known_frame_in_eval remain offline-only.
+  native_checkpoint_path: ""
+  replay_native_appearance: false
+  replay_native_extrinsics: false
+  # Approximate offline control: inverse-warp the rendered image with the
+  # frozen native 12x12 per-frame projection field before appearance replay.
+  replay_native_distortion: false
+  native_distortion_sign: 1.0
+  native_distortion_iterations: 5
+  native_extrinsic_max_rotation_deg: 5.0
+  native_extrinsic_max_center_shift_m: 1.0
+  # Reconstruction scoring uses known per-image fields. Keep false for
+  # held-out/novel-view metrics.
+  apply_known_frame_in_eval: false
   residual_grid_size: 32
   residual_grid_max: 0.05
   residual_grid_reg_lambda: 0.01
@@ -469,6 +591,9 @@ post_processing:
   temporal_max_log_gain: 0.08
   temporal_max_bias: 0.03
   temporal_reg_lambda: 0.50
+  native_preoptimize: false
+  native_max_appearance_iterations: 4
+  native_iteration_multipliers: []
 
 hydra:
   output_subdir:
@@ -479,7 +604,12 @@ hydra:
 
 camera_residual:
   enabled: false
+  native_absolute_colmap: false
   lr: 0.0001
+  rotation_lr: ${.lr}
+  translation_lr: ${.lr}
+  betas: [0.9, 0.999]
+  eps: 1.e-8
   lr_end_fraction: 0.01
   warmup_steps: 0
   reg_lambda: 1.0
@@ -509,24 +639,6 @@ wandb_run_id: ""
 wandb_resume: "allow"
 validate_final: true
 validate_only: false
-diagnostics:
-  parquet_enabled: true     # Write per-step metrics to {output_dir}/diagnostics.parquet
-  parquet_flush_steps: 100  # Flush row groups every N steps
-  snapshot_frequency: 500   # Save render/residual/grad_positions PNGs every N steps (0 disables)
-  snapshot_camera_index: 0  # Which train camera to render snapshots from
-  snapshot_resolution: 256  # Thumbnail edge length
-  snapshot_include_gt: true  # Include GT RGB when the train batch exposes it
-  snapshot_contact_sheet_enabled: true  # Log GT/render/residual/grad in one PNG
-  snapshot_grad_enabled: false  # Grad panels are sparse; opt in when needed
-  snapshot_grad_attr: density  # Grad panel attr: positions/rotation/scale/density/features_albedo/features_specular
-  snapshot_grad_scale_mode: p95  # Grad panel scale: p95/p99/log/linear
-  validation_metrics_enabled: true  # Compute full validation diagnostics beyond PSNR/loss.
-  training_metrics_enabled: true  # Compute comparable train-split diagnostics at validation checkpoints.
-  training_metrics_max_views: 64  # Cap train-split eval views; 0 evaluates every train view.
-  loss_volume_after_training: false  # Voxelize per-pixel error in 3D after training
-  loss_volume_voxel_size_m: 0.1
-  loss_volume_view_stride: 4
-  loss_volume_pixel_stride: 8
 early_stopping:
   enabled: false
   metric: masked_psnr_if_available
@@ -549,4 +661,3 @@ camera_intrinsics_audit:
   affine_delta: 0.001
   tangential_delta: 0.001
   exit_after: true
-

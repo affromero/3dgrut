@@ -1,0 +1,19 @@
+defaults:
+  - 3dgut
+  - _self_
+
+method: native_ewa
+
+native_ewa:
+  eps2d: 0.1
+  near_plane: 0.1
+  tile_size: 16
+  global_z_order: true
+  fov_clamp_backward: autodiff
+  layered_depth:
+    compositor: reference
+    tile_height: 16
+    tile_rows_per_batch: 16
+    activation_checkpoint: true
+    alpha_cutoff: 0.00392156862745098
+    transparency_threshold: 0.0

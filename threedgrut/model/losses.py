@@ -13,11 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 import torch.nn.functional as F
 from beartype import beartype
-from fused_ssim import fused_ssim
+from fused_ssim import FusedSSIMMap, fused_ssim
 from jaxtyping import Float, jaxtyped
+
+FIXED_IMAGE_LOSS_MIN_VALID_FRACTION = 0.8
 
 
 @torch.cuda.nvtx.range("l1_loss")
@@ -30,10 +34,369 @@ def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
 
 
+def native_huber_loss(
+    residual: torch.Tensor,
+    *,
+    delta: float,
+) -> torch.Tensor:
+    """Return a per-pixel Huber loss without reducing the tensor."""
+    if delta <= 0.0:
+        raise ValueError(f"Huber delta must be positive, got {delta}.")
+    absolute = torch.abs(residual)
+    return torch.where(
+        absolute <= delta,
+        residual.square() / (2.0 * delta),
+        absolute - 0.5 * delta,
+    )
+
+
+def fixed_image_loss_denominator(
+    *,
+    rgb: torch.Tensor,
+    mask: torch.Tensor | None,
+    image_scale: float | torch.Tensor = 1.0,
+    min_valid_fraction: float = FIXED_IMAGE_LOSS_MIN_VALID_FRACTION,
+) -> torch.Tensor:
+    """Return a full-image RGB reduction denominator with a validity floor."""
+    if rgb.ndim != 4 or rgb.shape[0] != 1 or rgb.shape[-1] != 3:
+        raise ValueError(
+            "Fixed image loss requires one HWC image with three channels."
+        )
+    image_scale_tensor = torch.as_tensor(
+        image_scale,
+        dtype=rgb.dtype,
+        device=rgb.device,
+    )
+    if image_scale_tensor.shape != ():
+        raise ValueError("Fixed image loss scale must be scalar.")
+    if (
+        not torch.isfinite(image_scale_tensor).item()
+        or image_scale_tensor.item() <= 0.0
+    ):
+        raise ValueError(
+            "Fixed image loss image scale must be finite and positive."
+        )
+    if (
+        not math.isfinite(min_valid_fraction)
+        or not 0.0 < min_valid_fraction <= 1.0
+    ):
+        raise ValueError(
+            "Fixed image loss minimum valid fraction must be in (0, 1]."
+        )
+    denominator = torch.tensor(
+        rgb.numel(),
+        dtype=rgb.dtype,
+        device=rgb.device,
+    ) * image_scale_tensor
+    if mask is None:
+        return denominator
+    expected_shape = (*rgb.shape[:-1], 1)
+    if mask.shape != expected_shape:
+        raise ValueError(
+            f"Fixed image loss mask must have shape {expected_shape}."
+        )
+    valid_fraction = mask.to(dtype=rgb.dtype).mean()
+    return denominator * torch.clamp(
+        valid_fraction,
+        min=min_valid_fraction,
+    )
+
+
+def indexed_camera_loss_weight(
+    *,
+    camera_index: int,
+    configured_weights: list[float],
+) -> float:
+    """Return a validated camera weight for an explicit camera index."""
+    if camera_index < 0 or camera_index >= len(configured_weights):
+        raise ValueError(
+            "Camera loss weights must include the requested camera index "
+            f"{camera_index}."
+        )
+    weight = float(configured_weights[camera_index])
+    if not math.isfinite(weight) or weight <= 0.0:
+        raise ValueError("Camera loss weights must be finite and positive.")
+    return weight
+
+
+def _layered_depth_neighbor_sign_sum(
+    transparency: torch.Tensor,
+) -> torch.Tensor:
+    """Return the four-neighbour transparency sign term."""
+    result = torch.zeros_like(transparency)
+    horizontal = transparency[:, :, 1:, :] - transparency[:, :, :-1, :]
+    horizontal_sign = torch.copysign(
+        torch.ones_like(horizontal),
+        horizontal,
+    )
+    result[:, :, 1:, :] += horizontal_sign
+    reverse_horizontal = transparency[:, :, :-1, :] - transparency[:, :, 1:, :]
+    result[:, :, :-1, :] += torch.copysign(
+        torch.ones_like(reverse_horizontal),
+        reverse_horizontal,
+    )
+    vertical = transparency[:, 1:, :, :] - transparency[:, :-1, :, :]
+    vertical_sign = torch.copysign(torch.ones_like(vertical), vertical)
+    result[:, 1:, :, :] += vertical_sign
+    reverse_vertical = transparency[:, :-1, :, :] - transparency[:, 1:, :, :]
+    result[:, :-1, :, :] += torch.copysign(
+        torch.ones_like(reverse_vertical),
+        reverse_vertical,
+    )
+    return result
+
+
+def _validate_semantic_label(
+    *,
+    label: int | None,
+    name: str,
+) -> None:
+    """Validate an optional uint8 semantic label selector."""
+    if label is None:
+        return
+    if not isinstance(label, int) or not 0 <= label <= 255:
+        raise ValueError(f"{name} must be a uint8 label or None, got {label!r}.")
+
+
+@torch.no_grad()
+def layered_depth_adjoint_gradients(
+    *,
+    raw_depth: torch.Tensor,
+    layer_transparency: torch.Tensor,
+    median_depth: torch.Tensor,
+    semantic_mask: torch.Tensor,
+    normalized_weight: float,
+    semantic_label_remap_from: int | None = None,
+    semantic_label_remap_to: int | None = None,
+    primary_semantic_label: int | None = None,
+    primary_transparency_bias: float = 0.0,
+    secondary_semantic_label: int | None = None,
+    secondary_transparency_bias: float = 0.0,
+    transparency_target: float = 0.5,
+    transparency_gradient_scale: float = 0.2,
+    neighbor_gradient_scale: float = 0.1,
+    depth_transparency_threshold: float = 0.1,
+    depth_gradient_scale: float = 0.01,
+    depth_residual_delta: float = 0.1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a configurable injected adjoint for layered depth buffers."""
+    if raw_depth.ndim != 4 or raw_depth.shape[-1] != 1:
+        raise ValueError("Layered raw depth must be [B, H, W, 1].")
+    if layer_transparency.shape != raw_depth.shape:
+        raise ValueError("Layer transparency must match raw depth.")
+    if median_depth.shape != raw_depth.shape:
+        raise ValueError("Median depth must match raw depth.")
+    if semantic_mask.shape != raw_depth.shape:
+        raise ValueError("Semantic mask must match raw depth.")
+    if semantic_mask.dtype != torch.uint8:
+        raise ValueError("Semantic mask must use uint8 labels.")
+    if not math.isfinite(normalized_weight) or normalized_weight <= 0.0:
+        raise ValueError(
+            "Layered depth normalized weight must be finite and positive."
+        )
+    if (semantic_label_remap_from is None) != (
+        semantic_label_remap_to is None
+    ):
+        raise ValueError(
+            "Semantic label remapping requires both source and target labels."
+        )
+    for name, label in (
+        ("semantic_label_remap_from", semantic_label_remap_from),
+        ("semantic_label_remap_to", semantic_label_remap_to),
+        ("primary_semantic_label", primary_semantic_label),
+        ("secondary_semantic_label", secondary_semantic_label),
+    ):
+        _validate_semantic_label(label=label, name=name)
+    if (
+        primary_semantic_label is not None
+        and primary_semantic_label == secondary_semantic_label
+    ):
+        raise ValueError("Primary and secondary semantic labels must differ.")
+    coefficients = (
+        primary_transparency_bias,
+        secondary_transparency_bias,
+        transparency_target,
+        transparency_gradient_scale,
+        neighbor_gradient_scale,
+        depth_transparency_threshold,
+        depth_gradient_scale,
+        depth_residual_delta,
+    )
+    if not all(math.isfinite(value) for value in coefficients):
+        raise ValueError("Layered depth adjoint coefficients must be finite.")
+    if depth_transparency_threshold <= 0.0:
+        raise ValueError("Depth transparency threshold must be positive.")
+    if depth_residual_delta <= 0.0:
+        raise ValueError("Depth residual delta must be positive.")
+
+    labels = semantic_mask
+    if semantic_label_remap_from is not None:
+        labels = torch.where(
+            semantic_mask == semantic_label_remap_from,
+            torch.full_like(semantic_mask, semantic_label_remap_to),
+            semantic_mask,
+        )
+    height = raw_depth.shape[1]
+    width = raw_depth.shape[2]
+    weight = raw_depth.new_tensor(normalized_weight / (height * width))
+    valid = labels != 0
+    class_term = torch.zeros_like(raw_depth)
+    if primary_semantic_label is not None:
+        class_term = torch.where(
+            labels == primary_semantic_label,
+            torch.full_like(raw_depth, primary_transparency_bias) * weight,
+            class_term,
+        )
+    if secondary_semantic_label is not None:
+        class_term = torch.where(
+            labels == secondary_semantic_label,
+            torch.full_like(raw_depth, secondary_transparency_bias) * weight,
+            class_term,
+        )
+    transparency_gradient = (
+        weight
+        * transparency_gradient_scale
+        * (transparency_target - layer_transparency)
+        + class_term
+        + weight
+        * neighbor_gradient_scale
+        * _layered_depth_neighbor_sign_sum(layer_transparency)
+    )
+    transparency_gradient = torch.where(
+        valid,
+        transparency_gradient,
+        torch.zeros_like(transparency_gradient),
+    )
+
+    residual = raw_depth - median_depth * (1.0 - layer_transparency)
+    huber_gradient = torch.clamp(
+        residual / depth_residual_delta,
+        min=-1.0,
+        max=1.0,
+    )
+    raw_depth_gradient = (
+        weight
+        * depth_gradient_scale
+        * (1.0 - layer_transparency / depth_transparency_threshold)
+        * huber_gradient
+    )
+    depth_eligible = (
+        valid
+        & (median_depth > 0.0)
+        & (layer_transparency < depth_transparency_threshold)
+    )
+    raw_depth_gradient = torch.where(
+        depth_eligible,
+        raw_depth_gradient,
+        torch.zeros_like(raw_depth_gradient),
+    )
+    return raw_depth_gradient, transparency_gradient
+
+
+def layered_depth_adjoint_injection(
+    *,
+    raw_depth: torch.Tensor,
+    layer_transparency: torch.Tensor,
+    median_depth: torch.Tensor,
+    semantic_mask: torch.Tensor,
+    normalized_weight: float,
+    semantic_label_remap_from: int | None = None,
+    semantic_label_remap_to: int | None = None,
+    primary_semantic_label: int | None = None,
+    primary_transparency_bias: float = 0.0,
+    secondary_semantic_label: int | None = None,
+    secondary_transparency_bias: float = 0.0,
+    transparency_target: float = 0.5,
+    transparency_gradient_scale: float = 0.2,
+    neighbor_gradient_scale: float = 0.1,
+    depth_transparency_threshold: float = 0.1,
+    depth_gradient_scale: float = 0.01,
+    depth_residual_delta: float = 0.1,
+) -> torch.Tensor:
+    """Inject layered-depth gradients without differentiating them twice."""
+    raw_depth_gradient, transparency_gradient = (
+        layered_depth_adjoint_gradients(
+            raw_depth=raw_depth,
+            layer_transparency=layer_transparency,
+            median_depth=median_depth,
+            semantic_mask=semantic_mask,
+            normalized_weight=normalized_weight,
+            semantic_label_remap_from=semantic_label_remap_from,
+            semantic_label_remap_to=semantic_label_remap_to,
+            primary_semantic_label=primary_semantic_label,
+            primary_transparency_bias=primary_transparency_bias,
+            secondary_semantic_label=secondary_semantic_label,
+            secondary_transparency_bias=secondary_transparency_bias,
+            transparency_target=transparency_target,
+            transparency_gradient_scale=transparency_gradient_scale,
+            neighbor_gradient_scale=neighbor_gradient_scale,
+            depth_transparency_threshold=depth_transparency_threshold,
+            depth_gradient_scale=depth_gradient_scale,
+            depth_residual_delta=depth_residual_delta,
+        )
+    )
+    return (
+        raw_depth * raw_depth_gradient.detach()
+        + layer_transparency * transparency_gradient.detach()
+    ).sum()
+
+
 @torch.cuda.nvtx.range("ssim")
 def ssim(img1, img2, window_size=11, size_average=True):
     # predicted_image, gt_image: [BS, CH, H, W], predicted_image is differentiable
     return fused_ssim(img1, img2, padding="valid")
+
+
+@torch.cuda.nvtx.range("masked_ssim_same")
+def masked_ssim_same_loss(
+    *,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    denominator: torch.Tensor,
+    require_full_valid_window: bool = False,
+) -> torch.Tensor:
+    """Return zero-padded SSIM reduced over selected valid map centers."""
+    if prediction.ndim != 4 or prediction.shape != target.shape:
+        raise ValueError(
+            "Masked SSIM requires matching NCHW prediction and target tensors."
+        )
+    expected_mask_shape = (
+        prediction.shape[0],
+        1,
+        prediction.shape[2],
+        prediction.shape[3],
+    )
+    if mask.shape != expected_mask_shape:
+        raise ValueError(
+            "Masked SSIM mask must have shape [N, 1, H, W]."
+        )
+    if denominator.shape != ():
+        raise ValueError("Masked SSIM denominator must be scalar.")
+    if not torch.isfinite(denominator).item() or denominator.item() <= 0.0:
+        raise ValueError(
+            "Masked SSIM denominator must be finite and positive."
+        )
+    masked_prediction = prediction * mask
+    masked_target = target * mask
+    ssim_map = FusedSSIMMap.apply(
+        0.01**2,
+        0.03**2,
+        masked_prediction,
+        masked_target,
+        "same",
+        True,
+    )
+    center_mask = mask
+    if require_full_valid_window:
+        invalid_mask = F.pad(1.0 - mask, (5, 5, 5, 5), value=0.0)
+        invalid_window = F.max_pool2d(
+            invalid_mask,
+            kernel_size=11,
+            stride=1,
+        )
+        center_mask = mask * (invalid_window == 0.0).to(dtype=mask.dtype)
+    return ((1.0 - ssim_map) * center_mask).sum() / denominator
 
 
 @jaxtyped(typechecker=beartype)

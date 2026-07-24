@@ -37,16 +37,37 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 import wandb
 from threedgrut import datasets
+from threedgrut.datasets.native_checkpoint import load_native_checkpoint
+from threedgrut.datasets.native_image_replay import (
+    NativeImageReplay,
+    NativeImageReplaySampler,
+)
 from threedgrut.datasets.protocols import Batch, BoundedMultiViewDataset
 from threedgrut.datasets.native_ray_evidence import NativeRayEvidence
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
+from threedgrut.lidar_supervision import LidarRaySampler, native_lidar_loss
+from threedgrut.native_lidar_renderer import (
+    NativeLidarGaussianState,
+    NativeLidarRenderer,
+    parse_native_lidar_renderer,
+    render_classic_expected_depth,
+)
 from threedgrut.model.camera_residual import CameraResidual
 from threedgrut.model.factory import (
     GaussianRepresentation,
     checkpoint_representation,
     create_gaussian_model,
 )
-from threedgrut.model.losses import rim_high_frequency_loss, ssim
+from threedgrut.model.local_projection_field import LocalProjectionField
+from threedgrut.model.losses import (
+    fixed_image_loss_denominator,
+    indexed_camera_loss_weight,
+    layered_depth_adjoint_injection,
+    masked_ssim_same_loss,
+    native_huber_loss,
+    rim_high_frequency_loss,
+    ssim,
+)
 from threedgrut.model.model import (
     MixtureOfGaussians,
     validated_surface_aligned_pca_config,
@@ -55,6 +76,8 @@ from threedgrut.model.native_ray_inverse_sensor import (
     interval_transmittance_losses,
     shift_ray_origins,
 )
+from threedgrut.model.native_camera_extrinsics import NativeCameraExtrinsics
+from threedgrut.model.native_projection_distortion import warp_native_render
 from threedgrut.model.mvdino_rim_loss import (
     mvdino_feature_rim_loss,
     mvdino_rim_crop_loss,
@@ -64,9 +87,20 @@ from threedgrut.model.view_conditioned_anchor_field import (
     load_fold_safe_point_source,
 )
 from threedgrut.optimizers import (
+    NativeCameraAdam,
     SelectiveAdam,
     SparseGeometryAdam,
     VisibilityDecayedAdam,
+    VisibilitySelectiveAdam,
+)
+from threedgrut.optimizers.local_projection_field_adam import (
+    LocalProjectionFieldAdam,
+)
+from threedgrut.optimizers.native_camera_adam import (
+    NATIVE_CAMERA_BETAS,
+    NATIVE_CAMERA_EPSILON,
+    NATIVE_CAMERA_QVEC_LR,
+    NATIVE_CAMERA_TVEC_LR,
 )
 from threedgrut.post_processing import (
     LuminanceAffine,
@@ -78,6 +112,7 @@ from threedgrut.post_processing.checkpoint_contract import (
     inherited_controller_inference_contract,
     module_state_sha256,
 )
+from threedgrut.post_processing.native_appearance import IndexedAppearanceAdam
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
 from threedgrut.strategy.fixed_anchor import FixedAnchorStrategy
@@ -126,6 +161,263 @@ SEMANTIC_LABEL_COLORS_RGB = (
     (0.72, 0.35, 1.00),
     (0.05, 0.95, 0.80),
 )
+
+
+def _uses_known_frame_reconstruction_validation(
+    *,
+    conf: DictConfig,
+    post_processing: torch.nn.Module | None,
+) -> bool:
+    """Return whether validation exactly mirrors native training frames."""
+    if bool(conf.validate_only) or post_processing is None:
+        return False
+    if not bool(
+        getattr(post_processing, "use_native_appearance_grid", False)
+    ):
+        return False
+    if int(conf.dataset.test_split_interval) > 0:
+        return False
+    holdout_path = conf.dataset.get("holdout_image_list_path")
+    return not bool(str(holdout_path or "").strip())
+
+
+def _validate_native_replay_configuration(
+    *,
+    validate_only: bool,
+    native_checkpoint_path: str,
+    replay_native_appearance: bool,
+    replay_native_extrinsics: bool,
+    replay_native_distortion: bool,
+    apply_known_frame_in_eval: bool,
+) -> None:
+    """Validate independent native checkpoint replay controls."""
+    if apply_known_frame_in_eval and not validate_only:
+        raise ValueError(
+            "apply_known_frame_in_eval is an offline replay control and "
+            "requires validate_only=true."
+        )
+    replay_requested = (
+        replay_native_appearance
+        or replay_native_extrinsics
+        or replay_native_distortion
+    )
+    if replay_requested and not native_checkpoint_path:
+        raise ValueError(
+            "native checkpoint replay requires native_checkpoint_path."
+        )
+    if (
+        validate_only
+        and replay_native_appearance
+        and not apply_known_frame_in_eval
+    ):
+        raise ValueError(
+            "offline native appearance replay requires "
+            "apply_known_frame_in_eval=true."
+        )
+
+
+def _validate_native_camera_configuration(conf: DictConfig) -> None:
+    """Require the recovered absolute-camera contract without fallbacks."""
+    camera = conf.camera_residual
+    expected_flags = {
+        "optimize_global": False,
+        "optimize_per_camera": False,
+        "optimize_per_image": True,
+        "optimize_rolling_per_camera": False,
+    }
+    mismatched_flags = [
+        name
+        for name, expected in expected_flags.items()
+        if bool(camera.get(name, False)) is not expected
+    ]
+    if mismatched_flags:
+        raise ValueError(
+            "Native absolute COLMAP cameras require only per-image "
+            f"optimization; mismatched={mismatched_flags}."
+        )
+    if str(conf.dataset.shutter_type).upper() != "GLOBAL":
+        raise ValueError(
+            "Native absolute COLMAP cameras do not support rolling shutter."
+        )
+    if int(conf.dataset.blur_samples) != 1:
+        raise ValueError(
+            "Native absolute COLMAP cameras require blur_samples=1."
+        )
+    if bool(conf.dataset.get("rs_ray_injection", False)):
+        raise ValueError(
+            "Native absolute COLMAP cameras require camera-space rays; set "
+            "dataset.rs_ray_injection=false."
+        )
+    if bool(conf.post_processing.get("replay_native_extrinsics", False)):
+        raise ValueError(
+            "Native camera optimization and extrinsic replay cannot both "
+            "own source poses."
+        )
+    if bool(camera.finite_difference_audit.get("enabled", False)):
+        raise ValueError(
+            "The bounded-residual finite-difference audit is incompatible "
+            "with native absolute COLMAP cameras."
+        )
+    exact_values = {
+        "rotation_lr": NATIVE_CAMERA_QVEC_LR,
+        "translation_lr": NATIVE_CAMERA_TVEC_LR,
+        "eps": NATIVE_CAMERA_EPSILON,
+        "reg_lambda": 0.0,
+        "warmup_steps": 0.0,
+        "lr_end_fraction": 1.0,
+    }
+    mismatched_values = [
+        name
+        for name, expected in exact_values.items()
+        if float(camera.get(name)) != expected
+    ]
+    if tuple(float(value) for value in camera.betas) != NATIVE_CAMERA_BETAS:
+        mismatched_values.append("betas")
+    if mismatched_values:
+        raise ValueError(
+            "Native absolute COLMAP camera hyperparameters do not match "
+            f"the recovered DLL contract: {mismatched_values}."
+        )
+
+
+def _parse_native_replay_integer(
+    value: object,
+    *,
+    field_name: str,
+    minimum: int,
+) -> int:
+    """Parse one strict integer from immutable replay configuration."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer.")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.isdecimal():
+        parsed = int(value)
+    else:
+        raise ValueError(f"{field_name} must be an integer.")
+    if parsed < minimum:
+        raise ValueError(f"{field_name} must be at least {minimum}.")
+    return parsed
+
+
+def _native_replay_age_increments(
+    *,
+    replay_conf: DictConfig,
+    dataset: BoundedMultiViewDataset,
+    replay: NativeImageReplay,
+) -> tuple[dict[int, int], dict[int, int]]:
+    """Translate stable source-camera increments to runtime camera indices."""
+    configured = replay_conf.get("age_increment_by_camera", {})
+    if configured is None:
+        return {}, {}
+    if not isinstance(configured, (dict, DictConfig)):
+        raise ValueError(
+            "Native replay age_increment_by_camera must be a mapping."
+        )
+
+    camera_idx_by_camera_id: dict[int, int] = {}
+    for selection in replay.selections:
+        camera_id = int(dataset.get_intrinsics_idx(selection.ordinal))
+        camera_idx = int(dataset.get_camera_idx(selection.ordinal))
+        previous_idx = camera_idx_by_camera_id.get(camera_id)
+        if previous_idx is not None and previous_idx != camera_idx:
+            raise ValueError(
+                "Native replay source-camera mapping is inconsistent."
+            )
+        camera_idx_by_camera_id[camera_id] = camera_idx
+
+    increments_by_camera_id: dict[int, int] = {}
+    for raw_camera_id, raw_increment in configured.items():
+        camera_id = _parse_native_replay_integer(
+            raw_camera_id,
+            field_name="Native replay age-increment camera ID",
+            minimum=0,
+        )
+        increment = _parse_native_replay_integer(
+            raw_increment,
+            field_name="Native replay age increment",
+            minimum=1,
+        )
+        if camera_id in increments_by_camera_id:
+            raise ValueError(
+                "Native replay age-increment camera IDs must be unique."
+            )
+        if camera_id not in camera_idx_by_camera_id:
+            raise ValueError(
+                "Native replay age-increment camera ID is absent from the "
+                "replayed COLMAP images."
+            )
+        increments_by_camera_id[camera_id] = increment
+
+    increments_by_camera_idx = {
+        camera_idx_by_camera_id[camera_id]: increment
+        for camera_id, increment in increments_by_camera_id.items()
+    }
+    return increments_by_camera_idx, increments_by_camera_id
+
+
+def _step_gaussian_optimizer(
+    *,
+    optimizer: torch.optim.Optimizer,
+    density: torch.Tensor,
+    outputs: dict[str, torch.Tensor],
+    visibility: torch.Tensor | None = None,
+    advance_age: bool = True,
+    age_increment: int = 1,
+) -> None:
+    """Step Gaussian parameters using renderer visibility when required."""
+    if isinstance(optimizer, VisibilitySelectiveAdam):
+        if visibility is None:
+            visibility = outputs["mog_visibility"]
+        if visibility.shape != density.shape:
+            raise ValueError(
+                f"Visibility shape {visibility.shape} does not match "
+                f"density shape {density.shape}."
+            )
+        optimizer.step(
+            visibility,
+            advance_age=advance_age,
+            age_increment=age_increment,
+        )
+        return
+    if isinstance(optimizer, (SelectiveAdam, VisibilityDecayedAdam)):
+        if visibility is None:
+            visibility = outputs["mog_visibility"]
+        if visibility.shape != density.shape:
+            raise ValueError(
+                f"Visibility shape {visibility.shape} does not match "
+                f"density shape {density.shape}."
+            )
+        optimizer.step(visibility)
+        return
+    optimizer.step()
+
+
+def _positive_loss_scale(
+    *,
+    loss_conf: DictConfig,
+    key: str,
+    default: float,
+) -> float:
+    scale = float(loss_conf.get(key, default))
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"loss.{key} must be finite and positive.")
+    return scale
+
+
+def _scale_parameter_gradient(
+    parameter: torch.nn.Parameter,
+    scale: float,
+) -> None:
+    gradient = parameter.grad
+    if gradient is None:
+        return
+    if gradient.is_sparse:
+        scaled = gradient.coalesce()
+        scaled._values().mul_(scale)
+        parameter.grad = scaled
+        return
+    gradient.mul_(scale)
 
 
 def _predicted_axial_depth(
@@ -321,6 +613,22 @@ def _safe_metric_group_name(name: str) -> str:
     return name.replace("/", "_").strip()
 
 
+def _metric_group_array(
+    *,
+    metrics: dict[str, Any],
+    metric_name: str,
+    group_key: str,
+) -> np.ndarray | None:
+    """Return grouping values aligned with one possibly optional metric."""
+    metric_group_key = f"{metric_name}_{group_key}"
+    resolved_key = (
+        metric_group_key if metric_group_key in metrics else group_key
+    )
+    if resolved_key not in metrics:
+        return None
+    return np.asarray(metrics[resolved_key], dtype=object)
+
+
 def _group_metric_summary(
     *,
     metrics: dict[str, Any],
@@ -344,9 +652,17 @@ def _group_metric_summary(
             if source_name not in metrics:
                 continue
             values = np.asarray(metrics[source_name], dtype=np.float32)
-            if values.shape[0] != groups.shape[0]:
+            metric_groups = _metric_group_array(
+                metrics=metrics,
+                metric_name=source_name,
+                group_key=group_key,
+            )
+            if (
+                metric_groups is None
+                or values.shape[0] != metric_groups.shape[0]
+            ):
                 continue
-            group_values = values[group_mask]
+            group_values = values[metric_groups == raw_group]
             if group_values.size == 0:
                 continue
             group_summary[metric_name] = float(np.mean(group_values))
@@ -388,9 +704,30 @@ def _group_metric_summary_by_keys(
             if source_name not in metrics:
                 continue
             values = np.asarray(metrics[source_name], dtype=np.float32)
-            if values.shape[0] != group_size:
+            metric_group_arrays = [
+                _metric_group_array(
+                    metrics=metrics,
+                    metric_name=source_name,
+                    group_key=group_key,
+                )
+                for group_key in group_keys
+            ]
+            if (
+                any(array is None for array in metric_group_arrays)
+                or any(
+                    array.shape[0] != values.shape[0]
+                    for array in metric_group_arrays
+                    if array is not None
+                )
+            ):
                 continue
-            group_values = values[group_mask]
+            metric_group_mask = np.ones(values.shape[0], dtype=bool)
+            for metric_group_array, group_value in zip(
+                metric_group_arrays, raw_group, strict=True
+            ):
+                if metric_group_array is not None:
+                    metric_group_mask &= metric_group_array == group_value
+            group_values = values[metric_group_mask]
             if group_values.size == 0:
                 continue
             group_summary[metric_name] = float(np.mean(group_values))
@@ -1308,6 +1645,22 @@ def _load_post_processing_state(
     Keys missing from the saved state are tolerated via ``strict=False``.
     """
     current_state = module.state_dict()
+    manifest_key = "native_appearance_grid.source_manifest_hash"
+    saved_manifest = saved_state.get(manifest_key)
+    current_manifest = current_state.get(manifest_key)
+    if (saved_manifest is None) != (current_manifest is None):
+        raise ValueError("native appearance mode changed across checkpoint resume")
+    if (
+        saved_manifest is not None
+        and bool(torch.count_nonzero(current_manifest))
+        and not torch.equal(
+            saved_manifest.to(device=current_manifest.device),
+            current_manifest,
+        )
+    ):
+        raise ValueError(
+            "native appearance source-frame manifest changed across resume"
+        )
     filtered: dict = {}
     dropped: list[str] = []
     for key, value in saved_state.items():
@@ -1347,6 +1700,16 @@ def _drop_shape_mismatched_optimizer_state(
             for key, value in state.items():
                 if not torch.is_tensor(value) or value.ndim == 0:
                     continue
+                if (
+                    isinstance(optimizer, IndexedAppearanceAdam)
+                    and key == "step"
+                    and tuple(value.shape)
+                    == (
+                        parameter.shape[0],
+                        parameter.shape[1] // 8,
+                    )
+                ):
+                    continue
                 if tuple(value.shape) != parameter_shape:
                     dropped.append(
                         f"{label}.group{group_index}.param{param_index}."
@@ -1373,6 +1736,37 @@ def _load_optimizer_state(
         )
         return []
     return _drop_shape_mismatched_optimizer_state(optimizer, label=label)
+
+
+def _native_ray_evidence_from_loss(
+    loss_config: DictConfig,
+) -> NativeRayEvidence | None:
+    """Load optional native-ray evidence from the geometry-only loss block."""
+    geometry_only_config = loss_config.get("geometry_only_pass", {})
+    native_ray_folder = str(
+        geometry_only_config.get("native_ray_evidence_folder", "")
+    )
+    if not native_ray_folder:
+        return None
+    return NativeRayEvidence(
+        folder=native_ray_folder,
+        manifest_sha256=str(
+            geometry_only_config.get(
+                "native_ray_evidence_manifest_sha256",
+                "",
+            )
+        ),
+        sample_count=int(
+            geometry_only_config.get("native_ray_sample_count", 16_384)
+        ),
+        seed=int(geometry_only_config.get("native_ray_seed", 20260718)),
+        equirect_width=int(
+            geometry_only_config.get("native_ray_equirect_width", 256)
+        ),
+        equirect_height=int(
+            geometry_only_config.get("native_ray_equirect_height", 128)
+        ),
+    )
 
 
 class Trainer3DGRUT:
@@ -1417,8 +1811,20 @@ class Trainer3DGRUT:
     _frozen_post_processing_metadata: dict[str, object] | None = None
     """Inference proof copied from the checkpoint that supplied frozen PPISP."""
 
-    camera_residual: CameraResidual | None = None
-    """Optional bounded ray-space camera residual module."""
+    native_distortion_maps: torch.Tensor | None = None
+    """Frozen native per-frame distortion maps for offline replay."""
+
+    local_projection_field: LocalProjectionField | None = None
+    """Optional per-source-frame native EWA projection field."""
+
+    local_projection_field_optimizer: LocalProjectionFieldAdam | None = None
+    """Optimizer for the local projection field."""
+
+    _local_projection_field_activation_step: int = -1
+    """First global step allowed to update the local projection field."""
+
+    camera_residual: CameraResidual | NativeCameraExtrinsics | None = None
+    """Optional bounded residual or native absolute camera module."""
 
     camera_residual_optimizer: torch.optim.Optimizer | None = None
     """Optimizer for camera residual parameters."""
@@ -1432,11 +1838,17 @@ class Trainer3DGRUT:
     native_ray_evidence: NativeRayEvidence | None = None
     """Optional authenticated world-space range rays for geometry training."""
 
+    lidar_ray_sampler: LidarRaySampler | None = None
+    """Optional independent native LiDAR supervision stream."""
+
     _pending_geometry_optimizer_state: dict[str, object] | None = None
     """Resume state loaded lazily after topology-changing stages finish."""
 
     _last_camera_residual_stats: dict[str, float] | None = None
     """Most recent camera residual stats captured before gradients are zeroed."""
+
+    _camera_residual_gradient_observed: bool = False
+    """Whether any active training batch reached camera residual parameters."""
 
     _distillation_start_step: int = -1
     """ Step at which distillation starts (-1 means disabled) """
@@ -1542,49 +1954,7 @@ class Trainer3DGRUT:
         self._post_processing_camera_index_mode = post_processing_camera_index_mode(conf)
         self.geometry_only_optimizer = None
         self._pending_geometry_optimizer_state = None
-        native_ray_folder = str(
-            conf.loss.geometry_only_pass.get(
-                "native_ray_evidence_folder",
-                "",
-            )
-        )
-        self.native_ray_evidence = (
-            NativeRayEvidence(
-                folder=native_ray_folder,
-                manifest_sha256=str(
-                    conf.loss.geometry_only_pass.get(
-                        "native_ray_evidence_manifest_sha256",
-                        "",
-                    )
-                ),
-                sample_count=int(
-                    conf.loss.geometry_only_pass.get(
-                        "native_ray_sample_count",
-                        16_384,
-                    )
-                ),
-                seed=int(
-                    conf.loss.geometry_only_pass.get(
-                        "native_ray_seed",
-                        20260718,
-                    )
-                ),
-                equirect_width=int(
-                    conf.loss.geometry_only_pass.get(
-                        "native_ray_equirect_width",
-                        256,
-                    )
-                ),
-                equirect_height=int(
-                    conf.loss.geometry_only_pass.get(
-                        "native_ray_equirect_height",
-                        128,
-                    )
-                ),
-            )
-            if native_ray_folder
-            else None
-        )
+        self.native_ray_evidence = _native_ray_evidence_from_loss(conf.loss)
 
         # Setup the trainer and components
         logger.log_rule("Load Datasets")
@@ -1593,6 +1963,7 @@ class Trainer3DGRUT:
         self.init_scene_extents(self.train_dataset)
         logger.log_rule("Initialize Model")
         self.init_model(conf, self.scene_extent)
+        self.init_lidar_supervision(conf)
         self.init_densification_and_pruning_strategy(conf)
         logger.log_rule("Setup Model Weights & Training")
         self.init_metrics()
@@ -1600,8 +1971,10 @@ class Trainer3DGRUT:
         self.init_feature_decoder(conf)
         self.init_post_processing(conf)
         self.init_camera_residual(conf)
+        self.init_local_projection_field(conf)
         self._validate_geometry_only_pass_config()
         self.setup_training(conf, self.model, self.train_dataset)
+        self._replay_native_appearance(conf)
         self.init_experiments_tracking(conf)
         self.init_gui(
             conf,
@@ -1665,6 +2038,150 @@ class Trainer3DGRUT:
         if len(frames_per_camera) == 1:
             return ["physical_camera"]
         return None
+
+    def _native_appearance_preopt_step_count(self, conf, gpu_batch) -> int:
+        post_conf = conf.post_processing
+        if not bool(post_conf.get("use_native_appearance_grid", False)):
+            return 0
+        if self._native_appearance_updates_frozen(conf):
+            return 0
+        if not bool(post_conf.get("native_preoptimize", False)):
+            return 0
+        max_iterations = int(
+            post_conf.get("native_max_appearance_iterations", 4)
+        )
+        if max_iterations <= 0:
+            raise ValueError(
+                "post_processing.native_max_appearance_iterations must be "
+                "positive."
+            )
+        multipliers = list(post_conf.get("native_iteration_multipliers", ()))
+        if not multipliers:
+            return 0
+        camera_index = self._post_processing_camera_idx(gpu_batch)
+        if 0 <= camera_index < len(multipliers):
+            multiplier = int(multipliers[camera_index])
+        else:
+            multiplier = int(
+                post_conf.get(
+                    "native_default_iteration_multiplier",
+                    max_iterations,
+                )
+            )
+        if multiplier < 0:
+            raise ValueError(
+                "post_processing.native_iteration_multipliers must be "
+                "non-negative."
+            )
+        return max(0, max_iterations - multiplier)
+
+    @staticmethod
+    def _native_appearance_updates_frozen(conf: DictConfig) -> bool:
+        post_conf = conf.post_processing
+        return bool(
+            post_conf.get("use_native_appearance_grid", False)
+        ) and bool(post_conf.get("freeze_native_appearance", False))
+
+    def _radiance_gradient_scale(self) -> float:
+        return _positive_loss_scale(
+            loss_conf=self.conf.loss,
+            key="radiance_gradient_scale",
+            default=1.0,
+        )
+
+    def _native_appearance_grid_weight(self) -> torch.nn.Parameter | None:
+        if self.post_processing is None:
+            return None
+        grid = getattr(self.post_processing, "native_appearance_grid", None)
+        embedding = getattr(grid, "embedding", None)
+        weight = getattr(embedding, "weight", None)
+        if isinstance(weight, torch.nn.Parameter):
+            return weight
+        return None
+
+    def _scale_appearance_gradients(self) -> None:
+        scale = self._radiance_gradient_scale()
+        if scale == 1.0:
+            return
+        weight = self._native_appearance_grid_weight()
+        if weight is not None:
+            _scale_parameter_gradient(weight, scale)
+
+    def _scale_radiance_gradients(self) -> None:
+        scale = self._radiance_gradient_scale()
+        if scale == 1.0:
+            return
+        for parameter_name in (
+            "features_albedo",
+            "features_specular",
+            "color_encoder",
+        ):
+            parameter = getattr(self.model, parameter_name, None)
+            if isinstance(parameter, torch.nn.Parameter):
+                _scale_parameter_gradient(parameter, scale)
+        self._scale_appearance_gradients()
+
+    def _run_native_appearance_preoptimization(
+        self,
+        *,
+        gpu_batch,
+        outputs: dict[str, torch.Tensor],
+        conf: DictConfig,
+    ) -> int:
+        step_count = self._native_appearance_preopt_step_count(conf, gpu_batch)
+        if step_count == 0:
+            return 0
+        if self.post_processing is None or self.post_processing_optimizers is None:
+            return 0
+        if not getattr(
+            self.post_processing,
+            "use_native_appearance_grid",
+            False,
+        ):
+            return 0
+        camera_idx = self._post_processing_camera_idx(gpu_batch)
+        for optimizer in self.post_processing_optimizers:
+            optimizer.zero_grad()
+        for _ in range(step_count):
+            detached_outputs = {
+                key: value.detach() if torch.is_tensor(value) else value
+                for key, value in outputs.items()
+            }
+            appearance_outputs = apply_post_processing(
+                self.post_processing,
+                detached_outputs,
+                gpu_batch,
+                training=True,
+                camera_idx_override=camera_idx,
+            )
+            appearance_losses = self.get_losses(gpu_batch, appearance_outputs)
+            appearance_losses["total_loss"].backward()
+            self._scale_appearance_gradients()
+            for optimizer in self.post_processing_optimizers:
+                optimizer.step()
+                optimizer.zero_grad()
+        return step_count
+
+    def _step_post_processing_optimizers(
+        self,
+        *,
+        conf: DictConfig,
+        native_appearance_preopt_steps: int,
+    ) -> None:
+        if self.post_processing_optimizers is None:
+            return
+        if (
+            native_appearance_preopt_steps > 0
+            or self._native_appearance_updates_frozen(conf)
+        ):
+            for optimizer in self.post_processing_optimizers:
+                optimizer.zero_grad()
+            return
+        for optimizer in self.post_processing_optimizers:
+            optimizer.step()
+            optimizer.zero_grad()
+        for scheduler in self.post_processing_schedulers:
+            scheduler.step()
 
     def _post_processing_checkpoint_metadata(self) -> dict[str, object]:
         """Build the durable camera and inference contract for a checkpoint."""
@@ -1905,16 +2422,6 @@ class Trainer3DGRUT:
         from threedgrut.datasets.utils import configure_dataloader_for_platform
 
         train_dataset, val_dataset = datasets.make(name=conf.dataset.type, config=conf, ray_jitter=None)
-        train_dataloader_kwargs = configure_dataloader_for_platform(
-            {
-                "num_workers": conf.num_workers,
-                "batch_size": 1,
-                "shuffle": True,
-                "pin_memory": True,
-                "persistent_workers": True if conf.num_workers > 0 else False,
-            }
-        )
-
         val_dataloader_kwargs = configure_dataloader_for_platform(
             {
                 "num_workers": conf.num_workers,
@@ -1925,20 +2432,222 @@ class Trainer3DGRUT:
             }
         )
 
-        train_dataloader = MultiEpochsDataLoader(
-            train_dataset,
-            generator=self.run_generator,
-            **train_dataloader_kwargs,
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset, **val_dataloader_kwargs
         )
-        val_dataloader = torch.utils.data.DataLoader(val_dataset, **val_dataloader_kwargs)
 
         self.train_dataset = train_dataset
-        self.train_dataloader = train_dataloader
+        self.native_image_replay = self._load_native_image_replay(conf)
+        self.train_dataloader = self._make_train_dataloader(conf)
         self.val_dataset = val_dataset
         self.val_dataloader = val_dataloader
 
+    def _load_native_image_replay(
+        self, conf: DictConfig
+    ) -> NativeImageReplay | None:
+        self.native_image_age_increments_by_camera_idx: dict[int, int] = {}
+        self.native_image_age_increments_by_camera_id: dict[int, int] = {}
+        replay_conf = conf.dataset.get("native_image_replay")
+        if replay_conf is None:
+            return None
+        age_increment_config = replay_conf.get(
+            "age_increment_by_camera",
+            {},
+        )
+        if not bool(replay_conf.get("enabled", False)):
+            if age_increment_config:
+                raise ValueError(
+                    "Native replay age_increment_by_camera requires "
+                    "native_image_replay.enabled=true."
+                )
+            return None
+        if conf.dataset.type != "colmap":
+            raise ValueError(
+                "Native image replay is implemented only for COLMAP data."
+            )
+        if int(conf.dataset.test_split_interval) != 0:
+            raise ValueError(
+                "Native image replay requires dataset.test_split_interval=0."
+            )
+        if not bool(conf.dataset.native_image_scale.get("enabled", False)):
+            raise ValueError(
+                "Native image replay requires native image scaling."
+            )
+        for key in (
+            "holdout_image_list_path",
+            "train_exclude_image_list_path",
+            "train_focus_image_list_path",
+        ):
+            if bool(str(conf.dataset.get(key, "") or "").strip()):
+                raise ValueError(
+                    "Native image replay requires the unfiltered COLMAP "
+                    f"image set; remove dataset.{key}."
+                )
+        trace_path = str(replay_conf.get("trace_path", "") or "")
+        replay = NativeImageReplay(trace_path)
+        if int(conf.n_iterations) > len(replay):
+            raise ValueError(
+                "Native image replay trace is shorter than n_iterations: "
+                f"{len(replay)} < {int(conf.n_iterations)}."
+            )
+        invalid_ordinals = [
+            selection.ordinal
+            for selection in replay.selections
+            if selection.ordinal >= len(self.train_dataset)
+        ]
+        if invalid_ordinals:
+            raise ValueError(
+                "Native image replay ordinal exceeds the training image "
+                f"set: {min(invalid_ordinals)} >= {len(self.train_dataset)}."
+            )
+        (
+            self.native_image_age_increments_by_camera_idx,
+            self.native_image_age_increments_by_camera_id,
+        ) = _native_replay_age_increments(
+            replay_conf=replay_conf,
+            dataset=self.train_dataset,
+            replay=replay,
+        )
+        if self.native_image_age_increments_by_camera_id:
+            logger.info(
+                "Using native replay optimizer age increments for source "
+                "camera IDs: "
+                f"{self.native_image_age_increments_by_camera_id}."
+            )
+        logger.info(
+            "Using immutable native image replay: "
+            f"{len(replay)} selections, sha256={replay.trace_sha256}."
+        )
+        return replay
+
+    def _native_replay_age_increment_manifest(self) -> str:
+        """Return the immutable source-camera age schedule for a checkpoint."""
+        return json.dumps(
+            self.native_image_age_increments_by_camera_id,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    def _validate_native_replay_age_increment_manifest(
+        self,
+        manifest: dict[str, object],
+    ) -> None:
+        """Reject a resume whose source-camera age schedule changed."""
+        saved = manifest.get("age_increment_by_camera")
+        expected = self._native_replay_age_increment_manifest()
+        if saved is None:
+            if self.native_image_age_increments_by_camera_id:
+                raise ValueError(
+                    "Native image replay resume lacks its source-camera "
+                    "age-increment manifest."
+                )
+            return
+        if saved != expected:
+            raise ValueError(
+                "Native image replay source-camera age increments differ "
+                "on resume."
+            )
+
+    def _native_replay_age_increment(self, gpu_batch: Batch) -> int:
+        """Return the configured image-age increment for one camera batch."""
+        return self.native_image_age_increments_by_camera_idx.get(
+            int(gpu_batch.camera_idx),
+            1,
+        )
+
+    def _make_train_dataloader(self, conf: DictConfig):
+        from threedgrut.datasets.utils import configure_dataloader_for_platform
+
+        replay = getattr(self, "native_image_replay", None)
+        kwargs = configure_dataloader_for_platform(
+            {
+                "num_workers": conf.num_workers,
+                "batch_size": 1,
+                "shuffle": replay is None,
+                "pin_memory": True,
+                "persistent_workers": True if conf.num_workers > 0 else False,
+            }
+        )
+        if replay is not None:
+            kwargs["sampler"] = NativeImageReplaySampler(
+                replay,
+                start_step=self.global_step,
+                end_step=int(conf.n_iterations),
+            )
+        return MultiEpochsDataLoader(
+            self.train_dataset,
+            generator=self.run_generator,
+            **kwargs,
+        )
+
+    def _rebuild_native_replay_dataloader_for_global_step(
+        self,
+        conf: DictConfig,
+    ) -> None:
+        """Align replay sampling after checkpoint setup restores its step."""
+        if self.native_image_replay is None or self.global_step <= 0:
+            return
+        old_dataloader = self.train_dataloader
+        old_dataloader.shutdown()
+        self.train_dataloader = self._make_train_dataloader(conf)
+        del old_dataloader
+
+    def _native_image_scale_config(self, conf: DictConfig):
+        if getattr(self, "native_image_replay", None) is not None:
+            return None
+        scale_conf = conf.dataset.get("native_image_scale")
+        if scale_conf is None or not bool(scale_conf.get("enabled", False)):
+            return None
+        if conf.dataset.type != "colmap":
+            raise ValueError(
+                "Native image scaling is implemented only for COLMAP data."
+            )
+        interval = int(scale_conf.get("interval", 3000))
+        if interval <= 0:
+            raise ValueError("Native image scale interval must be positive.")
+        start = float(scale_conf.get("start", 0.05))
+        end = float(scale_conf.get("end", 0.95))
+        if start <= 0.0 or end <= 0.0:
+            raise ValueError("Native image scale bounds must be positive.")
+        if end < start:
+            raise ValueError(
+                "Native image scale end must be at least the start."
+            )
+        return scale_conf
+
+    def _native_image_scale_for_step(
+        self, conf: DictConfig, step: int
+    ) -> float:
+        scale_conf = self._native_image_scale_config(conf)
+        if scale_conf is None:
+            return 1.0
+        interval = int(scale_conf.get("interval", 3000))
+        scheduled_step = (step // interval) * interval
+        progress = min(
+            max(scheduled_step / int(conf.n_iterations), 0.0), 1.0
+        )
+        start = float(scale_conf.get("start", 0.05))
+        end = float(scale_conf.get("end", 0.95))
+        return start + (end - start) * progress
+
+    def _replace_train_dataloader_for_native_scale(
+        self, conf: DictConfig, scale: float
+    ) -> None:
+        changed = self.train_dataset.set_native_image_scale(scale)
+        if not changed:
+            return
+        old_dataloader = self.train_dataloader
+        old_dataloader.shutdown()
+        self.train_dataloader = self._make_train_dataloader(conf)
+        del old_dataloader
+        logger.info(
+            f"Native image scale changed at step {self.global_step}: "
+            f"{scale:.9f}"
+        )
+
     def teardown_dataloaders(self):
         if self.train_dataloader is not None:
+            self.train_dataloader.shutdown()
             del self.train_dataloader
         if self.val_dataloader is not None:
             del self.val_dataloader
@@ -1963,6 +2672,33 @@ class Trainer3DGRUT:
             conf,
             scene_extent=scene_extent,
             checkpoint=checkpoint,
+        )
+
+    def init_lidar_supervision(self, conf: DictConfig) -> None:
+        """Initialize the opt-in native-style LiDAR ray source."""
+        lidar_conf = conf.lidar_supervision
+        if not bool(lidar_conf.enabled):
+            self.lidar_ray_sampler = None
+            return
+        if (
+            not lidar_conf.map_path
+            or not lidar_conf.poses_path
+            or not lidar_conf.calibration_path
+        ):
+            raise ValueError(
+                "lidar_supervision requires map_path, poses_path, and "
+                "calibration_path when enabled."
+            )
+        self.lidar_ray_sampler = LidarRaySampler(
+            map_path=str(lidar_conf.map_path),
+            poses_path=str(lidar_conf.poses_path),
+            calibration_path=str(lidar_conf.calibration_path),
+            map_to_world_transform=lidar_conf.map_to_world_transform,
+            seed=int(conf.seed_initialization),
+        )
+        logger.info(
+            "Using native packet LiDAR supervision from "
+            f"{lidar_conf.map_path}."
         )
 
     def init_densification_and_pruning_strategy(self, conf: DictConfig) -> None:
@@ -1992,6 +2728,18 @@ class Trainer3DGRUT:
             case "FixedAnchorStrategy":
                 self.strategy = FixedAnchorStrategy(conf, self.model)
                 logger.info("Using fixed anchor strategy")
+            case "VisibilityAdaptiveStrategy":
+                if not isinstance(self.model, MixtureOfGaussians):
+                    raise ValueError(
+                        "VisibilityAdaptiveStrategy requires a Gaussian "
+                        "mixture representation."
+                    )
+                from threedgrut.strategy.visibility_adaptive import (
+                    VisibilityAdaptiveStrategy,
+                )
+
+                self.strategy = VisibilityAdaptiveStrategy(conf, self.model)
+                logger.info("Using visibility-adaptive strategy")
             case _:
                 raise ValueError(f"unrecognized model.strategy {conf.strategy.method}")
 
@@ -2007,6 +2755,7 @@ class Trainer3DGRUT:
         3. Set up the optimizer to optimize the gaussian model params
         4. Initialize the densification buffers in the densificaiton strategy
         """
+        replay_checkpoint_manifest = None
         # Initialize
         if conf.resume:  # Load a checkpoint
             logger.info(f"🤸 Loading a pretrained checkpoint from {conf.resume}!")
@@ -2069,6 +2818,14 @@ class Trainer3DGRUT:
                 )
             self.strategy.init_densification_buffer(checkpoint)
             global_step = checkpoint["global_step"]
+            if self.lidar_ray_sampler is not None:
+                lidar_state = checkpoint.get("lidar_supervision")
+                if lidar_state is None:
+                    raise ValueError(
+                        "LiDAR-enabled native training cannot resume without "
+                        "exact LiDAR packet state."
+                    )
+                self.lidar_ray_sampler.load_state_dict(lidar_state)
 
             # Restore post-processing state
             if "post_processing" in checkpoint and self.post_processing is not None:
@@ -2113,15 +2870,68 @@ class Trainer3DGRUT:
                     sched.load_state_dict(sched_state)
                 logger.info("📷 Post-processing state restored from checkpoint")
             if "camera_residual" in checkpoint and self.camera_residual is not None:
-                self.camera_residual.load_state_dict(checkpoint["camera_residual"]["module"])
-                if self.camera_residual_optimizer is not None:
-                    _load_optimizer_state(
-                        self.camera_residual_optimizer,
-                        checkpoint["camera_residual"]["optimizer"],
-                        label="camera_residual",
+                camera_checkpoint = checkpoint["camera_residual"]
+                if camera_checkpoint.get("format_version") != (
+                    self.camera_residual.checkpoint_format_version
+                ):
+                    raise ValueError(
+                        "Legacy camera-residual checkpoints are incompatible "
+                        "with this camera algorithm; regenerate the checkpoint."
                     )
+                if camera_checkpoint.get(
+                    "algorithm",
+                    CameraResidual.checkpoint_algorithm,
+                ) != self.camera_residual.checkpoint_algorithm:
+                    raise ValueError(
+                        "Camera checkpoint algorithm does not match the "
+                        "configured camera module."
+                    )
+                expected_manifest_hash = camera_checkpoint.get(
+                    "source_frame_manifest_hash"
+                )
+                if self.camera_residual.optimize_per_image:
+                    manifest_hash = str(
+                        self.train_dataset.get_source_frame_manifest_hash()
+                    )
+                    if expected_manifest_hash != manifest_hash:
+                        raise ValueError(
+                            "Camera-residual source-frame manifest mismatch."
+                        )
+                saved_group_manifest = tuple(
+                    tuple(group)
+                    for group in camera_checkpoint.get(
+                        "optimizer_group_manifest", ()
+                    )
+                )
+                if (
+                    saved_group_manifest
+                    != self.camera_residual.optimizer_group_manifest()
+                ):
+                    raise ValueError(
+                        "Camera-residual optimizer group manifest mismatch."
+                    )
+                self.camera_residual.load_state_dict(camera_checkpoint["module"])
+                validate_camera_state = getattr(
+                    self.camera_residual,
+                    "validate_state",
+                    None,
+                )
+                if validate_camera_state is not None:
+                    validate_camera_state()
+                if self.camera_residual_optimizer is not None:
+                    try:
+                        self.camera_residual_optimizer.load_state_dict(
+                            camera_checkpoint["optimizer"]
+                        )
+                    except ValueError as exc:
+                        raise ValueError(
+                            "Camera-residual optimizer checkpoint is "
+                            "incompatible; regenerate the checkpoint."
+                        ) from exc
                 if self.camera_residual_scheduler is not None:
-                    self.camera_residual_scheduler.load_state_dict(checkpoint["camera_residual"]["scheduler"])
+                    self.camera_residual_scheduler.load_state_dict(
+                        camera_checkpoint["scheduler"]
+                    )
                 logger.info("📷 Camera residual state restored from checkpoint")
 
             # Restore feature decoder state (skip if architecture drifted vs checkpoint)
@@ -2287,6 +3097,8 @@ class Trainer3DGRUT:
                                 "📷 Camera residual module restored from "
                                 "initialization checkpoint"
                             )
+                    case "point_set":
+                        model.init_from_point_set(conf.initialization.path)
                     case "lidar":
                         assert isinstance(
                             train_dataset, datasets.NCoreDataset
@@ -2314,7 +3126,8 @@ class Trainer3DGRUT:
                         raise ValueError(
                             "unrecognized initialization.method "
                             f"{conf.initialization.method}, choose from "
-                            "[colmap, point_cloud, random, checkpoint, lidar]"
+                            "[colmap, point_cloud, random, checkpoint, lidar, "
+                            "point_set]"
                         )
 
             self.strategy.init_densification_buffer()
@@ -2324,6 +3137,7 @@ class Trainer3DGRUT:
             global_step = 0
 
         self.global_step = global_step
+        self._rebuild_native_replay_dataloader_for_global_step(conf)
         self.n_epochs = int((conf.n_iterations + len(train_dataset) - 1) / len(train_dataset))
 
     def init_gui(
@@ -2528,6 +3342,57 @@ class Trainer3DGRUT:
     def init_post_processing(self, conf: DictConfig):
         """Initialize post-processing module based on config."""
         method = conf.post_processing.method
+        native_checkpoint_path = str(
+            conf.post_processing.get("native_checkpoint_path", "")
+        )
+        replay_native_appearance = bool(
+            conf.post_processing.get("replay_native_appearance", False)
+        )
+        replay_native_extrinsics = bool(
+            conf.post_processing.get("replay_native_extrinsics", False)
+        )
+        replay_native_distortion = bool(
+            conf.post_processing.get("replay_native_distortion", False)
+        )
+        known_frame_replay = bool(
+            conf.post_processing.get("apply_known_frame_in_eval", False)
+        )
+        _validate_native_replay_configuration(
+            validate_only=bool(conf.validate_only),
+            native_checkpoint_path=native_checkpoint_path,
+            replay_native_appearance=replay_native_appearance,
+            replay_native_extrinsics=replay_native_extrinsics,
+            replay_native_distortion=replay_native_distortion,
+            apply_known_frame_in_eval=known_frame_replay,
+        )
+
+        self.native_distortion_maps = None
+        if replay_native_distortion:
+            if not native_checkpoint_path:
+                raise ValueError(
+                    "replay_native_distortion requires "
+                    "native_checkpoint_path."
+                )
+            source_frame_names = getattr(
+                self.train_dataset,
+                "get_source_frame_names",
+                None,
+            )
+            if source_frame_names is None:
+                raise ValueError(
+                    "native distortion replay requires source image names."
+                )
+            native_checkpoint = load_native_checkpoint(
+                native_checkpoint_path,
+                source_image_names=source_frame_names(),
+            )
+            self.native_distortion_maps = torch.from_numpy(
+                native_checkpoint.distortion_rows()
+            ).to(device=self.device, dtype=torch.float32)
+            logger.info(
+                "📷 Loaded native distortion checkpoint for "
+                f"{self.native_distortion_maps.shape[0]} source frames"
+            )
 
         if method is None:
             return
@@ -2707,7 +3572,34 @@ class Trainer3DGRUT:
         elif method == "luminance_affine":
             frames_per_camera = self._post_processing_frames_per_camera()
             num_cameras = len(frames_per_camera)
-            num_frames = sum(frames_per_camera)
+            use_native_appearance_grid = conf.post_processing.get(
+                "use_native_appearance_grid",
+                False,
+            )
+            native_source_manifest_hash = None
+            if use_native_appearance_grid:
+                source_frame_count = getattr(
+                    self.train_dataset,
+                    "get_source_frame_count",
+                    None,
+                )
+                if source_frame_count is None:
+                    raise ValueError(
+                        "native appearance requires stable source-frame IDs"
+                    )
+                num_frames = int(source_frame_count())
+                source_manifest_hash = getattr(
+                    self.train_dataset,
+                    "get_source_frame_manifest_hash",
+                    None,
+                )
+                if source_manifest_hash is None:
+                    raise ValueError(
+                        "native appearance requires a source-frame manifest"
+                    )
+                native_source_manifest_hash = str(source_manifest_hash())
+            else:
+                num_frames = sum(frames_per_camera)
 
             self.post_processing = LuminanceAffine(
                 num_cameras=num_cameras,
@@ -2755,6 +3647,18 @@ class Trainer3DGRUT:
                 use_residual_grid=conf.post_processing.get(
                     "use_residual_grid",
                     False,
+                ),
+                use_frame_residual_grid=conf.post_processing.get(
+                    "use_frame_residual_grid",
+                    False,
+                ),
+                use_native_appearance_grid=use_native_appearance_grid,
+                native_appearance_source_manifest_hash=(
+                    native_source_manifest_hash
+                ),
+                native_appearance_fp16=conf.post_processing.get(
+                    "native_appearance_fp16",
+                    True,
                 ),
                 residual_grid_size=conf.post_processing.get(
                     "residual_grid_size",
@@ -2872,19 +3776,115 @@ class Trainer3DGRUT:
             module_state_sha256(module_state)
         )
 
+    def _replay_native_appearance(self, conf: DictConfig) -> None:
+        """Apply native appearance after checkpoint restoration."""
+        native_checkpoint_path = str(
+            conf.post_processing.get("native_checkpoint_path", "")
+        )
+        if not native_checkpoint_path or not bool(
+            conf.post_processing.get("replay_native_appearance", False)
+        ):
+            return
+        if self.post_processing is None or not bool(
+            conf.post_processing.get("use_native_appearance_grid", False)
+        ):
+            raise ValueError(
+                "native_checkpoint_path requires "
+                "use_native_appearance_grid=true."
+            )
+        source_frame_names = getattr(
+            self.train_dataset,
+            "get_source_frame_names",
+            None,
+        )
+        if not callable(source_frame_names):
+            raise ValueError(
+                "Native checkpoint replay requires source image names."
+            )
+        native_checkpoint = load_native_checkpoint(
+            native_checkpoint_path,
+            source_image_names=source_frame_names(),
+        )
+        native_grid = self.post_processing.native_appearance_grid
+        appearance = torch.from_numpy(native_checkpoint.appearance_rows()).to(
+            device=self.device,
+            dtype=native_grid.embedding.weight.dtype,
+        )
+        with torch.no_grad():
+            native_grid.embedding.weight.copy_(appearance)
+        logger.info(
+            "Replayed native appearance checkpoint for "
+            f"{appearance.shape[0]} source frames."
+        )
+
     def init_camera_residual(self, conf: DictConfig) -> None:
         """Initialize optional bounded camera residual calibration."""
         if not conf.camera_residual.enabled:
             return
+        if bool(conf.camera_residual.get("native_absolute_colmap", False)):
+            _validate_native_camera_configuration(conf)
+            source_extrinsics = getattr(
+                self.train_dataset,
+                "get_source_frame_colmap_extrinsics",
+                None,
+            )
+            if source_extrinsics is None:
+                raise ValueError(
+                    "Native absolute cameras require source COLMAP "
+                    "extrinsics."
+                )
+            initial_qvecs, initial_tvecs = source_extrinsics()
+            self.camera_residual = NativeCameraExtrinsics(
+                initial_qvecs=torch.from_numpy(initial_qvecs),
+                initial_tvecs=torch.from_numpy(initial_tvecs),
+            ).to(self.device)
+            (
+                self.camera_residual_optimizer,
+                self.camera_residual_scheduler,
+            ) = self.camera_residual.create_optimizer()
+            logger.info(
+                "Camera optimization uses native absolute per-image COLMAP "
+                "qvec/tvec Adam."
+            )
+            return
         frames_per_camera = self.train_dataset.get_frames_per_camera()
         optimize_per_image = getattr(conf.camera_residual, "optimize_per_image", False)
-        num_images = len(self.train_dataset) if optimize_per_image else 0
+        num_images = 0
+        if optimize_per_image:
+            source_frame_count = getattr(
+                self.train_dataset,
+                "get_source_frame_count",
+                None,
+            )
+            if source_frame_count is None:
+                raise ValueError(
+                    "per-image camera residuals require stable source-frame IDs"
+                )
+            source_manifest_hash = getattr(
+                self.train_dataset,
+                "get_source_frame_manifest_hash",
+                None,
+            )
+            if source_manifest_hash is None:
+                raise ValueError(
+                    "per-image camera residuals require a source-frame "
+                    "manifest"
+                )
+            num_images = int(source_frame_count())
         warmup_steps = getattr(conf.camera_residual, "warmup_steps", 0)
         lr_end_fraction = getattr(conf.camera_residual, "lr_end_fraction", 0.01)
         self.camera_residual = CameraResidual(
             num_cameras=len(frames_per_camera),
             num_images=num_images,
             lr=conf.camera_residual.lr,
+            rotation_lr=conf.camera_residual.get(
+                "rotation_lr", conf.camera_residual.lr
+            ),
+            translation_lr=conf.camera_residual.get(
+                "translation_lr", conf.camera_residual.lr
+            ),
+            betas=tuple(conf.camera_residual.get("betas", (0.9, 0.999))),
+            eps=conf.camera_residual.get("eps", 1.0e-8),
             lr_end_fraction=lr_end_fraction,
             warmup_steps=warmup_steps,
             reg_lambda=conf.camera_residual.reg_lambda,
@@ -2904,12 +3904,154 @@ class Trainer3DGRUT:
             "return ray/sensor gradients; monitor camera_residual/max_abs_grad."
         )
 
+    def init_local_projection_field(self, conf: DictConfig) -> None:
+        """Bind an opt-in per-source-frame field to the native EWA tracer."""
+        field_conf = conf.get("local_projection_field")
+        if field_conf is None or not bool(field_conf.get("enabled", False)):
+            return
+        if str(conf.render.method) != "native_ewa":
+            raise ValueError(
+                "local_projection_field requires render.method=native_ewa."
+            )
+        if bool(conf.post_processing.get("replay_native_distortion", False)):
+            raise ValueError(
+                "local_projection_field cannot combine with distortion replay."
+            )
+        source_frame_count = getattr(
+            self.train_dataset,
+            "get_source_frame_count",
+            None,
+        )
+        source_manifest_hash = getattr(
+            self.train_dataset,
+            "get_source_frame_manifest_hash",
+            None,
+        )
+        if not callable(source_frame_count) or not callable(
+            source_manifest_hash
+        ):
+            raise ValueError(
+                "local_projection_field requires stable source-frame metadata."
+            )
+        configured_step = int(field_conf.get("activation_start_step", -1))
+        if configured_step < -1:
+            raise ValueError(
+                "local_projection_field.activation_start_step must be >= -1."
+            )
+        activation_passes = int(
+            field_conf.get("activation_full_passes", 1)
+        )
+        if activation_passes < 0:
+            raise ValueError(
+                "local_projection_field.activation_full_passes must be >= 0."
+            )
+        num_source_frames = int(source_frame_count())
+        activation_step = (
+            configured_step
+            if configured_step >= 0
+            else activation_passes * num_source_frames
+        )
+        field = LocalProjectionField(
+            num_source_frames=num_source_frames,
+            grid_height=int(field_conf.get("grid_height", 12)),
+            grid_width=int(field_conf.get("grid_width", 12)),
+        ).to(self.device)
+        field.validate_state()
+        self.local_projection_field = field
+        self.local_projection_field_optimizer = LocalProjectionFieldAdam(
+            field.values,
+            lr=float(field_conf.get("lr", 1.0e-3)),
+            betas=tuple(
+                float(value)
+                for value in field_conf.get("betas", (0.8, 0.95))
+            ),
+            eps=float(field_conf.get("eps", 2.0e-5)),
+            shrinkage=float(field_conf.get("shrinkage", 0.1)),
+            warmup_updates=int(field_conf.get("warmup_updates", 4)),
+        )
+        setter = getattr(
+            self.model.renderer,
+            "set_local_projection_field",
+            None,
+        )
+        if not callable(setter):
+            raise RuntimeError(
+                "native_ewa tracer does not support local projection fields."
+            )
+        setter(field)
+        self._local_projection_field_activation_step = activation_step
+        logger.info(
+            "Local projection field enabled for "
+            f"{num_source_frames} source frames; activation step="
+            f"{activation_step}; manifest={source_manifest_hash()}."
+        )
+
+    def _local_projection_field_is_active(self, global_step: int) -> bool:
+        """Return whether the selected field row can be updated."""
+        return (
+            self.local_projection_field is not None
+            and global_step >= self._local_projection_field_activation_step
+        )
+
+    def _step_local_projection_field(self, gpu_batch, global_step: int) -> None:
+        """Update the selected field row after image backpropagation."""
+        optimizer = self.local_projection_field_optimizer
+        if optimizer is None:
+            return
+        if self._local_projection_field_is_active(global_step):
+            optimizer.step(int(gpu_batch.source_frame_idx))
+        optimizer.zero_grad(set_to_none=True)
+
+    def _local_projection_field_checkpoint_state(
+        self,
+        field_checkpoint: object,
+        *,
+        require_optimizer: bool,
+    ) -> tuple[dict, dict | None]:
+        """Validate saved field identity before resume or best-state restore."""
+        field = self.local_projection_field
+        if field is None:
+            raise RuntimeError("Local projection field was not initialized.")
+        if not isinstance(field_checkpoint, dict):
+            raise ValueError("Local projection field checkpoint state is invalid.")
+        if field_checkpoint.get("format_version") != (
+            field.checkpoint_format_version
+        ):
+            raise ValueError("Local projection field checkpoint version is invalid.")
+        if field_checkpoint.get("algorithm") != field.checkpoint_algorithm:
+            raise ValueError("Local projection field checkpoint algorithm is invalid.")
+        current_manifest_hash = self.train_dataset.get_source_frame_manifest_hash()
+        if field_checkpoint.get("source_frame_manifest_hash") != (
+            current_manifest_hash
+        ):
+            raise ValueError("Local projection field source-frame manifest mismatch.")
+        if int(field_checkpoint.get("activation_step", -1)) != (
+            self._local_projection_field_activation_step
+        ):
+            raise ValueError("Local projection field activation schedule mismatch.")
+        module_state = field_checkpoint.get("module")
+        optimizer_state = field_checkpoint.get("optimizer")
+        if not isinstance(module_state, dict):
+            raise ValueError("Local projection field module state is invalid.")
+        if require_optimizer and not isinstance(optimizer_state, dict):
+            raise ValueError("Local projection field optimizer state is invalid.")
+        return module_state, (
+            optimizer_state if isinstance(optimizer_state, dict) else None
+        )
+
     def _validate_camera_residual_gradient(self, global_step: int) -> None:
         """Abort invalid camera-residual runs with no pose gradients."""
         if self.camera_residual is None:
             return
         camera_conf = self.conf.camera_residual
         if not bool(camera_conf.get("fail_on_zero_grad", True)):
+            return
+        max_abs_grad = self.camera_residual.max_abs_grad()
+        min_abs_grad = float(camera_conf.get("min_abs_grad", 1e-12))
+        if max_abs_grad > min_abs_grad:
+            self._camera_residual_gradient_observed = True
+            return
+        if self._camera_residual_gradient_observed:
             return
         fail_after_steps = int(camera_conf.get("fail_after_steps", 5))
         # CameraResidual.forward returns the batch untouched while
@@ -2918,10 +4060,6 @@ class Trainer3DGRUT:
         # after warmup ends; warmup_steps=0 keeps the original behavior.
         warmup_steps = int(getattr(self.camera_residual, "warmup_steps", 0))
         if global_step < warmup_steps + fail_after_steps:
-            return
-        max_abs_grad = self.camera_residual.max_abs_grad()
-        min_abs_grad = float(camera_conf.get("min_abs_grad", 1e-12))
-        if max_abs_grad > min_abs_grad:
             return
         msg = (
             "Camera residual is enabled, but no gradient reached the SO3/SE3 "
@@ -2939,6 +4077,50 @@ class Trainer3DGRUT:
         if self.camera_residual is None:
             return gpu_batch
         return self.camera_residual(gpu_batch, global_step=global_step)
+
+    def _apply_native_distortion_replay(self, gpu_batch, outputs):
+        """Apply the fixed image-space native distortion control."""
+        if self.native_distortion_maps is None:
+            return outputs
+        camera_params = (
+            gpu_batch.intrinsics_OpenCVPinholeCameraModelParameters
+        )
+        if camera_params is None:
+            raise ValueError(
+                "native distortion replay requires a PINHOLE camera."
+            )
+        radial = np.asarray(camera_params["radial_coeffs"])
+        tangential = np.asarray(camera_params["tangential_coeffs"])
+        if np.any(radial != 0.0) or np.any(tangential != 0.0):
+            raise ValueError(
+                "native distortion replay requires a rectified PINHOLE "
+                "camera with zero base distortion."
+            )
+        source_frame_idx = int(gpu_batch.source_frame_idx)
+        if not 0 <= source_frame_idx < self.native_distortion_maps.shape[0]:
+            raise ValueError(
+                "native distortion replay requires a known source frame."
+            )
+        focal_length = torch.as_tensor(
+            camera_params["focal_length"],
+            device=self.device,
+            dtype=outputs["pred_rgb"].dtype,
+        )
+        outputs["pred_rgb"] = warp_native_render(
+            outputs["pred_rgb"],
+            gpu_batch.pixel_coords,
+            self.native_distortion_maps[source_frame_idx],
+            focal_length=focal_length,
+            sign=float(
+                self.conf.post_processing.get("native_distortion_sign", 1.0)
+            ),
+            iterations=int(
+                self.conf.post_processing.get(
+                    "native_distortion_iterations", 5
+                )
+            ),
+        )
+        return outputs
 
     def _camera_residual_audit_axis_candidates(
         self,
@@ -3654,6 +4836,8 @@ class Trainer3DGRUT:
 
         rgb_gt = gpu_batch.rgb_gt
         rgb_pred = outputs["pred_rgb"]
+        ssim_rgb_gt = rgb_gt
+        ssim_rgb_pred = rgb_pred
 
         psnr = self.criterions["psnr"]
         ssim = self.criterions["ssim"]
@@ -3718,6 +4902,13 @@ class Trainer3DGRUT:
                     masked_mse = masked_error.sum() / masked_denominator
                     metrics["masked_psnr"] = (-10.0 * torch.log10(torch.clamp_min(masked_mse, 1e-12))).item()
                     metrics["mask_coverage"] = mask.mean().item()
+                    if is_compute_eval_metrics:
+                        metrics["masked_psnr_camera_idx"] = int(
+                            gpu_batch.camera_idx
+                        )
+                        metrics["masked_psnr_source_scan_id"] = (
+                            source_scan_id or ""
+                        )
 
         if is_compute_validation_metrics:
             metrics["camera_idx"] = int(gpu_batch.camera_idx)
@@ -3813,16 +5004,44 @@ class Trainer3DGRUT:
         """
         rgb_gt = gpu_batch.rgb_gt
         rgb_pred = outputs["pred_rgb"]
+        ssim_rgb_gt = rgb_gt
+        ssim_rgb_pred = rgb_pred
         mask = gpu_batch.mask
-        loss_denominator = torch.tensor(rgb_gt.numel(), dtype=rgb_gt.dtype, device=self.device)
+        native_image_scale = getattr(gpu_batch, "native_image_scale", 1.0)
+        use_fixed_image_loss_denominator = bool(
+            self.conf.loss.get("use_fixed_image_loss_denominator", False)
+        )
+        fixed_image_loss_min_valid_fraction = float(
+            self.conf.loss.get("fixed_image_loss_min_valid_fraction", 0.8)
+        )
+        loss_denominator = torch.tensor(
+            rgb_gt.numel(), dtype=rgb_gt.dtype, device=self.device
+        )
 
         # Mask out the invalid pixels if the mask is provided
         if mask is not None:
             rgb_gt = rgb_gt * mask
             rgb_pred = rgb_pred * mask
-            loss_denominator = torch.clamp(
-                mask.sum() * rgb_gt.shape[-1],
-                min=1.0,
+            if use_fixed_image_loss_denominator:
+                loss_denominator = fixed_image_loss_denominator(
+                    rgb=rgb_gt,
+                    mask=mask,
+                    image_scale=native_image_scale,
+                    min_valid_fraction=(
+                        fixed_image_loss_min_valid_fraction
+                    ),
+                )
+            else:
+                loss_denominator = torch.clamp(
+                    mask.sum() * rgb_gt.shape[-1],
+                    min=1.0,
+                )
+        elif use_fixed_image_loss_denominator:
+            loss_denominator = fixed_image_loss_denominator(
+                rgb=rgb_gt,
+                mask=None,
+                image_scale=native_image_scale,
+                min_valid_fraction=fixed_image_loss_min_valid_fraction,
             )
 
         # L1 loss
@@ -3865,11 +5084,22 @@ class Trainer3DGRUT:
                     loss_l1 = (
                         (torch.sqrt(rgb_error.square() + epsilon * epsilon) - epsilon) * erp_weight
                     ).sum() / loss_denominator
+                elif l1_loss_type == "native_huber":
+                    huber_delta = float(
+                        self.conf.loss.get("huber_delta", 0.1)
+                    )
+                    loss_l1 = (
+                        native_huber_loss(
+                            rgb_error,
+                            delta=huber_delta,
+                        )
+                        * erp_weight
+                    ).sum() / loss_denominator
                 else:
                     msg = (
                         "Unsupported loss.l1_loss_type "
                         f"{l1_loss_type!r}. Supported values: "
-                        "absolute, charbonnier."
+                        "absolute, charbonnier, native_huber."
                     )
                     raise RuntimeError(msg)
                 lambda_l1 = self.conf.loss.lambda_l1
@@ -3888,9 +5118,34 @@ class Trainer3DGRUT:
         lambda_ssim = 0.0
         if self.conf.loss.use_ssim:
             with torch.cuda.nvtx.range("loss-ssim"):
-                rgb_gt_full = torch.permute(rgb_gt, (0, 3, 1, 2))
-                pred_rgb_full = torch.permute(rgb_pred, (0, 3, 1, 2))
-                loss_ssim = 1.0 - ssim(pred_rgb_full, rgb_gt_full)
+                if self.conf.loss.get(
+                    "use_masked_ssim_same_padding",
+                    False,
+                ):
+                    if mask is None:
+                        raise RuntimeError(
+                            "Masked same-padding SSIM requires a pixel mask."
+                        )
+                    loss_ssim = masked_ssim_same_loss(
+                        prediction=torch.permute(
+                            ssim_rgb_pred,
+                            (0, 3, 1, 2),
+                        ),
+                        target=torch.permute(
+                            ssim_rgb_gt,
+                            (0, 3, 1, 2),
+                        ),
+                        mask=torch.permute(mask, (0, 3, 1, 2)),
+                        denominator=loss_denominator,
+                        require_full_valid_window=self.conf.loss.get(
+                            "masked_ssim_require_full_valid_window",
+                            False,
+                        ),
+                    )
+                else:
+                    rgb_gt_full = torch.permute(rgb_gt, (0, 3, 1, 2))
+                    pred_rgb_full = torch.permute(rgb_pred, (0, 3, 1, 2))
+                    loss_ssim = 1.0 - ssim(pred_rgb_full, rgb_gt_full)
                 lambda_ssim = self.conf.loss.lambda_ssim
 
         # Opacity regularization
@@ -4295,16 +5550,126 @@ class Trainer3DGRUT:
                     warmup_scale = min(1.0, self.global_step / warmup_iters)
                     lambda_mvdino_rim *= warmup_scale
 
+        layered_depth_adjoint_loss = torch.zeros(
+            1,
+            device=self.device,
+            dtype=rgb_pred.dtype,
+        )
+        if bool(self.conf.loss.get("use_layered_depth_adjoint", False)):
+            if gpu_batch.semantic_mask is None:
+                raise RuntimeError(
+                    "Layered depth adjoint requires semantic mask labels."
+                )
+            required_outputs = (
+                "layered_depth_raw",
+                "layered_transparency",
+                "layered_median_depth",
+            )
+            missing_outputs = [
+                key for key in required_outputs if key not in outputs
+            ]
+            if missing_outputs:
+                raise RuntimeError(
+                    "Layered depth adjoint requires renderer outputs: "
+                    f"{', '.join(missing_outputs)}."
+                )
+            layered_depth_adjoint_loss = layered_depth_adjoint_injection(
+                raw_depth=outputs["layered_depth_raw"],
+                layer_transparency=outputs["layered_transparency"],
+                median_depth=outputs["layered_median_depth"],
+                semantic_mask=gpu_batch.semantic_mask,
+                normalized_weight=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_normalized_weight",
+                        1.0,
+                    )
+                ),
+                semantic_label_remap_from=self.conf.loss.get(
+                    "layered_depth_adjoint_semantic_label_remap_from",
+                    None,
+                ),
+                semantic_label_remap_to=self.conf.loss.get(
+                    "layered_depth_adjoint_semantic_label_remap_to",
+                    None,
+                ),
+                primary_semantic_label=self.conf.loss.get(
+                    "layered_depth_adjoint_primary_semantic_label",
+                    None,
+                ),
+                primary_transparency_bias=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_primary_transparency_bias",
+                        0.0,
+                    )
+                ),
+                secondary_semantic_label=self.conf.loss.get(
+                    "layered_depth_adjoint_secondary_semantic_label",
+                    None,
+                ),
+                secondary_transparency_bias=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_secondary_transparency_bias",
+                        0.0,
+                    )
+                ),
+                transparency_target=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_transparency_target",
+                        0.5,
+                    )
+                ),
+                transparency_gradient_scale=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_transparency_gradient_scale",
+                        0.2,
+                    )
+                ),
+                neighbor_gradient_scale=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_neighbor_gradient_scale",
+                        0.1,
+                    )
+                ),
+                depth_transparency_threshold=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_depth_transparency_threshold",
+                        0.1,
+                    )
+                ),
+                depth_gradient_scale=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_depth_gradient_scale",
+                        0.01,
+                    )
+                ),
+                depth_residual_delta=float(
+                    self.conf.loss.get(
+                        "layered_depth_adjoint_depth_residual_delta",
+                        0.1,
+                    )
+                ),
+            )
+
         # Total loss
         camera_loss_weight = torch.ones(1, device=self.device)
         if self.conf.loss.use_camera_loss_weights:
             camera_idx = int(gpu_batch.camera_idx)
+            if bool(
+                self.conf.loss.get(
+                    "camera_loss_weights_use_physical_camera",
+                    False,
+                )
+            ):
+                camera_idx = int(gpu_batch.post_processing_camera_idx)
             configured_weights = list(self.conf.loss.camera_loss_weights)
             if camera_idx >= len(configured_weights):
                 msg = "loss.camera_loss_weights must include one weight per " f"camera. Missing index {camera_idx}."
                 raise RuntimeError(msg)
             camera_loss_weight = torch.tensor(
-                float(configured_weights[camera_idx]),
+                indexed_camera_loss_weight(
+                    camera_index=camera_idx,
+                    configured_weights=configured_weights,
+                ),
                 device=self.device,
                 dtype=rgb_pred.dtype,
             )
@@ -4338,6 +5703,7 @@ class Trainer3DGRUT:
             + lambda_mvdino_rim * loss_mvdino_rim
         )
         loss = loss * camera_loss_weight * image_loss_weight
+        loss = loss + layered_depth_adjoint_loss
         return dict(
             total_loss=loss,
             l1_loss=lambda_l1 * loss_l1,
@@ -4366,6 +5732,7 @@ class Trainer3DGRUT:
             rim_hf_loss_raw=loss_rim_hf,
             mvdino_rim_loss=lambda_mvdino_rim * loss_mvdino_rim,
             mvdino_rim_loss_raw=loss_mvdino_rim,
+            layered_depth_adjoint_loss=layered_depth_adjoint_loss,
         )
 
     @torch.cuda.nvtx.range("log_validation_iter")
@@ -4671,13 +6038,30 @@ class Trainer3DGRUT:
                 ("radial_rim_edge_energy_ratio", "rim_edge_energy_ratio"),
             )
             for camera_idx in sorted(set(camera_indices.tolist())):
-                camera_mask = camera_indices == camera_idx
                 for source_name, metric_name in camera_metric_names:
                     if source_name in metrics:
-                        values = np.asarray(metrics[source_name], dtype=np.float32)
+                        values = np.asarray(
+                            metrics[source_name], dtype=np.float32
+                        )
+                        metric_camera_indices = _metric_group_array(
+                            metrics=metrics,
+                            metric_name=source_name,
+                            group_key="camera_idx",
+                        )
+                        if (
+                            metric_camera_indices is None
+                            or values.shape[0]
+                            != metric_camera_indices.shape[0]
+                        ):
+                            continue
+                        camera_values = values[
+                            metric_camera_indices == camera_idx
+                        ]
+                        if camera_values.size == 0:
+                            continue
                         writer.add_scalar(
                             f"diagnostics/camera/{camera_idx}/{metric_name}",
-                            values[camera_mask].mean(),
+                            camera_values.mean(),
                             global_step,
                         )
         source_scan_summary = _group_metric_summary(
@@ -5283,6 +6667,13 @@ class Trainer3DGRUT:
                     "📷 Dropping shape-mismatched post-processing "
                     f"buffers when restoring best checkpoint: {sorted(dropped)}."
                 )
+        if self.local_projection_field is not None:
+            module_state, _ = self._local_projection_field_checkpoint_state(
+                checkpoint.get("local_projection_field"),
+                require_optimizer=False,
+            )
+            self.local_projection_field.load_state_dict(module_state)
+            self.local_projection_field.validate_state()
         self.global_step = int(checkpoint["global_step"])
 
     @torch.cuda.nvtx.range("log_training_iter")
@@ -5788,6 +7179,10 @@ class Trainer3DGRUT:
 
         strategy_parameters = self.strategy.get_strategy_parameters()
         parameters = {**parameters, **strategy_parameters}
+        if self.lidar_ray_sampler is not None:
+            parameters["lidar_supervision"] = (
+                self.lidar_ray_sampler.state_dict()
+            )
 
         # Add feature decoder state to checkpoint (module + optimizer + scheduler + EMA)
         if getattr(self, "feature_decoder", None) is not None:
@@ -5823,6 +7218,18 @@ class Trainer3DGRUT:
             and self.camera_residual_scheduler is not None
         ):
             parameters["camera_residual"] = {
+                "format_version": (
+                    self.camera_residual.checkpoint_format_version
+                ),
+                "algorithm": self.camera_residual.checkpoint_algorithm,
+                "optimizer_group_manifest": (
+                    self.camera_residual.optimizer_group_manifest()
+                ),
+                "source_frame_manifest_hash": (
+                    self.train_dataset.get_source_frame_manifest_hash()
+                    if self.camera_residual.optimize_per_image
+                    else None
+                ),
                 "module": self.camera_residual.state_dict(),
                 "optimizer": self.camera_residual_optimizer.state_dict(),
                 "scheduler": self.camera_residual_scheduler.state_dict(),
@@ -6657,6 +8064,406 @@ class Trainer3DGRUT:
                 )
         return True
 
+    @torch.no_grad()
+    def _dump_native_gradient_probe(
+        self,
+        *,
+        global_step: int,
+        stage: str,
+        gpu_batch: dict,
+        outputs: dict[str, torch.Tensor],
+        batch_losses: dict[str, torch.Tensor],
+    ) -> None:
+        diagnostics = self.conf.get("diagnostics")
+        if diagnostics is None or not bool(
+            diagnostics.get("native_gradient_probe_enabled", False)
+        ):
+            return
+        dump_dir = str(
+            diagnostics.get(
+                "native_gradient_probe_dir",
+                path_join(self.tracking.output_dir, "native_gradient_probe"),
+            )
+        )
+        path_mkdir(dump_dir, parents=True, exist_ok=True)
+        visibility = outputs.get("mog_visibility")
+        visible_indices = None
+        if visibility is not None:
+            visible_indices = torch.nonzero(
+                visibility.detach().reshape(-1).to(torch.bool),
+                as_tuple=False,
+            ).squeeze(1)
+        tensor_names = (
+            "features_albedo",
+            "features_specular",
+            "positions",
+            "density",
+            "scale",
+            "rotation",
+        )
+        gradients = {}
+        for tensor_name in tensor_names:
+            parameter = getattr(self.model, tensor_name)
+            if parameter.grad is None:
+                continue
+            gradients[tensor_name] = parameter.grad.detach().cpu()
+        losses = {
+            name: float(value.detach().item())
+            for name, value in batch_losses.items()
+            if value is not None and hasattr(value, "detach")
+        }
+        payload = {
+            "global_step": int(global_step),
+            "stage": stage,
+            "losses": losses,
+            "image_path": str(getattr(gpu_batch, "image_path", "")),
+            "source_frame_idx": int(getattr(gpu_batch, "source_frame_idx", -1)),
+            "post_processing_camera_idx": int(
+                getattr(gpu_batch, "post_processing_camera_idx", -1)
+            ),
+            "rgb_shape": tuple(int(v) for v in outputs["pred_rgb"].shape),
+            "mask_mean": (
+                None
+                if getattr(gpu_batch, "mask", None) is None
+                else float(gpu_batch.mask.detach().mean().item())
+            ),
+            "visible_indices": (
+                None if visible_indices is None else visible_indices.cpu()
+            ),
+            "gradients": gradients,
+        }
+        if bool(diagnostics.get("native_gradient_probe_full_state", False)):
+            payload["parameters"] = self._native_gradient_probe_parameters(
+                tensor_names
+            )
+        if bool(diagnostics.get("native_gradient_probe_images", False)):
+            payload["pred_rgb"] = outputs["pred_rgb"].detach().cpu()
+            if outputs["pred_rgb"].grad is not None:
+                payload["pred_rgb_grad"] = (
+                    outputs["pred_rgb"].grad.detach().cpu()
+                )
+            pred_opacity = outputs.get("pred_opacity")
+            if pred_opacity is not None:
+                payload["pred_opacity"] = pred_opacity.detach().cpu()
+                if pred_opacity.grad is not None:
+                    payload["pred_opacity_grad"] = (
+                        pred_opacity.grad.detach().cpu()
+                    )
+            payload["rgb_gt"] = gpu_batch.rgb_gt.detach().cpu()
+            if getattr(gpu_batch, "mask", None) is not None:
+                payload["mask"] = gpu_batch.mask.detach().cpu()
+        if bool(
+            diagnostics.get("native_gradient_probe_optimizer_state", False)
+        ):
+            payload["optimizer_state"] = (
+                self._native_gradient_probe_optimizer_state()
+            )
+        for output_name in (
+            "mog_projected_position",
+            "mog_projected_conic_opacity",
+            "mog_projected_extent",
+            "mog_projected_position_gradient",
+            "mog_accumulated_weight",
+            "mog_visibility",
+            "mog_tiles_count",
+        ):
+            output_tensor = outputs.get(output_name)
+            if output_tensor is not None:
+                payload[output_name] = output_tensor.detach().cpu()
+        dump_path = path_join(
+            dump_dir,
+            f"step_{global_step:06d}_{stage}.pt",
+        )
+        torch.save(payload, dump_path)
+
+    def _native_gradient_probe_parameters(
+        self,
+        tensor_names: tuple[str, ...],
+    ) -> dict[str, torch.Tensor]:
+        parameters = {}
+        for tensor_name in tensor_names:
+            parameter = getattr(self.model, tensor_name)
+            parameters[tensor_name] = parameter.detach().cpu()
+        return parameters
+
+    def _register_native_opacity_gradient_override(
+        self,
+        *,
+        diagnostics: DictConfig | dict,
+        outputs: dict[str, torch.Tensor],
+    ) -> None:
+        override_path = diagnostics.get(
+            "native_opacity_gradient_override_path",
+            None,
+        )
+        if not override_path:
+            return
+        pred_opacity = outputs.get("pred_opacity")
+        if pred_opacity is None:
+            raise RuntimeError(
+                "Native opacity gradient override requires pred_opacity."
+            )
+        if pred_opacity.ndim != 4 or pred_opacity.shape[-1] != 1:
+            raise RuntimeError(
+                "Native opacity gradient override requires BHWC opacity."
+            )
+        override_array = np.fromfile(str(override_path), dtype=np.float32)
+        expected = int(pred_opacity.numel())
+        if int(override_array.size) != expected:
+            raise RuntimeError(
+                "Native opacity gradient override has "
+                f"{override_array.size} values, expected {expected}."
+            )
+        override_scale = float(
+            diagnostics.get("native_opacity_gradient_override_scale", 1.0)
+        )
+        override_gradient = torch.from_numpy(override_array.reshape(
+            tuple(int(v) for v in pred_opacity.shape)
+        )).to(device=pred_opacity.device, dtype=pred_opacity.dtype)
+        override_gradient = override_gradient * override_scale
+
+        def _override_hook(_: torch.Tensor) -> torch.Tensor:
+            return override_gradient
+
+        pred_opacity.register_hook(_override_hook)
+
+    @torch.no_grad()
+    def _dump_native_lidar_gradient_probe(
+        self,
+        *,
+        global_step: int,
+        stage: str,
+        outputs: dict[str, torch.Tensor],
+        depth_gt: torch.Tensor,
+        pred_depth: torch.Tensor,
+        valid: torch.Tensor,
+        loss: torch.Tensor,
+        sample_weight: float,
+        ray_z: torch.Tensor,
+        visibility: torch.Tensor | None = None,
+    ) -> None:
+        diagnostics = self.conf.get("diagnostics")
+        if diagnostics is None or not bool(
+            diagnostics.get("native_gradient_probe_enabled", False)
+        ):
+            return
+        dump_dir = str(
+            diagnostics.get(
+                "native_gradient_probe_dir",
+                path_join(self.tracking.output_dir, "native_gradient_probe"),
+            )
+        )
+        path_mkdir(dump_dir, parents=True, exist_ok=True)
+        if visibility is None:
+            visibility = outputs.get("mog_visibility")
+        visible_indices = None
+        if visibility is not None:
+            visible_indices = torch.nonzero(
+                visibility.detach().reshape(-1).to(torch.bool),
+                as_tuple=False,
+            ).squeeze(1)
+        tensor_names = (
+            "features_albedo",
+            "features_specular",
+            "positions",
+            "density",
+            "scale",
+            "rotation",
+        )
+        gradients = {}
+        for tensor_name in tensor_names:
+            parameter = getattr(self.model, tensor_name)
+            if parameter.grad is None:
+                continue
+            gradients[tensor_name] = parameter.grad.detach().cpu()
+        payload = {
+            "global_step": int(global_step),
+            "stage": stage,
+            "losses": {"lidar_range_loss": float(loss.detach().item())},
+            "sample_weight": float(sample_weight),
+            "depth_shape": tuple(int(v) for v in depth_gt.shape),
+            "valid_count": int(valid.detach().sum().item()),
+            "valid_fraction": float(
+                valid.detach().to(torch.float32).mean().item()
+            ),
+            "ray_z_mean": float(ray_z.detach().mean().item()),
+            "pred_depth_mean": float(pred_depth.detach().mean().item()),
+            "target_depth_mean": float(depth_gt.detach().mean().item()),
+            "visible_indices": (
+                None if visible_indices is None else visible_indices.cpu()
+            ),
+            "gradients": gradients,
+        }
+        if bool(diagnostics.get("native_gradient_probe_full_state", False)):
+            payload["parameters"] = self._native_gradient_probe_parameters(
+                tensor_names
+            )
+        if bool(
+            diagnostics.get("native_gradient_probe_optimizer_state", False)
+        ):
+            payload["optimizer_state"] = (
+                self._native_gradient_probe_optimizer_state()
+            )
+        for output_name in (
+            "mog_projected_conic_opacity",
+            "mog_projected_extent",
+            "mog_projected_position_gradient",
+            "mog_accumulated_weight",
+        ):
+            output_tensor = outputs.get(output_name)
+            if output_tensor is not None:
+                payload[output_name] = output_tensor.detach().cpu()
+        dump_path = path_join(
+            dump_dir,
+            f"step_{global_step:06d}_{stage}.pt",
+        )
+        torch.save(payload, dump_path)
+
+    def _native_gradient_probe_optimizer_state(
+        self,
+    ) -> dict[str, dict[str, torch.Tensor | int | float]]:
+        optimizer_state = {}
+        for fallback_index, group in enumerate(
+            self.model.optimizer.param_groups
+        ):
+            group_name = str(group.get("name", fallback_index))
+            parameters = group.get("params")
+            if not isinstance(parameters, list) or len(parameters) != 1:
+                continue
+            parameter = parameters[0]
+            state = self.model.optimizer.state.get(parameter)
+            if not isinstance(state, dict):
+                continue
+            group_state = {}
+            for key, value in state.items():
+                if torch.is_tensor(value):
+                    group_state[str(key)] = value.detach().cpu()
+                elif isinstance(value, (int, float)):
+                    group_state[str(key)] = value
+            if group_state:
+                optimizer_state[group_name] = group_state
+        return optimizer_state
+
+    def run_lidar_step(
+        self, global_step: int, conf: DictConfig
+    ) -> float | None:
+        """Optimize Gaussians against an independent timestamped LiDAR map."""
+        sampler = self.lidar_ray_sampler
+        lidar_conf = conf.lidar_supervision
+        if sampler is None or global_step % int(lidar_conf.frequency) != 0:
+            return None
+
+        sample = sampler.sample(
+            rays_per_step=int(lidar_conf.rays_per_step),
+            device=self.device,
+            dtype=self.model.positions.dtype,
+        )
+        if sample is None:
+            return None
+        (
+            rays_ori,
+            rays_dir,
+            camera_to_world,
+            sample_grid,
+            depth_gt,
+            ray_z,
+            sample_weight,
+        ) = sample
+        renderer_name = str(
+            lidar_conf.get(
+                "renderer",
+                NativeLidarRenderer.GUT_HIT_DISTANCE.value,
+            )
+        )
+        renderer = parse_native_lidar_renderer(renderer_name)
+        optimizer_visibility = None
+        outputs: dict[str, torch.Tensor] = {}
+        if renderer is NativeLidarRenderer.CLASSIC_EXPECTED_DEPTH:
+            lidar_render = render_classic_expected_depth(
+                gaussian_state=NativeLidarGaussianState(
+                    positions=self.model.get_positions(),
+                    rotations=self.model.get_rotation(),
+                    scales=self.model.get_scale(),
+                    opacities=self.model.get_density(),
+                    skip_mask=self.model.environment_mask,
+                ),
+                camera_to_world=camera_to_world,
+                intrinsics=sampler.intrinsics,
+                sample_grid=sample_grid,
+                image_size=int(rays_dir.shape[1]),
+            )
+            pred_depth = lidar_render.depth
+            sampled_alpha = lidar_render.alpha
+            optimizer_visibility = lidar_render.visibility.unsqueeze(-1)
+        else:
+            lidar_batch = Batch(
+                rays_ori=rays_ori,
+                rays_dir=rays_dir,
+                T_to_world=camera_to_world,
+                intrinsics=sampler.intrinsics,
+            )
+            outputs = self.model(
+                lidar_batch,
+                train=True,
+                frame_id=global_step,
+            )
+            pred_dist = outputs["pred_dist"]
+            if pred_dist.ndim == 3:
+                pred_dist = pred_dist.unsqueeze(-1)
+            sampled_pred_dist = F.grid_sample(
+                pred_dist.permute(0, 3, 1, 2),
+                sample_grid,
+                mode="bilinear",
+                align_corners=False,
+            ).permute(0, 2, 3, 1)
+            pred_depth = sampled_pred_dist * ray_z
+            sampled_alpha = None
+        min_depth = float(lidar_conf.min_depth_m)
+        valid = (
+            torch.isfinite(pred_depth)
+            & torch.isfinite(depth_gt)
+            & (pred_depth > min_depth)
+            & (depth_gt > min_depth)
+        )
+        if sampled_alpha is not None:
+            valid = valid & (sampled_alpha > 0.0)
+        error = native_lidar_loss(pred_depth, depth_gt)
+        loss = (
+            float(lidar_conf.lambda_range)
+            * (error * valid.to(dtype=error.dtype)).sum()
+            * sample_weight
+        )
+        loss.backward()
+        self._dump_native_lidar_gradient_probe(
+            global_step=global_step,
+            stage="after_lidar_backward",
+            outputs=outputs,
+            depth_gt=depth_gt,
+            pred_depth=pred_depth,
+            valid=valid,
+            loss=loss,
+            sample_weight=sample_weight,
+            ray_z=ray_z,
+            visibility=optimizer_visibility,
+        )
+        _step_gaussian_optimizer(
+            optimizer=self.model.optimizer,
+            density=self.model.density,
+            outputs=outputs,
+            visibility=optimizer_visibility,
+            advance_age=False,
+        )
+        self.model.optimizer.zero_grad()
+        self.model.build_acc(rebuild=True)
+        loss_value = float(loss.detach().item())
+        if self.conf.enable_writer:
+            self.tracking.writer.add_scalar(
+                "train/lidar_range_loss",
+                loss_value,
+                global_step,
+            )
+        return loss_value
+
     @torch.cuda.nvtx.range("run_train_iter")
     def run_train_iter(
         self,
@@ -6705,6 +8512,8 @@ class Trainer3DGRUT:
         ):
             self.model.freeze_gaussians()
             self.strategy.suspend()
+        else:
+            self.run_lidar_step(global_step, conf)
 
         # Access the GPU-cache batch data
         with torch.cuda.nvtx.range(f"train_iter{global_step}_get_gpu_batch"):
@@ -6713,6 +8522,8 @@ class Trainer3DGRUT:
             gpu_batch,
             global_step=global_step,
         )
+        if self.local_projection_field_optimizer is not None:
+            self.local_projection_field_optimizer.zero_grad(set_to_none=True)
 
         # Perform validation if required
         is_time_to_validate = (global_step > 0 or conf.validate_first) and (global_step % self.val_frequency == 0)
@@ -6732,6 +8543,17 @@ class Trainer3DGRUT:
             outputs = self.model(gpu_batch, train=True, frame_id=global_step)
             profilers["inference"].end()
         outputs = collapse_blur_samples(outputs, gpu_batch)
+        outputs = self._apply_native_distortion_replay(
+            gpu_batch,
+            outputs,
+        )
+        native_appearance_preopt_steps = (
+            self._run_native_appearance_preoptimization(
+                gpu_batch=gpu_batch,
+                outputs=outputs,
+                conf=conf,
+            )
+        )
 
         # Apply feature decoder to convert N-dimensional features to RGB (NHT mode)
         if self.feature_decoder is not None:
@@ -6814,16 +8636,40 @@ class Trainer3DGRUT:
             )
 
         # Back-propagate the gradients and update the parameters
+        diagnostics = self.conf.get("diagnostics")
+        if diagnostics is not None and bool(
+            diagnostics.get("native_gradient_probe_images", False)
+        ):
+            outputs["pred_rgb"].retain_grad()
+            pred_opacity = outputs.get("pred_opacity")
+            if pred_opacity is not None:
+                pred_opacity.retain_grad()
+        if diagnostics is not None:
+            self._register_native_opacity_gradient_override(
+                diagnostics=diagnostics,
+                outputs=outputs,
+            )
         with torch.cuda.nvtx.range(f"train_{global_step}_bwd"):
             profilers["backward"].start()
             batch_losses["total_loss"].backward()
             profilers["backward"].end()
-        if self.camera_residual_optimizer is not None:
+        if (
+            self.camera_residual_optimizer is not None
+            and self.camera_residual is not None
+            and self.camera_residual.is_active(global_step)
+        ):
             self._validate_camera_residual_gradient(global_step)
             if self.camera_residual is not None:
                 self._last_camera_residual_stats = self.camera_residual.stats()
         self._compute_per_gaussian_grad_norms()
         self._log_gradient_diagnostics(global_step)
+        self._dump_native_gradient_probe(
+            global_step=global_step,
+            stage="after_backward",
+            gpu_batch=gpu_batch,
+            outputs=outputs,
+            batch_losses=batch_losses,
+        )
         if self.diagnostics is not None:
             step_total_ms = float(
                 profilers["backward"].timing() if hasattr(profilers.get("backward"), "timing") else 0.0
@@ -6862,21 +8708,35 @@ class Trainer3DGRUT:
                 gpu_batch=gpu_batch,
                 outputs=outputs,
             )
+        self._dump_native_gradient_probe(
+            global_step=global_step,
+            stage="after_post_backward",
+            gpu_batch=gpu_batch,
+            outputs=outputs,
+            batch_losses=batch_losses,
+        )
+        self._scale_radiance_gradients()
 
         # Optimizer step
         with torch.cuda.nvtx.range(f"train_{global_step}_backprop"):
             self._zero_color_refine_frozen_grads()
-            if isinstance(
-                self.model.optimizer,
-                (VisibilityDecayedAdam, SelectiveAdam),
-            ):
-                assert (
-                    outputs["mog_visibility"].shape == self.model.density.shape
-                ), f"Visibility shape {outputs['mog_visibility'].shape} does not match density shape {self.model.density.shape}"
-                self.model.optimizer.step(outputs["mog_visibility"])
-            else:
-                self.model.optimizer.step()
+            _step_gaussian_optimizer(
+                optimizer=self.model.optimizer,
+                density=self.model.density,
+                outputs=outputs,
+                age_increment=self._native_replay_age_increment(gpu_batch),
+            )
+            self._dump_native_gradient_probe(
+                global_step=global_step,
+                stage="after_optimizer",
+                gpu_batch=gpu_batch,
+                outputs=outputs,
+                batch_losses=batch_losses,
+            )
             self.model.optimizer.zero_grad()
+            if self.model.color_encoder_optimizer is not None:
+                self.model.color_encoder_optimizer.step()
+                self.model.color_encoder_optimizer.zero_grad()
 
         geometry_updated = self._run_geometry_only_pass(
             gpu_batch=gpu_batch,
@@ -6898,19 +8758,40 @@ class Trainer3DGRUT:
 
         # Post-processing optimizer/scheduler step
         if self.post_processing_optimizers is not None:
-            with torch.cuda.nvtx.range(f"train_{global_step}_post_processing_opt"):
-                for opt in self.post_processing_optimizers:
-                    opt.step()
-                    opt.zero_grad()
-                for sched in self.post_processing_schedulers:
-                    sched.step()
+            with torch.cuda.nvtx.range(
+                f"train_{global_step}_post_processing_opt"
+            ):
+                self._step_post_processing_optimizers(
+                    conf=conf,
+                    native_appearance_preopt_steps=(
+                        native_appearance_preopt_steps
+                    ),
+                )
 
         if self.camera_residual_optimizer is not None:
-            with torch.cuda.nvtx.range(f"train_{global_step}_camera_residual_opt"):
-                self.camera_residual_optimizer.step()
+            with torch.cuda.nvtx.range(
+                f"train_{global_step}_camera_residual_opt"
+            ):
+                if isinstance(
+                    self.camera_residual_optimizer,
+                    NativeCameraAdam,
+                ):
+                    self.camera_residual_optimizer.step(
+                        int(gpu_batch.source_frame_idx)
+                    )
+                else:
+                    self.camera_residual_optimizer.step()
                 self.camera_residual_optimizer.zero_grad()
-                if self.camera_residual_scheduler is not None:
+                if (
+                    self.camera_residual_scheduler is not None
+                ):
                     self.camera_residual_scheduler.step()
+
+        if self.local_projection_field_optimizer is not None:
+            with torch.cuda.nvtx.range(
+                f"train_{global_step}_local_projection_field_opt"
+            ):
+                self._step_local_projection_field(gpu_batch, global_step)
 
         # Post backward strategy step
         with torch.cuda.nvtx.range(f"train_{global_step}_post_opt_step"):
@@ -6980,6 +8861,11 @@ class Trainer3DGRUT:
     @torch.cuda.nvtx.range("run_train_pass")
     def run_train_pass(self, conf: DictConfig):
         """Runs a single train epoch over the dataset."""
+        scale_conf = self._native_image_scale_config(conf)
+        if scale_conf is not None:
+            self._run_native_scaled_train_pass(conf, scale_conf)
+            return
+
         metrics = []
         profilers = {
             "inference": CudaTimer(enabled=self.conf.enable_frame_timings),
@@ -6998,6 +8884,47 @@ class Trainer3DGRUT:
                 return
 
         self.log_training_pass(metrics)
+
+    def _run_native_scaled_train_pass(
+        self, conf: DictConfig, scale_conf: DictConfig
+    ) -> None:
+        interval = int(scale_conf.get("interval", 3000))
+        while self.global_step < int(conf.n_iterations):
+            scale = self._native_image_scale_for_step(
+                conf, self.global_step
+            )
+            self._replace_train_dataloader_for_native_scale(conf, scale)
+            next_boundary = (
+                (self.global_step // interval) + 1
+            ) * interval
+            segment_end = min(next_boundary, int(conf.n_iterations))
+            metrics = []
+            profilers = {
+                "inference": CudaTimer(
+                    enabled=self.conf.enable_frame_timings
+                ),
+                "backward": CudaTimer(
+                    enabled=self.conf.enable_frame_timings
+                ),
+                "build_as": CudaTimer(
+                    enabled=self.conf.enable_frame_timings
+                ),
+            }
+
+            for _iteration, batch in enumerate(self.train_dataloader):
+                self.run_train_iter(
+                    self.global_step,
+                    batch,
+                    profilers,
+                    metrics,
+                    conf,
+                )
+                if self._should_stop_training:
+                    return
+                if self.global_step >= segment_end:
+                    break
+
+            self.log_training_pass(metrics)
 
     @torch.cuda.nvtx.range("run_training_metrics_pass")
     @torch.no_grad()
@@ -7050,6 +8977,10 @@ class Trainer3DGRUT:
                 profilers["inference"].start()
                 outputs = self.model(gpu_batch, train=False)
                 outputs = collapse_blur_samples(outputs, gpu_batch)
+                outputs = self._apply_native_distortion_replay(
+                    gpu_batch,
+                    outputs,
+                )
                 if self.post_processing is not None:
                     outputs = apply_post_processing(
                         self.post_processing,
@@ -7264,6 +9195,11 @@ class Trainer3DGRUT:
                 break
 
         logger.end_progress(task_name="Training")
+
+        if not self._should_stop_training:
+            scene_updated = self.strategy.finalize_training()
+            if scene_updated:
+                self.model.build_acc(rebuild=True)
 
         # Report training statistics
         stats = logger.finished_tasks["Training"]

@@ -533,6 +533,27 @@ def apply_points_transform(
         raise ValueError("transform must contain only finite values")
     return points @ transform_tensor[:3, :3].T + transform_tensor[:3, 3]
 
+try:
+    from simple_knn._C import distCUDA2 as _dist_cuda2
+except ImportError:
+    _dist_cuda2 = None
+
+
+def native_simple_knn_mean_dist2(points: torch.Tensor) -> torch.Tensor:
+    """Return the visibility-adaptive three-neighbor mean squared distance."""
+    if _dist_cuda2 is None:
+        raise RuntimeError(
+            "Native point-set initialization requires simple-knn. Run "
+            "./scripts/post_build.sh before training."
+        )
+    if points.dtype is not torch.float32:
+        raise ValueError("simple-knn points must use float32.")
+    if not points.is_cuda:
+        raise ValueError("simple-knn points must be on a CUDA device.")
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("simple-knn points must have shape (N, 3).")
+    return _dist_cuda2(points.contiguous())
+
 
 def k_nearest_neighbors(x: torch.Tensor, K: int = 4) -> torch.Tensor:
     x_np = x.cpu().numpy()

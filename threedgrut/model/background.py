@@ -62,6 +62,15 @@ class BaseBackground(ABC, torch.nn.Module):
 class BackgroundColor(BaseBackground):
     def setup(self, **kwargs):
         self.background_color_type = self.config.color
+        self.detach_opacity_gradient = bool(
+            self.config.get("detach_opacity_gradient", False)
+        )
+        self.opacity_gradient_scale = float(
+            self.config.get(
+                "opacity_gradient_scale",
+                0.0 if self.detach_opacity_gradient else 1.0,
+            )
+        )
 
         assert self.background_color_type in [
             "white",
@@ -88,7 +97,10 @@ class BackgroundColor(BaseBackground):
                 self.color = color
                 rgb = rgb + color * (1.0 - opacity)
         elif self.background_color_type != "black":
-            rgb = rgb + color * (1.0 - opacity)
+            opacity_for_background = opacity.detach() + (
+                self.opacity_gradient_scale * (opacity - opacity.detach())
+            )
+            rgb = rgb + color * (1.0 - opacity_for_background)
 
         return rgb, opacity
 

@@ -24,10 +24,15 @@ from omegaconf import DictConfig
 from plyfile import PlyData
 
 import threedgrt_tracer
+import threedgrut.native_ewa_renderer as native_ewa_renderer
 import threedgrut.model.background as background
 import threedgut_tracer
 from threedgrut.datasets.protocols import Batch
-from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
+from threedgrut.datasets.point_set_artifact import load_point_set_artifact
+from threedgrut.datasets.utils import (
+    read_colmap_points3D_text,
+    read_next_bytes,
+)
 from threedgrut.export import PLYExporter
 from threedgrut.export.base import ExportableModel
 from threedgrut.model.acquisition_appearance import (
@@ -45,13 +50,19 @@ from threedgrut.model.gaussian_track_acquisition import (
 from threedgrut.model.geometry import (
     SurfaceAlignedPCAConfig,
     k_nearest_neighbors,
+    native_simple_knn_mean_dist2,
     nearest_neighbor_dist_cpuKD,
     surface_aligned_pca_initialize,
 )
 from threedgrut.model.surface_acquisition_spline import (
     SurfaceAcquisitionSpline,
 )
-from threedgrut.optimizers import SelectiveAdam, VisibilityDecayedAdam
+from threedgrut.optimizers import (
+    FP16GlobalAdam,
+    SelectiveAdam,
+    VisibilityDecayedAdam,
+    VisibilitySelectiveAdam,
+)
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import (
     get_activation_function,
@@ -68,6 +79,127 @@ SCENE_EXTENT_MIN = 1e-6
 SCENE_EXTENT_MAX_SAMPLES = 1_000_000
 PROTECTED_GAUSSIAN_PREFIX_VERSION = 1
 PROTECTED_GEOMETRY_NAMES = ("positions", "rotation", "scale")
+GABOR_CARRIER_NUM_TERMS = 3
+GABOR_CARRIER_EXTRA_COEFFS = GABOR_CARRIER_NUM_TERMS + 3
+SIREN_CARRIER_INPUT_DIM = 5
+SIREN_CARRIER_DEFAULT_HIDDEN_DIM = 6
+NATIVE_COLOR_ENCODER_SH_DEGREE = 3
+
+
+def native_initial_scale_from_mean_dist2(
+    mean_dist2: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the recovered visibility-adaptive median cap and distance floor."""
+    median_dist2 = torch.median(mean_dist2)
+    clipped_dist2 = mean_dist2.clamp(max=100.0 * median_dist2)
+    return torch.sqrt(clipped_dist2.clamp(min=1.0e-8))
+
+
+def native_environment_parameters(
+    *,
+    positions: torch.Tensor,
+    center: torch.Tensor,
+    xy_scale: float,
+    z_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return native environmental physical scales and wxyz rotations."""
+    radial = positions - center[None, :]
+    radii = torch.linalg.vector_norm(radial, dim=1)
+    if torch.any(radii <= 0.0):
+        raise ValueError("Environmental points must not equal scene center.")
+    directions = radial / radii[:, None]
+    normalization = float(np.sqrt(positions.shape[0]))
+    physical_scales = torch.stack(
+        (
+            radii * xy_scale / normalization,
+            radii * xy_scale / normalization,
+            radii * z_scale / normalization,
+        ),
+        dim=1,
+    )
+
+    rotations = torch.zeros(
+        (positions.shape[0], 4),
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    rotations[:, 0] = 1.0 + directions[:, 2]
+    rotations[:, 1] = -directions[:, 1]
+    rotations[:, 2] = directions[:, 0]
+    antiparallel = directions[:, 2] <= -1.0 + 1.0e-6
+    rotations[antiparallel] = torch.tensor(
+        (0.0, 1.0, 0.0, 0.0),
+        dtype=positions.dtype,
+        device=positions.device,
+    )
+    rotations = torch.nn.functional.normalize(rotations, dim=1)
+    return physical_scales, rotations
+
+
+def _gabor_carrier_enabled(conf) -> bool:
+    return bool(conf.model.get("use_gabor_carrier", False))
+
+
+
+def _siren_carrier_enabled(conf) -> bool:
+    return bool(conf.model.get("use_siren_carrier", False))
+
+
+def _native_color_encoder_enabled(conf) -> bool:
+    encoder = conf.model.get("native_color_encoder", {})
+    return bool(encoder.get("enabled", False))
+
+
+def _native_color_encoder_latent_dim(conf) -> int:
+    encoder = conf.model.get("native_color_encoder", {})
+    latent_dim = int(encoder.get("latent_dim", 8))
+    if latent_dim <= 0:
+        raise ValueError(
+            "model.native_color_encoder.latent_dim must be positive; "
+            f"got {latent_dim}."
+        )
+    return latent_dim
+
+
+def _native_color_encoder_weight_init_std(conf) -> float:
+    encoder = conf.model.get("native_color_encoder", {})
+    init_std = float(encoder.get("weight_init_std", 0.01))
+    if not np.isfinite(init_std) or init_std <= 0.0:
+        raise ValueError(
+            "model.native_color_encoder.weight_init_std must be finite and "
+            f"positive; got {init_std}."
+        )
+    return init_std
+
+
+def decode_native_color_features(
+    latents: torch.Tensor,
+    encoder: torch.Tensor,
+) -> torch.Tensor:
+    """Decode native per-Gaussian latents into non-DC SH coefficients."""
+    if latents.ndim != 2 or encoder.ndim != 2:
+        raise ValueError("Native color latents and encoder must be matrices.")
+    if latents.shape[1] != encoder.shape[1]:
+        raise ValueError(
+            "Native color latent width must match encoder input width; got "
+            f"{latents.shape[1]} and {encoder.shape[1]}."
+        )
+    return latents @ encoder.transpose(0, 1)
+
+
+def _validate_carrier_config(conf) -> None:
+    enabled_modes = sum(
+        (
+            _gabor_carrier_enabled(conf),
+            _siren_carrier_enabled(conf),
+            _native_color_encoder_enabled(conf),
+        )
+    )
+    if enabled_modes > 1:
+        raise ValueError(
+            "Gabor, SIREN, and native color encoder modes are mutually "
+            "exclusive."
+        )
 
 
 def tensor_prefix_sha256(
@@ -259,6 +391,15 @@ def _estimate_scene_extent_from_points(points: torch.Tensor) -> float:
     return 1.0
 
 
+def position_learning_rate_scale(
+    *, scale_by_scene_extent: bool, scene_extent: float
+) -> float:
+    """Return the position-LR multiplier selected by the training profile."""
+    if scale_by_scene_extent:
+        return scene_extent
+    return 1.0
+
+
 def _subsample_initial_points(
     pts: torch.Tensor,
     rgb: torch.Tensor,
@@ -321,22 +462,33 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
     def get_features_specular(self) -> torch.Tensor:
         if self.feature_type == Features.Type.SH:
+            if _native_color_encoder_enabled(self.conf):
+                return decode_native_color_features(
+                    self.features_specular,
+                    self.color_encoder,
+                )
             return self.features_specular
-        else:
-            raise AttributeError(
-                f"features_specular not available in feature_type='{self.feature_type.name.lower()}' mode"
-            )
+        raise AttributeError(
+            "features_specular not available in "
+            f"feature_type='{self.feature_type.name.lower()}' mode"
+        )
 
-    def get_features(self):
+    def get_features(self) -> torch.Tensor:
         if self.feature_type == Features.Type.SH:
-            return torch.cat((self.features_albedo, self.features_specular), dim=1)
+            return torch.cat(
+                (self.features_albedo, self.get_features_specular()),
+                dim=1,
+            )
         elif self.feature_type == Features.Type.NHT:
-            return self.features  # [N, K]
-        else:
-            raise ValueError(f"Unknown feature_type: {self.feature_type}")
+            return self.features
+        raise ValueError(f"Unknown feature_type: {self.feature_type}")
 
     def _specular_feature_dim(self) -> int:
-        return sh_degree_to_specular_dim(self.max_n_features) + carrier_specular_dim(self.conf)
+        if _native_color_encoder_enabled(self.conf):
+            return _native_color_encoder_latent_dim(self.conf)
+        return sh_degree_to_specular_dim(
+            self.max_n_features
+        ) + carrier_specular_dim(self.conf)
 
     def _with_carrier_tail(self, features_specular: torch.Tensor) -> torch.Tensor:
         """Widen SH-only specular features with freshly initialized carrier slots."""
@@ -394,6 +546,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             "rotation": self.rotation,
             "scale": self.scale,
             "density": self.density,
+            "environment_mask": self.environment_mask,
             "background": self.background.state_dict(),
             # Add other attributes that we need at restore
             "n_active_features": self.n_active_features,
@@ -416,6 +569,12 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         if self.feature_type == Features.Type.SH:
             model_params["features_albedo"] = self.features_albedo
             model_params["features_specular"] = self.features_specular
+            if _native_color_encoder_enabled(self.conf):
+                model_params["color_encoder"] = self.color_encoder
+                if self.color_encoder_optimizer is not None:
+                    model_params["color_encoder_optimizer"] = (
+                        self.color_encoder_optimizer.state_dict()
+                    )
         elif self.feature_type == Features.Type.NHT:
             model_params["features"] = self.features
 
@@ -433,7 +592,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             if expected_hashes != actual_hashes:
                 raise RuntimeError("Protected Gaussian prefix geometry changed before checkpoint save.")
             model_params["protected_gaussian_prefix"] = dict(self._protected_prefix_metadata)
-
         return model_params
 
     def __init__(self, conf, scene_extent=None):
@@ -451,6 +609,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # Consumed by the live GUI for grad-mode visualization. Empty in
         # inference-only loading.
         self._last_grad_norms: dict[str, torch.Tensor] = {}
+        _validate_carrier_config(conf)
+
+        self.feature_type = Features.Type.from_string(
+            self.conf.model.get("feature_type", "sh")
+        )
 
         sh_degree = conf.model.progressive_training.max_n_features
         render_sph_degree = conf.render.particle_radiance_sph_degree
@@ -461,21 +624,32 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 f"Clamping max_n_features to {render_sph_degree}."
             )
             sh_degree = render_sph_degree
-        specular_dim = sh_degree_to_specular_dim(sh_degree) + carrier_specular_dim(conf)
+        if (
+            _native_color_encoder_enabled(conf)
+            and self.feature_type != Features.Type.SH
+        ):
+            raise ValueError("Native color encoder requires feature_type='sh'.")
+        if (
+            _native_color_encoder_enabled(conf)
+            and sh_degree != NATIVE_COLOR_ENCODER_SH_DEGREE
+        ):
+            raise ValueError(
+                f"Native color encoder requires SH degree 3; got {sh_degree}."
+            )
+        if _native_color_encoder_enabled(conf):
+            specular_dim = _native_color_encoder_latent_dim(conf)
+        else:
+            specular_dim = sh_degree_to_specular_dim(
+                sh_degree
+            ) + carrier_specular_dim(conf)
         self.positions = torch.nn.Parameter(
             torch.empty([0, 3])
         )  # Positions of the 3D Gaussians (x, y, z) [n_gaussians, 3]
         self.rotation = torch.nn.Parameter(
             torch.empty([0, 4])
         )  # Rotation of each Gaussian represented as a unit quaternion [n_gaussians, 4]
-        self.scale = torch.nn.Parameter(torch.empty([0, 3]))  # Anisotropic scale of each Gaussian [n_gaussians, 3]
-        self.density = torch.nn.Parameter(torch.empty([0, 1]))  # Density of each Gaussian [n_gaussians, 1]
-
-        # Feature type configuration - determine feature storage mode
-        self.feature_type = Features.Type.from_string(
-            self.conf.model.get("feature_type", "sh")
-        )
-
+        self.scale = torch.nn.Parameter(torch.empty([0, 3]))
+        self.density = torch.nn.Parameter(torch.empty([0, 1]))
         primitive_type = (getattr(conf.render, "primitive_type", None) or "").lower()
         if self.feature_type == Features.Type.NHT and primitive_type == "trisurfel":
             raise ValueError(
@@ -490,7 +664,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.features_specular = torch.nn.Parameter(
                 torch.empty([0, specular_dim])
             )  # Features of the higher order SH coefficients [n_gaussians, specular_dim]
-            self.particle_feature_dim = 3 + specular_dim  # SH coeffs (input to tracer)
+            output_specular_dim = sh_degree_to_specular_dim(sh_degree)
+            self.particle_feature_dim = 3 + output_specular_dim
             self.ray_feature_dim = 3  # RGB output from tracer
         elif self.feature_type == Features.Type.NHT:
             # NHT: per-particle feature vector, decoder maps rendered features -> RGB
@@ -510,42 +685,78 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )  # NHT features [n_gaussians, particle_feature_dim]
         else:
             raise ValueError(f"Unknown feature_type: {self.feature_type}. Must be 'sh' or 'nht'.")
-
+        self.register_buffer(
+            "environment_mask",
+            torch.empty((0,), dtype=torch.bool),
+        )
+        if _native_color_encoder_enabled(conf):
+            output_dim = sh_degree_to_specular_dim(sh_degree)
+            generator = torch.Generator().manual_seed(
+                int(conf.seed_initialization)
+            )
+            encoder = torch.randn(
+                (output_dim, specular_dim),
+                generator=generator,
+            ) * _native_color_encoder_weight_init_std(conf)
+            self.color_encoder = torch.nn.Parameter(encoder)
+        else:
+            self.color_encoder = torch.nn.Parameter(
+                torch.empty(0), requires_grad=False
+            )
         self.max_sh_degree = sh_degree
 
         self.positions_gradient_norm = None
 
         self.device = "cuda"
         self.optimizer = None
-        self.density_activation = get_activation_function(self.conf.model.density_activation)
-        self.density_activation_inv = get_activation_function(self.conf.model.density_activation, inverse=True)
-        self.scale_activation = get_activation_function(self.conf.model.scale_activation)
-        self.scale_activation_inv = get_activation_function(self.conf.model.scale_activation, inverse=True)
-        self.rotation_activation = get_activation_function("normalize")  # The default value of the dim parameter is 1
+        self.color_encoder_optimizer = None
+        self.density_activation = get_activation_function(
+            self.conf.model.density_activation
+        )
+        self.density_activation_inv = get_activation_function(
+            self.conf.model.density_activation,
+            inverse=True,
+        )
+        self.scale_activation = get_activation_function(
+            self.conf.model.scale_activation
+        )
+        self.scale_activation_inv = get_activation_function(
+            self.conf.model.scale_activation,
+            inverse=True,
+        )
+        self.rotation_activation = get_activation_function("normalize")
+        self.background = background.make(
+            self.conf.model.background.name,
+            self.conf.model.background,
+        )
 
-        self.background = background.make(self.conf.model.background.name, self.conf.model.background)
-
-        # Progressive feature training is SH-specific. NHT renders the full learned
-        # harmonic feature vector from the first step, matching the reference.
+        # NHT renders the complete learned feature vector from the first step.
         if self.feature_type == Features.Type.NHT:
             self.n_active_features = self.ray_feature_dim
             self.max_n_features = self.ray_feature_dim
             self.progressive_training = False
         else:
-            self.n_active_features = min(self.conf.model.progressive_training.init_n_features, sh_degree)
-            self.max_n_features = (
-                sh_degree  # For SH, this is the SH degree (clamped if > render.particle_radiance_sph_degree)
+            self.n_active_features = min(
+                self.conf.model.progressive_training.init_n_features,
+                sh_degree,
             )
+            self.max_n_features = sh_degree
             self.progressive_training = False
             if self.n_active_features < self.max_n_features:
-                self.feature_dim_increase_interval = self.conf.model.progressive_training.increase_frequency
-                self.feature_dim_increase_step = self.conf.model.progressive_training.increase_step
+                self.feature_dim_increase_interval = (
+                    self.conf.model.progressive_training.increase_frequency
+                )
+                self.feature_dim_increase_step = (
+                    self.conf.model.progressive_training.increase_step
+                )
                 self.progressive_training = True
 
         if conf.render.method == "3dgrt":
             self.renderer = threedgrt_tracer.Tracer(conf)
         elif conf.render.method == "3dgut":
             self.renderer = threedgut_tracer.Tracer(conf)
+        elif conf.render.method == "native_ewa":
+            self.renderer = native_ewa_renderer.Tracer(conf)
         else:
             raise ValueError(f"Unknown rendering method: {conf.render.method}")
 
@@ -664,6 +875,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         if self.feature_type == Features.Type.SH:
             self.features_albedo.requires_grad = False
             self.features_specular.requires_grad = False
+            if _native_color_encoder_enabled(self.conf):
+                self.color_encoder.requires_grad = False
         elif self.feature_type == Features.Type.NHT:
             self.features.requires_grad = False
 
@@ -836,14 +1049,44 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         assert self.density.shape == (num_gaussians, 1)
         assert self.rotation.shape == (num_gaussians, 4)
         assert self.scale.shape == (num_gaussians, 3)
+        if self.environment_mask.numel() != 0:
+            assert self.environment_mask.dtype == torch.bool
+            assert self.environment_mask.shape == (num_gaussians,)
+            assert (
+                self.environment_mask.device == self.positions.device
+            )
 
         if self.feature_type == Features.Type.SH:
             assert self.features_albedo.shape == (num_gaussians, 3)
-            assert self.features_specular.shape == (num_gaussians, self._specular_feature_dim())
+            assert self.features_specular.shape == (
+                num_gaussians,
+                self._specular_feature_dim(),
+            )
+            if _native_color_encoder_enabled(self.conf):
+                assert self.color_encoder.shape == (
+                    sh_degree_to_specular_dim(self.max_n_features),
+                    self._specular_feature_dim(),
+                )
         elif self.feature_type == Features.Type.NHT:
             assert self.features.shape == (num_gaussians, self.particle_feature_dim)
         else:
             raise ValueError(f"Unknown feature_type: {self.feature_type}")
+
+    def _set_environment_mask(self, mask: torch.Tensor) -> None:
+        """Assign validated structural identity for native environment rows."""
+        if not isinstance(mask, torch.Tensor):
+            raise ValueError("Native environment mask must be a tensor.")
+        if mask.dtype != torch.bool:
+            raise ValueError("Native environment mask must use bool dtype.")
+        if mask.shape != (self.num_gaussians,):
+            raise ValueError(
+                "Native environment mask must have one value per Gaussian."
+            )
+        if mask.device != self.positions.device:
+            raise ValueError(
+                "Native environment mask must share the Gaussian device."
+            )
+        self.environment_mask = mask.detach()
 
     def init_from_colmap(
         self,
@@ -1208,13 +1451,28 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.rotation = checkpoint["rotation"]
         self.scale = checkpoint["scale"]
         self.density = checkpoint["density"]
+        environment_mask = checkpoint.get("environment_mask")
+        if environment_mask is None:
+            if self.conf.strategy.method == "VisibilityAdaptiveStrategy":
+                raise ValueError(
+                    "Visibility-adaptive checkpoint is missing the environment mask."
+                )
+            environment_mask = torch.zeros(
+                (self.positions.shape[0],),
+                dtype=torch.bool,
+                device=self.positions.device,
+            )
+        self._set_environment_mask(environment_mask)
         self.n_active_features = checkpoint["n_active_features"]
         self.max_n_features = checkpoint["max_n_features"]
         self.scene_extent = checkpoint["scene_extent"]
 
         # Load feature dimensions. For NHT, keep config-derived dims (validated above vs checkpoint tensors);
         # stale metadata keys must not override after a successful shape check.
-        if checkpoint_feature_type != Features.Type.NHT:
+        if (
+            checkpoint_feature_type != Features.Type.NHT
+            and not _native_color_encoder_enabled(self.conf)
+        ):
             if "particle_feature_dim" in checkpoint:
                 self.particle_feature_dim = checkpoint["particle_feature_dim"]
             if "ray_feature_dim" in checkpoint:
@@ -1223,6 +1481,13 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         if checkpoint_feature_type == Features.Type.SH:
             self.features_albedo = checkpoint["features_albedo"]
             self.features_specular = torch.nn.Parameter(self._with_carrier_tail(checkpoint["features_specular"]))
+            if _native_color_encoder_enabled(self.conf):
+                color_encoder = checkpoint.get("color_encoder")
+                if color_encoder is None:
+                    raise ValueError(
+                        "Native color encoder checkpoint is missing color_encoder."
+                    )
+                self.color_encoder = torch.nn.Parameter(color_encoder)
         elif checkpoint_feature_type == Features.Type.NHT:
             self.features = checkpoint["features"]
             self.nht_num_interpolation_points = Features(self.conf).num_interpolation_points
@@ -1291,6 +1556,18 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.set_optimizable_parameters()
             self.setup_optimizer(state_dict=checkpoint["optimizer"])
             self.validate_protected_optimizer_state()
+            if self.color_encoder_optimizer is not None:
+                color_encoder_state = checkpoint.get(
+                    "color_encoder_optimizer"
+                )
+                if color_encoder_state is None:
+                    raise ValueError(
+                        "Native checkpoint is missing color encoder "
+                        "optimizer state."
+                    )
+                self.color_encoder_optimizer.load_state_dict(
+                    color_encoder_state
+                )
         self.validate_fields()
 
     def init_from_lidar(self, point_cloud, observer_pts):
@@ -1307,6 +1584,217 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             point_cloud.color,
             use_observer_pts=self.conf.initialization.use_observation_points,
         )
+
+    def init_from_point_set(self, artifact_path: str):
+        """Initialize from a verified point-set artifact."""
+        artifact = load_point_set_artifact(artifact_path)
+        pts = torch.tensor(
+            artifact.positions, dtype=torch.float32, device=self.device
+        )
+        features_albedo = torch.tensor(
+            artifact.sh0, dtype=torch.float32, device=self.device
+        )
+        if artifact.has_materialized_state:
+            assert artifact.density_logits is not None
+            assert artifact.log_scales is not None
+            assert artifact.rotations_wxyz is not None
+            assert artifact.environment_mask is not None
+            self.initialize_materialized_point_set(
+                pts=pts,
+                features_albedo=features_albedo,
+                density_logits=torch.tensor(
+                    artifact.density_logits,
+                    dtype=torch.float32,
+                    device=self.device,
+                )[:, None],
+                log_scales=torch.tensor(
+                    artifact.log_scales,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                rotations_wxyz=torch.tensor(
+                    artifact.rotations_wxyz,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                environment_mask=torch.tensor(
+                    artifact.environment_mask,
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+            )
+            return
+        if artifact.opacity is None:
+            raise ValueError("Seed point-set artifact is missing opacity.")
+        density_values = torch.tensor(
+            artifact.opacity, dtype=torch.float32, device=self.device
+        )[:, None]
+        self.initialize_native_point_set(
+            pts=pts,
+            features_albedo=features_albedo,
+            density_values=density_values,
+            manifest=artifact.manifest,
+        )
+
+    def initialize_materialized_point_set(
+        self,
+        pts: torch.Tensor,
+        features_albedo: torch.Tensor,
+        density_logits: torch.Tensor,
+        log_scales: torch.Tensor,
+        rotations_wxyz: torch.Tensor,
+        environment_mask: torch.Tensor,
+    ) -> None:
+        """Initialize directly from raw Gaussian optimization parameters."""
+        point_count = pts.shape[0]
+        if features_albedo.shape != (point_count, 3):
+            raise ValueError("Point-set SH0 must have shape (N, 3).")
+        if density_logits.shape != (point_count, 1):
+            raise ValueError(
+                "Point-set density logits must have shape (N, 1)."
+            )
+        if log_scales.shape != (point_count, 3):
+            raise ValueError("Point-set log scales must have shape (N, 3).")
+        if rotations_wxyz.shape != (point_count, 4):
+            raise ValueError(
+                "Point-set WXYZ rotations must have shape (N, 4)."
+            )
+        if environment_mask.shape != (point_count,):
+            raise ValueError(
+                "Point-set environment mask must have shape (N,)."
+            )
+        tensors = (
+            pts,
+            features_albedo,
+            density_logits,
+            log_scales,
+            rotations_wxyz,
+        )
+        if not all(torch.isfinite(tensor).all() for tensor in tensors):
+            raise ValueError("Materialized point-set tensors must be finite.")
+        if torch.any(torch.linalg.vector_norm(rotations_wxyz, dim=1) <= 0.0):
+            raise ValueError("Point-set rotations must be nonzero.")
+
+        self.ensure_scene_extent_from_points(pts)
+        num_specular_dims = self._specular_feature_dim()
+        features_specular = torch.zeros(
+            (point_count, num_specular_dims),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if carrier_specular_dim(self.conf) > 0:
+            sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+            features_specular[:, sh_dim:] = initial_carrier_tail(
+                num_gaussians=point_count,
+                device=self.device,
+                dtype=torch.float32,
+                conf=self.conf,
+            )
+
+        self.positions = torch.nn.Parameter(pts)
+        self._set_environment_mask(environment_mask)
+        self.rotation = torch.nn.Parameter(rotations_wxyz)
+        self.scale = torch.nn.Parameter(log_scales)
+        self.density = torch.nn.Parameter(density_logits)
+        self.features_albedo = torch.nn.Parameter(features_albedo)
+        self.features_specular = torch.nn.Parameter(features_specular)
+        self.set_optimizable_parameters()
+        self.setup_optimizer()
+        self.validate_fields()
+
+    def initialize_native_point_set(
+        self,
+        pts: torch.Tensor,
+        features_albedo: torch.Tensor,
+        density_values: torch.Tensor,
+        manifest: dict | None = None,
+    ) -> None:
+        """Initialize parameters with the recovered native point rule."""
+        dtype = torch.float32
+        point_count = pts.shape[0]
+        if features_albedo.shape != (point_count, 3):
+            raise ValueError("Point-set SH0 must have shape (N, 3).")
+        if density_values.shape != (point_count, 1):
+            raise ValueError("Point-set opacity must have shape (N, 1).")
+        if not torch.isfinite(pts).all():
+            raise ValueError("Point-set positions must be finite.")
+        if not torch.isfinite(features_albedo).all():
+            raise ValueError("Point-set SH0 must be finite.")
+        if not torch.all((density_values > 0.0) & (density_values < 1.0)):
+            raise ValueError("Point-set opacity must be in (0, 1).")
+
+        self.ensure_scene_extent_from_points(pts)
+        rotations = torch.zeros(
+            (point_count, 4), dtype=dtype, device=self.device
+        )
+        rotations[:, 0] = 1.0
+
+        count_base = point_count
+        environmental = None
+        if manifest is not None:
+            count_base = int(manifest["count_base"])
+            if count_base <= 0 or count_base >= point_count:
+                raise ValueError(
+                    "Native environmental point set requires base and "
+                    "environment points."
+                )
+            environmental = manifest["environmental"]
+        mean_dist2 = native_simple_knn_mean_dist2(pts[:count_base])
+        initial_scale = native_initial_scale_from_mean_dist2(mean_dist2)
+        base_scales = self.scale_activation_inv(initial_scale)[:, None].repeat(
+            1, 3
+        )
+        if environmental is None:
+            scales = base_scales
+        else:
+            env_positions = pts[count_base:]
+            center = torch.tensor(
+                environmental["center"], dtype=dtype, device=self.device
+            )
+            env_physical_scales, env_rotations = native_environment_parameters(
+                positions=env_positions,
+                center=center,
+                xy_scale=float(environmental["xy_scale"]),
+                z_scale=float(environmental["z_scale"]),
+            )
+            rotations[count_base:] = env_rotations
+            env_scales = self.scale_activation_inv(env_physical_scales)
+            scales = torch.cat((base_scales, env_scales), dim=0)
+
+        num_specular_dims = self._specular_feature_dim()
+        features_specular = torch.zeros(
+            (point_count, num_specular_dims),
+            dtype=dtype,
+            device=self.device,
+        )
+        if carrier_specular_dim(self.conf) > 0:
+            sh_dim = sh_degree_to_specular_dim(self.max_n_features)
+            features_specular[:, sh_dim:] = initial_carrier_tail(
+                num_gaussians=point_count,
+                device=self.device,
+                dtype=dtype,
+                conf=self.conf,
+            )
+
+        self.positions = torch.nn.Parameter(pts)
+        environment_mask = torch.zeros(
+            (point_count,),
+            dtype=torch.bool,
+            device=self.positions.device,
+        )
+        if environmental is not None:
+            environment_mask[count_base:] = True
+        self._set_environment_mask(environment_mask)
+        self.rotation = torch.nn.Parameter(rotations)
+        self.scale = torch.nn.Parameter(scales)
+        self.density = torch.nn.Parameter(
+            self.density_activation_inv(density_values)
+        )
+        self.features_albedo = torch.nn.Parameter(features_albedo)
+        self.features_specular = torch.nn.Parameter(features_specular)
+        self.set_optimizable_parameters()
+        self.setup_optimizer()
+        self.validate_fields()
 
     def default_initialize_from_points(
         self,
@@ -1435,13 +1923,17 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
             # If the module is a torch.nn.Parameter, we can add it to the optimizer
             elif isinstance(module, torch.nn.Parameter):
-                if module.requires_grad:
+                if module.requires_grad and module.numel() > 0:
                     params.append({"params": [module], "name": name, **args})
 
-        optimizer_betas = tuple(float(beta) for beta in self.conf.optimizer.get("betas", (0.9, 0.999)))
+        optimizer_betas = tuple(
+            float(beta)
+            for beta in self.conf.optimizer.get("betas", (0.9, 0.999))
+        )
         if len(optimizer_betas) != 2:
-            raise ValueError("optimizer.betas must contain exactly two values")
+            raise ValueError("optimizer.betas must contain exactly two values.")
 
+        self.color_encoder_optimizer = None
         if self.conf.optimizer.type == "adam":
             self.optimizer = torch.optim.Adam(
                 params,
@@ -1451,7 +1943,12 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             )
             logger.info("🔆 Using Adam optimizer")
         elif self.conf.optimizer.type == "selective_adam":
-            self.optimizer = SelectiveAdam(params, lr=self.conf.optimizer.lr, eps=self.conf.optimizer.eps)
+            self.optimizer = SelectiveAdam(
+                params,
+                lr=self.conf.optimizer.lr,
+                betas=optimizer_betas,
+                eps=self.conf.optimizer.eps,
+            )
             logger.info("🔆 Using Selective Adam optimizer")
         elif self.conf.optimizer.type == "visibility_decayed_adam":
             self.optimizer = VisibilityDecayedAdam(
@@ -1461,14 +1958,66 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
                 eps=self.conf.optimizer.eps,
             )
             logger.info("Using visibility-decayed Adam optimizer")
+        elif self.conf.optimizer.type == "visibility_selective_adam":
+            color_encoder_groups = [
+                group
+                for group in params
+                if group["name"] == "color_encoder"
+            ]
+            params = [
+                group
+                for group in params
+                if group["name"] != "color_encoder"
+            ]
+            self.optimizer = VisibilitySelectiveAdam(
+                params,
+                lr=self.conf.optimizer.lr,
+                betas=optimizer_betas,
+                eps=self.conf.optimizer.eps,
+            )
+            if color_encoder_groups:
+                if len(color_encoder_groups) != 1:
+                    raise ValueError(
+                        "Native color encoder requires one optimizer group."
+                    )
+                color_encoder_group = color_encoder_groups[0]
+                color_encoder_betas = tuple(
+                    float(beta)
+                    for beta in color_encoder_group.get(
+                        "betas", optimizer_betas
+                    )
+                )
+                if len(color_encoder_betas) != 2:
+                    raise ValueError(
+                        "Native color encoder Adam betas must contain two "
+                        "values."
+                    )
+                color_encoder_group["betas"] = color_encoder_betas
+                self.color_encoder_optimizer = FP16GlobalAdam(
+                    [color_encoder_group],
+                    lr=float(color_encoder_group["lr"]),
+                    betas=color_encoder_betas,
+                    eps=float(
+                        color_encoder_group.get(
+                            "eps", self.conf.optimizer.eps
+                        )
+                    ),
+                )
+            logger.info("Using visibility-adaptive Adam optimizer")
         else:
             raise ValueError(f"Unknown optimizer type: {self.conf.optimizer.type}")
 
+        position_lr_scale = position_learning_rate_scale(
+            scale_by_scene_extent=bool(
+                self.conf.optimizer.get(
+                    "scale_position_lr_by_scene_extent", True
+                )
+            ),
+            scene_extent=self.scene_extent,
+        )
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "positions" and bool(
-                self.conf.optimizer.get("scale_position_lr_by_scene_extent", True)
-            ):
-                param_group["lr"] *= self.scene_extent  # Multiply the position lr by the scene scale
+            if param_group["name"] == "positions":
+                param_group["lr"] *= position_lr_scale
 
         self.setup_scheduler()
 
@@ -1495,6 +2044,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
     def setup_scheduler(self):
         self.schedulers = {}
+        position_lr_scale = position_learning_rate_scale(
+            scale_by_scene_extent=bool(
+                self.conf.optimizer.get(
+                    "scale_position_lr_by_scene_extent", True
+                )
+            ),
+            scene_extent=self.scene_extent,
+        )
         for name, args in self.conf.scheduler.items():
             if not hasattr(self, name):
                 continue
@@ -1561,6 +2118,14 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         )
 
     def set_optimizable_parameters(self):
+        if (
+            _native_color_encoder_enabled(self.conf)
+            and self.color_encoder.device != self.positions.device
+        ):
+            self.color_encoder = torch.nn.Parameter(
+                self.color_encoder.to(device=self.positions.device),
+                requires_grad=self.color_encoder.requires_grad,
+            )
         self._initialize_acquisition_appearance()
         self._initialize_acquisition_visibility()
         self._initialize_surface_acquisition_spline()
@@ -1608,6 +2173,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.features_specular.requires_grad = bool(
                 self.conf.model.optimize_features_specular and not freeze_base
             )
+            if _native_color_encoder_enabled(self.conf):
+                self.color_encoder.requires_grad = bool(
+                    self.conf.model.get("optimize_color_encoder", True)
+                    and not freeze_base
+                )
         elif feature_type == Features.Type.NHT:
             # For learned features, check if optimize_features config exists
             self.features.requires_grad = bool(self.conf.model.optimize_features and not freeze_base)
@@ -1869,8 +2439,13 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             if other.feature_type == Features.Type.SH:
                 self.features_albedo = torch.nn.Parameter(other.features_albedo.clone())
                 self.features_specular = torch.nn.Parameter(other.features_specular.clone())
+                if _native_color_encoder_enabled(other.conf):
+                    self.color_encoder = torch.nn.Parameter(
+                        other.color_encoder.clone()
+                    )
             elif other.feature_type == Features.Type.NHT:
                 self.features = torch.nn.Parameter(other.features.clone())
+            self.environment_mask = other.environment_mask.clone()
         else:
             self.positions = torch.nn.Parameter(other.positions)
             self.rotation = torch.nn.Parameter(other.rotation)
@@ -1879,8 +2454,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             if other.feature_type == Features.Type.SH:
                 self.features_albedo = torch.nn.Parameter(other.features_albedo)
                 self.features_specular = torch.nn.Parameter(other.features_specular)
+                if _native_color_encoder_enabled(other.conf):
+                    self.color_encoder = torch.nn.Parameter(other.color_encoder)
             elif other.feature_type == Features.Type.NHT:
                 self.features = torch.nn.Parameter(other.features)
+            self.environment_mask = other.environment_mask
         self.max_sh_degree = other.max_sh_degree
         self.n_active_features = other.n_active_features
         self.scene_extent = other.scene_extent
@@ -1912,6 +2490,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             sliced.features_specular = torch.nn.Parameter(sliced.features_specular[idx])
         elif self.feature_type == Features.Type.NHT:
             sliced.features = torch.nn.Parameter(sliced.features[idx])
+        if sliced.environment_mask.numel() != 0:
+            sliced.environment_mask = sliced.environment_mask[idx]
         return sliced
 
     def __len__(self):

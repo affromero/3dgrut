@@ -2,10 +2,20 @@
 
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
+import torch
 from omegaconf import OmegaConf
-from threedgrut.trainer import Trainer3DGRUT
+import threedgrut.trainer as trainer_module
+from threedgrut.trainer import (
+    SOURCE_SCAN_METRIC_NAMES,
+    Trainer3DGRUT,
+    _group_metric_summary,
+    _group_metric_summary_by_keys,
+    _uses_known_frame_reconstruction_validation,
+    _validate_native_camera_configuration,
+)
 
 
 class _ScalarWriter:
@@ -45,6 +55,249 @@ class _PostProcessing:
     def __init__(self, *, last_epoch: int, activation_step: int) -> None:
         self._ppisp_scheduler = _Scheduler(last_epoch)
         self._controller_activation_step = activation_step
+
+
+class _NativeAppearancePostProcessing:
+    """Minimal native appearance shell for validation-routing tests."""
+
+    use_native_appearance_grid = True
+
+
+def test_checkpoint_serializes_lidar_sampler_state(tmp_path: object) -> None:
+    """LiDAR-enabled checkpoints must resume the exact packet stream."""
+    lidar_state = {
+        "packet_count": 2,
+        "packet_queue": [(0, 3, 1), (1, 7, 0)],
+        "pcg_state": 23,
+        "rng_state": {"state": 29},
+        "source_fingerprint": "fingerprint",
+    }
+    trainer = object.__new__(Trainer3DGRUT)
+    trainer.global_step = 17
+    trainer.n_epochs = 1
+    trainer.tracking = _Tracking(str(tmp_path))
+    trainer.model = SimpleNamespace(
+        get_model_parameters=lambda: {"positions": torch.zeros((1, 3))}
+    )
+    trainer.strategy = SimpleNamespace(get_strategy_parameters=lambda: {})
+    trainer.lidar_ray_sampler = SimpleNamespace(state_dict=lambda: lidar_state)
+    trainer.feature_decoder = None
+    trainer.post_processing = None
+    trainer.camera_residual = None
+    trainer.geometry_only_optimizer = None
+    trainer._pending_geometry_optimizer_state = None
+    trainer.conf = OmegaConf.create(
+        {"checkpoint": {"keep_step_checkpoints": True}}
+    )
+
+    checkpoint_path = trainer.save_checkpoint()
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+
+    assert checkpoint["lidar_supervision"] == lidar_state
+
+
+def test_init_dataloaders_builds_validation_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Validation setup uses the platform-adjusted loader configuration."""
+    train_dataset = object()
+    val_dataset = torch.utils.data.TensorDataset(torch.arange(2))
+
+    def make_datasets(
+        *,
+        name: str,
+        config: object,
+        ray_jitter: object,
+    ) -> tuple[object, torch.utils.data.TensorDataset]:
+        assert name == "colmap"
+        assert config is conf
+        assert ray_jitter is None
+        return train_dataset, val_dataset
+
+    trainer = object.__new__(Trainer3DGRUT)
+    trainer._load_native_image_replay = lambda _conf: None
+    trainer._make_train_dataloader = lambda _conf: "train-loader"
+    conf = OmegaConf.create(
+        {"dataset": {"type": "colmap"}, "num_workers": 0}
+    )
+    monkeypatch.setattr(trainer_module.datasets, "make", make_datasets)
+
+    trainer.init_dataloaders(conf)
+
+    assert trainer.train_dataset is train_dataset
+    assert trainer.train_dataloader == "train-loader"
+    assert trainer.val_dataset is val_dataset
+    assert trainer.val_dataloader.dataset is val_dataset
+    assert trainer.val_dataloader.batch_size == 1
+
+
+def test_run_training_finalizes_before_final_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal topology mutation must precede final rendered metrics."""
+    events: list[str] = []
+
+    def finalize_training() -> bool:
+        events.append("finalize")
+        return True
+
+    trainer = object.__new__(Trainer3DGRUT)
+    trainer.conf = OmegaConf.create(
+        {
+            "render": {"method": "native_ewa"},
+            "camera_residual": {
+                "finite_difference_audit": {
+                    "enabled": False,
+                    "exit_after": False,
+                },
+            },
+            "camera_intrinsics_audit": {
+                "enabled": False,
+                "exit_after": False,
+            },
+            "validate_only": False,
+            "validate_final": True,
+            "n_iterations": 0,
+        }
+    )
+    trainer.model = SimpleNamespace(
+        optimizer=object(),
+        build_acc=lambda *, rebuild: events.append(
+            f"build_acc:{rebuild}"
+        ),
+    )
+    trainer.strategy = SimpleNamespace(finalize_training=finalize_training)
+    trainer.n_epochs = 0
+    trainer.global_step = 0
+    trainer._should_stop_training = False
+    trainer.diagnostics = None
+    trainer.gui = None
+    trainer.run_training_metrics_pass = lambda _conf: (
+        events.append("training_metrics") or {"psnr": [30.0]}
+    )
+    trainer.run_validation_pass = lambda _conf, training_metrics: (
+        events.append("validation") or training_metrics
+    )
+    trainer._handle_validation_checkpointing = lambda _metrics: events.append(
+        "checkpoint"
+    )
+    trainer.on_training_end = lambda: events.append("end")
+    test_logger = SimpleNamespace(
+        finished_tasks={"Training": {"elapsed": 1.0}},
+        log_rule=lambda *_args, **_kwargs: None,
+        start_progress=lambda **_kwargs: None,
+        end_progress=lambda **_kwargs: None,
+        log_table=lambda *_args, **_kwargs: None,
+        info=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(trainer_module, "logger", test_logger)
+
+    trainer.run_training()
+
+    assert events == [
+        "finalize",
+        "build_acc:True",
+        "training_metrics",
+        "validation",
+        "checkpoint",
+        "end",
+    ]
+
+
+def test_native_camera_rejects_pretransformed_world_rays() -> None:
+    """Absolute COLMAP ownership requires unposed camera-space rays."""
+    conf = OmegaConf.create(
+        {
+            "dataset": {
+                "shutter_type": "GLOBAL",
+                "blur_samples": 1,
+                "rs_ray_injection": True,
+            },
+            "post_processing": {"replay_native_extrinsics": False},
+            "camera_residual": {
+                "optimize_global": False,
+                "optimize_per_camera": False,
+                "optimize_per_image": True,
+                "optimize_rolling_per_camera": False,
+                "rotation_lr": 1.0e-5,
+                "translation_lr": 1.0e-3,
+                "eps": 1.0e-7,
+                "reg_lambda": 0.0,
+                "warmup_steps": 0,
+                "lr_end_fraction": 1.0,
+                "betas": [0.8, 0.95],
+                "finite_difference_audit": {"enabled": False},
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="camera-space rays"):
+        _validate_native_camera_configuration(conf)
+
+
+@pytest.mark.parametrize(
+    ("validate_only", "test_split_interval", "holdout_path", "expected"),
+    (
+        (False, 0, None, True),
+        (False, 8, None, False),
+        (False, 0, "holdout.txt", False),
+        (True, 0, None, False),
+    ),
+)
+def test_native_reconstruction_validation_requires_the_training_split(
+    validate_only: bool,
+    test_split_interval: int,
+    holdout_path: str | None,
+    expected: bool,
+) -> None:
+    """Known appearance must never leak into a held-out validation split."""
+    conf = OmegaConf.create(
+        {
+            "validate_only": validate_only,
+            "dataset": {
+                "test_split_interval": test_split_interval,
+                "holdout_image_list_path": holdout_path,
+            },
+        }
+    )
+
+    actual = _uses_known_frame_reconstruction_validation(
+        conf=conf,
+        post_processing=_NativeAppearancePostProcessing(),
+    )
+
+    assert actual is expected
+
+
+def test_optional_metrics_keep_their_own_group_alignment() -> None:
+    """Masked metrics should group only the views carrying a mask."""
+    metrics = {
+        "source_scan_id": ["scan_a", "scan_a", "scan_b"],
+        "camera_idx": [0, 1, 0],
+        "psnr": [10.0, 20.0, 30.0],
+        "masked_psnr": [11.0, 31.0],
+        "masked_psnr_source_scan_id": ["scan_a", "scan_b"],
+        "masked_psnr_camera_idx": [0, 0],
+    }
+
+    by_scan = _group_metric_summary(
+        metrics=metrics,
+        group_key="source_scan_id",
+        metric_names=SOURCE_SCAN_METRIC_NAMES,
+    )
+    by_scan_camera = _group_metric_summary_by_keys(
+        metrics=metrics,
+        group_keys=("source_scan_id", "camera_idx"),
+        metric_names=SOURCE_SCAN_METRIC_NAMES,
+    )
+
+    assert by_scan["scan_a"]["psnr"] == pytest.approx(15.0)
+    assert by_scan["scan_a"]["masked_psnr"] == pytest.approx(11.0)
+    assert by_scan["scan_b"]["masked_psnr"] == pytest.approx(31.0)
+    assert by_scan_camera["scan_a/0"]["masked_psnr"] == pytest.approx(
+        11.0
+    )
+    assert "masked_psnr" not in by_scan_camera["scan_a/1"]
 
 
 def _checkpointing_trainer(saved_paths: list[str]) -> Trainer3DGRUT:

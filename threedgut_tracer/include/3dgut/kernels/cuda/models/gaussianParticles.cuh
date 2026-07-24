@@ -607,8 +607,11 @@ __device__ inline void processHitBwd(
     const float3 gcrod   = SurfelPrimitive ? gro + grd * -gro.z / grd.z : cross(grd, gro);
     const float grayDist = dot(gcrod, gcrod);
 
-    const float gres   = particleResponse<ParticleKernelDegree>(grayDist);
-    const float galpha = fminf(GAUSSIAN_PARTICLE_MAX_ALPHA, gres * particleDensity);
+    const float gres           = particleResponse<ParticleKernelDegree>(grayDist);
+    const float unclampedAlpha = gres * particleDensity;
+    const float galpha = fminf(GAUSSIAN_PARTICLE_MAX_ALPHA, unclampedAlpha);
+    const float alphaGradient =
+        unclampedAlpha < GAUSSIAN_PARTICLE_MAX_ALPHA ? 1.0f : 0.0f;
 
     if ((gres > minParticleKernelDensity) && (galpha > minParticleAlpha)) {
 
@@ -685,11 +688,6 @@ __device__ inline void processHitBwd(
             particleRadianceGradPtr[0] = radianceGrad.x * weight;
             particleRadianceGradPtr[1] = radianceGrad.y * weight;
             particleRadianceGradPtr[2] = radianceGrad.z * weight;
-            if (globalSphCoefficientsPtr) {
-                const float3* coeffs = &globalSphCoefficientsPtr[particleIdx * PARTICLE_RADIANCE_NUM_COEFFS];
-                rayDirectionGrad = rayDirectionGrad + weight * radianceFromSpHDirBwd(
-                    sphEvalDegree, coeffs, rayDirection, radianceGrad);
-            }
         }
 
         // >>> rayRadiance = accumulatedRayRad + weigth * rayRad + (1-galpha)*transmit * residualRayRad
@@ -709,7 +707,7 @@ __device__ inline void processHitBwd(
         //                  transmit * residualRayRad
         // ===> d_rayRad / d_gdns = gres * transmit * grad - gres * transmit * residualRayRad
         particleDensityGradPtr->density =
-            gres * (galphaRayHitGrd + galphaRayDnsGrd + transmittance * (grad.x - residualRayRad.x) * radianceGrad.x +
+            alphaGradient * gres * (galphaRayHitGrd + galphaRayDnsGrd + transmittance * (grad.x - residualRayRad.x) * radianceGrad.x +
                     transmittance * (grad.y - residualRayRad.y) * radianceGrad.y +
                     transmittance * (grad.z - residualRayRad.z) * radianceGrad.z);
 
@@ -724,7 +722,7 @@ __device__ inline void processHitBwd(
         //                  transmit * residualRayRad
         // ===> d_rayRad / d_gres = gdns * transmit * grad - gdns * transmit * residualRayRad
         const float gresGrd =
-            particleDensity * (galphaRayHitGrd + galphaRayDnsGrd + transmittance * (grad.x - residualRayRad.x) * radianceGrad.x +
+            alphaGradient * particleDensity * (galphaRayHitGrd + galphaRayDnsGrd + transmittance * (grad.x - residualRayRad.x) * radianceGrad.x +
                                transmittance * (grad.y - residualRayRad.y) * radianceGrad.y +
                                transmittance * (grad.z - residualRayRad.z) * radianceGrad.z);
 

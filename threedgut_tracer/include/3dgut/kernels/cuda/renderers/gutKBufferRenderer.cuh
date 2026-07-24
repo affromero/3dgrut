@@ -196,7 +196,12 @@ struct GUTKBufferRenderer : Params {
                                                           hitParticle.hitT,
                                                           ray.hitTBackward,
                                                           ray.hitTGradient,
-                                                          canonicalIntersectionGrad);
+                                                          canonicalIntersectionGrad,
+                                                          nullptr,
+                                                          nullptr,
+                                                          nullptr,
+                                                          &ray.originGradient,
+                                                          &ray.directionGradient);
 
             ray.transmittance *= (1.0 - hitParticle.alpha);
 
@@ -210,14 +215,18 @@ struct GUTKBufferRenderer : Params {
             if (particlesResponsibilityPtr != nullptr && hitWeight > 0.0f) {
                 atomicAdd(
                     &particlesResponsibilityPtr[hitParticle.idx], hitWeight);
-                const float diagnostic = rayDiagnosticPtr[ray.idx];
-                if (isfinite(diagnostic)) {
-                    atomicAdd(
-                        &particlesDiagnosticResponsibilityPtr[hitParticle.idx],
-                        hitWeight);
-                    atomicAdd(
-                        &particlesDiagnosticWeightedSumPtr[hitParticle.idx],
-                        hitWeight * diagnostic);
+                if (rayDiagnosticPtr != nullptr &&
+                    particlesDiagnosticResponsibilityPtr != nullptr &&
+                    particlesDiagnosticWeightedSumPtr != nullptr) {
+                    const float diagnostic = rayDiagnosticPtr[ray.idx];
+                    if (isfinite(diagnostic)) {
+                        atomicAdd(
+                            &particlesDiagnosticResponsibilityPtr[hitParticle.idx],
+                            hitWeight);
+                        atomicAdd(
+                            &particlesDiagnosticWeightedSumPtr[hitParticle.idx],
+                            hitWeight * diagnostic);
+                    }
                 }
             }
 
@@ -536,14 +545,18 @@ struct GUTKBufferRenderer : Params {
 
                 if (particlesResponsibilityPtr != nullptr && hitWeight > 0.0f) {
                     atomicAdd(&particlesResponsibilityPtr[particleIdx], hitWeight);
-                    const float diagnostic = rayDiagnosticPtr[ray.idx];
-                    if (isfinite(diagnostic)) {
-                        atomicAdd(
-                            &particlesDiagnosticResponsibilityPtr[particleIdx],
-                            hitWeight);
-                        atomicAdd(
-                            &particlesDiagnosticWeightedSumPtr[particleIdx],
-                            hitWeight * diagnostic);
+                    if (rayDiagnosticPtr != nullptr &&
+                        particlesDiagnosticResponsibilityPtr != nullptr &&
+                        particlesDiagnosticWeightedSumPtr != nullptr) {
+                        const float diagnostic = rayDiagnosticPtr[ray.idx];
+                        if (isfinite(diagnostic)) {
+                            atomicAdd(
+                                &particlesDiagnosticResponsibilityPtr[particleIdx],
+                                hitWeight);
+                            atomicAdd(
+                                &particlesDiagnosticWeightedSumPtr[particleIdx],
+                                hitWeight * diagnostic);
+                        }
                     }
                 }
 
@@ -681,7 +694,12 @@ struct GUTKBufferRenderer : Params {
                                                                                    hitT,
                                                                                    ray.hitTBackward,
                                                                                    ray.hitTGradient,
-                                                                                   canonicalIntersectionGrad);
+                                                                                   canonicalIntersectionGrad,
+                                                                                   nullptr,
+                                                                                   nullptr,
+                                                                                   nullptr,
+                                                                                   &ray.originGradient,
+                                                                                   &ray.directionGradient);
 
                             ray.transmittance *= (1.0f - hitAlpha);
                         }

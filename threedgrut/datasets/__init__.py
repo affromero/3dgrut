@@ -47,10 +47,14 @@ def _load_colmap_exif_exposures(
 
     # Read COLMAP extrinsics to get image names
     try:
-        cameras_extrinsic_file = os.path.join(dataset_path, "sparse/0", "images.bin")
+        cameras_extrinsic_file = os.path.join(
+            dataset_path, "sparse/0", "images.bin"
+        )
         cam_extrinsics = read_colmap_extrinsics_binary(cameras_extrinsic_file)
     except Exception:
-        cameras_extrinsic_file = os.path.join(dataset_path, "sparse/0", "images.txt")
+        cameras_extrinsic_file = os.path.join(
+            dataset_path, "sparse/0", "images.txt"
+        )
         cam_extrinsics = read_colmap_extrinsics_text(cameras_extrinsic_file)
 
     # Build image paths
@@ -81,6 +85,7 @@ def make(name: str, config, ray_jitter):
             )
         case "colmap":
             gsplat_image_downscale = config.dataset.get("gsplat_image_downscale", False)
+            native_image_scale = config.dataset.get("native_image_scale", {})
             # Load EXIF exposure data if enabled (shared between train and val)
             if config.dataset.get("load_exif", True):
                 exif_exposures = _load_colmap_exif_exposures(
@@ -103,8 +108,51 @@ def make(name: str, config, ray_jitter):
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
-                train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
-                holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
+                train_focus_image_list_path=config.dataset.get(
+                    "train_focus_image_list_path", None
+                ),
+                train_focus_image_weight=config.dataset.get(
+                    "train_focus_image_weight", 1.0
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                    and config.dataset.get("rs_ray_injection", True)
+                ),
+                # Exposure-time sampling is a TRAIN-only forward model; the
+                # val dataset stays single-instant so metrics and snapshots
+                # evaluate the sharp underlying scene.
+                blur_samples=int(config.dataset.get("blur_samples", 1)),
+                native_checkpoint_path=config.post_processing.get(
+                    "native_checkpoint_path", ""
+                ),
+                replay_native_extrinsics=config.post_processing.get(
+                    "replay_native_extrinsics", False
+                ),
+                native_extrinsic_max_rotation_deg=config.post_processing.get(
+                    "native_extrinsic_max_rotation_deg", 5.0
+                ),
+                native_extrinsic_max_center_shift_m=config.post_processing.get(
+                    "native_extrinsic_max_center_shift_m", 1.0
+                ),
+                native_image_scale_enabled=native_image_scale.get(
+                    "enabled", False
+                ),
+                native_image_scale=native_image_scale.get("start", 0.05),
+                native_image_min_size=native_image_scale.get("min_size", 160),
+                native_image_max_size=native_image_scale.get("max_size", 5120),
+                native_image_physical_camera_factors=native_image_scale.get(
+                    "physical_camera_factors", ()
+                ),
+                image_horizontal_flip=config.dataset.get(
+                    "image_horizontal_flip", False
+                ),
             )
             val_dataset = ColmapDataset(
                 config.path,
@@ -117,8 +165,43 @@ def make(name: str, config, ray_jitter):
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
-                train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
-                holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                    and config.dataset.get("rs_ray_injection", True)
+                ),
+                native_checkpoint_path=config.post_processing.get(
+                    "native_checkpoint_path", ""
+                ),
+                replay_native_extrinsics=config.post_processing.get(
+                    "replay_native_extrinsics", False
+                ),
+                native_extrinsic_max_rotation_deg=config.post_processing.get(
+                    "native_extrinsic_max_rotation_deg", 5.0
+                ),
+                native_extrinsic_max_center_shift_m=config.post_processing.get(
+                    "native_extrinsic_max_center_shift_m", 1.0
+                ),
+                native_image_scale_enabled=native_image_scale.get(
+                    "enabled", False
+                ),
+                # Native evaluation keeps the immutable physical-camera
+                # factors but does not follow the train resolution schedule.
+                native_image_scale=1.0,
+                native_image_min_size=native_image_scale.get("min_size", 160),
+                native_image_max_size=native_image_scale.get("max_size", 5120),
+                native_image_physical_camera_factors=native_image_scale.get(
+                    "physical_camera_factors", ()
+                ),
+                image_horizontal_flip=config.dataset.get(
+                    "image_horizontal_flip", False
+                ),
             )
         case "scannetpp":
             train_dataset = ScannetppDataset(
@@ -143,28 +226,64 @@ def make(name: str, config, ray_jitter):
                 datapath=config.path,
                 device="cuda",
                 split="train",
-                camera_ids=config.dataset.get("camera_ids", None),  # Null = auto-select single camera sensor
-                lidar_ids=config.dataset.get("lidar_ids", None),  # Null = auto-select single lidar sensor
-                downsample=config.dataset.get("downsample", 1.0),  # Training downsample factor
-                sample_full_image=config.dataset.train.get("sample_full_image", True),
+                camera_ids=config.dataset.get(
+                    "camera_ids", None
+                ),  # Null = auto-select single camera sensor
+                lidar_ids=config.dataset.get(
+                    "lidar_ids", None
+                ),  # Null = auto-select single lidar sensor
+                downsample=config.dataset.get(
+                    "downsample", 1.0
+                ),  # Training downsample factor
+                sample_full_image=config.dataset.train.get(
+                    "sample_full_image", True
+                ),
                 window_size=config.dataset.train.get("window_size", 256),
-                n_samples_per_epoch=config.dataset.train.get("n_samples_per_epoch", 1000),
-                n_train_sample_timepoints=config.dataset.train.get("n_train_sample_timepoints", 1),
-                n_train_sample_camera_rays=config.dataset.train.get("n_train_sample_camera_rays", 4096),
-                n_val_image_subsample=config.dataset.get("n_val_image_subsample", 1),
-                val_frame_interval=config.dataset.get("val_frame_interval", 8),  # Frame-level split
-                seek_offset_sec=config.dataset.train.get("seek_offset_sec", 0.0),
+                n_samples_per_epoch=config.dataset.train.get(
+                    "n_samples_per_epoch", 1000
+                ),
+                n_train_sample_timepoints=config.dataset.train.get(
+                    "n_train_sample_timepoints", 1
+                ),
+                n_train_sample_camera_rays=config.dataset.train.get(
+                    "n_train_sample_camera_rays", 4096
+                ),
+                n_val_image_subsample=config.dataset.get(
+                    "n_val_image_subsample", 1
+                ),
+                val_frame_interval=config.dataset.get(
+                    "val_frame_interval", 8
+                ),  # Frame-level split
+                seek_offset_sec=config.dataset.train.get(
+                    "seek_offset_sec", 0.0
+                ),
                 duration_sec=config.dataset.train.get("duration_sec", None),
-                poses_component_group=config.dataset.get("poses_component_group", "default"),
-                intrinsics_component_group=config.dataset.get("intrinsics_component_group", "default"),
-                masks_component_group=config.dataset.get("masks_component_group", "default"),
-                jpeg_backend_cpu=config.dataset.get("jpeg_backend_cpu", "simplejpeg"),
-                simplejpeg_fastdct=config.dataset.get("simplejpeg_fastdct", False),
-                simplejpeg_fastupsample=config.dataset.get("simplejpeg_fastupsample", False),
-                lidar_color_generic_data_name=config.dataset.get("lidar_color_generic_data_name", "rgb"),
+                poses_component_group=config.dataset.get(
+                    "poses_component_group", "default"
+                ),
+                intrinsics_component_group=config.dataset.get(
+                    "intrinsics_component_group", "default"
+                ),
+                masks_component_group=config.dataset.get(
+                    "masks_component_group", "default"
+                ),
+                jpeg_backend_cpu=config.dataset.get(
+                    "jpeg_backend_cpu", "simplejpeg"
+                ),
+                simplejpeg_fastdct=config.dataset.get(
+                    "simplejpeg_fastdct", False
+                ),
+                simplejpeg_fastupsample=config.dataset.get(
+                    "simplejpeg_fastupsample", False
+                ),
+                lidar_color_generic_data_name=config.dataset.get(
+                    "lidar_color_generic_data_name", "rgb"
+                ),
             )
             # Validation uses same temporal window as training by default
-            train_seek_offset = config.dataset.train.get("seek_offset_sec", 0.0)
+            train_seek_offset = config.dataset.train.get(
+                "seek_offset_sec", 0.0
+            )
             train_duration = config.dataset.train.get("duration_sec", None)
 
             val_config = config.dataset.get("val", {})
@@ -173,30 +292,58 @@ def make(name: str, config, ray_jitter):
 
             # Use training values if validation config is None, -1, or not set
             val_seek_offset = (
-                train_seek_offset if (val_seek_offset_cfg is None or val_seek_offset_cfg < 0) else val_seek_offset_cfg
+                train_seek_offset
+                if (val_seek_offset_cfg is None or val_seek_offset_cfg < 0)
+                else val_seek_offset_cfg
             )
-            val_duration = train_duration if (val_duration_cfg is None or val_duration_cfg < 0) else val_duration_cfg
+            val_duration = (
+                train_duration
+                if (val_duration_cfg is None or val_duration_cfg < 0)
+                else val_duration_cfg
+            )
 
             val_dataset = NCoreDataset(
                 datapath=config.path,
                 device="cuda",
                 split="val",
-                camera_ids=config.dataset.get("camera_ids", None),  # Null = auto-select single camera sensor
-                lidar_ids=config.dataset.get("lidar_ids", None),  # Null = auto-select single lidar sensor
+                camera_ids=config.dataset.get(
+                    "camera_ids", None
+                ),  # Null = auto-select single camera sensor
+                lidar_ids=config.dataset.get(
+                    "lidar_ids", None
+                ),  # Null = auto-select single lidar sensor
                 downsample=config.dataset.get("downsample", 1.0),
                 sample_full_image=True,
                 window_size=config.dataset.get("window_size", 256),
-                n_val_image_subsample=config.dataset.get("n_val_image_subsample", 1),
-                val_frame_interval=config.dataset.get("val_frame_interval", 8),  # Frame-level split
+                n_val_image_subsample=config.dataset.get(
+                    "n_val_image_subsample", 1
+                ),
+                val_frame_interval=config.dataset.get(
+                    "val_frame_interval", 8
+                ),  # Frame-level split
                 seek_offset_sec=val_seek_offset,
                 duration_sec=val_duration,
-                poses_component_group=config.dataset.get("poses_component_group", "default"),
-                intrinsics_component_group=config.dataset.get("intrinsics_component_group", "default"),
-                masks_component_group=config.dataset.get("masks_component_group", "default"),
-                jpeg_backend_cpu=config.dataset.get("jpeg_backend_cpu", "simplejpeg"),
-                simplejpeg_fastdct=config.dataset.get("simplejpeg_fastdct", False),
-                simplejpeg_fastupsample=config.dataset.get("simplejpeg_fastupsample", False),
-                lidar_color_generic_data_name=config.dataset.get("lidar_color_generic_data_name", "rgb"),
+                poses_component_group=config.dataset.get(
+                    "poses_component_group", "default"
+                ),
+                intrinsics_component_group=config.dataset.get(
+                    "intrinsics_component_group", "default"
+                ),
+                masks_component_group=config.dataset.get(
+                    "masks_component_group", "default"
+                ),
+                jpeg_backend_cpu=config.dataset.get(
+                    "jpeg_backend_cpu", "simplejpeg"
+                ),
+                simplejpeg_fastdct=config.dataset.get(
+                    "simplejpeg_fastdct", False
+                ),
+                simplejpeg_fastupsample=config.dataset.get(
+                    "simplejpeg_fastupsample", False
+                ),
+                lidar_color_generic_data_name=config.dataset.get(
+                    "lidar_color_generic_data_name", "rgb"
+                ),
             )
         case _:
             raise ValueError(
@@ -216,6 +363,7 @@ def make_test(name: str, config):
             )
         case "colmap":
             gsplat_image_downscale = config.dataset.get("gsplat_image_downscale", False)
+            native_image_scale = config.dataset.get("native_image_scale", {})
             # Load EXIF exposure data if enabled
             if config.dataset.get("load_exif", True):
                 exif_exposures = _load_colmap_exif_exposures(
@@ -237,8 +385,29 @@ def make_test(name: str, config):
                 normalize_world_space=config.dataset.get("normalize_world_space", False),
                 gsplat_image_downscale=gsplat_image_downscale,
                 depth_folder=config.dataset.get("depth_folder", None),
-                train_exclude_image_list_path=config.dataset.get("train_exclude_image_list_path", None),
-                holdout_image_list_path=config.dataset.get("holdout_image_list_path", None),
+                train_exclude_image_list_path=config.dataset.get(
+                    "train_exclude_image_list_path", None
+                ),
+                holdout_image_list_path=config.dataset.get(
+                    "holdout_image_list_path", None
+                ),
+                shutter_type=config.dataset.get("shutter_type", "GLOBAL"),
+                rs_ray_injection=(
+                    config.render.get("method", "3dgut") == "3dgrt"
+                    and config.dataset.get("rs_ray_injection", True)
+                ),
+                native_image_scale_enabled=native_image_scale.get(
+                    "enabled", False
+                ),
+                native_image_scale=1.0,
+                native_image_min_size=native_image_scale.get("min_size", 160),
+                native_image_max_size=native_image_scale.get("max_size", 5120),
+                native_image_physical_camera_factors=native_image_scale.get(
+                    "physical_camera_factors", ()
+                ),
+                image_horizontal_flip=config.dataset.get(
+                    "image_horizontal_flip", False
+                ),
             )
         case "scannetpp":
             dataset = ScannetppDataset(
@@ -251,7 +420,9 @@ def make_test(name: str, config):
             )
         case "ncore":
             # Inherit temporal window from training by default
-            train_seek_offset = config.dataset.train.get("seek_offset_sec", 0.0)
+            train_seek_offset = config.dataset.train.get(
+                "seek_offset_sec", 0.0
+            )
             train_duration = config.dataset.train.get("duration_sec", None)
 
             val_config = config.dataset.get("val", {})
@@ -260,30 +431,58 @@ def make_test(name: str, config):
 
             # Use training values if validation config is None, -1, or not set
             test_seek_offset = (
-                train_seek_offset if (val_seek_offset_cfg is None or val_seek_offset_cfg < 0) else val_seek_offset_cfg
+                train_seek_offset
+                if (val_seek_offset_cfg is None or val_seek_offset_cfg < 0)
+                else val_seek_offset_cfg
             )
-            test_duration = train_duration if (val_duration_cfg is None or val_duration_cfg < 0) else val_duration_cfg
+            test_duration = (
+                train_duration
+                if (val_duration_cfg is None or val_duration_cfg < 0)
+                else val_duration_cfg
+            )
 
             dataset = NCoreDataset(
                 datapath=config.path,
                 device="cuda",
                 split="val",
-                camera_ids=config.dataset.get("camera_ids", None),  # Null = auto-select single camera sensor
-                lidar_ids=config.dataset.get("lidar_ids", None),  # Null = auto-select single lidar sensor
+                camera_ids=config.dataset.get(
+                    "camera_ids", None
+                ),  # Null = auto-select single camera sensor
+                lidar_ids=config.dataset.get(
+                    "lidar_ids", None
+                ),  # Null = auto-select single lidar sensor
                 downsample=config.dataset.get("downsample", 1.0),
                 sample_full_image=True,
                 window_size=config.dataset.get("window_size", 256),
-                n_val_image_subsample=config.dataset.get("n_val_image_subsample", 1),
-                val_frame_interval=config.dataset.get("val_frame_interval", 8),  # Frame-level split
+                n_val_image_subsample=config.dataset.get(
+                    "n_val_image_subsample", 1
+                ),
+                val_frame_interval=config.dataset.get(
+                    "val_frame_interval", 8
+                ),  # Frame-level split
                 seek_offset_sec=test_seek_offset,
                 duration_sec=test_duration,
-                poses_component_group=config.dataset.get("poses_component_group", "default"),
-                intrinsics_component_group=config.dataset.get("intrinsics_component_group", "default"),
-                masks_component_group=config.dataset.get("masks_component_group", "default"),
-                jpeg_backend_cpu=config.dataset.get("jpeg_backend_cpu", "simplejpeg"),
-                simplejpeg_fastdct=config.dataset.get("simplejpeg_fastdct", False),
-                simplejpeg_fastupsample=config.dataset.get("simplejpeg_fastupsample", False),
-                lidar_color_generic_data_name=config.dataset.get("lidar_color_generic_data_name", "rgb"),
+                poses_component_group=config.dataset.get(
+                    "poses_component_group", "default"
+                ),
+                intrinsics_component_group=config.dataset.get(
+                    "intrinsics_component_group", "default"
+                ),
+                masks_component_group=config.dataset.get(
+                    "masks_component_group", "default"
+                ),
+                jpeg_backend_cpu=config.dataset.get(
+                    "jpeg_backend_cpu", "simplejpeg"
+                ),
+                simplejpeg_fastdct=config.dataset.get(
+                    "simplejpeg_fastdct", False
+                ),
+                simplejpeg_fastupsample=config.dataset.get(
+                    "simplejpeg_fastupsample", False
+                ),
+                lidar_color_generic_data_name=config.dataset.get(
+                    "lidar_color_generic_data_name", "rgb"
+                ),
             )
         case _:
             raise ValueError(

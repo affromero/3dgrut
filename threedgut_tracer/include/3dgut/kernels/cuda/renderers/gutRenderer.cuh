@@ -330,20 +330,56 @@ __global__ void projectBackward(tcnn::uvec2 tileGrid,
                                 const float* __restrict__ particlesGlobalDepthGradPtr,
                                 const float* __restrict__ particlesPrecomputedFeaturesPtr,
                                 const float* __restrict__ particlesPrecomputedFeaturesGradPtr,
-                                const uint64_t* __restrict__ parameterGradientMemoryHandles) {
+                                const uint64_t* __restrict__ parameterGradientMemoryHandles,
+                                tcnn::vec3* __restrict__ sensorWorldPositionGradientPtr) {
 
-    TGUTProjector::evalBackward(tileGrid,
-                                numParticles,
-                                resolution,
-                                sensorModel,
-                                sensorWorldPosition,
-                                sensorViewMatrix,
-                                particlesTilesCountPtr,
-                                {parameterMemoryHandles},
-                                particlesProjectedPositionGradPtr,
-                                particlesProjectedConicOpacityGradPtr,
-                                particlesGlobalDepthGradPtr,
-                                particlesPrecomputedFeaturesPtr,
-                                particlesPrecomputedFeaturesGradPtr,
-                                {parameterGradientMemoryHandles});
+    const tcnn::vec3 sensorWorldPositionGradient =
+        TGUTProjector::evalBackward(
+            tileGrid,
+            numParticles,
+            resolution,
+            sensorModel,
+            sensorWorldPosition,
+            sensorViewMatrix,
+            particlesTilesCountPtr,
+            {parameterMemoryHandles},
+            particlesProjectedPositionGradPtr,
+            particlesProjectedConicOpacityGradPtr,
+            particlesGlobalDepthGradPtr,
+            particlesPrecomputedFeaturesPtr,
+            particlesPrecomputedFeaturesGradPtr,
+            {parameterGradientMemoryHandles});
+
+    static_assert(
+        (threedgut::GUTParameters::Tiling::BlockSize &
+         (threedgut::GUTParameters::Tiling::BlockSize - 1)) == 0,
+        "Project-backward block size must be a power of two.");
+    __shared__ tcnn::vec3 blockSensorWorldPositionGradients[
+        threedgut::GUTParameters::Tiling::BlockSize];
+    blockSensorWorldPositionGradients[threadIdx.x] =
+        sensorWorldPositionGradient;
+    __syncthreads();
+
+    for (uint32_t offset =
+             threedgut::GUTParameters::Tiling::BlockSize / 2;
+         offset > 0;
+         offset >>= 1) {
+        if (threadIdx.x < offset) {
+            blockSensorWorldPositionGradients[threadIdx.x] +=
+                blockSensorWorldPositionGradients[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0 && sensorWorldPositionGradientPtr != nullptr) {
+        atomicAdd(
+            &(*sensorWorldPositionGradientPtr)[0],
+            blockSensorWorldPositionGradients[0][0]);
+        atomicAdd(
+            &(*sensorWorldPositionGradientPtr)[1],
+            blockSensorWorldPositionGradients[0][1]);
+        atomicAdd(
+            &(*sensorWorldPositionGradientPtr)[2],
+            blockSensorWorldPositionGradients[0][2]);
+    }
 }

@@ -101,6 +101,8 @@ public:
                           tcnn::vec3* worldRayOriginGradientCudaPtr,
                           tcnn::vec3* worldRayDirectionGradientCudaPtr,
                           tcnn::vec3* particlePositionGradientAbsCudaPtr,
+                          tcnn::vec3* sensorWorldPositionGradientCudaPtr,
+                          tcnn::vec2* particlesProjectedPositionGradientCudaPtr,
                           Parameters& parameters,
                           int cudaDeviceIndex,
                           cudaStream_t cudaStream);
