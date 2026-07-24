@@ -281,8 +281,8 @@ float integrateHit<let backToFront : bool>(
 
 [BackwardDifferentiable][ForceInline]
 float processHitFromBuffer<let backToFront : bool>(
-    no_diff float3 rayOrigin,
-    no_diff float3 rayDirection,
+    float3 rayOrigin,
+    float3 rayDirection,
     no_diff uint32_t particleIdx,
     no_diff RawParametersBuffer parametersBuffer,
     inout float transmittance,
@@ -326,7 +326,7 @@ float processHitFromBuffer<let backToFront : bool>(
 [BackwardDifferentiable] [ForceInline]
 float3 incidentDirectionFromParameters(
     Parameters parameters,
-    no_diff float3 sourcePosition
+    float3 sourcePosition
 )
 {
     return normalize(parameters.position - sourcePosition);
@@ -336,7 +336,7 @@ float3 incidentDirectionFromParameters(
 float3 incidentDirectionFromBuffer(
     no_diff uint32_t particleIdx,
     no_diff RawParametersBuffer parametersBuffer,
-    no_diff float3 sourcePosition
+    float3 sourcePosition
 )
 {
     return incidentDirectionFromParameters(
@@ -440,7 +440,9 @@ void particleDensityProcessHitBwdToBuffer(
     bool enableNormal,
     in float3 normal,
     inout float3 integratedNormal,
-    inout float3 integratedNormalGrad)
+    inout float3 integratedNormalGrad,
+    inout float3 rayOriginGrad,
+    inout float3 rayDirectionGrad)
 {
     if (alpha > 0.0f)
     {
@@ -463,9 +465,14 @@ void particleDensityProcessHitBwdToBuffer(
             integratedNormalDiff = DifferentialPair<float3>(float3(0), float3(0));
         }
 
+        DifferentialPair<float3> rayOriginDiff =
+            DifferentialPair<float3>(rayOrigin, rayOriginGrad);
+        DifferentialPair<float3> rayDirectionDiff =
+            DifferentialPair<float3>(rayDirection, rayDirectionGrad);
+
         bwd_diff(gaussianParticle.processHitFromBuffer<true>)(
-            rayOrigin,
-            rayDirection,
+            rayOriginDiff,
+            rayDirectionDiff,
             particleIdx,
             commonParameters.parametersBuffer,
             transmittanceDiff,
@@ -481,6 +488,8 @@ void particleDensityProcessHitBwdToBuffer(
         {
             integratedNormalGrad = integratedNormalDiff.getDifferential();
         }
+        rayOriginGrad = rayOriginDiff.getDifferential();
+        rayDirectionGrad = rayDirectionDiff.getDifferential();
     }
 }
 
@@ -552,13 +561,17 @@ bool particleDensityHitInstance(
     in uint32_t particleIdx,
     gaussianParticle.CommonParameters commonParameters,
     in float3 sourcePosition,
-    in float3 incidentDirectionGrad
+    in float3 incidentDirectionGrad,
+    out float3 sourcePositionGrad
 )
 {
+    DifferentialPair<float3> sourcePositionDiff =
+        DifferentialPair<float3>(sourcePosition, float3(0));
     bwd_diff(gaussianParticle.incidentDirectionFromBuffer)(
         particleIdx,
         commonParameters.parametersBuffer,
-        sourcePosition,
+        sourcePositionDiff,
         incidentDirectionGrad
     );
+    sourcePositionGrad = sourcePositionDiff.getDifferential();
 }

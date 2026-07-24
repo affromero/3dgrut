@@ -398,11 +398,10 @@ SplatRaster::traceWithResponsibilityImpl(
     torch::Tensor particleTilesCount            = torch::zeros(
         {numParticles, 1},
         torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    torch::Tensor particleResponsibility = torch::empty({0, 1}, opts);
+    torch::Tensor particleResponsibility = torch::zeros({numParticles, 1}, opts);
     torch::Tensor particleDiagnosticResponsibility = torch::empty({0, 1}, opts);
     torch::Tensor particleDiagnosticWeightedSum = torch::empty({0, 1}, opts);
     if (rayDiagnostic.defined()) {
-        particleResponsibility = torch::zeros({numParticles, 1}, opts);
         particleDiagnosticResponsibility = torch::zeros({numParticles, 1}, opts);
         particleDiagnosticWeightedSum = torch::zeros({numParticles, 1}, opts);
     }
@@ -447,9 +446,7 @@ SplatRaster::traceWithResponsibilityImpl(
         rayDiagnostic.defined()
             ? reinterpret_cast<const float*>(voidDataPtr(rayDiagnostic))
             : nullptr,
-        rayDiagnostic.defined()
-            ? reinterpret_cast<float*>(voidDataPtr(particleResponsibility))
-            : nullptr,
+        reinterpret_cast<float*>(voidDataPtr(particleResponsibility)),
         rayDiagnostic.defined()
             ? reinterpret_cast<float*>(
                   voidDataPtr(particleDiagnosticResponsibility))
@@ -482,7 +479,8 @@ SplatRaster::traceWithResponsibilityImpl(
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor>
 SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
                    torch::Tensor particleDensity,
                    torch::Tensor particleRadiance,
@@ -516,7 +514,8 @@ SplatRaster::trace(uint32_t frameNumber, int numActiveFeatures,
         std::get<4>(result),
         std::get<5>(result),
         std::get<6>(result),
-        std::get<7>(result)};
+        std::get<7>(result),
+        std::get<8>(result)};
 }
 
 SplatRaster::TraceWithResponsibilityResult
@@ -569,7 +568,7 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
     torch::Tensor particlePositionGradientAbs = torch::empty(
         {0, 3},
         particleDensity.options());
-    return traceBwdWithAbs(
+    auto result = traceBwdWithAbs(
         frameNumber,
         numActiveFeatures,
         particleDensity,
@@ -587,9 +586,15 @@ SplatRaster::traceBwd(uint32_t frameNumber, int numActiveFeatures,
         rayHitDistance,
         rayHitDistanceGradient,
         particlePositionGradientAbs);
+    return {
+        std::get<0>(result),
+        std::get<1>(result),
+        std::get<2>(result),
+        std::get<3>(result)};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor>
 SplatRaster::traceBwdWithAbs(uint32_t frameNumber, int numActiveFeatures,
                       torch::Tensor particleDensity,
                       torch::Tensor particleRadiance,
@@ -701,6 +706,9 @@ SplatRaster::traceBwdWithAbs(uint32_t frameNumber, int numActiveFeatures,
     torch::Tensor particleDensityGradient  = torch::zeros({particleDensity.size(0), particleDensity.size(1)}, opts);
     torch::Tensor particleRadianceGradient = torch::zeros({particleRadiance.size(0), particleRadiance.size(1)}, opts);
     torch::Tensor particleRadianceKernel   = particleRadianceKernelTensor(particleRadiance);
+    torch::Tensor sensorWorldPositionGradient = torch::zeros({3}, opts);
+    torch::Tensor particleProjectedPositionGradient =
+        torch::zeros({particleDensity.size(0), 2}, opts);
 
     const bool rayBackpropagation = true;
 
@@ -749,6 +757,8 @@ SplatRaster::traceBwdWithAbs(uint32_t frameNumber, int numActiveFeatures,
         rayBackpropagation ? reinterpret_cast<tcnn::vec3*>(voidDataPtr(rayOriginGradient)) : nullptr,
         rayBackpropagation ? reinterpret_cast<tcnn::vec3*>(voidDataPtr(rayDirectionGradient)) : nullptr,
         reinterpret_cast<tcnn::vec3*>(voidDataPtr(particlePositionGradientAbs)),
+        reinterpret_cast<tcnn::vec3*>(voidDataPtr(sensorWorldPositionGradient)),
+        reinterpret_cast<tcnn::vec2*>(voidDataPtr(particleProjectedPositionGradient)),
         m_parameters, cudaDeviceIndex, cudaStream);
 
     CUDA_CHECK_LAST(m_logger);
@@ -757,8 +767,14 @@ SplatRaster::traceBwdWithAbs(uint32_t frameNumber, int numActiveFeatures,
         timer->stop();
     }
 
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
-        particleDensityGradient, particleRadianceGradient, rayOriginGradient, rayDirectionGradient);
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
+                      torch::Tensor, torch::Tensor, torch::Tensor>(
+        particleDensityGradient,
+        particleRadianceGradient,
+        rayOriginGradient,
+        rayDirectionGradient,
+        sensorWorldPositionGradient,
+        particleProjectedPositionGradient);
 }
 
 std::map<std::string, float>

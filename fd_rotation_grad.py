@@ -105,7 +105,7 @@ def main() -> None:
     g = torch.zeros_like(rd_density)
     g[..., :3] = 1.0
     hit = res[1]
-    _, _, ori_grd, dir_grd = raster.trace_bwd(
+    _, _, ori_grd, dir_grd, _, _ = raster.trace_bwd(
         0, 1, pd, pr, ray_ori, ray_dir, ray_time, sp, 0, 0, pose, pose,
         rd_density, g, hit, torch.zeros_like(hit),
     )

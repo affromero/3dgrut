@@ -17,3 +17,17 @@ holdout_image_list_path: null  # name-based held-out eval (val == these frames)
 shutter_type: GLOBAL  # GLOBAL or ROLLING_TOP_TO_BOTTOM (needs images_end.txt)
 rs_ray_injection: true  # 3dgrt ray path: inject per-pixel world rays (diag toggle)
 blur_samples: 1  # >1: K exposure-time samples per train frame (needs sparse/0/pose_knots.json; renders averaged before the loss; val stays single-instant)
+native_image_scale:
+  enabled: false
+  start: 0.05
+  end: 0.95
+  interval: 3000
+  min_size: 160
+  max_size: 5120
+  physical_camera_factors: []
+native_image_replay:
+  enabled: false
+  trace_path: null
+  age_increment_by_camera: {}
+
+image_horizontal_flip: false

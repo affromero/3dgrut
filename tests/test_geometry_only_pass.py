@@ -8,7 +8,10 @@ from omegaconf import OmegaConf
 
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers.sparse_geometry_adam import SparseGeometryAdam
-from threedgrut.trainer import Trainer3DGRUT
+from threedgrut.trainer import (
+    Trainer3DGRUT,
+    _native_ray_evidence_from_loss,
+)
 
 
 class _GeometryModel:
@@ -95,6 +98,39 @@ def _loss_trainer(*, geometry_enabled: bool) -> Trainer3DGRUT:
     return trainer
 
 
+def test_legacy_loss_config_does_not_require_geometry_only_pass() -> None:
+    """Historical replay configs may predate the optional geometry pass."""
+    loss = OmegaConf.create({"use_depth": False})
+
+    assert _native_ray_evidence_from_loss(loss) is None
+
+
+def test_fixed_image_loss_denominator_uses_legacy_defaults() -> None:
+    """Historical replay configs retain the denominator fallback values."""
+    trainer = _loss_trainer(geometry_enabled=False)
+    trainer.conf.loss.use_fixed_image_loss_denominator = True
+
+    losses = trainer.get_losses(_depth_batch(), _depth_outputs())
+
+    assert torch.isfinite(losses["total_loss"])
+
+
+def test_camera_loss_weights_can_use_physical_camera() -> None:
+    """Physical-camera weighting must not index the per-frame camera id."""
+    trainer = _loss_trainer(geometry_enabled=False)
+    trainer.conf.loss.use_depth = False
+    trainer.conf.loss.use_camera_loss_weights = True
+    trainer.conf.loss.camera_loss_weights = [1.0, 2.0]
+    trainer.conf.loss.camera_loss_weights_use_physical_camera = True
+    batch = _depth_batch()
+    batch.camera_idx = 5
+    batch.post_processing_camera_idx = 1
+
+    losses = trainer.get_losses(batch, _depth_outputs())
+
+    assert losses["camera_loss_weight"].item() == pytest.approx(2.0)
+
+
 def _depth_batch() -> SimpleNamespace:
     return SimpleNamespace(
         rgb_gt=torch.zeros((1, 2, 2, 3)),
@@ -104,8 +140,10 @@ def _depth_batch() -> SimpleNamespace:
         rays_dir=torch.tensor([[[[0.0, 0.0, 1.0]]]]).expand(1, 2, 2, 3),
         rays_in_world_space=False,
         depth_ray_z=None,
+        semantic_mask=None,
         intrinsics_EquirectCameraModelParameters=None,
         camera_idx=0,
+        post_processing_camera_idx=0,
         image_path="camera_0001.png",
     )
 
@@ -220,6 +258,41 @@ def test_l2_image_loss_contributes_to_total_loss() -> None:
     assert losses["total_loss"].item() == pytest.approx(2.0)
     losses["total_loss"].backward()
     assert outputs["pred_rgb"].grad is not None
+
+
+def test_layered_depth_adjoint_reaches_layered_renderer_outputs() -> None:
+    """The optional layered adjoint adds its renderer-facing gradients."""
+    trainer = _loss_trainer(geometry_enabled=False)
+    trainer.conf.loss.use_layered_depth_adjoint = True
+    trainer.conf.loss.use_depth = False
+    batch = _depth_batch()
+    batch.semantic_mask = torch.ones((1, 2, 2, 1), dtype=torch.uint8)
+    outputs = _depth_outputs()
+    outputs.update(
+        {
+            "layered_depth_raw": torch.full(
+                (1, 2, 2, 1),
+                0.07,
+                requires_grad=True,
+            ),
+            "layered_transparency": torch.full(
+                (1, 2, 2, 1),
+                0.05,
+                requires_grad=True,
+            ),
+            "layered_median_depth": torch.full(
+                (1, 2, 2, 1),
+                0.1,
+                requires_grad=True,
+            ),
+        }
+    )
+
+    losses = trainer.get_losses(batch, outputs)
+    losses["total_loss"].backward()
+
+    assert outputs["layered_transparency"].grad is not None
+    assert torch.count_nonzero(outputs["layered_transparency"].grad) > 0
 
 
 def _validation_trainer() -> Trainer3DGRUT:

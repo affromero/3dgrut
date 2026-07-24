@@ -15,10 +15,15 @@
 # limitations under the License.
 
 import copy
+import hashlib
 import json
 import os
+import platform
+from collections.abc import Iterable
+from numbers import Integral
 from typing import Optional
 
+import cv2
 import ncore.sensors
 import numpy as np
 import torch
@@ -34,6 +39,8 @@ from torch.utils.data import Dataset
 from threedgrut.utils.logger import logger
 
 from .colmap_gsplat import normalize_world_space, scene_scale
+from .native_checkpoint import load_native_checkpoint
+from .native_image_replay import NativeImageSelection
 from .protocols import Batch, BoundedMultiViewDataset, DatasetVisualization
 from .rs_rays import build_rs_world_rays
 from .utils import (
@@ -83,8 +90,6 @@ def _interp_c2w_knots(slerp, rel_stamps, translations, query_stamps):
     for axis in range(3):
         matrices[:, axis, 3] = np.interp(query_stamps, rel_stamps, translations[:, axis])
     return matrices
-
-
 def _get_relative_paths(path_dir: str) -> list[str]:
     paths = []
     for dirpath, _, filenames in os.walk(path_dir):
@@ -169,6 +174,16 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         shutter_type: str = "GLOBAL",
         rs_ray_injection: bool = False,
         blur_samples: int = 1,
+        native_checkpoint_path: str = "",
+        replay_native_extrinsics: bool = False,
+        native_extrinsic_max_rotation_deg: float = 5.0,
+        native_extrinsic_max_center_shift_m: float = 1.0,
+        native_image_scale_enabled: bool = False,
+        native_image_scale: float = 1.0,
+        native_image_min_size: int = 160,
+        native_image_max_size: int = 5120,
+        native_image_physical_camera_factors: Iterable[float] = (),
+        image_horizontal_flip: bool = False,
     ):
         self.path = path
         self.device = device
@@ -192,6 +207,25 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.rs_ray_injection = rs_ray_injection
         self.blur_samples = int(blur_samples)
         self.preserve_soft_training_masks = self._validate_soft_training_mask_contract()
+        self.native_checkpoint_path = native_checkpoint_path
+        self.replay_native_extrinsics = bool(replay_native_extrinsics)
+        self.native_extrinsic_max_rotation_deg = float(
+            native_extrinsic_max_rotation_deg
+        )
+        self.native_extrinsic_max_center_shift_m = float(
+            native_extrinsic_max_center_shift_m
+        )
+        self.native_image_scale_enabled = bool(native_image_scale_enabled)
+        self.native_image_scale = float(native_image_scale)
+        self.native_image_min_size = int(native_image_min_size)
+        self.native_image_max_size = int(native_image_max_size)
+        self.native_image_physical_camera_factors = tuple(
+            float(factor) for factor in native_image_physical_camera_factors
+        )
+        self.image_horizontal_flip = bool(
+            image_horizontal_flip
+        )
+        self._validate_native_image_scale()
         if self.blur_samples < 1:
             raise ValueError(f"blur_samples must be >= 1, got {self.blur_samples}.")
         if self.blur_samples > 1 and not rs_ray_injection:
@@ -210,6 +244,163 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # (Re)load intrinsics and extrinsics
         self.reload()
 
+    def _validate_native_image_scale(self) -> None:
+        if any(
+            not np.isfinite(factor) or factor <= 0.0
+            for factor in self.native_image_physical_camera_factors
+        ):
+            raise ValueError(
+                "Native physical-camera image factors must be finite and "
+                "positive."
+            )
+        if not self.native_image_scale_enabled:
+            return
+        if self.native_image_scale <= 0.0:
+            raise ValueError("Native image scale must be positive.")
+        if self.native_image_min_size <= 0:
+            raise ValueError("Native minimum image size must be positive.")
+        if self.native_image_max_size < self.native_image_min_size:
+            raise ValueError(
+                "Native maximum image size must be at least the minimum."
+            )
+
+    def _validate_native_physical_camera_factors(self) -> None:
+        factors = self.native_image_physical_camera_factors
+        if not self.native_image_scale_enabled or not factors:
+            return
+        physical_camera_count = len(self._post_processing_camera_key_to_idx)
+        if len(factors) != physical_camera_count:
+            raise ValueError(
+                "Native physical-camera image factors must contain one "
+                f"value per physical camera; got {len(factors)} for "
+                f"{physical_camera_count} cameras."
+            )
+
+    def _native_physical_camera_factor(
+        self, physical_camera_index: int | None
+    ) -> float:
+        factors = self.native_image_physical_camera_factors
+        if not self.native_image_scale_enabled or not factors:
+            return 1.0
+        if physical_camera_index is None:
+            raise ValueError(
+                "Native image scaling requires a physical-camera index "
+                "when physical-camera factors are configured."
+            )
+        if not 0 <= physical_camera_index < len(factors):
+            raise ValueError(
+                "Native physical-camera index is out of range: "
+                f"{physical_camera_index} for {len(factors)} factors."
+            )
+        return factors[physical_camera_index]
+
+    def set_native_image_scale(self, scale: float) -> bool:
+        if not self.native_image_scale_enabled:
+            return False
+        scale = float(scale)
+        if scale <= 0.0:
+            raise ValueError("Native image scale must be positive.")
+        if scale == self.native_image_scale:
+            return False
+        self.native_image_scale = scale
+        self._worker_gpu_cache.clear()
+        return True
+
+    def effective_native_image_scale(
+        self,
+        width: int,
+        height: int,
+        *,
+        physical_camera_index: int | None = None,
+    ) -> float:
+        if not self.native_image_scale_enabled:
+            return 1.0
+        physical_camera_factor = self._native_physical_camera_factor(
+            physical_camera_index
+        )
+        scale = min(
+            self.native_image_scale * physical_camera_factor,
+            self.native_image_max_size / width,
+            self.native_image_max_size / height,
+        )
+        return max(
+            scale,
+            self.native_image_min_size / width,
+            self.native_image_min_size / height,
+        )
+
+    def native_image_size(
+        self,
+        width: int,
+        height: int,
+        *,
+        physical_camera_index: int | None = None,
+    ) -> tuple[int, int, float]:
+        scale = self.effective_native_image_scale(
+            width,
+            height,
+            physical_camera_index=physical_camera_index,
+        )
+        return round(width * scale), round(height * scale), scale
+
+    def _apply_native_checkpoint_extrinsics(self) -> None:
+        """Replace COLMAP W2C poses with native optimized poses."""
+        if not self.replay_native_extrinsics:
+            return
+        if not self.native_checkpoint_path:
+            raise ValueError(
+                "replay_native_extrinsics requires native_checkpoint_path."
+            )
+        source_names = tuple(extr.name for extr in self.cam_extrinsics)
+        checkpoint = load_native_checkpoint(
+            self.native_checkpoint_path,
+            source_image_names=source_names,
+        )
+        rotation_deltas = []
+        center_deltas = []
+        replayed = []
+        for extrinsic in self.cam_extrinsics:
+            native = checkpoint.images_by_name[extrinsic.name]
+            base_rotation = qvec_to_so3(extrinsic.qvec)
+            native_rotation = qvec_to_so3(native.qvec)
+            base_qvec = np.asarray(extrinsic.qvec, dtype=np.float64)
+            base_qvec = base_qvec / np.linalg.norm(base_qvec)
+            native_qvec = native.qvec / np.linalg.norm(native.qvec)
+            cosine = np.clip(
+                abs(float(np.dot(native_qvec, base_qvec))), 0.0, 1.0
+            )
+            rotation_deltas.append(float(np.degrees(2.0 * np.arccos(cosine))))
+            base_center = -base_rotation.T @ np.asarray(extrinsic.tvec)
+            native_center = -native_rotation.T @ native.tvec
+            center_deltas.append(
+                float(np.linalg.norm(native_center - base_center))
+            )
+            replayed.append(
+                extrinsic._replace(qvec=native.qvec, tvec=native.tvec)
+            )
+        max_rotation = max(rotation_deltas, default=0.0)
+        max_center = max(center_deltas, default=0.0)
+        if max_rotation > self.native_extrinsic_max_rotation_deg:
+            raise ValueError(
+                "Native checkpoint rotation delta exceeds replay guard: "
+                f"{max_rotation:.6f} deg > "
+                f"{self.native_extrinsic_max_rotation_deg:.6f} deg."
+            )
+        if max_center > self.native_extrinsic_max_center_shift_m:
+            raise ValueError(
+                "Native checkpoint camera-center delta exceeds replay guard: "
+                f"{max_center:.6f} m > "
+                f"{self.native_extrinsic_max_center_shift_m:.6f} m."
+            )
+        self.cam_extrinsics = replayed
+        logger.info(
+            "📷 Native extrinsic replay: "
+            f"rotation median={np.median(rotation_deltas):.6f} deg, "
+            f"max={max_rotation:.6f} deg; center median="
+            f"{np.median(center_deltas) * 1000.0:.3f} mm, "
+            f"max={max_center * 1000.0:.3f} mm"
+        )
+
     def reload(self):
         # GPU cache of processed camera intrinsics - now per camera ID
         self.intrinsics = {}
@@ -217,6 +408,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         # Get the scene data
         self.load_intrinsics_and_extrinsics()
+        self._apply_native_checkpoint_extrinsics()
         frame_indices_before_split = self._filter_cameras()
 
         # Build mapping from COLMAP camera_id to 0-based contiguous index
@@ -225,12 +417,35 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self._camera_id_to_idx = {cam_id: idx for idx, cam_id in enumerate(sorted_camera_ids)}
         physical_camera_keys = sorted({self._post_processing_camera_key(extr) for extr in self.cam_extrinsics})
         self._post_processing_camera_key_to_idx = {key: idx for idx, key in enumerate(physical_camera_keys)}
+        self._validate_native_physical_camera_factors()
 
         self.n_frames = len(self.cam_extrinsics)
         self.load_camera_data()
         if self.normalize_world_space:
             self._apply_world_space_normalization()
-        indices = np.arange(self.n_frames)
+        frame_indices = np.arange(self.n_frames)
+        indices = np.ones(self.n_frames, dtype=bool)
+        self.source_frame_count = self.n_frames
+        self.source_frame_indices = frame_indices.copy()
+        source_names = "\n".join(extr.name for extr in self.cam_extrinsics)
+        self.source_frame_names = tuple(
+            extr.name for extr in self.cam_extrinsics
+        )
+        self.source_frame_qvecs = np.stack(
+            [
+                np.asarray(extr.qvec, dtype=np.float32)
+                for extr in self.cam_extrinsics
+            ]
+        )
+        self.source_frame_tvecs = np.stack(
+            [
+                np.asarray(extr.tvec, dtype=np.float32)
+                for extr in self.cam_extrinsics
+            ]
+        )
+        self.source_frame_manifest_hash = hashlib.sha256(
+            source_names.encode("utf-8")
+        ).hexdigest()
 
         # A name-based holdout list takes precedence over the positional
         # test_split_interval. The COLMAP reader sorts frames by name, so a
@@ -263,11 +478,15 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # If test_split_interval is non-positive, all images will be used for training and testing
         elif self.test_split_interval > 0:
             if self.split == "train":
-                indices = np.mod(indices, self.test_split_interval) != 0
+                indices = np.mod(frame_indices, self.test_split_interval) != 0
             else:
-                indices = np.mod(indices, self.test_split_interval) == 0
+                indices = np.mod(frame_indices, self.test_split_interval) == 0
 
-        self.cam_extrinsics = [self.cam_extrinsics[i] for i in np.where(indices)[0]]
+        selected_indices = np.where(indices)[0]
+        self.source_frame_indices = self.source_frame_indices[indices]
+        self.cam_extrinsics = [
+            self.cam_extrinsics[i] for i in selected_indices
+        ]
         self.poses = self.poses[indices].astype(np.float32)
         if self.poses_end is not None:
             self.poses_end = self.poses_end[indices].astype(np.float32)
@@ -360,6 +579,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         if self.depth_paths is not None:
             self.depth_paths = self.depth_paths[keep]
         self.camera_centers = self.camera_centers[keep]
+        self.source_frame_indices = self.source_frame_indices[keep]
         if self.exif_exposures is not None:
             self.exif_exposures = [exposure for exposure, keep_item in zip(self.exif_exposures, keep) if keep_item]
 
@@ -531,6 +751,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         colmap_mask_path = os.path.join(self.path, self.get_masks_folder(), image_name)
         if os.path.exists(colmap_mask_path):
             return colmap_mask_path
+        colmap_png_mask_path = os.path.splitext(colmap_mask_path)[0] + ".png"
+        if os.path.exists(colmap_png_mask_path):
+            return colmap_png_mask_path
         return os.path.splitext(image_path)[0] + "_mask.png"
 
     def _validate_soft_training_mask_contract(self) -> bool:
@@ -691,10 +914,20 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 focal_length=np.asarray(focal_length, dtype=np.float32),
                 radial_coeffs=np.asarray(radial_coeffs, dtype=np.float32),
                 tangential_coeffs=np.asarray(tangential_coeffs, dtype=np.float32),
-                thin_prism_coeffs=np.asarray(thin_prism_coeffs, dtype=np.float32),
+                thin_prism_coeffs=np.asarray(
+                    thin_prism_coeffs,
+                    dtype=np.float32,
+                ),
             )
-            camera_model = ncore.sensors.CameraModel.from_parameters(params, device="cpu", dtype=torch.float32)
-            int_pixel_coords = torch.tensor(np.stack([u, v], axis=1), dtype=torch.int32)
+            camera_model = ncore.sensors.CameraModel.from_parameters(
+                params,
+                device="cpu",
+                dtype=torch.float32,
+            )
+            int_pixel_coords = torch.tensor(
+                np.stack([u, v], axis=1),
+                dtype=torch.int32,
+            )
             image_points = camera_model.pixels_to_image_points(int_pixel_coords)
             rays_d_cam = camera_model.image_points_to_camera_rays(image_points)
             rays_o_cam = torch.zeros_like(rays_d_cam)
@@ -994,7 +1227,9 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 "SPHERICAL",
                 "OPENCV_SPHERICAL",
             ):
-                self.intrinsics[intr.id] = create_equirect_camera(width, height)
+                self.intrinsics[intr.id] = create_equirect_camera(
+                    width, height
+                )
 
             else:
                 assert False, (
@@ -1191,6 +1426,24 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         )
         return [key for key, _ in ordered_keys]
 
+    def get_source_frame_count(self) -> int:
+        """Return the pre-split frame count used by per-image parameters."""
+        return self.source_frame_count
+
+    def get_source_frame_manifest_hash(self) -> str:
+        """Return the ordered pre-split image-name fingerprint."""
+        return self.source_frame_manifest_hash
+
+    def get_source_frame_names(self) -> tuple[str, ...]:
+        """Return pre-split image names in stable source-frame order."""
+        return self.source_frame_names
+
+    def get_source_frame_colmap_extrinsics(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return pre-split absolute COLMAP qvecs and tvecs."""
+        return self.source_frame_qvecs.copy(), self.source_frame_tvecs.copy()
+
     def get_frames_per_camera(self) -> list[int]:
         """Return list of frame counts per camera.
 
@@ -1258,10 +1511,45 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         return int(digits)
 
     @torch.cuda.nvtx.range("colmap_dataset::_getitem")
-    def __getitem__(self, idx) -> dict:
-        # Load image and get its actual dimensions
+    def __getitem__(self, idx: int | NativeImageSelection) -> dict:
+        selection = idx if isinstance(idx, NativeImageSelection) else None
+        if selection is not None:
+            if not self.native_image_scale_enabled:
+                raise ValueError(
+                    "Native image replay requires native image scaling."
+                )
+            idx = selection.ordinal
+        if (
+            not isinstance(idx, Integral)
+            or idx < 0
+            or idx >= len(self.image_paths)
+        ):
+            raise IndexError(f"Invalid COLMAP image index: {idx!r}.")
+        idx = int(idx)
         image_data = _read_rgb_image_array(self.image_paths[idx])
-        actual_h, actual_w = image_data.shape[:2]
+        source_h, source_w = image_data.shape[:2]
+        physical_camera_index = self.get_post_processing_camera_idx(idx)
+        if selection is None:
+            actual_w, actual_h, image_scale = self.native_image_size(
+                source_w,
+                source_h,
+                physical_camera_index=physical_camera_index,
+            )
+        else:
+            actual_w = selection.width
+            actual_h = selection.height
+            image_scale = min(
+                actual_w / source_w,
+                actual_h / source_h,
+            )
+        if (actual_w, actual_h) != (source_w, source_h):
+            image_data = cv2.resize(
+                image_data,
+                (actual_w, actual_h),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        if self.image_horizontal_flip:
+            image_data = np.ascontiguousarray(np.fliplr(image_data))
 
         assert image_data.dtype == np.uint8, "Image data must be of type uint8"
 
@@ -1270,10 +1558,22 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "pose": torch.tensor(self.poses[idx]).unsqueeze(0),
             "intr": self.get_intrinsics_idx(idx),
             "camera_idx": self.get_camera_idx(idx),
-            "post_processing_camera_idx": self.get_post_processing_camera_idx(idx),
+            "post_processing_camera_idx": physical_camera_index,
             "frame_idx": idx,
-            "sequence_idx": self._sequence_idx_from_path(self.image_paths[idx]),
+            "source_frame_idx": int(self.source_frame_indices[idx]),
+            "sequence_idx": self._sequence_idx_from_path(
+                self.image_paths[idx]
+            ),
             "image_path": self.image_paths[idx],
+            "native_image_scale": image_scale,
+            "image_width": actual_w,
+            "image_height": actual_h,
+            "native_replay_sequence": (
+                selection.sequence if selection is not None else -1
+            ),
+            "native_replay_subindex": (
+                selection.subindex if selection is not None else -1
+            ),
         }
 
         if self.poses_end is not None:
@@ -1281,14 +1581,42 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         # Only add mask to dictionary if it exists
         if os.path.exists(mask_path := self.mask_paths[idx]):
-            mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, actual_h, actual_w, 1)
+            with Image.open(mask_path) as mask_image:
+                mask_array = np.array(mask_image.convert("L"), copy=True)
+            if mask_array.shape != (actual_h, actual_w):
+                mask_array = cv2.resize(
+                    mask_array,
+                    (actual_w, actual_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            if self.image_horizontal_flip:
+                mask_array = np.ascontiguousarray(np.fliplr(mask_array))
+            mask = torch.from_numpy(mask_array).reshape(
+                1, actual_h, actual_w, 1
+            )
             output_dict["mask"] = mask
 
         if self.sky_mask_paths is not None:
             sky_mask_path = self.sky_mask_paths[idx]
             if not os.path.exists(sky_mask_path):
-                raise FileNotFoundError(f"Sky mask sidecar not found: {sky_mask_path}")
-            sky_mask = torch.from_numpy(np.array(Image.open(sky_mask_path).convert("L"))).reshape(
+                raise FileNotFoundError(
+                    f"Sky mask sidecar not found: {sky_mask_path}"
+                )
+            with Image.open(sky_mask_path) as sky_mask_image:
+                sky_mask_array = np.array(
+                    sky_mask_image.convert("L"), copy=True
+                )
+            if sky_mask_array.shape != (actual_h, actual_w):
+                sky_mask_array = cv2.resize(
+                    sky_mask_array,
+                    (actual_w, actual_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            if self.image_horizontal_flip:
+                sky_mask_array = np.ascontiguousarray(
+                    np.fliplr(sky_mask_array)
+                )
+            sky_mask = torch.from_numpy(sky_mask_array).reshape(
                 1, actual_h, actual_w, 1
             )
             output_dict["sky_mask"] = sky_mask
@@ -1302,15 +1630,27 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             if depth.ndim == 3 and depth.shape[-1] == 1:
                 depth = depth[..., 0]
             if depth.ndim != 2:
-                raise ValueError(f"Depth sidecar must be HxW or HxWx1: {depth_path}")
-            if depth.shape != (actual_h, actual_w):
                 raise ValueError(
-                    "Depth sidecar resolution must match the training image: "
+                    f"Depth sidecar must be HxW or HxWx1: {depth_path}"
+                )
+            if depth.shape != (source_h, source_w):
+                raise ValueError(
+                    "Depth sidecar resolution must match the source image: "
                     f"{depth_path} has {depth.shape}, expected "
-                    f"{(actual_h, actual_w)} for {self.image_paths[idx]}"
+                    f"{(source_h, source_w)} for {self.image_paths[idx]}"
                 )
             depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-            output_dict["depth_gt"] = torch.from_numpy(depth).reshape(1, depth.shape[0], depth.shape[1], 1)
+            if depth.shape != (actual_h, actual_w):
+                depth = cv2.resize(
+                    depth,
+                    (actual_w, actual_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            if self.image_horizontal_flip:
+                depth = np.ascontiguousarray(np.fliplr(depth))
+            output_dict["depth_gt"] = torch.from_numpy(depth).reshape(
+                1, depth.shape[0], depth.shape[1], 1
+            )
 
         # Add EXIF exposure if available for this frame
         if self.exif_exposures is not None and self.exif_exposures[idx] is not None:
@@ -1354,6 +1694,72 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             bundle_dirs.append(dir_k)
         return torch.cat(bundle_oris, dim=0), torch.cat(bundle_dirs, dim=0)
 
+    def _native_scaled_intrinsics(
+        self,
+        intr: int,
+        scale: float,
+        width: int,
+        height: int,
+    ):
+        worker_id = get_worker_id()
+        cache_key = (intr, scale, width, height)
+        worker_cache = self._worker_gpu_cache.setdefault(worker_id, {})
+        if cache_key in worker_cache:
+            return worker_cache[cache_key]
+
+        params, _, _, camera_name, _ = self.intrinsics[intr]
+        if camera_name != "OpenCVPinholeCameraModelParameters":
+            raise ValueError(
+                "Native image scaling currently requires PINHOLE COLMAP "
+                f"cameras, got {camera_name} for camera {intr}."
+            )
+        source_resolution = np.asarray(params["resolution"])
+        axis_scale = np.array(
+            [
+                width / int(source_resolution[0]),
+                height / int(source_resolution[1]),
+            ],
+            dtype=np.float32,
+        )
+        focal_length = np.asarray(params["focal_length"]) * axis_scale
+        principal_point = np.asarray(params["principal_point"]) * axis_scale
+        scaled_params = copy.deepcopy(params)
+        scaled_params["resolution"] = np.array(
+            [width, height], dtype=np.uint64
+        )
+        scaled_params["focal_length"] = focal_length.astype(np.float32)
+        scaled_params["principal_point"] = principal_point.astype(np.float32)
+
+        u = np.tile(np.arange(width), height)
+        v = np.arange(height).repeat(width)
+        rays_o, rays_d = pinhole_camera_rays(
+            u,
+            v,
+            float(focal_length[0]),
+            float(focal_length[1]),
+            width,
+            height,
+            self.ray_jitter,
+            cx=float(principal_point[0]),
+            cy=float(principal_point[1]),
+        )
+        shape = (1, height, width, 3)
+        scaled = (
+            scaled_params,
+            torch.tensor(rays_o, dtype=torch.float32)
+            .reshape(shape)
+            .to(self.device, non_blocking=True),
+            torch.tensor(rays_d, dtype=torch.float32)
+            .reshape(shape)
+            .to(self.device, non_blocking=True),
+            camera_name,
+            create_pixel_coords(width, height).to(
+                self.device, non_blocking=True
+            ),
+        )
+        worker_cache[cache_key] = scaled
+        return scaled
+
     def get_gpu_batch_with_intrinsics(self, batch):
         """Add the intrinsics to the batch and move data to GPU."""
 
@@ -1364,10 +1770,41 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         assert data.dtype == torch.float32
         assert pose.dtype == torch.float32
 
-        # Get intrinsics for current worker
-        worker_intrinsics = self._lazy_worker_intrinsics_cache()
+        image_scale = 1.0
+        if self.native_image_scale_enabled:
+            image_scale = float(
+                self._first_scalar(batch["native_image_scale"])
+            )
+            image_width = int(self._first_scalar(batch["image_width"]))
+            image_height = int(self._first_scalar(batch["image_height"]))
+            (
+                camera_params_dict,
+                rays_ori,
+                rays_dir,
+                camera_name,
+                pixel_coords,
+            ) = self._native_scaled_intrinsics(
+                intr,
+                image_scale,
+                image_width,
+                image_height,
+            )
+        else:
+            worker_intrinsics = self._lazy_worker_intrinsics_cache()
+            (
+                camera_params_dict,
+                rays_ori,
+                rays_dir,
+                camera_name,
+                pixel_coords,
+            ) = worker_intrinsics[intr]
 
-        camera_params_dict, rays_ori, rays_dir, camera_name, pixel_coords = worker_intrinsics[intr]
+        source_frame_idx = batch.get("source_frame_idx")
+        if source_frame_idx is None:
+            raise ValueError(
+                "COLMAP batches require source_frame_idx to preserve stable "
+                "pre-split frame identity."
+            )
 
         sample = {
             "rgb_gt": data,
@@ -1376,10 +1813,19 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             "T_to_world": pose,
             f"intrinsics_{camera_name}": camera_params_dict,
             "camera_idx": int(self._first_scalar(batch["camera_idx"])),
-            "post_processing_camera_idx": int(self._first_scalar(batch["post_processing_camera_idx"])),
+            "post_processing_camera_idx": int(
+                self._first_scalar(
+                    batch.get(
+                        "post_processing_camera_idx",
+                        batch["camera_idx"],
+                    )
+                )
+            ),
             "frame_idx": int(self._first_scalar(batch["frame_idx"])),
+            "source_frame_idx": int(self._first_scalar(source_frame_idx)),
             "sequence_idx": int(self._first_scalar(batch["sequence_idx"])),
             "image_path": batch["image_path"][0],
+            "native_image_scale": image_scale,
             "pixel_coords": pixel_coords,
         }
 
@@ -1441,8 +1887,14 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             sample["rays_in_world_space"] = True
 
         if "mask" in batch:
+            semantic_mask = batch["mask"][0].to(
+                self.device,
+                dtype=torch.uint8,
+                non_blocking=True,
+            )
+            sample["semantic_mask"] = semantic_mask
             mask = self._normalize_training_mask(
-                batch["mask"][0].to(self.device, non_blocking=True),
+                semantic_mask,
                 preserve_soft_weights=(
                     self.preserve_soft_training_masks
                     and self.split == "train"

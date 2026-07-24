@@ -177,6 +177,15 @@ class MultiEpochsDataLoader(torch.utils.data.DataLoader):
         for i in range(len(self)):
             yield next(self.iterator)
 
+    def shutdown(self) -> None:
+        iterator = getattr(self, "iterator", None)
+        if iterator is None:
+            return
+        shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+        if shutdown_workers is not None:
+            shutdown_workers()
+        self.iterator = None
+
 
 class _RepeatSampler(object):
     """Sampler that repeats forever.

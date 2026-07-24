@@ -32,6 +32,7 @@ class Batch:
     depth_ray_z: Optional[torch.Tensor] = None  # [B, H, W, 1] |ray_z| in camera space
     range_return_weight: Optional[torch.Tensor] = None  # [B, H, W, 1] per-pixel loss weight
     mask: Optional[torch.Tensor] = None
+    semantic_mask: Optional[torch.Tensor] = None
     sky_mask: Optional[torch.Tensor] = None
     intrinsics: Optional[list] = None
     intrinsics_OpenCVPinholeCameraModelParameters: Optional[dict] = None
@@ -42,9 +43,11 @@ class Batch:
     # Camera/frame indices for post-processing
     camera_idx: int = -1  # 0-based camera index
     post_processing_camera_idx: int = -1  # physical-camera index
-    frame_idx: int = -1  # 0-based frame index (global across split)
+    frame_idx: int = -1  # 0-based frame index within the active split
+    source_frame_idx: int = -1  # 0-based frame index before dataset splitting
     sequence_idx: int = -1  # Parsed scanner sequence index from image name
     image_path: str = ""  # Source image path for logging and diagnostics
+    native_image_scale: float = 1.0  # Effective native resize scale for loss normalization
     # Pixel coordinates for post-processing
     pixel_coords: Optional[torch.Tensor] = None  # [B, H, W, 2] (x, y) with +0.5 center offset
     # Exposure prior from EXIF metadata (mean-normalized log2 exposure [1], None if unavailable)
@@ -52,8 +55,14 @@ class Batch:
 
     def __post_init__(self):
         batch_size = self.T_to_world.shape[0]
-        assert self.rays_ori.shape[0] == batch_size, "rays_ori must have the same batch size"
-        assert self.rays_dir.shape[0] == batch_size, "rays_dir must have the same batch size"
+        # Exposure-time blur sampling stacks K world-space ray bundles per
+        # input frame, while the ground-truth batch remains one frame wide.
+        assert self.rays_ori.shape[0] % batch_size == 0, (
+            "rays_ori batch must be a multiple of the pose batch size"
+        )
+        assert self.rays_dir.shape[0] == self.rays_ori.shape[0], (
+            "rays_dir must match the rays_ori batch size"
+        )
         if self.rgb_gt is not None:
             assert self.rgb_gt.ndim == 4, "rgb_gt must be a 4D tensor [B, H, W, 3]"
             assert self.rgb_gt.shape[0] == batch_size, "rgb_gt must have the same batch size"
@@ -69,6 +78,26 @@ class Batch:
         if self.mask is not None:
             assert self.mask.ndim == 4, "mask must be a 3D tensor [B, H, W, 1]"
             assert self.mask.shape[0] == batch_size, "mask must have the same batch size"
+        if self.semantic_mask is not None:
+            assert self.semantic_mask.ndim == 4, (
+                "semantic_mask must be a 4D tensor [B, H, W, 1]"
+            )
+            assert self.semantic_mask.shape[0] == batch_size, (
+                "semantic_mask must have the same batch size"
+            )
+            assert self.semantic_mask.shape[-1] == 1, (
+                "semantic_mask must have one channel"
+            )
+            assert self.semantic_mask.dtype == torch.uint8, (
+                "semantic_mask must preserve uint8 class labels"
+            )
+        if self.sky_mask is not None:
+            assert self.sky_mask.ndim == 4, (
+                "sky_mask must be a 4D tensor [B, H, W, 1]"
+            )
+            assert self.sky_mask.shape[0] == batch_size, (
+                "sky_mask must have the same batch size"
+            )
         if self.intrinsics:
             assert isinstance(self.intrinsics, list), "intrinsics must be a list"
             assert len(self.intrinsics) == 4, "intrinsics must have 4 elements [fx, fy, cx, cy]"
@@ -76,6 +105,11 @@ class Batch:
             assert self.pixel_coords.ndim == 4, "pixel_coords must be a 4D tensor [B, H, W, 2]"
             assert self.pixel_coords.shape[0] == batch_size, "pixel_coords must have the same batch size"
             assert self.pixel_coords.shape[3] == 2, "pixel_coords last dimension must be 2 (x, y)"
+        if (
+            not np.isfinite(self.native_image_scale)
+            or self.native_image_scale <= 0.0
+        ):
+            raise ValueError("native_image_scale must be finite and positive.")
 
 
 class BoundedMultiViewDataset(Protocol):
@@ -119,6 +153,10 @@ class BoundedMultiViewDataset(Protocol):
 
     def get_camera_idx(self, frame_idx: int) -> int:
         """Return 0-based camera index for a given train split frame index."""
+        ...
+
+    def get_intrinsics_idx(self, frame_idx: int) -> int:
+        """Return the stable source-camera identifier for a frame."""
         ...
 
     def get_frames_per_camera(self) -> list[int]:
