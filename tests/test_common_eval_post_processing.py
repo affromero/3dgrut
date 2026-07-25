@@ -1083,6 +1083,23 @@ def test_luminance_restore_is_exact_and_records_manifest() -> None:
         assert torch.equal(restored.state_dict()[key], value)
 
 
+def test_luminance_restore_infers_legacy_native_appearance_grid() -> None:
+    """Serialized native-grid weights restore without a legacy config key."""
+    source = LuminanceAffine(
+        num_cameras=1,
+        num_frames=2,
+        use_native_appearance_grid=True,
+    )
+    checkpoint = _luminance_checkpoint(source.state_dict())
+
+    restored = load_checkpoint_post_processing(checkpoint, device="cpu")
+
+    assert restored is not None
+    assert restored.use_native_appearance_grid is True
+    for key, value in source.state_dict().items():
+        assert torch.equal(restored.state_dict()[key], value)
+
+
 def test_luminance_restore_rejects_shape_mismatch() -> None:
     """Scientific evaluation never interpolates or drops learned state."""
     source = LuminanceAffine(num_cameras=1, num_frames=2)

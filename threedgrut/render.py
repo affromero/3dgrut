@@ -497,7 +497,24 @@ def load_checkpoint_post_processing(
     elif method == "luminance_affine":
         state = post_processing_state["module"]
         num_cameras = state["camera_log_gain"].shape[0]
-        num_frames = state["frame_log_gain"].shape[0]
+        native_weight_key = "native_appearance_grid.embedding.weight"
+        use_native_appearance_grid = bool(
+            conf.post_processing.get("use_native_appearance_grid", False)
+            or native_weight_key in state
+        )
+        if use_native_appearance_grid:
+            if native_weight_key not in state:
+                raise ValueError(
+                    "LuminanceAffine checkpoint enables the native appearance "
+                    "grid but does not contain its embedding weights."
+                )
+            num_frames = state[native_weight_key].shape[0]
+            native_appearance_fp16 = (
+                state[native_weight_key].dtype == torch.float16
+            )
+        else:
+            num_frames = state["frame_log_gain"].shape[0]
+            native_appearance_fp16 = False
         post_processing = LuminanceAffine(
             num_cameras=num_cameras,
             num_frames=num_frames,
@@ -545,6 +562,12 @@ def load_checkpoint_post_processing(
                 "use_residual_grid",
                 False,
             ),
+            use_frame_residual_grid=conf.post_processing.get(
+                "use_frame_residual_grid",
+                False,
+            ),
+            use_native_appearance_grid=use_native_appearance_grid,
+            native_appearance_fp16=native_appearance_fp16,
             residual_grid_size=conf.post_processing.get(
                 "residual_grid_size",
                 32,
