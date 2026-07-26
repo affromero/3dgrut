@@ -2092,7 +2092,7 @@ class Trainer3DGRUT:
         ):
             return _positive_loss_scale(
                 loss_conf=self.conf.loss,
-                key="native_xgrids_rgb_gradient_scale",
+                key="reference_replay_radiance_gradient_scale",
                 default=1.0,
             )
         return _positive_loss_scale(

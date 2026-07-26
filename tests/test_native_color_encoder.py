@@ -153,14 +153,14 @@ def test_native_rgb_gradient_scale_skips_geometry_grads() -> None:
     )
 
 
-def test_reference_replay_uses_archived_radiance_gradient_scale() -> None:
+def test_reference_replay_uses_its_radiance_gradient_scale() -> None:
     """Reference replay honors the archived radiance-gradient setting."""
     trainer = object.__new__(Trainer3DGRUT)
     trainer.conf = OmegaConf.create(
         {
             "loss": {
                 "radiance_gradient_scale": 1.0,
-                "native_xgrids_rgb_gradient_scale": 0.5,
+                "reference_replay_radiance_gradient_scale": 0.5,
             },
             "strategy": {"reference_replay": True},
         }
