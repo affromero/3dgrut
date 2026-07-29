@@ -19,6 +19,7 @@ import collections
 import math
 import multiprocessing
 import platform
+import re
 import struct
 from dataclasses import dataclass
 from typing import Sequence
@@ -27,6 +28,10 @@ import numpy as np
 import torch
 
 DEFAULT_DEVICE = torch.device("cuda")
+_DATALOADER_WORKER_SIGABRT_PATTERN = re.compile(
+    r"DataLoader worker \(pid(?:s)? [^)]+\) is killed by signal: "
+    r"Aborted\.?\s*"
+)
 
 
 def fov2focal(fov_radians: float, pixels: int):
@@ -182,9 +187,16 @@ class MultiEpochsDataLoader(torch.utils.data.DataLoader):
         if iterator is None:
             return
         shutdown_workers = getattr(iterator, "_shutdown_workers", None)
-        if shutdown_workers is not None:
-            shutdown_workers()
-        self.iterator = None
+        try:
+            if shutdown_workers is not None:
+                shutdown_workers()
+        finally:
+            self.iterator = None
+
+
+def is_dataloader_worker_sigabrt_error(error: RuntimeError) -> bool:
+    """Return whether PyTorch reported a worker SIGABRT during teardown."""
+    return _DATALOADER_WORKER_SIGABRT_PATTERN.fullmatch(str(error)) is not None
 
 
 class _RepeatSampler(object):

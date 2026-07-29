@@ -1,12 +1,16 @@
 """Behavior tests for recovered visibility-adaptive densification primitives."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
-from threedgrut.optimizers.visibility_selective_adam import VisibilitySelectiveAdam
+from threedgrut.optimizers.visibility_selective_adam import (
+    VisibilitySelectiveAdam,
+)
 from threedgrut.strategy.visibility_adaptive import (
     VISIBILITY_ADAPTIVE_CHILD_OFFSET,
     VISIBILITY_ADAPTIVE_COHERENCE_INTERVAL,
@@ -33,8 +37,8 @@ from threedgrut.strategy.visibility_adaptive import (
     visibility_adaptive_preprocess_gradients,
     visibility_adaptive_projected_gradient_pixels,
     visibility_adaptive_projected_radius_pixels,
-    visibility_adaptive_projected_size_pixels,
     visibility_adaptive_projected_size_from_weight,
+    visibility_adaptive_projected_size_pixels,
     visibility_adaptive_regular_prune_keep_mask,
     visibility_adaptive_split_children,
     visibility_adaptive_split_opacity,
@@ -42,6 +46,28 @@ from threedgrut.strategy.visibility_adaptive import (
     visibility_adaptive_topology_schedule,
     visibility_adaptive_update_point_status,
 )
+
+
+def test_visibility_adaptive_config_accepts_accumulation_source_override() -> (
+    None
+):
+    """Expose replay accumulation selection through the structured config."""
+    config_dir = str((Path(__file__).parent / ".." / "configs").resolve())
+    with initialize_config_dir(
+        config_dir=config_dir,
+        version_base=None,
+    ):
+        config = compose(
+            config_name="apps/colmap_3dgut",
+            overrides=[
+                "strategy=visibility_adaptive",
+                "strategy.accumulation_weight_source=rendered_weight",
+                "loss.reference_replay_radiance_gradient_scale=0.5",
+            ],
+        )
+
+    assert config.strategy.accumulation_weight_source == "rendered_weight"
+    assert config.loss.reference_replay_radiance_gradient_scale == 0.5
 
 
 class _NativeStrategyModel:

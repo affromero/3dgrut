@@ -758,11 +758,11 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
     def resolve_mask_path(self, image_path, image_name):
         colmap_mask_path = os.path.join(self.path, self.get_masks_folder(), image_name)
-        if os.path.exists(colmap_mask_path):
-            return colmap_mask_path
         colmap_png_mask_path = os.path.splitext(colmap_mask_path)[0] + ".png"
         if os.path.exists(colmap_png_mask_path):
             return colmap_png_mask_path
+        if os.path.exists(colmap_mask_path):
+            return colmap_mask_path
         return os.path.splitext(image_path)[0] + "_mask.png"
 
     def _validate_soft_training_mask_contract(self) -> bool:
@@ -1720,9 +1720,13 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             return worker_cache[cache_key]
 
         params, _, _, camera_name, _ = self.intrinsics[intr]
-        if camera_name != "OpenCVPinholeCameraModelParameters":
+        supported_camera_names = {
+            "OpenCVPinholeCameraModelParameters",
+            "OpenCVFisheyeCameraModelParameters",
+        }
+        if camera_name not in supported_camera_names:
             raise ValueError(
-                "Native image scaling currently requires PINHOLE COLMAP "
+                "Native image scaling requires pinhole or fisheye COLMAP "
                 f"cameras, got {camera_name} for camera {intr}."
             )
         source_resolution = np.asarray(params["resolution"])
@@ -1744,26 +1748,54 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         u = np.tile(np.arange(width), height)
         v = np.arange(height).repeat(width)
-        rays_o, rays_d = pinhole_camera_rays(
-            u,
-            v,
-            float(focal_length[0]),
-            float(focal_length[1]),
-            width,
-            height,
-            self.ray_jitter,
-            cx=float(principal_point[0]),
-            cy=float(principal_point[1]),
-        )
+        if camera_name == "OpenCVPinholeCameraModelParameters":
+            rays_o, rays_d = pinhole_camera_rays(
+                u,
+                v,
+                float(focal_length[0]),
+                float(focal_length[1]),
+                width,
+                height,
+                self.ray_jitter,
+                cx=float(principal_point[0]),
+                cy=float(principal_point[1]),
+            )
+            rays_o_tensor = torch.tensor(rays_o, dtype=torch.float32)
+            rays_d_tensor = torch.tensor(rays_d, dtype=torch.float32)
+        else:
+            fisheye_params = OpenCVFisheyeCameraModelParameters(
+                resolution=np.array([width, height], dtype=np.uint64),
+                shutter_type=ShutterType[params["shutter_type"]],
+                principal_point=principal_point.astype(np.float32),
+                focal_length=focal_length.astype(np.float32),
+                radial_coeffs=np.asarray(
+                    params["radial_coeffs"], dtype=np.float32
+                ),
+                max_angle=float(params["max_angle"]),
+            )
+            camera_model = ncore.sensors.CameraModel.from_parameters(
+                fisheye_params,
+                device="cpu",
+                dtype=torch.float32,
+            )
+            pixel_indices = torch.tensor(
+                np.stack([u, v], axis=1),
+                dtype=torch.int32,
+            )
+            image_points = camera_model.pixels_to_image_points(pixel_indices)
+            rays_d_tensor = camera_model.image_points_to_camera_rays(
+                image_points
+            )
+            rays_o_tensor = torch.zeros_like(rays_d_tensor)
         shape = (1, height, width, 3)
         scaled = (
             scaled_params,
-            torch.tensor(rays_o, dtype=torch.float32)
-            .reshape(shape)
-            .to(self.device, non_blocking=True),
-            torch.tensor(rays_d, dtype=torch.float32)
-            .reshape(shape)
-            .to(self.device, non_blocking=True),
+            rays_o_tensor.reshape(shape).to(
+                self.device, non_blocking=True
+            ),
+            rays_d_tensor.reshape(shape).to(
+                self.device, non_blocking=True
+            ),
             camera_name,
             create_pixel_coords(width, height).to(
                 self.device, non_blocking=True

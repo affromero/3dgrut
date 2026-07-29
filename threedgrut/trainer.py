@@ -44,7 +44,12 @@ from threedgrut.datasets.native_image_replay import (
 )
 from threedgrut.datasets.protocols import Batch, BoundedMultiViewDataset
 from threedgrut.datasets.native_ray_evidence import NativeRayEvidence
-from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
+from threedgrut.datasets.utils import (
+    DEFAULT_DEVICE,
+    MultiEpochsDataLoader,
+    PointCloud,
+    is_dataloader_worker_sigabrt_error,
+)
 from threedgrut.lidar_supervision import (
     LidarRaySampler,
     native_lidar_loss,
@@ -2649,7 +2654,15 @@ class Trainer3DGRUT:
         if not changed:
             return
         old_dataloader = self.train_dataloader
-        old_dataloader.shutdown()
+        try:
+            old_dataloader.shutdown()
+        except RuntimeError as error:
+            if not is_dataloader_worker_sigabrt_error(error):
+                raise
+            logger.warning(
+                "Ignoring a DataLoader worker SIGABRT while intentionally "
+                f"retiring the native-scale loader: {error}"
+            )
         self.train_dataloader = self._make_train_dataloader(conf)
         del old_dataloader
         logger.info(

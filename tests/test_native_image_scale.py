@@ -3,13 +3,18 @@
 import numpy as np
 import pytest
 import torch
-from ncore.data import OpenCVPinholeCameraModelParameters, ShutterType
+from ncore.data import (
+    OpenCVFisheyeCameraModelParameters,
+    OpenCVPinholeCameraModelParameters,
+    ShutterType,
+)
 from omegaconf import OmegaConf
 from PIL import Image
 from threedgrut import datasets
 from threedgrut.datasets import dataset_colmap
 from threedgrut.datasets.dataset_colmap import ColmapDataset
 from threedgrut.datasets.native_image_replay import NativeImageSelection
+from threedgrut.datasets.utils import MultiEpochsDataLoader
 from threedgrut.trainer import Trainer3DGRUT
 
 
@@ -163,6 +168,32 @@ def test_colmap_mask_resolution_accepts_stem_matched_png(
     assert resolved == expected
 
 
+def test_colmap_mask_resolution_prefers_lossless_png(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prefer a lossless sidecar when both JPEG and PNG masks exist."""
+    dataset = ColmapDataset.__new__(ColmapDataset)
+    dataset.path = "/dataset"
+    dataset.downsample_factor = 1
+    expected = "/dataset/masks/map_0/camera_1/frame.png"
+    available = {
+        expected,
+        "/dataset/masks/map_0/camera_1/frame.jpg",
+    }
+    monkeypatch.setattr(
+        dataset_colmap.os.path,
+        "exists",
+        lambda path: path in available,
+    )
+
+    resolved = dataset.resolve_mask_path(
+        "/dataset/images/map_0/camera_1/frame.jpg",
+        "map_0/camera_1/frame.jpg",
+    )
+
+    assert resolved == expected
+
+
 def test_native_image_factors_validate_mapping_and_lookup() -> None:
     """Positional factors must exactly match the physical-camera mapping."""
     dataset = make_scale_dataset(factors=(1.0, 0.6666667))
@@ -221,6 +252,47 @@ def test_native_scaled_pinhole_intrinsics_use_rounded_axis_ratios() -> None:
     )
     np.testing.assert_array_equal(scaled["resolution"], [167, 160])
     assert directions.shape == (1, 160, 167, 3)
+    assert pixels.shape[-3:-1] == (160, 167)
+
+
+def test_native_scaled_fisheye_intrinsics_use_rounded_axis_ratios() -> None:
+    """Scale fisheye intrinsics while preserving its angular calibration."""
+    dataset = make_scale_dataset()
+    params = OpenCVFisheyeCameraModelParameters(
+        resolution=np.array([3200, 3061], dtype=np.uint64),
+        shutter_type=ShutterType.GLOBAL,
+        principal_point=np.array([1552.35, 1754.39], dtype=np.float32),
+        focal_length=np.array([915.64, 918.97], dtype=np.float32),
+        radial_coeffs=np.array(
+            [0.01, -0.001, 0.0001, -0.00001],
+            dtype=np.float32,
+        ),
+        max_angle=2.8,
+    ).to_dict()
+    dataset.intrinsics = {
+        2: (params, None, None, "OpenCVFisheyeCameraModelParameters", None)
+    }
+    scale = 160 / 3061
+
+    scaled, origins, directions, name, pixels = (
+        dataset._native_scaled_intrinsics(2, scale, 167, 160)
+    )
+
+    np.testing.assert_allclose(
+        scaled["focal_length"],
+        np.asarray(params["focal_length"]) * [167 / 3200, 160 / 3061],
+    )
+    np.testing.assert_allclose(
+        scaled["principal_point"],
+        np.asarray(params["principal_point"]) * [167 / 3200, 160 / 3061],
+    )
+    np.testing.assert_array_equal(scaled["resolution"], [167, 160])
+    assert scaled["radial_coeffs"] == params["radial_coeffs"]
+    assert scaled["max_angle"] == params["max_angle"]
+    assert origins.shape == (1, 160, 167, 3)
+    assert directions.shape == (1, 160, 167, 3)
+    assert torch.isfinite(directions).all()
+    assert name == "OpenCVFisheyeCameraModelParameters"
     assert pixels.shape[-3:-1] == (160, 167)
 
 
@@ -428,3 +500,134 @@ def test_native_scale_replacement_shuts_down_prefetched_loader_first() -> None:
     )
 
     assert events == ["scale:0.077", "shutdown", "replace"]
+
+
+def test_native_scale_replacement_retires_spawned_workers() -> None:
+    """Replace a real worker-backed loader and iterate its successor."""
+
+    class ScaleDataset:
+        def set_native_image_scale(self, scale: float) -> bool:
+            assert scale == 0.077
+            return True
+
+    def make_loader() -> MultiEpochsDataLoader:
+        dataset = torch.utils.data.TensorDataset(torch.arange(8))
+        return MultiEpochsDataLoader(
+            dataset,
+            batch_size=2,
+            num_workers=2,
+            persistent_workers=True,
+            multiprocessing_context="spawn",
+        )
+
+    trainer = Trainer3DGRUT.__new__(Trainer3DGRUT)
+    trainer.train_dataset = ScaleDataset()
+    trainer.train_dataloader = make_loader()
+    trainer.global_step = 3000
+    old_workers = tuple(trainer.train_dataloader.iterator._workers)
+    trainer._make_train_dataloader = lambda _conf: make_loader()
+
+    try:
+        trainer._replace_train_dataloader_for_native_scale(
+            OmegaConf.create({}),
+            0.077,
+        )
+        batch = next(iter(trainer.train_dataloader))
+
+        assert batch[0].numel() == 2
+        assert all(not worker.is_alive() for worker in old_workers)
+    finally:
+        trainer.train_dataloader.shutdown()
+
+
+def test_loader_shutdown_clears_iterator_when_worker_retirement_fails() -> None:
+    """Release a failed iterator so its destructor cannot repeat shutdown."""
+
+    class FailingIterator:
+        def _shutdown_workers(self) -> None:
+            message = (
+                "DataLoader worker (pid 1234) is killed by signal: Aborted."
+            )
+            raise RuntimeError(message)
+
+    loader = MultiEpochsDataLoader.__new__(MultiEpochsDataLoader)
+    loader.iterator = FailingIterator()
+
+    with pytest.raises(RuntimeError, match="signal: Aborted"):
+        loader.shutdown()
+
+    assert loader.iterator is None
+    loader.shutdown()
+
+
+def test_native_scale_replacement_tolerates_retiring_worker_sigabrt() -> None:
+    """A retiring worker cannot discard completed scale-segment updates."""
+    events: list[str] = []
+
+    class FakeDataset:
+        def set_native_image_scale(self, scale: float) -> bool:
+            events.append(f"scale:{scale}")
+            return True
+
+    class AbortingLoader:
+        def shutdown(self) -> None:
+            events.append("shutdown")
+            message = (
+                "DataLoader worker (pid 1234) is killed by signal: Aborted."
+            )
+            raise RuntimeError(message)
+
+    class ReplacementLoader:
+        pass
+
+    trainer = Trainer3DGRUT.__new__(Trainer3DGRUT)
+    trainer.train_dataset = FakeDataset()
+    trainer.train_dataloader = AbortingLoader()
+    trainer.global_step = 3000
+
+    def make_loader(_conf: object) -> ReplacementLoader:
+        events.append("replace")
+        return ReplacementLoader()
+
+    trainer._make_train_dataloader = make_loader
+
+    trainer._replace_train_dataloader_for_native_scale(
+        OmegaConf.create({}), 0.077
+    )
+
+    assert events == ["scale:0.077", "shutdown", "replace"]
+    assert isinstance(trainer.train_dataloader, ReplacementLoader)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "DataLoader worker (pid 1234) is killed by signal: Bus error.",
+        "DataLoader worker (pid 1234) is killed by signal: Segmentation fault.",
+        "worker failed while loading an image",
+    ],
+)
+def test_native_scale_replacement_propagates_non_sigabrt_errors(
+    message: str,
+) -> None:
+    """Only the known intentional-retirement SIGABRT is recoverable."""
+
+    class FakeDataset:
+        def set_native_image_scale(self, _scale: float) -> bool:
+            return True
+
+    class FailingLoader:
+        def shutdown(self) -> None:
+            raise RuntimeError(message)
+
+    trainer = Trainer3DGRUT.__new__(Trainer3DGRUT)
+    trainer.train_dataset = FakeDataset()
+    trainer.train_dataloader = FailingLoader()
+    trainer.global_step = 3000
+    trainer._make_train_dataloader = lambda _conf: object()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        trainer._replace_train_dataloader_for_native_scale(
+            OmegaConf.create({}), 0.077
+        )
+    assert str(exc_info.value) == message

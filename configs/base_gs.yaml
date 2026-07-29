@@ -376,6 +376,9 @@ loss:
   image_gradient_scale: 1.0
   # Scales only radiance/color parameter gradients after topology bookkeeping.
   radiance_gradient_scale: 1.0
+  # Optional second scale for radiance replay paths used by recovered
+  # topology strategies. Defaults to the standard radiance gradient scale.
+  reference_replay_radiance_gradient_scale: 1.0
 
   # ErpGS-style distortion-aware latitude weighting of the RGB L1 term.
   # When true AND the frame is equirectangular, the per-pixel L1 residual is
