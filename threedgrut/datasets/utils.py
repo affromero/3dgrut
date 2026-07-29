@@ -191,7 +191,69 @@ class MultiEpochsDataLoader(torch.utils.data.DataLoader):
             if shutdown_workers is not None:
                 shutdown_workers()
         finally:
+            self._force_close_iterator(iterator)
             self.iterator = None
+
+    @staticmethod
+    def _force_close_iterator(iterator) -> None:
+        pin_thread = getattr(iterator, "_pin_memory_thread", None)
+        pin_done = getattr(iterator, "_pin_memory_thread_done_event", None)
+        result_queue = getattr(iterator, "_worker_result_queue", None)
+        if pin_thread is not None:
+            try:
+                pin_done.set()
+                result_queue.put((None, None))
+                pin_thread.join(timeout=5)
+            except Exception:
+                pass
+
+        workers = tuple(getattr(iterator, "_workers", ()))
+        for worker in workers:
+            try:
+                worker.terminate()
+            except Exception:
+                pass
+        for worker in workers:
+            try:
+                worker.join(timeout=5)
+            except Exception:
+                pass
+            try:
+                worker.kill()
+            except Exception:
+                pass
+            try:
+                worker.join(timeout=5)
+            except Exception:
+                pass
+            try:
+                worker.close()
+            except Exception:
+                pass
+
+        queues = tuple(getattr(iterator, "_index_queues", ()))
+        if result_queue is not None:
+            queues = (*queues, result_queue)
+        for queue in queues:
+            try:
+                queue.cancel_join_thread()
+                queue.close()
+            except Exception:
+                pass
+        iterator._workers = []
+        iterator._workers_status = []
+        iterator._index_queues = []
+        iterator._shutdown = True
+        unclosed_workers = tuple(
+            worker.pid
+            for worker in workers
+            if not getattr(worker, "_closed", False)
+        )
+        if unclosed_workers:
+            raise RuntimeError(
+                "Failed to close retired DataLoader workers: "
+                f"{unclosed_workers}"
+            )
 
 
 def is_dataloader_worker_sigabrt_error(error: RuntimeError) -> bool:

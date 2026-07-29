@@ -535,7 +535,7 @@ def test_native_scale_replacement_retires_spawned_workers() -> None:
         batch = next(iter(trainer.train_dataloader))
 
         assert batch[0].numel() == 2
-        assert all(not worker.is_alive() for worker in old_workers)
+        assert all(worker._closed for worker in old_workers)
     finally:
         trainer.train_dataloader.shutdown()
 
@@ -558,6 +558,36 @@ def test_loader_shutdown_clears_iterator_when_worker_retirement_fails() -> None:
 
     assert loader.iterator is None
     loader.shutdown()
+
+
+def test_loader_shutdown_force_closes_workers_after_retirement_abort() -> None:
+    """An interrupted PyTorch shutdown cannot leak worker process handles."""
+    dataset = torch.utils.data.TensorDataset(torch.arange(8))
+    loader = MultiEpochsDataLoader(
+        dataset,
+        batch_size=2,
+        num_workers=2,
+        persistent_workers=True,
+        multiprocessing_context="spawn",
+    )
+    iterator = loader.iterator
+    workers = tuple(iterator._workers)
+    original_shutdown = iterator._shutdown_workers
+
+    def abort_shutdown() -> None:
+        message = "DataLoader worker (pid 1234) is killed by signal: Aborted."
+        raise RuntimeError(message)
+
+    iterator._shutdown_workers = abort_shutdown
+
+    with pytest.raises(RuntimeError, match="signal: Aborted"):
+        loader.shutdown()
+    iterator._shutdown_workers = original_shutdown
+
+    assert loader.iterator is None
+    assert all(worker._closed for worker in workers)
+    assert iterator._workers == []
+    assert iterator._index_queues == []
 
 
 def test_native_scale_replacement_tolerates_retiring_worker_sigabrt() -> None:
