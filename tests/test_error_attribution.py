@@ -8,20 +8,26 @@ import torch
 from plyfile import PlyData, PlyElement
 
 from render_error_splats import (
+    DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD,
     DEFAULT_VISIBILITY_THRESHOLD,
+    MANIFEST_SCHEMA_VERSION,
     _counterfactual_cohorts,
     _scene_relative_path,
     _suppressed_density_cohort,
+    _write_raw_field,
 )
 from threedgrut.error_attribution import (
     ErrorAttributionAccumulator,
     ErrorAttributionMetric,
     ErrorAttributionParameter,
+    attribution_components,
     attribution_loss,
+    camera_support_indicators,
     heldout_ownership_dominance,
     native_contributor_ray_fields,
     native_render_evidence_maps,
     native_structural_gaussian_fields,
+    ownership_weighted_mean,
     recolor_gaussian_ply,
 )
 
@@ -57,12 +63,45 @@ class _DensityModel(torch.nn.Module):
         self.density = torch.nn.Parameter(torch.tensor([[1.0], [2.0], [3.0]]))
 
 
+class _IndependentPixelModel(torch.nn.Module):
+    """Two row-aligned Gaussian parameters with independent image pixels."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.features_albedo = torch.nn.Parameter(torch.tensor([[1.0], [2.0]]))
+
+
+def test_manifest_contract_records_threshold_and_raw_field_version() -> None:
+    """New exports use the explicit support and raw-field manifest contract."""
+    assert MANIFEST_SCHEMA_VERSION == 4
+    assert DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD > 0.0
+
+
+def test_raw_field_round_trips_row_aligned_float32(
+    tmp_path: os.PathLike[str],
+) -> None:
+    """Raw sidecars preserve scientific values independently of PLY color."""
+    metadata = _write_raw_field(
+        output_dir=str(tmp_path),
+        field_id="mse__density",
+        scores=torch.tensor([[1.25], [2.5]], dtype=torch.float64),
+    )
+
+    values = np.load(os.path.join(tmp_path, metadata["raw_filename"]))
+    assert values.dtype == np.float32
+    assert values.tolist() == pytest.approx([1.25, 2.5])
+    assert metadata["raw_shape"] == [2]
+    assert len(metadata["raw_sha256"]) == 64
+
+
 def test_error_splat_export_preserves_full_scene_by_default() -> None:
     """Default error colors retain every source Gaussian's opacity."""
     assert DEFAULT_VISIBILITY_THRESHOLD == 0.0
 
 
-def test_counterfactual_cohorts_have_ranked_and_deterministic_controls() -> None:
+def test_counterfactual_cohorts_have_ranked_and_deterministic_controls() -> (
+    None
+):
     """Counterfactual controls retain the requested cohort size."""
     scores = torch.tensor([0.2, 0.9, 0.1, 0.5])
 
@@ -71,10 +110,13 @@ def test_counterfactual_cohorts_have_ranked_and_deterministic_controls() -> None
     assert cohorts["top_density_sensitivity"].tolist() == [3, 1]
     assert cohorts["low_density_sensitivity"].tolist() == [2, 0]
     assert cohorts["random_control"].numel() == 2
-    assert torch.equal(cohorts["random_control"], _counterfactual_cohorts(
-        scores,
-        cohort_size=2,
-    )["random_control"])
+    assert torch.equal(
+        cohorts["random_control"],
+        _counterfactual_cohorts(
+            scores,
+            cohort_size=2,
+        )["random_control"],
+    )
 
 
 def test_density_suppression_is_restored_after_intervention() -> None:
@@ -109,6 +151,43 @@ def test_masked_mae_excludes_invalid_pixels() -> None:
     )
 
     assert float(loss) == pytest.approx(0.5)
+
+
+def test_mse_components_reduce_rgb_to_one_scalar_per_valid_pixel() -> None:
+    """The MSE sensitivity domain contains pixels, not RGB channel entries."""
+    prediction = torch.tensor([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]]])
+    target = torch.zeros_like(prediction)
+    mask = torch.tensor([[[[1.0], [0.0]]]])
+
+    components, component_count = attribution_components(
+        ErrorAttributionMetric.MSE,
+        prediction,
+        target,
+        mask,
+    )
+
+    assert components.shape == (1, 1, 2, 1)
+    assert components.reshape(-1).tolist() == pytest.approx([14.0 / 3.0, 0.0])
+    assert component_count == pytest.approx(1.0)
+    assert attribution_loss(
+        ErrorAttributionMetric.MSE,
+        prediction,
+        target,
+        mask,
+    ).item() == pytest.approx(14.0 / 3.0)
+
+
+def test_empty_pixel_mask_is_rejected() -> None:
+    """A sensitivity field cannot assign a score with no valid pixels."""
+    image = torch.zeros((1, 1, 1, 3))
+
+    with pytest.raises(ValueError, match="no valid pixels"):
+        attribution_components(
+            ErrorAttributionMetric.MSE,
+            image,
+            image,
+            torch.zeros((1, 1, 1, 1)),
+        )
 
 
 def test_low_frequency_fraction_is_larger_for_smooth_residual() -> None:
@@ -157,6 +236,59 @@ def test_component_probes_do_not_cancel_opposing_pixel_gradients() -> None:
     assert accumulator.rms_scores()["mse:sh_dc_rgb"].item() > 0.0
 
 
+def test_hutchinson_score_matches_exact_local_jacobian_energy() -> None:
+    """RMS scores match exhaustive local gradients for independent pixels."""
+    model = _IndependentPixelModel()
+    prediction = model.features_albedo.reshape(1, 1, 2, 1).expand(
+        -1, -1, -1, 3
+    )
+    target = torch.zeros_like(prediction)
+    accumulator = ErrorAttributionAccumulator(
+        model=model,
+        metrics=(ErrorAttributionMetric.MSE,),
+        parameters=(ErrorAttributionParameter.APPEARANCE,),
+        probe_count=2,
+    )
+
+    accumulator.accumulate(
+        outputs={"pred_rgb": prediction},
+        target=target,
+        mask=None,
+    )
+
+    expected = torch.tensor([2.0**0.5, 8.0**0.5])
+    assert torch.allclose(
+        accumulator.rms_scores()["mse:sh_dc_rgb"],
+        expected,
+    )
+    metadata = accumulator.component_metadata()["mse"]
+    assert metadata["domain"] == "valid_rgb_mean_pixel"
+    assert metadata["per_view_effective_counts"] == [2.0]
+
+
+def test_probe_standard_error_reports_stochastic_uncertainty() -> None:
+    """Probe uncertainty is available when at least two probes were used."""
+    model = _TwoPixelModel()
+    prediction = model.features_albedo.reshape(1, 1, 1, 1).expand(1, 1, 2, 3)
+    target = torch.tensor([[[[-1.0] * 3, [1.0] * 3]]])
+    accumulator = ErrorAttributionAccumulator(
+        model=model,
+        metrics=(ErrorAttributionMetric.MSE,),
+        parameters=(ErrorAttributionParameter.APPEARANCE,),
+        probe_count=16,
+    )
+
+    accumulator.accumulate(
+        outputs={"pred_rgb": prediction},
+        target=target,
+        mask=None,
+    )
+
+    standard_error = accumulator.rms_standard_errors()["mse:sh_dc_rgb"]
+    assert standard_error.shape == (1,)
+    assert standard_error.item() > 0.0
+
+
 def test_native_evidence_recovers_conditional_depth_variance() -> None:
     """Second moments yield variance only where native alpha has support."""
     evidence = native_render_evidence_maps(
@@ -166,7 +298,9 @@ def test_native_evidence_recovers_conditional_depth_variance() -> None:
         hit_count=torch.tensor([[[[2.0], [0.0]]]]),
     )
 
-    assert evidence["accumulated_alpha"][0, 0, 0, 0].item() == pytest.approx(0.5)
+    assert evidence["accumulated_alpha"][0, 0, 0, 0].item() == pytest.approx(
+        0.5
+    )
     assert evidence["expected_depth"][0, 0, 0, 0].item() == pytest.approx(2.0)
     assert evidence["depth_variance"][0, 0, 0, 0].item() == pytest.approx(6.0)
     assert torch.isnan(evidence["expected_depth"][0, 0, 1, 0])
@@ -213,7 +347,34 @@ def test_structural_fields_separate_spacing_and_covariance_overlap() -> None:
     assert torch.all(fields["nearest_covariance_overlap"] > 0.7)
 
 
-def test_heldout_ownership_dominance_is_bounded_and_zero_without_support() -> None:
+def test_camera_support_threshold_is_resolution_normalized() -> None:
+    """Supporting-camera decisions use mean ownership per rendered ray."""
+    responsibility = torch.tensor([[0.0], [0.2], [2.0]])
+
+    nonzero, supporting = camera_support_indicators(
+        responsibility=responsibility,
+        ray_count=100,
+        ownership_support_threshold=0.01,
+    )
+
+    assert torch.equal(nonzero, torch.tensor([[0.0], [1.0], [1.0]]))
+    assert torch.equal(supporting, torch.tensor([[0.0], [0.0], [1.0]]))
+
+
+def test_ownership_weighted_mean_has_explicit_validity() -> None:
+    """Mean congestion distinguishes zero ownership from a measured zero."""
+    mean, valid = ownership_weighted_mean(
+        weighted_exposure=torch.tensor([[6.0], [0.0]]),
+        ownership=torch.tensor([[2.0], [0.0]]),
+    )
+
+    assert torch.equal(mean, torch.tensor([[3.0], [0.0]]))
+    assert torch.equal(valid, torch.tensor([[1.0], [0.0]]))
+
+
+def test_heldout_ownership_dominance_is_bounded_and_zero_without_support() -> (
+    None
+):
     """Held-out dominance cannot be inflated by a zero training denominator."""
     score = heldout_ownership_dominance(
         heldout_ownership=torch.tensor([[2.0], [0.0], [0.0]]),

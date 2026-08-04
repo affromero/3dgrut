@@ -3,12 +3,12 @@
 
 """Ray-attributed Gaussian error fields for offline diagnosis.
 
-Each score estimates the root-sum-square of the held-out metric components'
-derivatives with respect to one Gaussian parameter.  Rademacher probes avoid
-reducing signed pixel or patch derivatives before squaring.  The 3DGRUT
-backward pass includes the renderer's front-to-back transmittance and every
-Gaussian that contributed to a pixel; this is deliberately not a nearest-point
-or winner-id approximation.
+Each score estimates a view-balanced root-mean-square of local metric-
+component derivatives with respect to one Gaussian parameter. Rademacher
+probes avoid reducing signed pixel, window, or feature-cell derivatives before
+squaring. The 3DGRUT backward pass includes the renderer's front-to-back
+transmittance and every Gaussian that contributed to a pixel; this is
+deliberately not a nearest-point or winner-id approximation.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from beartype import beartype
 from jaxtyping import Float, jaxtyped
 from plyfile import PlyData, PlyElement
 
-from threedgrut.model.losses import ssim
 from threedgrut.model.geometry import nearest_neighbors
 from threedgrut.utils.grad_viz import (
     scale_grad_norms,
@@ -83,7 +82,9 @@ def native_render_evidence_maps(
     safe_alpha = alpha.clamp_min(opacity_floor)
     expected_depth = depth_moment / safe_alpha
     expected_depth_squared = depth_squared_moment / safe_alpha
-    depth_variance = (expected_depth_squared - expected_depth.square()).clamp_min(0.0)
+    depth_variance = (
+        expected_depth_squared - expected_depth.square()
+    ).clamp_min(0.0)
     nan = torch.full_like(expected_depth, torch.nan)
     return {
         "accumulated_alpha": alpha,
@@ -148,7 +149,9 @@ def native_structural_gaussian_fields(
     """
     count = positions.shape[0]
     if count < 2:
-        raise ValueError("Structural Gaussian fields require at least two rows.")
+        raise ValueError(
+            "Structural Gaussian fields require at least two rows."
+        )
     if covariances.shape != (count, 3, 3):
         raise ValueError("Covariances must have shape [gaussians, 3, 3].")
     if physical_scales.shape != (count, 3):
@@ -203,6 +206,56 @@ def heldout_ownership_dominance(
         heldout / denominator,
         torch.zeros_like(denominator),
     )
+
+
+@jaxtyped(typechecker=beartype)
+def camera_support_indicators(
+    *,
+    responsibility: Float[torch.Tensor, "gaussians 1"],
+    ray_count: int,
+    ownership_support_threshold: float,
+) -> tuple[
+    Float[torch.Tensor, "gaussians 1"],
+    Float[torch.Tensor, "gaussians 1"],
+]:
+    """Return exact visibility and resolution-normalized camera support.
+
+    Exact visibility records any positive native ownership. Meaningful camera
+    support thresholds mean ownership per rendered ray, so the threshold is
+    dimensionless and invariant to image resolution.
+    """
+    if ray_count <= 0:
+        raise ValueError("ray_count must be positive.")
+    if ownership_support_threshold < 0.0:
+        raise ValueError("ownership_support_threshold must be non-negative.")
+    nonzero = (responsibility > 0.0).to(dtype=responsibility.dtype)
+    normalized = responsibility / ray_count
+    supporting = (normalized >= ownership_support_threshold).to(
+        dtype=responsibility.dtype
+    )
+    return nonzero, supporting
+
+
+@jaxtyped(typechecker=beartype)
+def ownership_weighted_mean(
+    *,
+    weighted_exposure: Float[torch.Tensor, "gaussians 1"],
+    ownership: Float[torch.Tensor, "gaussians 1"],
+) -> tuple[
+    Float[torch.Tensor, "gaussians 1"],
+    Float[torch.Tensor, "gaussians 1"],
+]:
+    """Return a weighted mean and an explicit positive-ownership mask."""
+    if weighted_exposure.shape != ownership.shape:
+        raise ValueError("Exposure and ownership shapes must match.")
+    valid = ownership > 0.0
+    mean = torch.where(
+        valid,
+        weighted_exposure
+        / ownership.clamp_min(torch.finfo(ownership.dtype).eps),
+        torch.zeros_like(weighted_exposure),
+    )
+    return mean, valid.to(dtype=ownership.dtype)
 
 
 def _mask_like(
@@ -280,35 +333,21 @@ def attribution_loss(
     lpips_model: torch.nn.Module | None = None,
 ) -> torch.Tensor:
     """Return a scalar differentiable loss in the metric's native domain."""
-    weights = _mask_like(mask, prediction)
-    residual = prediction - target
-    denominator = (weights.sum() * prediction.shape[-1]).clamp_min(1.0)
-    if metric == ErrorAttributionMetric.MAE:
-        return (residual.abs() * weights).sum() / denominator
-    if metric == ErrorAttributionMetric.MSE:
-        return (residual.square() * weights).sum() / denominator
-
-    masked_prediction = _masked_prediction(prediction, target, weights)
-    prediction_bchw = masked_prediction.permute(0, 3, 1, 2)
-    target_bchw = target.permute(0, 3, 1, 2)
-    if metric == ErrorAttributionMetric.SSIM:
-        return 1.0 - ssim(prediction_bchw, target_bchw)
-    if metric == ErrorAttributionMetric.LPIPS:
-        if lpips_model is None:
-            raise ValueError("LPIPS attribution requires an LPIPS model.")
-        return lpips_model(prediction_bchw.clamp(0.0, 1.0), target_bchw).mean()
-    if metric == ErrorAttributionMetric.LOW_FREQUENCY:
-        residual_bchw = (residual * weights).permute(0, 3, 1, 2)
-        total_energy = residual_bchw.square().mean().clamp_min(1e-12)
-        return _low_pass(residual_bchw).square().mean() / total_energy
-    raise ValueError(f"Unsupported attribution metric: {metric!r}")
+    components, component_count = attribution_components(
+        metric,
+        prediction,
+        target,
+        mask,
+        lpips_model,
+    )
+    return components.sum() / component_count
 
 
 def _ssim_components(
     prediction: torch.Tensor,
     target: torch.Tensor,
 ) -> torch.Tensor:
-    """Return a standard local one-minus-SSIM field normalized to sum."""
+    """Return one scalar local one-minus-SSIM component per window centre."""
     prediction_bchw = prediction.permute(0, 3, 1, 2)
     target_bchw = target.permute(0, 3, 1, 2)
     channels = prediction_bchw.shape[1]
@@ -322,7 +361,7 @@ def _ssim_components(
     window = window.expand(channels, 1, 11, 11)
 
     def filter_image(image: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(image, window, padding=5, groups=channels)
+        return F.conv2d(image, window, padding=0, groups=channels)
 
     mu_prediction = filter_image(prediction_bchw)
     mu_target = filter_image(target_bchw)
@@ -341,7 +380,7 @@ def _ssim_components(
         sigma_prediction + sigma_target + 0.03**2
     )
     field = 1.0 - numerator / denominator.clamp_min(1e-12)
-    return field / field.numel()
+    return field.mean(dim=1, keepdim=True)
 
 
 def attribution_components(
@@ -350,19 +389,32 @@ def attribution_components(
     target: torch.Tensor,
     mask: torch.Tensor | None,
     lpips_model: torch.nn.Module | None = None,
-) -> torch.Tensor:
-    """Return spatial loss components whose sum is the reported loss."""
+) -> tuple[torch.Tensor, float]:
+    """Return raw scalar local components and their effective count.
+
+    MSE and MAE use one RGB-mean component per valid pixel. SSIM uses one
+    channel-mean component per window centre, LPIPS one component per spatial
+    feature cell, and low-frequency fraction one channel-mean component per
+    filtered pixel. The reported scalar loss is ``components.sum() / K``.
+    """
     weights = _mask_like(mask, prediction)
     residual = prediction - target
-    denominator = (weights.sum() * prediction.shape[-1]).clamp_min(1.0)
+    valid_count = float(weights.detach().sum())
     if metric == ErrorAttributionMetric.MAE:
-        return residual.abs() * weights / denominator
+        if valid_count <= 0.0:
+            raise ValueError("MAE attribution mask has no valid pixels.")
+        return residual.abs().mean(dim=-1, keepdim=True) * weights, valid_count
     if metric == ErrorAttributionMetric.MSE:
-        return residual.square() * weights / denominator
+        if valid_count <= 0.0:
+            raise ValueError("MSE attribution mask has no valid pixels.")
+        return residual.square().mean(
+            dim=-1, keepdim=True
+        ) * weights, valid_count
 
     masked_prediction = _masked_prediction(prediction, target, weights)
     if metric == ErrorAttributionMetric.SSIM:
-        return _ssim_components(masked_prediction, target)
+        field = _ssim_components(masked_prediction, target)
+        return field, float(field.numel())
     if metric == ErrorAttributionMetric.LPIPS:
         if lpips_model is None:
             raise ValueError("LPIPS attribution requires an LPIPS model.")
@@ -379,17 +431,23 @@ def attribution_components(
             normalize=True,
         )
         lpips_network.spatial = original_spatial
-        return field / field.numel()
+        return field, float(field.numel())
     if metric == ErrorAttributionMetric.LOW_FREQUENCY:
         residual_bchw = (residual * weights).permute(0, 3, 1, 2)
         total_energy = residual_bchw.square().mean().clamp_min(1e-12)
-        field = _low_pass(residual_bchw).square() / total_energy
-        return field / field.numel()
+        field = _low_pass(residual_bchw).square().mean(dim=1, keepdim=True)
+        field = field / total_energy
+        return field, float(field.numel())
     raise ValueError(f"Unsupported attribution metric: {metric!r}")
 
 
 class ErrorAttributionAccumulator:
-    """Estimate non-cancelling per-view component-gradient energy."""
+    """Estimate view-balanced non-cancelling component-gradient energy.
+
+    For view ``v`` with ``K_v`` scalar local components, each reported score
+    estimates ``sqrt(mean_v(mean_k(||d ell_vk / d theta_i||^2)))``. The root
+    is taken after averaging component energy over views.
+    """
 
     def __init__(
         self,
@@ -414,8 +472,10 @@ class ErrorAttributionAccumulator:
         self.lpips_model = lpips_model
         self.probe_count = probe_count
         self.seed = seed
-        self._squared_sums: dict[str, torch.Tensor] = {}
+        self._energy_sums: dict[str, torch.Tensor] = {}
+        self._probe_variance_sums: dict[str, torch.Tensor] = {}
         self._loss_sums = {metric.value: 0.0 for metric in metrics}
+        self._component_counts = {metric.value: [] for metric in metrics}
         self.view_count = 0
 
     def _model_parameters(self) -> tuple[torch.nn.Parameter, ...]:
@@ -464,16 +524,19 @@ class ErrorAttributionAccumulator:
         total_probes = len(self.metrics) * self.probe_count
         completed_probes = 0
         for metric_index, metric in enumerate(self.metrics):
-            components = component_fields[metric]
-            loss = components.sum()
+            components, component_count = component_fields[metric]
+            loss = components.sum() / component_count
             loss_value = float(loss.detach())
             view_losses[metric.value] = loss_value
             self._loss_sums[metric.value] += loss_value
+            self._component_counts[metric.value].append(component_count)
             generator = torch.Generator(device=components.device)
             generator.manual_seed(
                 self.seed + self.view_count * 104729 + metric_index * 1009
             )
-            for _ in range(self.probe_count):
+            probe_means: dict[str, torch.Tensor] = {}
+            probe_m2: dict[str, torch.Tensor] = {}
+            for probe_index in range(self.probe_count):
                 signs = torch.randint(
                     0,
                     2,
@@ -498,20 +561,42 @@ class ErrorAttributionAccumulator:
                     if gradient is None:
                         continue
                     key = f"{metric.value}:{parameter.value}"
-                    squared_norm = (
+                    energy_sample = (
                         gradient.detach()
                         .reshape(gradient.shape[0], -1)
                         .float()
                         .square()
                         .sum(dim=1)
-                        .div(self.probe_count)
+                        .div(component_count)
                         .cpu()
                     )
-                    previous = self._squared_sums.get(key)
-                    self._squared_sums[key] = (
-                        squared_norm
-                        if previous is None
-                        else previous + squared_norm
+                    previous_mean = probe_means.get(key)
+                    if previous_mean is None:
+                        probe_means[key] = energy_sample
+                        probe_m2[key] = torch.zeros_like(energy_sample)
+                        continue
+                    delta = energy_sample - previous_mean
+                    updated_mean = previous_mean + delta / (probe_index + 1)
+                    probe_m2[key] += delta * (energy_sample - updated_mean)
+                    probe_means[key] = updated_mean
+            for key, energy_mean in probe_means.items():
+                previous_energy = self._energy_sums.get(key)
+                self._energy_sums[key] = (
+                    energy_mean
+                    if previous_energy is None
+                    else previous_energy + energy_mean
+                )
+                if self.probe_count > 1:
+                    variance_of_mean = (
+                        probe_m2[key]
+                        / (self.probe_count - 1)
+                        / self.probe_count
+                    )
+                    previous_variance = self._probe_variance_sums.get(key)
+                    self._probe_variance_sums[key] = (
+                        variance_of_mean
+                        if previous_variance is None
+                        else previous_variance + variance_of_mean
                     )
         self.view_count += 1
         return view_losses
@@ -522,7 +607,45 @@ class ErrorAttributionAccumulator:
             raise ValueError("No views were accumulated.")
         return {
             key: (values / self.view_count).sqrt()
-            for key, values in self._squared_sums.items()
+            for key, values in self._energy_sums.items()
+        }
+
+    def rms_standard_errors(self) -> dict[str, torch.Tensor]:
+        """Return delta-method standard errors from Rademacher probe variance."""
+        if self.view_count == 0:
+            raise ValueError("No views were accumulated.")
+        if self.probe_count == 1:
+            return {}
+        scores = self.rms_scores()
+        errors: dict[str, torch.Tensor] = {}
+        for key, variance_sum in self._probe_variance_sums.items():
+            energy_standard_error = variance_sum.sqrt() / self.view_count
+            errors[key] = torch.where(
+                scores[key] > 0.0,
+                energy_standard_error / (2.0 * scores[key]),
+                torch.zeros_like(scores[key]),
+            )
+        return errors
+
+    def component_metadata(self) -> dict[str, dict[str, object]]:
+        """Describe local component domains and effective counts by view."""
+        domains = {
+            ErrorAttributionMetric.MAE.value: "valid_rgb_mean_pixel",
+            ErrorAttributionMetric.MSE.value: "valid_rgb_mean_pixel",
+            ErrorAttributionMetric.SSIM.value: "channel_mean_window_center",
+            ErrorAttributionMetric.LPIPS.value: "spatial_feature_cell",
+            ErrorAttributionMetric.LOW_FREQUENCY.value: (
+                "channel_mean_filtered_pixel"
+            ),
+        }
+        return {
+            metric.value: {
+                "domain": domains[metric.value],
+                "per_view_effective_counts": self._component_counts[
+                    metric.value
+                ],
+            }
+            for metric in self.metrics
         }
 
     def mean_losses(self) -> dict[str, float]:

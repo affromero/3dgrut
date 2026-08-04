@@ -27,10 +27,12 @@ from threedgrut.error_attribution import (
     ErrorAttributionMetric,
     ErrorAttributionParameter,
     attribution_loss,
+    camera_support_indicators,
     heldout_ownership_dominance,
     native_contributor_ray_fields,
     native_render_evidence_maps,
     native_structural_gaussian_fields,
+    ownership_weighted_mean,
     recolor_gaussian_ply,
 )
 from threedgrut.model.factory import create_gaussian_model
@@ -38,6 +40,8 @@ from threedgrut.render import POST_PROCESSING_EVAL_MODE_RAW
 from threedgrut.utils.logger import logger
 
 DEFAULT_VISIBILITY_THRESHOLD = 0.0
+DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD = 1e-6
+MANIFEST_SCHEMA_VERSION = 4
 
 
 def _enum_values(enum_type: type[ErrorAttributionMetric]) -> tuple[str, ...]:
@@ -65,6 +69,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Deterministic Rademacher probes per metric and held-out view.",
+    )
+    parser.add_argument(
+        "--attribution-seed",
+        type=int,
+        default=0,
+        help="Deterministic seed for Rademacher attribution probes.",
     )
     parser.add_argument(
         "--metrics",
@@ -95,6 +105,15 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "0 aggregates every training view; positive values sample evenly "
             "for the native per-Gaussian support exports."
+        ),
+    )
+    parser.add_argument(
+        "--ownership-support-threshold",
+        type=float,
+        default=DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD,
+        help=(
+            "Minimum mean native T*alpha ownership per rendered training ray "
+            "for a camera to count as meaningful support."
         ),
     )
     parser.add_argument(
@@ -146,6 +165,29 @@ def _sha256(path: str) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _write_raw_field(
+    *,
+    output_dir: str,
+    field_id: str,
+    scores: torch.Tensor,
+) -> dict[str, object]:
+    """Atomically persist row-aligned float32 scores with provenance."""
+    raw_dir = path_join(output_dir, "raw")
+    path_mkdir(raw_dir, parents=True, exist_ok=True)
+    output_path = path_join(raw_dir, f"{field_id}.npy")
+    temporary_path = f"{output_path}.tmp"
+    values = scores.detach().reshape(-1).float().cpu().numpy()
+    with open(temporary_path, "wb") as handle:
+        np.save(handle, values, allow_pickle=False)
+    os.replace(temporary_path, output_path)
+    return {
+        "raw_filename": path_relative_to(output_path, output_dir),
+        "raw_sha256": _sha256(output_path),
+        "raw_dtype": "float32",
+        "raw_shape": [int(values.size)],
+    }
 
 
 def _scene_relative_path(path: str, scene_root: str) -> str:
@@ -232,8 +274,8 @@ def _accumulate_native_contributor_fields(
             gpu_batch,
             ray_field.squeeze(0).squeeze(-1).float(),
         )["diagnostic_weighted_sum"]
-        scores[field_id] += weighted_sum.detach().float().cpu().reshape_as(
-            scores[field_id]
+        scores[field_id] += (
+            weighted_sum.detach().float().cpu().reshape_as(scores[field_id])
         )
 
 
@@ -249,6 +291,7 @@ def _export_training_support_fields(
     scale_mode: str,
     visibility_threshold: float,
     maximum_views: int,
+    ownership_support_threshold: float,
 ) -> tuple[list[dict[str, object]], int, list[str], torch.Tensor]:
     """Export exact native T*alpha training support for every Gaussian."""
     renderer = _build_renderer(
@@ -269,6 +312,7 @@ def _export_training_support_fields(
         device="cpu",
     )
     visible_view_count = torch.zeros_like(support)
+    supporting_camera_count = torch.zeros_like(support)
     narrow_view_coverage = torch.zeros(
         (model.density.shape[0], 3),
         dtype=torch.float32,
@@ -288,12 +332,24 @@ def _export_training_support_fields(
             device=gpu_batch.rays_ori.device,
             dtype=torch.float32,
         )
-        responsibility = model.render_responsibility(
-            gpu_batch,
-            ray_diagnostic,
-        )["responsibility"].detach().float().cpu().reshape_as(support)
+        responsibility = (
+            model.render_responsibility(
+                gpu_batch,
+                ray_diagnostic,
+            )["responsibility"]
+            .detach()
+            .float()
+            .cpu()
+            .reshape_as(support)
+        )
         support += responsibility
-        visible_view_count += (responsibility > 0.0).float()
+        nonzero, supporting = camera_support_indicators(
+            responsibility=responsibility,
+            ray_count=ray_diagnostic.numel(),
+            ownership_support_threshold=ownership_support_threshold,
+        )
+        visible_view_count += nonzero
+        supporting_camera_count += supporting
         camera_center = gpu_batch.T_to_world[0, :3, 3].detach()
         directions = camera_center.unsqueeze(0) - model.positions.detach()
         directions = directions / torch.linalg.vector_norm(
@@ -302,9 +358,11 @@ def _export_training_support_fields(
             keepdim=True,
         ).clamp_min(torch.finfo(directions.dtype).eps)
         narrow_view_coverage += (
-            responsibility.to(device=directions.device)
-            * directions
-        ).detach().float().cpu()
+            (responsibility.to(device=directions.device) * directions)
+            .detach()
+            .float()
+            .cpu()
+        )
         selected_names.append(path_basename(str(gpu_batch.image_path)))
 
     field_specs = (
@@ -323,9 +381,19 @@ def _export_training_support_fields(
             "coverage",
         ),
         (
+            "supporting_camera_count",
+            "Supporting-camera count",
+            supporting_camera_count,
+            "Number of training cameras whose mean native T*alpha ownership "
+            "per rendered ray meets the recorded support threshold.",
+            "coverage",
+        ),
+        (
             "narrow_training_view_coverage",
             "Narrow training-view coverage",
-            torch.linalg.vector_norm(narrow_view_coverage, dim=-1, keepdim=True)
+            torch.linalg.vector_norm(
+                narrow_view_coverage, dim=-1, keepdim=True
+            )
             / support.clamp_min(torch.finfo(support.dtype).eps),
             "Native ownership-weighted resultant camera-direction magnitude "
             "over training views. High means the Gaussian was seen from a "
@@ -346,6 +414,11 @@ def _export_training_support_fields(
             expected_density=model.density,
             visibility_threshold=visibility_threshold,
         )
+        raw_metadata = _write_raw_field(
+            output_dir=output_dir,
+            field_id=field_id,
+            scores=scores,
+        )
         fields.append(
             {
                 "id": field_id,
@@ -355,6 +428,7 @@ def _export_training_support_fields(
                 "artifact_kind": "ply",
                 "filename": path_relative_to(output_path, output_dir),
                 "artifact_sha256": _sha256(output_path),
+                **raw_metadata,
                 "normalization": scale_mode,
                 "visibility_threshold": visibility_threshold,
                 "statistics": statistics,
@@ -403,7 +477,9 @@ def _suppressed_density_cohort(
     """Temporarily remove a Gaussian cohort from native alpha compositing."""
     density = getattr(model, "density", None)
     if not isinstance(density, torch.nn.Parameter):
-        raise TypeError("Counterfactual export requires model.density parameter.")
+        raise TypeError(
+            "Counterfactual export requires model.density parameter."
+        )
     selected = indices.to(device=density.device, dtype=torch.long)
     with torch.no_grad():
         original = density.index_select(0, selected).clone()
@@ -425,7 +501,9 @@ def _mean_heldout_mse(
     dataset = getattr(renderer, "dataset", None)
     dataloader = getattr(renderer, "dataloader", None)
     if dataset is None or dataloader is None:
-        raise TypeError("Counterfactual renderer must expose dataset and dataloader.")
+        raise TypeError(
+            "Counterfactual renderer must expose dataset and dataloader."
+        )
     values: list[float] = []
     with torch.no_grad():
         for index, batch in enumerate(dataloader):
@@ -504,6 +582,8 @@ def main() -> None:
         raise ValueError("--training-support-max-views must be non-negative.")
     if args.attribution_probes <= 0:
         raise ValueError("--attribution-probes must be positive.")
+    if args.ownership_support_threshold < 0.0:
+        raise ValueError("--ownership-support-threshold must be non-negative.")
     if args.counterfactual_cohort_size < 0:
         raise ValueError("--counterfactual-cohort-size must be non-negative.")
     if not 0.0 <= args.visibility_threshold < 1.0:
@@ -585,6 +665,7 @@ def main() -> None:
         parameters=parameters,
         lpips_model=lpips_model,
         probe_count=args.attribution_probes,
+        seed=args.attribution_seed,
     )
     selected_indices = _sample_indices(
         len(renderer.dataloader),
@@ -644,6 +725,7 @@ def main() -> None:
         )
 
     rms_scores = accumulator.rms_scores()
+    rms_standard_errors = accumulator.rms_standard_errors()
     counterfactual: dict[str, object] | None = None
     if args.counterfactual_cohort_size > 0:
         density_key = "mse:density"
@@ -686,15 +768,42 @@ def main() -> None:
             visibility_threshold=args.visibility_threshold,
         )
         artifact_sha256 = _sha256(output_path)
+        field_id = f"{metric}__{parameter}"
+        raw_metadata = _write_raw_field(
+            output_dir=output_dir,
+            field_id=field_id,
+            scores=scores,
+        )
+        uncertainty = rms_standard_errors.get(key)
+        uncertainty_metadata = (
+            {}
+            if uncertainty is None
+            else {
+                "uncertainty_method": (
+                    "delta-method standard error from within-view "
+                    "Rademacher probe variance"
+                ),
+                **{
+                    f"uncertainty_{name}": value
+                    for name, value in _write_raw_field(
+                        output_dir=output_dir,
+                        field_id=f"{field_id}__standard_error",
+                        scores=uncertainty,
+                    ).items()
+                },
+            }
+        )
         fields.append(
             {
-                "id": f"{metric}__{parameter}",
+                "id": field_id,
                 "label": _field_label(metric, parameter),
                 "metric_id": metric,
                 "parameter": parameter,
                 "artifact_kind": "ply",
                 "filename": os.path.relpath(output_path, output_dir),
                 "artifact_sha256": artifact_sha256,
+                **raw_metadata,
+                **uncertainty_metadata,
                 "normalization": args.normalization,
                 "visibility_threshold": args.visibility_threshold,
                 "statistics": statistics,
@@ -707,6 +816,14 @@ def main() -> None:
             }
         )
 
+    mean_hit_congestion, congestion_validity = ownership_weighted_mean(
+        weighted_exposure=native_contributor_scores["hit_congestion_exposure"],
+        ownership=native_contributor_scores["heldout_native_ownership"],
+    )
+    native_contributor_scores["mean_hit_congestion"] = mean_hit_congestion
+    native_contributor_scores["mean_hit_congestion_validity"] = (
+        congestion_validity
+    )
     native_contributor_specs = (
         (
             "heldout_native_ownership",
@@ -725,26 +842,49 @@ def main() -> None:
             "Exact T*alpha-weighted exposure to native accepted-hit count; "
             "not an intrinsic per-Gaussian hit count.",
         ),
+        (
+            "mean_hit_congestion",
+            "Mean hit congestion",
+            "Ownership-weighted mean native accepted-hit count over held-out "
+            "rays with positive ownership.",
+        ),
+        (
+            "mean_hit_congestion_validity",
+            "Mean hit congestion validity",
+            "One where held-out native ownership is positive and the "
+            "ownership-weighted mean is defined; zero otherwise.",
+        ),
     )
     for field_id, label, attribution in native_contributor_specs:
+        field_scores = native_contributor_scores[field_id]
         output_path = os.path.join(ply_dir, f"{field_id}.ply")
         statistics = recolor_gaussian_ply(
             source_path=source_ply,
             output_path=output_path,
-            scores=native_contributor_scores[field_id].reshape(-1),
+            scores=field_scores.reshape(-1),
             scale_mode=args.normalization,
             expected_density=model.density,
             visibility_threshold=args.visibility_threshold,
+        )
+        raw_metadata = _write_raw_field(
+            output_dir=output_dir,
+            field_id=field_id,
+            scores=field_scores,
         )
         fields.append(
             {
                 "id": field_id,
                 "label": label,
-                "metric_id": "native_ray_exposure",
+                "metric_id": (
+                    "native_ray_mean"
+                    if field_id.startswith("mean_hit_congestion")
+                    else "native_ray_exposure"
+                ),
                 "parameter": field_id,
                 "artifact_kind": "ply",
                 "filename": os.path.relpath(output_path, output_dir),
                 "artifact_sha256": _sha256(output_path),
+                **raw_metadata,
                 "normalization": args.normalization,
                 "visibility_threshold": args.visibility_threshold,
                 "statistics": statistics,
@@ -758,19 +898,18 @@ def main() -> None:
         training_support_view_count,
         training_support_images,
         training_support_scores,
-    ) = (
-        _export_training_support_fields(
-            checkpoint=checkpoint,
-            model=model,
-            output_dir=output_dir,
-            eval_bundle=eval_bundle,
-            checkpoint_path=checkpoint_path,
-            original_training_bundle=original_training_bundle,
-            source_ply=source_ply,
-            scale_mode=args.normalization,
-            visibility_threshold=args.visibility_threshold,
-            maximum_views=args.training_support_max_views,
-        )
+    ) = _export_training_support_fields(
+        checkpoint=checkpoint,
+        model=model,
+        output_dir=output_dir,
+        eval_bundle=eval_bundle,
+        checkpoint_path=checkpoint_path,
+        original_training_bundle=original_training_bundle,
+        source_ply=source_ply,
+        scale_mode=args.normalization,
+        visibility_threshold=args.visibility_threshold,
+        maximum_views=args.training_support_max_views,
+        ownership_support_threshold=args.ownership_support_threshold,
     )
     fields.extend(training_fields)
     heldout_ownership = native_contributor_scores["heldout_native_ownership"]
@@ -823,6 +962,11 @@ def main() -> None:
             expected_density=model.density,
             visibility_threshold=args.visibility_threshold,
         )
+        raw_metadata = _write_raw_field(
+            output_dir=output_dir,
+            field_id=field_id,
+            scores=scores,
+        )
         fields.append(
             {
                 "id": field_id,
@@ -832,6 +976,7 @@ def main() -> None:
                 "artifact_kind": "ply",
                 "filename": os.path.relpath(output_path, output_dir),
                 "artifact_sha256": _sha256(output_path),
+                **raw_metadata,
                 "normalization": args.normalization,
                 "visibility_threshold": args.visibility_threshold,
                 "statistics": statistics,
@@ -840,7 +985,7 @@ def main() -> None:
             }
         )
     manifest = {
-        "schema_version": 3,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "source_checkpoint": _scene_relative_path(
             checkpoint_path,
             scene_root,
@@ -857,6 +1002,14 @@ def main() -> None:
         "frame": args.frame,
         "view_count": accumulator.view_count,
         "attribution_probes": args.attribution_probes,
+        "attribution_seed": args.attribution_seed,
+        "attribution_estimator": (
+            "sqrt(mean_views(mean_local_components("
+            "squared_parameter_block_gradient_norm)))"
+        ),
+        "attribution_components": accumulator.component_metadata(),
+        "ownership_support_threshold": args.ownership_support_threshold,
+        "ownership_support_threshold_units": "mean T*alpha per rendered ray",
         "visibility_threshold": args.visibility_threshold,
         "selected_images": selected_names,
         "training_support_view_count": training_support_view_count,
@@ -889,6 +1042,12 @@ def main() -> None:
             "hit_congestion_exposure": (
                 "exact T*alpha-weighted native hit-count exposure"
             ),
+            "mean_hit_congestion": (
+                "ownership-weighted mean native accepted-hit count"
+            ),
+            "mean_hit_congestion_validity": (
+                "positive held-out ownership validity mask"
+            ),
         },
         "fields": fields,
         "doctor_metric_coverage": {
@@ -898,6 +1057,10 @@ def main() -> None:
             ),
             "training_view_count": (
                 "exact count of training cameras with nonzero T*alpha support"
+            ),
+            "supporting_camera_count": (
+                "count of training cameras meeting the recorded mean "
+                "ownership-per-ray threshold"
             ),
             "psnr": "same local ordering as mse attribution",
             "masked_psnr": "same masked local ordering as mse attribution",
@@ -918,13 +1081,16 @@ def main() -> None:
             "fgd": "global scalar; no exact per-splat field exists",
         },
     }
+    manifest_path = os.path.join(output_dir, "error_splats.json")
+    temporary_manifest_path = f"{manifest_path}.tmp"
     with open(
-        os.path.join(output_dir, "error_splats.json"),
+        temporary_manifest_path,
         "w",
         encoding="utf-8",
     ) as handle:
         json.dump(manifest, handle, indent=2)
         handle.write("\n")
+    os.replace(temporary_manifest_path, manifest_path)
     logger.info(f"Wrote {len(fields)} Gaussian error fields to {output_dir}.")
 
 
