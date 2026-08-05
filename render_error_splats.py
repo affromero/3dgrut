@@ -41,6 +41,7 @@ from threedgrut.utils.logger import logger
 
 DEFAULT_VISIBILITY_THRESHOLD = 0.0
 DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD = 1e-6
+DEFAULT_NATIVE_OPACITY_FLOOR = 1e-4
 MANIFEST_SCHEMA_VERSION = 4
 
 
@@ -240,6 +241,7 @@ def _write_native_evidence_map(
             depth_moment=outputs["pred_dist"],
             depth_squared_moment=outputs["pred_dist_squared"],
             hit_count=outputs["hits_count"],
+            opacity_floor=DEFAULT_NATIVE_OPACITY_FLOOR,
         )
     native_dir = path_join(output_dir, "maps", "native")
     path_mkdir(native_dir, parents=True, exist_ok=True)
@@ -251,6 +253,7 @@ def _write_native_evidence_map(
     np.savez_compressed(
         path_join(native_dir, f"map_{image_hash}.npz"),
         image_name=np.array(image_name),
+        opacity_validity_floor=np.array(DEFAULT_NATIVE_OPACITY_FLOOR),
         **fields,
     )
     return evidence
@@ -1010,6 +1013,7 @@ def main() -> None:
         "attribution_components": accumulator.component_metadata(),
         "ownership_support_threshold": args.ownership_support_threshold,
         "ownership_support_threshold_units": "mean T*alpha per rendered ray",
+        "native_depth_opacity_floor": DEFAULT_NATIVE_OPACITY_FLOOR,
         "visibility_threshold": args.visibility_threshold,
         "selected_images": selected_names,
         "training_support_view_count": training_support_view_count,
