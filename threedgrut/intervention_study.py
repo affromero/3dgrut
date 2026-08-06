@@ -16,7 +16,10 @@ from enum import StrEnum
 import numpy as np
 import torch
 
-from threedgrut.error_attribution import ErrorAttributionMetric, attribution_loss
+from threedgrut.error_attribution import (
+    ErrorAttributionMetric,
+    attribution_loss,
+)
 from threedgrut.utils.logger import logger
 
 
@@ -136,7 +139,11 @@ def _sha256(path: str) -> str:
 
 def _image_names(path: str) -> set[str]:
     with open(path, encoding="utf-8") as handle:
-        names = {line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")}
+        names = {
+            line.strip()
+            for line in handle
+            if line.strip() and not line.lstrip().startswith("#")
+        }
     if not names:
         raise ValueError(f"image list is empty: {path}")
     return names
@@ -151,7 +158,7 @@ def _finite_scores(scores: torch.Tensor) -> torch.Tensor:
     )
 
 
-def matched_cohorts(
+def matched_cohorts_v1(
     *,
     scores: torch.Tensor,
     residual_scores: torch.Tensor,
@@ -159,7 +166,7 @@ def matched_cohorts(
     ranking: RankingDirection,
     random_seeds: tuple[int, ...],
 ) -> list[tuple[str, int, torch.Tensor]]:
-    """Return equal-size ranked, residual, and random control cohorts."""
+    """Reproduce the exact overlapping controls used by M1 at b5b68ae."""
     if cohort_size <= 0:
         raise ValueError("cohort size must be positive")
     if not random_seeds or len(random_seeds) != len(set(random_seeds)):
@@ -167,7 +174,9 @@ def matched_cohorts(
     values = _finite_scores(scores)
     residual = _finite_scores(residual_scores)
     if values.numel() == 0 or values.shape != residual.shape:
-        raise ValueError("field and residual scores must have equal nonzero size")
+        raise ValueError(
+            "field and residual scores must have equal nonzero size"
+        )
     count = min(cohort_size, values.numel())
     order = torch.argsort(values, stable=True)
     if ranking is RankingDirection.DESCENDING:
@@ -198,6 +207,151 @@ def matched_cohorts(
             )
         )
     return cohorts
+
+
+def matched_cohorts(
+    *,
+    scores: torch.Tensor,
+    residual_scores: torch.Tensor,
+    cohort_size: int,
+    ranking: RankingDirection,
+    random_seeds: tuple[int, ...],
+) -> list[tuple[str, int, torch.Tensor]]:
+    """Return treatment-disjoint controls for confirmatory studies."""
+    if cohort_size <= 0:
+        raise ValueError("cohort size must be positive")
+    if not random_seeds or len(random_seeds) != len(set(random_seeds)):
+        raise ValueError("random seeds must be present and unique")
+    values = _finite_scores(scores)
+    residual = _finite_scores(residual_scores)
+    if values.numel() == 0 or values.shape != residual.shape:
+        raise ValueError(
+            "field and residual scores must have equal nonzero size"
+        )
+    count = min(cohort_size, values.numel())
+    if 4 * count > values.numel():
+        raise ValueError(
+            "confirmatory cohorts require four disjoint cohort-sized pools"
+        )
+    order = torch.argsort(values, stable=True)
+    if ranking is RankingDirection.DESCENDING:
+        top, bottom = order[-count:], order[:count]
+    else:
+        top, bottom = order[:count], order[-count:]
+    eligible = torch.ones(values.numel(), dtype=torch.bool)
+    eligible[top] = False
+    eligible[bottom] = False
+    residual_order = torch.argsort(residual, stable=True)
+    residual_control = residual_order[eligible[residual_order]][-count:]
+    eligible[residual_control] = False
+    random_pool = torch.nonzero(eligible, as_tuple=False).reshape(-1)
+    if random_pool.numel() < count:
+        raise ValueError("not enough rows for treatment-disjoint controls")
+    cohorts = [
+        ("top_risk", 0, top),
+        ("bottom_risk", 0, bottom),
+        ("residual_only", 0, residual_control),
+    ]
+    for replicate, seed in enumerate(random_seeds):
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        selection = torch.randperm(random_pool.numel(), generator=generator)[
+            :count
+        ]
+        cohorts.append(("random", replicate, random_pool[selection]))
+    return cohorts
+
+
+def _index_sha256(indices: torch.Tensor) -> str:
+    values = indices.detach().cpu().numpy().astype("<i8", copy=False)
+    return hashlib.sha256(values.tobytes(order="C")).hexdigest()
+
+
+def generate_intervention_provenance(
+    *,
+    output_dir: str,
+    plan_path: str,
+    result_path: str,
+    manifest_path: str,
+    renderer_commit: str,
+    doctor_commit: str,
+    runner_sha256: str,
+) -> dict[str, object]:
+    """Authenticate an M1 result and its deterministic cohort selection."""
+    with open(plan_path, encoding="utf-8") as handle:
+        plan = json.load(handle)
+    with open(result_path, encoding="utf-8") as handle:
+        result = json.load(handle)
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if result["plan_sha256"] != _sha256(plan_path):
+        raise ValueError("result plan hash differs from the supplied plan")
+    if result["checkpoint_sha256"] != manifest["source_checkpoint_sha256"]:
+        raise ValueError("result and manifest checkpoint hashes differ")
+    selection_version = plan.get("cohort_selection_version", "m1_legacy_v1")
+    if selection_version != "m1_legacy_v1":
+        raise ValueError("M1 provenance requires m1_legacy_v1 selection")
+    raw_field_ids = {
+        str(field["source_field_id"]) for field in plan["fields"]
+    } | {"residual_mse_exposure"}
+    raw_fields: dict[str, object] = {}
+    for field_id in sorted(raw_field_ids):
+        path = os.path.join(output_dir, "raw", f"{field_id}.npy")
+        values = np.load(path, mmap_mode="r")
+        raw_fields[field_id] = {
+            "path": os.path.relpath(path, output_dir),
+            "sha256": _sha256(path),
+            "dtype": str(values.dtype),
+            "shape": list(values.shape),
+        }
+    residual = _load_scores(output_dir, "residual_mse_exposure")
+    cohort_hashes: list[dict[str, object]] = []
+    seeds = tuple(int(seed) for seed in plan["random_seeds"])
+    for field in plan["fields"]:
+        scores = _load_scores(output_dir, str(field["source_field_id"]))
+        for cohort, replicate, indices in matched_cohorts_v1(
+            scores=scores,
+            residual_scores=residual,
+            cohort_size=int(field["cohort_size"]),
+            ranking=RankingDirection(str(field["ranking"])),
+            random_seeds=seeds,
+        ):
+            cohort_hashes.append(
+                {
+                    "field": field["field"],
+                    "cohort": cohort,
+                    "replicate": replicate,
+                    "count": int(indices.numel()),
+                    "ordered_index_sha256": _index_sha256(indices),
+                }
+            )
+    return {
+        "schema_version": 1,
+        "study_id": plan["study_id"],
+        "scene": result["scene"],
+        "renderer_commit": renderer_commit,
+        "doctor_commit": doctor_commit,
+        "runner_sha256": runner_sha256,
+        "plan_sha256": _sha256(plan_path),
+        "result_sha256": _sha256(result_path),
+        "manifest_sha256": _sha256(manifest_path),
+        "checkpoint_sha256": result["checkpoint_sha256"],
+        "repair_list_sha256": result["repair_list_sha256"],
+        "certification_list_sha256": result["certification_list_sha256"],
+        "cohort_selection_version": selection_version,
+        "direction_seed": 1701,
+        "raw_fields": raw_fields,
+        "cohort_index_hashes": cohort_hashes,
+        "runtime": {
+            "numpy": np.__version__,
+            "torch": torch.__version__,
+        },
+        "interpretation": (
+            "Hashes reproduce the exact M1 selections and inputs. M1 random "
+            "and residual controls may overlap other deterministic cohorts; "
+            "confirmatory protocols use treatment-disjoint controls."
+        ),
+    }
 
 
 def _model_parameter(
@@ -233,7 +387,9 @@ def _row_directions(
     seed: int,
 ) -> torch.Tensor:
     rows = indices.to(device=device, dtype=torch.int64).reshape(-1, 1)
-    columns = torch.arange(width, device=device, dtype=torch.int64).reshape(1, -1)
+    columns = torch.arange(width, device=device, dtype=torch.int64).reshape(
+        1, -1
+    )
     parity = (rows * 1103515245 + columns * 12345 + seed) % 2
     return parity.to(dtype=dtype).mul_(2.0).sub_(1.0)
 
@@ -270,7 +426,9 @@ def perturbed_parameter_rows(
                 dtype=parameter.dtype,
                 seed=direction_seed,
             ).reshape_as(original)
-            delta = directions * reference.to(dtype=parameter.dtype) * magnitude
+            delta = (
+                directions * reference.to(dtype=parameter.dtype) * magnitude
+            )
         parameter.index_copy_(0, selected, original + delta)
     try:
         yield
@@ -288,13 +446,17 @@ def load_certification_batches(
     dataset = getattr(renderer, "dataset", None)
     dataloader = getattr(renderer, "dataloader", None)
     if dataset is None or dataloader is None:
-        raise TypeError("intervention renderer must expose dataset and dataloader")
+        raise TypeError(
+            "intervention renderer must expose dataset and dataloader"
+        )
     batches: list[tuple[str, object]] = []
     for index, batch in enumerate(dataloader):
         if index not in selected_indices:
             continue
         gpu_batch = dataset.get_gpu_batch_with_intrinsics(batch)
-        batches.append((os.path.basename(str(gpu_batch.image_path)), gpu_batch))
+        batches.append(
+            (os.path.basename(str(gpu_batch.image_path)), gpu_batch)
+        )
     if not batches:
         raise ValueError("no certification views were selected")
     return batches
@@ -326,7 +488,9 @@ def per_view_mse(
 def _load_scores(output_dir: str, field_id: str) -> torch.Tensor:
     path = os.path.join(output_dir, "raw", f"{field_id}.npy")
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"preregistered field is unavailable: {field_id}")
+        raise FileNotFoundError(
+            f"preregistered field is unavailable: {field_id}"
+        )
     return torch.from_numpy(np.load(path).astype(np.float32, copy=False))
 
 
@@ -347,9 +511,14 @@ def run_intervention_study(
         plan = json.load(handle)
     if scene_id not in plan["scenes"]:
         raise ValueError(f"scene {scene_id!r} is absent from the study plan")
-    overlap = _image_names(repair_list_path) & _image_names(certification_list_path)
+    overlap = _image_names(repair_list_path) & _image_names(
+        certification_list_path
+    )
     if overlap:
-        raise ValueError("repair and certification image lists overlap: " f"{sorted(overlap)[:5]}")
+        raise ValueError(
+            "repair and certification image lists overlap: "
+            f"{sorted(overlap)[:5]}"
+        )
     random_seeds = tuple(int(value) for value in plan["random_seeds"])
     certification_batches = load_certification_batches(
         renderer=certification_renderer,
@@ -366,7 +535,18 @@ def run_intervention_study(
     total_interventions = len(plan["fields"]) * (3 + len(random_seeds))
     for field in plan["fields"]:
         scores = _load_scores(output_dir, str(field["source_field_id"]))
-        cohorts = matched_cohorts(
+        selection_version = plan.get(
+            "cohort_selection_version", "m1_legacy_v1"
+        )
+        cohort_selector = {
+            "m1_legacy_v1": matched_cohorts_v1,
+            "disjoint_v2": matched_cohorts,
+        }.get(selection_version)
+        if cohort_selector is None:
+            raise ValueError(
+                f"unknown cohort selection version: {selection_version}"
+            )
+        cohorts = cohort_selector(
             scores=scores,
             residual_scores=residual_scores,
             cohort_size=int(field["cohort_size"]),
@@ -392,7 +572,9 @@ def run_intervention_study(
                 f"{intervention_count}/{total_interventions}: "
                 f"{field['field']} / {cohort} / {replicate}"
             )
-            changed_loss = float(np.mean([value for _, value in changed_views]))
+            changed_loss = float(
+                np.mean([value for _, value in changed_views])
+            )
             signed_delta = changed_loss - baseline_loss
             outcomes.append(
                 {
@@ -431,7 +613,9 @@ def run_intervention_study(
         "repair_list_sha256": _sha256(repair_list_path),
         "certification_list_sha256": _sha256(certification_list_path),
         "outcome_metric": plan["outcome_metric"],
-        "baseline_per_view": [{"image": image, "loss": value} for image, value in baseline_views],
+        "baseline_per_view": [
+            {"image": image, "loss": value} for image, value in baseline_views
+        ],
         "outcomes": outcomes,
         "interpretation": plan["interpretation"],
     }

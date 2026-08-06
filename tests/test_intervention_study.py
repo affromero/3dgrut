@@ -1,11 +1,18 @@
 """Tests for matched diagnostic-field interventions."""
 
+import hashlib
+import json
+from pathlib import Path
+
+import numpy as np
 import torch
 
 from threedgrut.intervention_study import (
     InterventionMode,
     RankingDirection,
+    generate_intervention_provenance,
     matched_cohorts,
+    matched_cohorts_v1,
     perturbed_parameter_rows,
 )
 
@@ -13,7 +20,9 @@ from threedgrut.intervention_study import (
 class _Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.density = torch.nn.Parameter(torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+        self.density = torch.nn.Parameter(
+            torch.tensor([[1.0], [2.0], [3.0], [4.0]])
+        )
         self.positions = torch.nn.Parameter(torch.ones((4, 3)))
 
     def get_scale(self) -> torch.Tensor:
@@ -21,8 +30,9 @@ class _Model(torch.nn.Module):
 
 
 def test_matched_cohorts_preserve_size_and_determinism() -> None:
-    scores = torch.tensor([0.2, 0.9, 0.1, 0.5])
-    residual = torch.tensor([0.8, 0.3, 0.2, 0.1])
+    """Confirmatory controls stay disjoint from treatment and each other."""
+    scores = torch.arange(12, dtype=torch.float32)
+    residual = torch.arange(12, 0, -1, dtype=torch.float32)
 
     cohorts = matched_cohorts(
         scores=scores,
@@ -39,14 +49,97 @@ def test_matched_cohorts_preserve_size_and_determinism() -> None:
         ("random", 0),
         ("random", 1),
     ]
-    assert cohorts[0][2].tolist() == [3, 1]
-    assert cohorts[1][2].tolist() == [2, 0]
-    assert cohorts[2][2].tolist() == [2, 0]
-    assert not set(cohorts[0][2].tolist()) & set(cohorts[2][2].tolist())
+    treatment = set(cohorts[0][2].tolist())
+    controls = [set(indices.tolist()) for _, _, indices in cohorts[1:]]
+    assert all(not treatment & control for control in controls)
+    assert not controls[0] & controls[1]
+    assert all(not controls[0] & control for control in controls[2:])
+    assert all(not controls[1] & control for control in controls[2:])
     assert all(indices.numel() == 2 for _, _, indices in cohorts)
 
 
+def test_m1_cohorts_reproduce_legacy_overlap() -> None:
+    """The provenance path retains the exact historical M1 selection."""
+    scores = torch.tensor([0.2, 0.9, 0.1, 0.5])
+    residual = torch.tensor([0.8, 0.3, 0.2, 0.1])
+
+    cohorts = matched_cohorts_v1(
+        scores=scores,
+        residual_scores=residual,
+        cohort_size=2,
+        ranking=RankingDirection.DESCENDING,
+        random_seeds=(4, 9),
+    )
+
+    assert cohorts[0][2].tolist() == [3, 1]
+    assert cohorts[1][2].tolist() == [2, 0]
+    assert cohorts[2][2].tolist() == [2, 0]
+
+
+def test_provenance_hashes_raw_fields_and_exact_cohort_indices(
+    tmp_path: Path,
+) -> None:
+    """Provenance authenticates source arrays and ordered cohort rows."""
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    scores = torch.arange(8, dtype=torch.float32).numpy()
+    residual = scores[::-1].copy()
+    np.save(raw / "field.npy", scores)
+    np.save(raw / "residual_mse_exposure.npy", residual)
+    plan = {
+        "study_id": "m1",
+        "scenes": ["scene"],
+        "random_seeds": [4, 9],
+        "fields": [
+            {
+                "field": "test",
+                "source_field_id": "field",
+                "cohort_size": 2,
+                "ranking": "descending",
+            }
+        ],
+    }
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    plan_hash = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    checkpoint_hash = "a" * 64
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "scene": "scene",
+                "plan_sha256": plan_hash,
+                "checkpoint_sha256": checkpoint_hash,
+                "repair_list_sha256": "b" * 64,
+                "certification_list_sha256": "c" * 64,
+            }
+        )
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"source_checkpoint_sha256": checkpoint_hash})
+    )
+
+    provenance = generate_intervention_provenance(
+        output_dir=str(tmp_path),
+        plan_path=str(plan_path),
+        result_path=str(result_path),
+        manifest_path=str(manifest_path),
+        renderer_commit="d" * 40,
+        doctor_commit="e" * 40,
+        runner_sha256="f" * 64,
+    )
+
+    assert (
+        provenance["result_sha256"]
+        == hashlib.sha256(result_path.read_bytes()).hexdigest()
+    )
+    assert len(provenance["cohort_index_hashes"]) == 5
+    assert provenance["raw_fields"]["field"]["shape"] == [8]
+
+
 def test_absolute_intervention_restores_checkpoint_rows() -> None:
+    """Absolute perturbations restore checkpoint rows on context exit."""
     model = _Model()
     original = model.density.detach().clone()
 
@@ -67,6 +160,7 @@ def test_absolute_intervention_restores_checkpoint_rows() -> None:
 
 
 def test_relative_position_intervention_uses_physical_scale() -> None:
+    """Relative position perturbations scale with physical Gaussians."""
     model = _Model()
     original = model.positions.detach().clone()
 
