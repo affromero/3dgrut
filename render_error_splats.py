@@ -29,14 +29,23 @@ from threedgrut.error_attribution import (
     ownership_weighted_mean,
     recolor_gaussian_ply,
 )
+from threedgrut.export_utils import (
+    sample_indices as _sample_indices,
+    scene_relative_path as _scene_relative_path,
+)
 from threedgrut.model.factory import create_gaussian_model
 from threedgrut.render import POST_PROCESSING_EVAL_MODE_RAW
+from threedgrut.split_membership import (
+    dataset_membership,
+    training_membership_provenance,
+    use_dataset_membership,
+)
 from threedgrut.utils.logger import logger
 
 DEFAULT_VISIBILITY_THRESHOLD = 0.0
 DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD = 1e-6
 DEFAULT_NATIVE_OPACITY_FLOOR = 1e-4
-MANIFEST_SCHEMA_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 5
 
 _counterfactual_cohorts = intervention_study.counterfactual_cohorts
 _evaluate_density_counterfactuals = intervention_study.evaluate_density_counterfactuals
@@ -206,22 +215,6 @@ def _write_raw_field(
         "raw_dtype": "float32",
         "raw_shape": [int(values.size)],
     }
-
-
-def _scene_relative_path(path: str, scene_root: str) -> str:
-    resolved_path = os.path.realpath(path)
-    resolved_root = os.path.realpath(scene_root)
-    if os.path.commonpath((resolved_path, resolved_root)) != resolved_root:
-        raise ValueError(f"Path escapes --scene-root: {path}")
-    return os.path.relpath(resolved_path, resolved_root)
-
-
-def _sample_indices(count: int, maximum: int) -> set[int]:
-    if maximum <= 0 or maximum >= count:
-        return set(range(count))
-    if maximum == 1:
-        return {count // 2}
-    return {round(index * (count - 1) / (maximum - 1)) for index in range(maximum)}
 
 
 def _field_label(metric: str, parameter: str) -> str:
@@ -479,6 +472,7 @@ def main() -> None:
 
     checkpoint = torch.load(checkpoint_path, weights_only=False)
     conf = checkpoint["config"]
+    checkpoint_training_membership = dataset_membership(conf)
     original_training_bundle = str(conf.path)
     conf.path = eval_bundle
     conf.dataset.holdout_image_list_path = os.path.abspath(args.holdout_list)
@@ -771,24 +765,25 @@ def main() -> None:
             }
         )
 
-    (
-        training_fields,
-        training_support_view_count,
-        training_support_images,
-        training_support_scores,
-    ) = _export_training_support_fields(
-        checkpoint=checkpoint,
-        model=model,
-        output_dir=output_dir,
-        eval_bundle=eval_bundle,
-        checkpoint_path=checkpoint_path,
-        original_training_bundle=original_training_bundle,
-        source_ply=source_ply,
-        scale_mode=args.normalization,
-        visibility_threshold=args.visibility_threshold,
-        maximum_views=args.training_support_max_views,
-        ownership_support_threshold=args.ownership_support_threshold,
-    )
+    with use_dataset_membership(conf, checkpoint_training_membership):
+        (
+            training_fields,
+            training_support_view_count,
+            training_support_images,
+            training_support_scores,
+        ) = _export_training_support_fields(
+            checkpoint=checkpoint,
+            model=model,
+            output_dir=output_dir,
+            eval_bundle=eval_bundle,
+            checkpoint_path=checkpoint_path,
+            original_training_bundle=original_training_bundle,
+            source_ply=source_ply,
+            scale_mode=args.normalization,
+            visibility_threshold=args.visibility_threshold,
+            maximum_views=args.training_support_max_views,
+            ownership_support_threshold=args.ownership_support_threshold,
+        )
     fields.extend(training_fields)
     heldout_ownership = native_contributor_scores["heldout_native_ownership"]
     mean_training_support = training_support_scores / max(
@@ -922,6 +917,9 @@ def main() -> None:
         "selected_images": selected_names,
         "training_support_view_count": training_support_view_count,
         "training_support_images": training_support_images,
+        "training_membership": training_membership_provenance(
+            checkpoint_training_membership
+        ),
         "mean_losses": accumulator.mean_losses(),
         "counterfactual_intervention": (
             None

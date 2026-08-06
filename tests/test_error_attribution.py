@@ -1,6 +1,7 @@
 """Tests for held-out Gaussian error attribution and PLY recoloring."""
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,7 +13,6 @@ from render_error_splats import (
     DEFAULT_VISIBILITY_THRESHOLD,
     MANIFEST_SCHEMA_VERSION,
     _counterfactual_cohorts,
-    _scene_relative_path,
     _suppressed_density_cohort,
     _write_raw_field,
 )
@@ -30,6 +30,12 @@ from threedgrut.error_attribution import (
     ownership_weighted_mean,
     recolor_gaussian_ply,
 )
+from threedgrut.export_utils import scene_relative_path
+from threedgrut.split_membership import (
+    dataset_membership,
+    training_membership_provenance,
+    use_dataset_membership,
+)
 
 
 def test_error_splat_manifest_paths_are_scene_relative(
@@ -39,12 +45,12 @@ def test_error_splat_manifest_paths_are_scene_relative(
     scene_root = os.path.join(tmp_path, "scene")
     checkpoint = os.path.join(scene_root, "generated_files", "ckpt.pt")
 
-    assert _scene_relative_path(checkpoint, scene_root) == os.path.join(
+    assert scene_relative_path(checkpoint, scene_root) == os.path.join(
         "generated_files",
         "ckpt.pt",
     )
     with pytest.raises(ValueError, match="escapes --scene-root"):
-        _scene_relative_path(os.path.join(tmp_path, "outside.pt"), scene_root)
+        scene_relative_path(os.path.join(tmp_path, "outside.pt"), scene_root)
 
 
 class _TwoPixelModel(torch.nn.Module):
@@ -73,8 +79,34 @@ class _IndependentPixelModel(torch.nn.Module):
 
 def test_manifest_contract_records_threshold_and_raw_field_version() -> None:
     """New exports use the explicit support and raw-field manifest contract."""
-    assert MANIFEST_SCHEMA_VERSION == 4
+    assert MANIFEST_SCHEMA_VERSION == 5
     assert DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD > 0.0
+
+
+def test_training_support_temporarily_restores_checkpoint_membership() -> None:
+    """Repair-view overrides cannot leak into training-support exports."""
+    dataset = SimpleNamespace(
+        holdout_image_list_path="repair.txt",
+        train_exclude_image_list_path=None,
+        test_split_interval=0,
+    )
+    dataset.get = lambda key: getattr(dataset, key, None)
+    conf = SimpleNamespace(dataset=dataset)
+    checkpoint_membership = {
+        "holdout_image_list_path": None,
+        "train_exclude_image_list_path": None,
+        "test_split_interval": 8,
+    }
+
+    with use_dataset_membership(conf, checkpoint_membership):
+        assert dataset_membership(conf) == checkpoint_membership
+
+    assert dataset.holdout_image_list_path == "repair.txt"
+    assert dataset.test_split_interval == 0
+    assert training_membership_provenance(checkpoint_membership) == {
+        "source": "checkpoint_test_split_interval",
+        **checkpoint_membership,
+    }
 
 
 def test_raw_field_round_trips_row_aligned_float32(
