@@ -400,6 +400,26 @@ def position_learning_rate_scale(
     return 1.0
 
 
+def restored_environment_mask(
+    *,
+    checkpoint_mask: torch.Tensor | None,
+    positions: torch.Tensor,
+    require_environment_identity: bool,
+) -> torch.Tensor:
+    """Normalize pre-environment checkpoint state without changing identity."""
+    if checkpoint_mask is not None and checkpoint_mask.numel() != 0:
+        return checkpoint_mask
+    if require_environment_identity:
+        raise ValueError(
+            "Visibility-adaptive checkpoint is missing the environment mask."
+        )
+    return torch.zeros(
+        (positions.shape[0],),
+        dtype=torch.bool,
+        device=positions.device,
+    )
+
+
 def _subsample_initial_points(
     pts: torch.Tensor,
     rgb: torch.Tensor,
@@ -1451,17 +1471,13 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.rotation = checkpoint["rotation"]
         self.scale = checkpoint["scale"]
         self.density = checkpoint["density"]
-        environment_mask = checkpoint.get("environment_mask")
-        if environment_mask is None:
-            if self.conf.strategy.method == "VisibilityAdaptiveStrategy":
-                raise ValueError(
-                    "Visibility-adaptive checkpoint is missing the environment mask."
-                )
-            environment_mask = torch.zeros(
-                (self.positions.shape[0],),
-                dtype=torch.bool,
-                device=self.positions.device,
-            )
+        environment_mask = restored_environment_mask(
+            checkpoint_mask=checkpoint.get("environment_mask"),
+            positions=self.positions,
+            require_environment_identity=(
+                self.conf.strategy.method == "VisibilityAdaptiveStrategy"
+            ),
+        )
         self._set_environment_mask(environment_mask)
         self.n_active_features = checkpoint["n_active_features"]
         self.max_n_features = checkpoint["max_n_features"]

@@ -9,6 +9,7 @@ from threedgrut.model.model import (
     native_environment_parameters,
     native_initial_scale_from_mean_dist2,
     position_learning_rate_scale,
+    restored_environment_mask,
 )
 
 
@@ -48,6 +49,30 @@ def test_environment_mask_rejects_invalid_state(
 
     with pytest.raises(ValueError, match="environment mask"):
         model._set_environment_mask(invalid_mask)
+
+
+def test_standard_checkpoint_empty_environment_mask_is_absence() -> None:
+    """Pre-environment checkpoints retain standard all-scene semantics."""
+    positions = torch.zeros((3, 3))
+    restored = restored_environment_mask(
+        checkpoint_mask=torch.empty((0,), dtype=torch.bool),
+        positions=positions,
+        require_environment_identity=False,
+    )
+
+    torch.testing.assert_close(restored, torch.zeros(3, dtype=torch.bool))
+
+
+def test_visibility_checkpoint_requires_environment_identity() -> None:
+    """Visibility-adaptive restoration rejects missing structural identity."""
+    positions = torch.zeros((3, 3))
+
+    with pytest.raises(ValueError, match="missing the environment mask"):
+        restored_environment_mask(
+            checkpoint_mask=torch.empty((0,), dtype=torch.bool),
+            positions=positions,
+            require_environment_identity=True,
+        )
 
 
 def test_position_learning_rate_scale_preserves_profile_semantics() -> None:
