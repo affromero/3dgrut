@@ -7,20 +7,14 @@ import argparse
 import hashlib
 import json
 import os
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 import numpy as np
 import torch
-from klogr.path import (
-    path_basename,
-    path_join,
-    path_mkdir,
-    path_relative_to,
-)
+from klogr.path import path_basename, path_join, path_mkdir, path_relative_to
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from render_common_eval import _build_renderer
+from threedgrut import intervention_study
 from threedgrut.datasets.protocols import Batch
 from threedgrut.error_attribution import (
     ErrorAttributionAccumulator,
@@ -44,6 +38,11 @@ DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD = 1e-6
 DEFAULT_NATIVE_OPACITY_FLOOR = 1e-4
 MANIFEST_SCHEMA_VERSION = 4
 
+_counterfactual_cohorts = intervention_study.counterfactual_cohorts
+_evaluate_density_counterfactuals = intervention_study.evaluate_density_counterfactuals
+_suppressed_density_cohort = intervention_study.suppressed_density_cohort
+run_intervention_study = intervention_study.run_intervention_study
+
 
 def _enum_values(enum_type: type[ErrorAttributionMetric]) -> tuple[str, ...]:
     return tuple(member.value for member in enum_type)
@@ -52,7 +51,10 @@ def _enum_values(enum_type: type[ErrorAttributionMetric]) -> tuple[str, ...]:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--source-ply", required=True)
+    parser.add_argument(
+        "--source-ply",
+        help=("Row-aligned source PLY. When omitted, export one from the " "checkpoint into the output directory."),
+    )
     parser.add_argument("--eval-bundle", required=True)
     parser.add_argument("--holdout-list", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -122,10 +124,7 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         metavar="METRIC:PARAMETER",
-        help=(
-            "Optional subset of the computed metric/parameter cross-product "
-            "to materialize as PLY files."
-        ),
+        help=("Optional subset of the computed metric/parameter cross-product " "to materialize as PLY files."),
     )
     parser.add_argument(
         "--normalization",
@@ -156,6 +155,24 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=-20.0,
         help="Pre-sigmoid density value assigned to a suppressed cohort.",
+    )
+    parser.add_argument(
+        "--intervention-plan",
+        help="Frozen matched-intervention study JSON.",
+    )
+    parser.add_argument(
+        "--certification-list",
+        help="Disjoint image list used only for intervention outcomes.",
+    )
+    parser.add_argument(
+        "--intervention-scene-id",
+        help="Scene identifier declared by the intervention plan.",
+    )
+    parser.add_argument(
+        "--intervention-max-views",
+        type=int,
+        default=0,
+        help="0 uses every certification view; positive values sample evenly.",
     )
     return parser.parse_args()
 
@@ -204,9 +221,7 @@ def _sample_indices(count: int, maximum: int) -> set[int]:
         return set(range(count))
     if maximum == 1:
         return {count // 2}
-    return {
-        round(index * (count - 1) / (maximum - 1)) for index in range(maximum)
-    }
+    return {round(index * (count - 1) / (maximum - 1)) for index in range(maximum)}
 
 
 def _field_label(metric: str, parameter: str) -> str:
@@ -246,10 +261,7 @@ def _write_native_evidence_map(
     native_dir = path_join(output_dir, "maps", "native")
     path_mkdir(native_dir, parents=True, exist_ok=True)
     image_hash = hashlib.sha256(image_name.encode("utf-8")).hexdigest()[:16]
-    fields = {
-        name: value.detach().squeeze(0).squeeze(-1).float().cpu().numpy()
-        for name, value in evidence.items()
-    }
+    fields = {name: value.detach().squeeze(0).squeeze(-1).float().cpu().numpy() for name, value in evidence.items()}
     np.savez_compressed(
         path_join(native_dir, f"map_{image_hash}.npz"),
         image_name=np.array(image_name),
@@ -277,9 +289,7 @@ def _accumulate_native_contributor_fields(
             gpu_batch,
             ray_field.squeeze(0).squeeze(-1).float(),
         )["diagnostic_weighted_sum"]
-        scores[field_id] += (
-            weighted_sum.detach().float().cpu().reshape_as(scores[field_id])
-        )
+        scores[field_id] += weighted_sum.detach().float().cpu().reshape_as(scores[field_id])
 
 
 def _export_training_support_fields(
@@ -322,10 +332,7 @@ def _export_training_support_fields(
         device="cpu",
     )
     selected_names: list[str] = []
-    logger.info(
-        "Computing native per-Gaussian training support for "
-        f"{len(selected_indices)} views."
-    )
+    logger.info("Computing native per-Gaussian training support for " f"{len(selected_indices)} views.")
     for index, batch in enumerate(renderer.dataloader):
         if index not in selected_indices:
             continue
@@ -360,12 +367,7 @@ def _export_training_support_fields(
             dim=-1,
             keepdim=True,
         ).clamp_min(torch.finfo(directions.dtype).eps)
-        narrow_view_coverage += (
-            (responsibility.to(device=directions.device) * directions)
-            .detach()
-            .float()
-            .cpu()
-        )
+        narrow_view_coverage += (responsibility.to(device=directions.device) * directions).detach().float().cpu()
         selected_names.append(path_basename(str(gpu_batch.image_path)))
 
     field_specs = (
@@ -394,9 +396,7 @@ def _export_training_support_fields(
         (
             "narrow_training_view_coverage",
             "Narrow training-view coverage",
-            torch.linalg.vector_norm(
-                narrow_view_coverage, dim=-1, keepdim=True
-            )
+            torch.linalg.vector_norm(narrow_view_coverage, dim=-1, keepdim=True)
             / support.clamp_min(torch.finfo(support.dtype).eps),
             "Native ownership-weighted resultant camera-direction magnitude "
             "over training views. High means the Gaussian was seen from a "
@@ -442,140 +442,6 @@ def _export_training_support_fields(
     return fields, len(selected_names), selected_names, support
 
 
-def _counterfactual_cohorts(
-    scores: torch.Tensor,
-    cohort_size: int,
-) -> dict[str, torch.Tensor]:
-    """Return deterministic top, random, and low-score index controls."""
-    if cohort_size <= 0:
-        raise ValueError("counterfactual cohort size must be positive.")
-    flattened = torch.nan_to_num(
-        scores.detach().reshape(-1).float().cpu(),
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0,
-    )
-    if flattened.numel() == 0:
-        raise ValueError("Counterfactual scores are empty.")
-    count = min(cohort_size, flattened.numel())
-    ordering = torch.argsort(flattened, stable=True)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(0)
-    return {
-        "top_density_sensitivity": ordering[-count:],
-        "random_control": torch.randperm(
-            flattened.numel(),
-            generator=generator,
-        )[:count],
-        "low_density_sensitivity": ordering[:count],
-    }
-
-
-@contextmanager
-def _suppressed_density_cohort(
-    model: torch.nn.Module,
-    indices: torch.Tensor,
-    suppression_logit: float,
-) -> Iterator[None]:
-    """Temporarily remove a Gaussian cohort from native alpha compositing."""
-    density = getattr(model, "density", None)
-    if not isinstance(density, torch.nn.Parameter):
-        raise TypeError(
-            "Counterfactual export requires model.density parameter."
-        )
-    selected = indices.to(device=density.device, dtype=torch.long)
-    with torch.no_grad():
-        original = density.index_select(0, selected).clone()
-        density.index_fill_(0, selected, suppression_logit)
-    try:
-        yield
-    finally:
-        with torch.no_grad():
-            density.index_copy_(0, selected, original)
-
-
-def _mean_heldout_mse(
-    *,
-    model: torch.nn.Module,
-    renderer: object,
-    selected_indices: set[int],
-) -> float:
-    """Rerender selected validation views and report their mean RGB MSE."""
-    dataset = getattr(renderer, "dataset", None)
-    dataloader = getattr(renderer, "dataloader", None)
-    if dataset is None or dataloader is None:
-        raise TypeError(
-            "Counterfactual renderer must expose dataset and dataloader."
-        )
-    values: list[float] = []
-    with torch.no_grad():
-        for index, batch in enumerate(dataloader):
-            if index not in selected_indices:
-                continue
-            gpu_batch = dataset.get_gpu_batch_with_intrinsics(batch)
-            outputs = model(gpu_batch, train=False)
-            prediction = outputs.get("pred_rgb")
-            if not isinstance(prediction, torch.Tensor):
-                raise KeyError("Renderer output has no pred_rgb.")
-            mse = attribution_loss(
-                ErrorAttributionMetric.MSE,
-                prediction,
-                gpu_batch.rgb_gt,
-                gpu_batch.mask,
-            )
-            values.append(float(mse.detach()))
-    if not values:
-        raise ValueError("No held-out views were selected for intervention.")
-    return float(np.mean(values))
-
-
-def _evaluate_density_counterfactuals(
-    *,
-    model: torch.nn.Module,
-    renderer: object,
-    selected_indices: set[int],
-    density_scores: torch.Tensor,
-    cohort_size: int,
-    suppression_logit: float,
-) -> dict[str, object]:
-    """Measure actual held-out MSE changes under matched density controls."""
-    baseline_mse = _mean_heldout_mse(
-        model=model,
-        renderer=renderer,
-        selected_indices=selected_indices,
-    )
-    cohorts = _counterfactual_cohorts(density_scores, cohort_size)
-    evaluations: list[dict[str, object]] = []
-    for name, indices in cohorts.items():
-        with _suppressed_density_cohort(model, indices, suppression_logit):
-            mse = _mean_heldout_mse(
-                model=model,
-                renderer=renderer,
-                selected_indices=selected_indices,
-            )
-        evaluations.append(
-            {
-                "cohort": name,
-                "gaussian_count": int(indices.numel()),
-                "heldout_mse": mse,
-                "delta_mse": mse - baseline_mse,
-                "absolute_delta_mse": abs(mse - baseline_mse),
-            }
-        )
-    return {
-        "method": "native density-logit suppression and held-out rerender",
-        "score": "mse:density RMS spatial loss-field sensitivity",
-        "baseline_heldout_mse": baseline_mse,
-        "suppression_logit": suppression_logit,
-        "cohorts": evaluations,
-        "interpretation": (
-            "This is an intervention-effect comparison, not a causal label. "
-            "The sensitivity ranks local effect magnitude; delta sign comes "
-            "only from the actual rerender."
-        ),
-    }
-
-
 def main() -> None:
     """Export the requested held-out metric/parameter Gaussian fields."""
     args = _parse_args()
@@ -589,14 +455,27 @@ def main() -> None:
         raise ValueError("--ownership-support-threshold must be non-negative.")
     if args.counterfactual_cohort_size < 0:
         raise ValueError("--counterfactual-cohort-size must be non-negative.")
+    study_arguments = (
+        args.intervention_plan,
+        args.certification_list,
+        args.intervention_scene_id,
+    )
+    if any(study_arguments) and not all(study_arguments):
+        raise ValueError("intervention plan, certification list, and scene id are " "required together")
+    if args.intervention_max_views < 0:
+        raise ValueError("--intervention-max-views must be non-negative.")
     if not 0.0 <= args.visibility_threshold < 1.0:
         raise ValueError("--visibility-threshold must be in [0, 1).")
     checkpoint_path = os.path.abspath(args.checkpoint)
-    source_ply = os.path.abspath(args.source_ply)
     eval_bundle = os.path.abspath(args.eval_bundle)
     output_dir = os.path.abspath(args.output_dir)
     scene_root = os.path.abspath(args.scene_root)
     os.makedirs(output_dir, exist_ok=True)
+    source_ply = (
+        os.path.abspath(args.source_ply)
+        if args.source_ply is not None
+        else path_join(output_dir, "source_checkpoint.ply")
+    )
 
     checkpoint = torch.load(checkpoint_path, weights_only=False)
     conf = checkpoint["config"]
@@ -614,6 +493,8 @@ def main() -> None:
 
     model = create_gaussian_model(conf, checkpoint=checkpoint)
     model.init_from_checkpoint(checkpoint, setup_optimizer=False)
+    if args.source_ply is None:
+        model.export_ply(source_ply)
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(True)
@@ -631,19 +512,9 @@ def main() -> None:
     )
 
     metrics = tuple(ErrorAttributionMetric(value) for value in args.metrics)
-    parameters = tuple(
-        ErrorAttributionParameter(value) for value in args.parameters
-    )
-    available_field_keys = {
-        f"{metric.value}:{parameter.value}"
-        for metric in metrics
-        for parameter in parameters
-    }
-    export_field_keys = (
-        set(args.export_fields)
-        if args.export_fields is not None
-        else available_field_keys
-    )
+    parameters = tuple(ErrorAttributionParameter(value) for value in args.parameters)
+    available_field_keys = {f"{metric.value}:{parameter.value}" for metric in metrics for parameter in parameters}
+    export_field_keys = set(args.export_fields) if args.export_fields is not None else available_field_keys
     unknown_field_keys = export_field_keys - available_field_keys
     if unknown_field_keys:
         raise ValueError(
@@ -690,12 +561,14 @@ def main() -> None:
             dtype=torch.float32,
             device="cpu",
         ),
+        "residual_mse_exposure": torch.zeros_like(
+            model.density.detach(),
+            dtype=torch.float32,
+            device="cpu",
+        ),
     }
     selected_names: list[str] = []
-    logger.info(
-        "Computing ray-attributed error fields for "
-        f"{len(selected_indices)} held-out views."
-    )
+    logger.info("Computing ray-attributed error fields for " f"{len(selected_indices)} held-out views.")
     for index, batch in enumerate(renderer.dataloader):
         if index not in selected_indices:
             continue
@@ -719,9 +592,17 @@ def main() -> None:
             evidence=native_evidence,
             scores=native_contributor_scores,
         )
-        rendered_losses = ", ".join(
-            f"{name}={value:.6f}" for name, value in losses.items()
+        residual_mse = (outputs["pred_rgb"] - gpu_batch.rgb_gt).square().mean(dim=-1)
+        if gpu_batch.mask is not None:
+            residual_mse = residual_mse * gpu_batch.mask.squeeze(-1)
+        residual_weighted_sum = model.render_responsibility(
+            gpu_batch,
+            residual_mse.squeeze(0).float(),
+        )["diagnostic_weighted_sum"]
+        native_contributor_scores["residual_mse_exposure"] += (
+            residual_weighted_sum.detach().float().cpu().reshape_as(native_contributor_scores["residual_mse_exposure"])
         )
+        rendered_losses = ", ".join(f"{name}={value:.6f}" for name, value in losses.items())
         logger.info(
             f"Attribution view {len(selected_names)}/{len(selected_indices)}: "
             f"{selected_names[-1]} ({rendered_losses})"
@@ -734,10 +615,7 @@ def main() -> None:
         density_key = "mse:density"
         density_scores = rms_scores.get(density_key)
         if density_scores is None:
-            raise ValueError(
-                "Density counterfactuals require --metrics mse and "
-                "--parameters density."
-            )
+            raise ValueError("Density counterfactuals require --metrics mse and " "--parameters density.")
         logger.info(
             "Evaluating held-out density suppression controls for "
             f"{args.counterfactual_cohort_size} Gaussians per cohort."
@@ -782,10 +660,7 @@ def main() -> None:
             {}
             if uncertainty is None
             else {
-                "uncertainty_method": (
-                    "delta-method standard error from within-view "
-                    "Rademacher probe variance"
-                ),
+                "uncertainty_method": ("delta-method standard error from within-view " "Rademacher probe variance"),
                 **{
                     f"uncertainty_{name}": value
                     for name, value in _write_raw_field(
@@ -824,9 +699,7 @@ def main() -> None:
         ownership=native_contributor_scores["heldout_native_ownership"],
     )
     native_contributor_scores["mean_hit_congestion"] = mean_hit_congestion
-    native_contributor_scores["mean_hit_congestion_validity"] = (
-        congestion_validity
-    )
+    native_contributor_scores["mean_hit_congestion_validity"] = congestion_validity
     native_contributor_specs = (
         (
             "heldout_native_ownership",
@@ -842,20 +715,24 @@ def main() -> None:
         (
             "hit_congestion_exposure",
             "Hit-congestion exposure",
-            "Exact T*alpha-weighted exposure to native accepted-hit count; "
-            "not an intrinsic per-Gaussian hit count.",
+            "Exact T*alpha-weighted exposure to native accepted-hit count; " "not an intrinsic per-Gaussian hit count.",
         ),
         (
             "mean_hit_congestion",
             "Mean hit congestion",
-            "Ownership-weighted mean native accepted-hit count over held-out "
-            "rays with positive ownership.",
+            "Ownership-weighted mean native accepted-hit count over held-out " "rays with positive ownership.",
         ),
         (
             "mean_hit_congestion_validity",
             "Mean hit congestion validity",
             "One where held-out native ownership is positive and the "
             "ownership-weighted mean is defined; zero otherwise.",
+        ),
+        (
+            "residual_mse_exposure",
+            "Residual-only control exposure",
+            "Exact T*alpha-weighted exposure to held-out per-pixel RGB MSE; "
+            "retained as a matched intervention control, not a diagnosis.",
         ),
     )
     for field_id, label, attribution in native_contributor_specs:
@@ -879,9 +756,7 @@ def main() -> None:
                 "id": field_id,
                 "label": label,
                 "metric_id": (
-                    "native_ray_mean"
-                    if field_id.startswith("mean_hit_congestion")
-                    else "native_ray_exposure"
+                    "native_ray_mean" if field_id.startswith("mean_hit_congestion") else "native_ray_exposure"
                 ),
                 "parameter": field_id,
                 "artifact_kind": "ply",
@@ -987,6 +862,38 @@ def main() -> None:
                 "attribution": attribution,
             }
         )
+    intervention_study = None
+    if args.intervention_plan is not None:
+        conf.dataset.holdout_image_list_path = os.path.abspath(args.certification_list)
+        certification_renderer = _build_renderer(
+            checkpoint,
+            model,
+            out_dir=path_join(output_dir, "certification"),
+            eval_bundle=eval_bundle,
+            post_processing_mode=POST_PROCESSING_EVAL_MODE_RAW,
+            split="val",
+            checkpoint_path=checkpoint_path,
+            checkpoint_sha256=_sha256(checkpoint_path),
+            original_training_bundle=original_training_bundle,
+        )
+        certification_indices = _sample_indices(
+            len(certification_renderer.dataloader),
+            args.intervention_max_views,
+        )
+        intervention_study = run_intervention_study(
+            plan_path=os.path.abspath(args.intervention_plan),
+            scene_id=args.intervention_scene_id,
+            output_dir=output_dir,
+            model=model,
+            certification_renderer=certification_renderer,
+            selected_indices=certification_indices,
+            repair_list_path=os.path.abspath(args.holdout_list),
+            certification_list_path=os.path.abspath(args.certification_list),
+            checkpoint_sha256=_sha256(checkpoint_path),
+        )
+        study_path = path_join(output_dir, "intervention_study.json")
+        with open(study_path, "w", encoding="utf-8") as handle:
+            json.dump(intervention_study, handle, indent=2, sort_keys=True)
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "source_checkpoint": _scene_relative_path(
@@ -1006,10 +913,7 @@ def main() -> None:
         "view_count": accumulator.view_count,
         "attribution_probes": args.attribution_probes,
         "attribution_seed": args.attribution_seed,
-        "attribution_estimator": (
-            "sqrt(mean_views(mean_local_components("
-            "squared_parameter_block_gradient_norm)))"
-        ),
+        "attribution_estimator": ("sqrt(mean_views(mean_local_components(" "squared_parameter_block_gradient_norm)))"),
         "attribution_components": accumulator.component_metadata(),
         "ownership_support_threshold": args.ownership_support_threshold,
         "ownership_support_threshold_units": "mean T*alpha per rendered ray",
@@ -1024,10 +928,17 @@ def main() -> None:
             if counterfactual is None
             else {
                 "filename": "interventions.json",
-                "artifact_sha256": _sha256(
-                    path_join(output_dir, "interventions.json")
-                ),
+                "artifact_sha256": _sha256(path_join(output_dir, "interventions.json")),
                 "contents": counterfactual,
+            }
+        ),
+        "matched_intervention_study": (
+            None
+            if intervention_study is None
+            else {
+                "filename": "intervention_study.json",
+                "artifact_sha256": _sha256(path_join(output_dir, "intervention_study.json")),
+                "contents": intervention_study,
             }
         ),
         "native_evidence_maps": {
@@ -1037,34 +948,20 @@ def main() -> None:
             "hit_count": "native accepted Gaussian-hit count",
         },
         "native_contributor_fields": {
-            "heldout_native_ownership": (
-                "exact held-out sum of front-to-back T*alpha ownership"
-            ),
-            "depth_ambiguity_exposure": (
-                "exact T*alpha-weighted native depth-variance exposure"
-            ),
-            "hit_congestion_exposure": (
-                "exact T*alpha-weighted native hit-count exposure"
-            ),
-            "mean_hit_congestion": (
-                "ownership-weighted mean native accepted-hit count"
-            ),
-            "mean_hit_congestion_validity": (
-                "positive held-out ownership validity mask"
-            ),
+            "heldout_native_ownership": ("exact held-out sum of front-to-back T*alpha ownership"),
+            "depth_ambiguity_exposure": ("exact T*alpha-weighted native depth-variance exposure"),
+            "hit_congestion_exposure": ("exact T*alpha-weighted native hit-count exposure"),
+            "mean_hit_congestion": ("ownership-weighted mean native accepted-hit count"),
+            "mean_hit_congestion_validity": ("positive held-out ownership validity mask"),
+            "residual_mse_exposure": ("exact T*alpha-weighted held-out per-pixel RGB MSE control"),
         },
         "fields": fields,
         "doctor_metric_coverage": {
             "lowfreq_frac": "ray-attributed splat field",
-            "training_support": (
-                "exact native sum of training-ray T*alpha ownership"
-            ),
-            "training_view_count": (
-                "exact count of training cameras with nonzero T*alpha support"
-            ),
+            "training_support": ("exact native sum of training-ray T*alpha ownership"),
+            "training_view_count": ("exact count of training cameras with nonzero T*alpha support"),
             "supporting_camera_count": (
-                "count of training cameras meeting the recorded mean "
-                "ownership-per-ray threshold"
+                "count of training cameras meeting the recorded mean " "ownership-per-ray threshold"
             ),
             "psnr": "same local ordering as mse attribution",
             "masked_psnr": "same masked local ordering as mse attribution",
