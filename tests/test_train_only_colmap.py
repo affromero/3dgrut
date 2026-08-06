@@ -64,12 +64,13 @@ def test_fixed_camera_metadata_accepts_identical_public_pose(
     output_path = tmp_path / "output"
     _write_model(source_path)
     _write_model(output_path)
-    source_sha, output_sha = validate_fixed_camera_metadata(
+    source_sha, output_sha, maximum_difference = validate_fixed_camera_metadata(
         source=pycolmap.Reconstruction(str(source_path)),
         output=pycolmap.Reconstruction(str(output_path)),
         training_names=["a.jpg"],
     )
     assert source_sha == output_sha
+    assert maximum_difference == 0.0
 
 
 def test_fixed_camera_metadata_rejects_pose_change(tmp_path: Path) -> None:

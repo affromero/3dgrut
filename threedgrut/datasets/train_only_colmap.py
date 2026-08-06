@@ -117,10 +117,11 @@ def validate_fixed_camera_metadata(
     output: pycolmap.Reconstruction,
     training_names: list[str],
     atol: float = 1e-12,
-) -> tuple[str, str]:
+) -> tuple[str, str, float]:
     """Require the output to retain each public ID, intrinsic, and pose."""
     source_records = _camera_pose_records(source, training_names)
     output_records = _camera_pose_records(output, training_names)
+    maximum_absolute_difference = 0.0
     for source_record, output_record in zip(source_records, output_records, strict=True):
         for key in (
             "image_id",
@@ -133,6 +134,8 @@ def validate_fixed_camera_metadata(
             if source_record[key] != output_record[key]:
                 _fail(f"fixed camera metadata changed field {key}")
         for key in ("camera_params", "qvec_xyzw", "tvec"):
+            difference = np.abs(np.asarray(source_record[key]) - np.asarray(output_record[key]))
+            maximum_absolute_difference = max(maximum_absolute_difference, float(np.max(difference)))
             if not np.allclose(
                 source_record[key],
                 output_record[key],
@@ -140,7 +143,11 @@ def validate_fixed_camera_metadata(
                 atol=atol,
             ):
                 _fail(f"fixed camera metadata changed field {key}")
-    return _sha256_json(source_records), _sha256_json(output_records)
+    return (
+        _sha256_json(source_records),
+        _sha256_json(output_records),
+        maximum_absolute_difference,
+    )
 
 
 def _write_input_model(*, source_sparse: Path, training_names: list[str], output_path: Path) -> pycolmap.Reconstruction:
@@ -256,7 +263,11 @@ def materialize_train_only_bundle(
         output_names = sorted(image.name for image in triangulated.images.values())
         if output_names != training_names:
             _fail("triangulated model contains non-training images")
-        source_metadata_sha256, output_metadata_sha256 = validate_fixed_camera_metadata(
+        (
+            source_metadata_sha256,
+            output_metadata_sha256,
+            maximum_camera_metadata_difference,
+        ) = validate_fixed_camera_metadata(
             source=source,
             output=triangulated,
             training_names=training_names,
@@ -314,6 +325,7 @@ def materialize_train_only_bundle(
                     "tvec",
                 ],
                 "absolute_tolerance": 1e-12,
+                "maximum_absolute_difference": (maximum_camera_metadata_difference),
                 "record_count": len(training_names),
                 "source_sha256": source_metadata_sha256,
                 "output_sha256": output_metadata_sha256,
