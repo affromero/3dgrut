@@ -1,5 +1,6 @@
 """Behavioral tests for M2 Ghost-directed Gaussian pruning."""
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,12 +22,18 @@ from threedgrut.ghost_repair_study import (
     candidate_id,
     cohort_overlaps,
     file_sha256,
+    payload_sha256,
     resolve_registered_path,
     seal_output_file,
     seal_output_tree,
     verify_output_file,
     verify_output_tree,
     write_json_exclusive,
+)
+from threedgrut.post_training.certification import (
+    certificate_payload,
+    sealed_certification_baseline,
+    sealed_scene_certificate,
 )
 
 
@@ -221,3 +228,224 @@ def test_sealed_render_tree_rejects_added_payload(tmp_path: Path) -> None:
     (render / "unexpected.npy").write_bytes(b"changed")
     with pytest.raises(ValueError, match="render output changed"):
         verify_output_tree(render)
+
+
+def test_certificate_fails_closed_when_ghost_evidence_is_unavailable() -> None:
+    """An all-abstaining sealed split emits nulls and cannot be accepted."""
+    plan = SimpleNamespace(
+        bootstrap_samples=100,
+        bootstrap_seed=7,
+        confidence_level=0.95,
+        certification=SimpleNamespace(
+            minimum_target_improvement=0.01,
+            metric_gates=[],
+        ),
+    )
+    selection = {
+        "selected_candidate": "baseline",
+        "calibrated_minimum_ghost_reduction": 0.01,
+        "random_superiority": False,
+    }
+    unavailable = {
+        "values": {"ghost": float("nan"), "psnr": 28.0},
+        "ghost": {"per_view": [float("nan")] * 5},
+    }
+
+    certificate = certificate_payload(
+        plan=plan,
+        scene_name="playroom",
+        selection=selection,
+        selection_sha256="selection",
+        certification_list_sha256="views",
+        baseline=unavailable,
+        selected_result=unavailable,
+    )
+
+    assert certificate["baseline_values"]["ghost"] is None
+    assert certificate["ghost_improvement"] is None
+    assert certificate["paired_bootstrap_lower_bound"] is None
+    assert certificate["evidence_availability"] == {
+        "baseline_ghost_views": 0,
+        "selected_ghost_views": 0,
+        "paired_ghost_views": 0,
+        "same_ghost_view_mask": True,
+        "complete_paired_ghost_evidence": False,
+    }
+    assert certificate["accepted"] is False
+    json.dumps(certificate, allow_nan=False)
+
+
+def test_certificate_rejects_partial_post_outcome_ghost_evidence() -> None:
+    """Matching partial masks remain descriptive and cannot certify a repair."""
+    plan = SimpleNamespace(
+        bootstrap_samples=100,
+        bootstrap_seed=7,
+        confidence_level=0.95,
+        certification=SimpleNamespace(
+            minimum_target_improvement=0.01,
+            metric_gates=[],
+        ),
+    )
+    selection = {
+        "selected_candidate": "candidate",
+        "calibrated_minimum_ghost_reduction": 0.01,
+        "random_superiority": False,
+    }
+    baseline = {
+        "values": {"ghost": 0.25},
+        "ghost": {"per_view": [0.2, float("nan"), 0.3]},
+    }
+    candidate = {
+        "values": {"ghost": 0.15},
+        "ghost": {"per_view": [0.1, float("nan"), 0.2]},
+    }
+
+    certificate = certificate_payload(
+        plan=plan,
+        scene_name="scene",
+        selection=selection,
+        selection_sha256="selection",
+        certification_list_sha256="views",
+        baseline=baseline,
+        selected_result=candidate,
+    )
+
+    assert certificate["ghost_improvement"] == pytest.approx(0.1)
+    assert certificate["paired_bootstrap_lower_bound"] is None
+    assert not certificate["evidence_availability"][
+        "complete_paired_ghost_evidence"
+    ]
+    assert certificate["accepted"] is False
+
+
+def test_sealed_baseline_recovery_authenticates_opened_evidence(
+    tmp_path: Path,
+) -> None:
+    """Recovery reuses only a complete result bound to the frozen identities."""
+    baseline = tmp_path / "certification" / "baseline"
+    for name in ("repair_renders", "hole_support_renders"):
+        render = baseline / name
+        render.mkdir(parents=True)
+        (render / "payload.bin").write_bytes(b"sealed")
+        seal_output_tree(render)
+    result = {
+        "surface": {
+            "rendered_view_names": ["cert.jpg"],
+            "teacher_fgd": {"teacher_train_names_sha256": "train"},
+        },
+        "hole": {"training_names_sha256": "support"},
+    }
+    result_path = baseline / "result.json"
+    result_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
+    seal_output_file(result_path)
+    fingerprint = {
+        "role": "certification_baseline",
+        "scene_study": {
+            "role": "certification",
+            "scene_study": {"complete": "registered identity"},
+            "selection_sha256": "selection",
+            "certification_list_sha256": "views",
+        },
+    }
+    marker_path = baseline / "input_fingerprint.json"
+    marker_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "fingerprint_sha256": payload_sha256(fingerprint),
+                "fingerprint": fingerprint,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    recovered = sealed_certification_baseline(
+        cert_dir=tmp_path / "certification",
+        selection_sha256="selection",
+        certification_list_sha256="views",
+        certification_names=["cert.jpg"],
+        canonical_train_sha256="train",
+        hole_support_sha256="support",
+    )
+
+    assert recovered == result
+    with pytest.raises(ValueError, match="identity differs"):
+        sealed_certification_baseline(
+            cert_dir=tmp_path / "certification",
+            selection_sha256="changed",
+            certification_list_sha256="views",
+            certification_names=["cert.jpg"],
+            canonical_train_sha256="train",
+            hole_support_sha256="support",
+        )
+
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["fingerprint_sha256"] = "changed"
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="authentication failed"):
+        sealed_certification_baseline(
+            cert_dir=tmp_path / "certification",
+            selection_sha256="selection",
+            certification_list_sha256="views",
+            certification_names=["cert.jpg"],
+            canonical_train_sha256="train",
+            hole_support_sha256="support",
+        )
+    marker["fingerprint"]["role"] = "development_baseline"
+    marker["fingerprint_sha256"] = payload_sha256(marker["fingerprint"])
+    marker_path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="authentication failed"):
+        sealed_certification_baseline(
+            cert_dir=tmp_path / "certification",
+            selection_sha256="selection",
+            certification_list_sha256="views",
+            certification_names=["cert.jpg"],
+            canonical_train_sha256="train",
+            hole_support_sha256="support",
+        )
+
+
+def test_sealed_certificate_reuse_authenticates_certification_split(
+    tmp_path: Path,
+) -> None:
+    """A sealed certificate cannot be reused under a missing or changed split."""
+    path = tmp_path / "certificate.json"
+    path.write_text(
+        json.dumps(
+            {
+                "scene": "scene",
+                "selection_sha256": "selection",
+                "certification_list_sha256": "views",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    seal_output_file(path)
+
+    assert (
+        sealed_scene_certificate(
+            path=path,
+            scene_name="scene",
+            selection_sha256="selection",
+            certification_list_sha256="views",
+        )
+        is not None
+    )
+    with pytest.raises(ValueError, match="identity differs"):
+        sealed_scene_certificate(
+            path=path,
+            scene_name="scene",
+            selection_sha256="selection",
+            certification_list_sha256="changed",
+        )
+    assert (
+        sealed_scene_certificate(
+            path=tmp_path / "missing.json",
+            scene_name="scene",
+            selection_sha256="selection",
+            certification_list_sha256="views",
+        )
+        is None
+    )

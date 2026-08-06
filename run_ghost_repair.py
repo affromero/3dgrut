@@ -16,7 +16,6 @@ from doctor_splat.post_training.ghost_repair import (
     GhostRepairPlan,
     calibrated_ghost_floor,
     method_level_passes,
-    paired_bootstrap_lower_bound,
     random_superiority,
     select_development_candidate,
 )
@@ -47,6 +46,11 @@ from threedgrut.ghost_repair_study import (
     verify_output_tree,
     write_json,
     write_json_exclusive,
+)
+from threedgrut.post_training.certification import (
+    seal_scene_certificate,
+    sealed_certification_baseline,
+    sealed_scene_certificate,
 )
 from threedgrut.post_training.provenance import (
     artifact_fingerprint,
@@ -594,6 +598,19 @@ def certify_scene(
     if selection["source_checkpoint_sha256"] != file_sha256(checkpoint_path):
         raise ValueError("selection checkpoint hash differs at certification")
     selection_sha256 = file_sha256(selection_path)
+    _, certification_path = certification_inputs(
+        scene, scene_root=scene_root, doctor_root=doctor_root
+    )
+    certification_list_sha256 = file_sha256(certification_path)
+    certificate_path = output_root / scene.scene / "certificate.json"
+    certificate = sealed_scene_certificate(
+        path=certificate_path,
+        scene_name=scene.scene,
+        selection_sha256=selection_sha256,
+        certification_list_sha256=certification_list_sha256,
+    )
+    if certificate is not None:
+        return certificate
     write_json_exclusive(
         output_root / scene.scene / "certification_opened.json",
         {
@@ -601,9 +618,6 @@ def certify_scene(
             "plan_sha256": file_sha256(plan_path.resolve()),
             "selection_sha256": selection_sha256,
         },
-    )
-    _, certification_path = certification_inputs(
-        scene, scene_root=scene_root, doctor_root=doctor_root
     )
     checkpoint = torch.load(
         checkpoint_path, map_location="cpu", weights_only=False
@@ -626,6 +640,27 @@ def certify_scene(
         raise ValueError("certification and canonical training views overlap")
     if certification_names & set(hole_support.names):
         raise ValueError("certification and Hole-support views overlap")
+    cert_dir = output_root / scene.scene / "certification"
+    if selection["selected_candidate"] == "baseline":
+        recovered_baseline = sealed_certification_baseline(
+            cert_dir=cert_dir,
+            selection_sha256=selection_sha256,
+            certification_list_sha256=certification_list_sha256,
+            certification_names=list(certification.names),
+            canonical_train_sha256=file_sha256(paths["canonical_train_list"]),
+            hole_support_sha256=file_sha256(paths["hole_support_list"]),
+        )
+        if recovered_baseline is not None:
+            return seal_scene_certificate(
+                path=certificate_path,
+                plan=plan,
+                scene_name=scene.scene,
+                selection=selection,
+                selection_sha256=selection_sha256,
+                certification_list_sha256=certification_list_sha256,
+                baseline=recovered_baseline,
+                selected_result=recovered_baseline,
+            )
     base_fingerprint = scene_fingerprint(
         plan=plan,
         scene=scene,
@@ -643,10 +678,9 @@ def certify_scene(
     certification_fingerprint = artifact_fingerprint(
         base_fingerprint,
         "certification",
-        certification_list_sha256=file_sha256(certification_path),
+        certification_list_sha256=certification_list_sha256,
         selection_sha256=selection_sha256,
     )
-    cert_dir = output_root / scene.scene / "certification"
     baseline = baseline_result(
         checkpoint=checkpoint_path,
         bundle=bundle,
@@ -692,51 +726,16 @@ def certify_scene(
                 cohort=selection["selected_cohort"],
             ),
         )
-    gates = gate_results(baseline["values"], selected_result["values"], plan)
-    before_views = baseline["ghost"]["per_view"]
-    after_views = selected_result["ghost"]["per_view"]
-    lower_bound = paired_bootstrap_lower_bound(
-        before=before_views,
-        after=after_views,
-        samples=plan.bootstrap_samples,
-        seed=plan.bootstrap_seed,
-        confidence_level=plan.confidence_level,
+    return seal_scene_certificate(
+        path=certificate_path,
+        plan=plan,
+        scene_name=scene.scene,
+        selection=selection,
+        selection_sha256=selection_sha256,
+        certification_list_sha256=certification_list_sha256,
+        baseline=baseline,
+        selected_result=selected_result,
     )
-    improvement = float(baseline["values"]["ghost"]) - float(
-        selected_result["values"]["ghost"]
-    )
-    target_floor = max(
-        plan.certification.minimum_target_improvement,
-        float(selection["calibrated_minimum_ghost_reduction"]),
-    )
-    accepted = (
-        selected_name != "baseline"
-        and all(gates.values())
-        and improvement >= target_floor
-        and lower_bound > 0.0
-    )
-    certificate = {
-        "schema_version": 1,
-        "scene": scene.scene,
-        "selection_sha256": selection_sha256,
-        "certification_list_sha256": file_sha256(certification_path),
-        "selected_candidate": selected_name,
-        "baseline_values": baseline["values"],
-        "selected_values": selected_result["values"],
-        "metric_gates": {
-            metric.value: value for metric, value in gates.items()
-        },
-        "ghost_improvement": improvement,
-        "required_ghost_improvement": target_floor,
-        "paired_bootstrap_lower_bound": lower_bound,
-        "exploratory_random_superiority": selection["random_superiority"],
-        "accepted": accepted,
-    }
-    write_json_exclusive(
-        output_root / scene.scene / "certificate.json", certificate
-    )
-    seal_output_file(output_root / scene.scene / "certificate.json")
-    return certificate
 
 
 def aggregate_certificates(
@@ -777,7 +776,12 @@ def aggregate_certificates(
     method_pass = method_level_passes(
         accepted=[bool(item["accepted"]) for item in certificates],
         ghost_improvements=[
-            float(item["ghost_improvement"]) for item in certificates
+            (
+                float(item["ghost_improvement"])
+                if item["ghost_improvement"] is not None
+                else 0.0
+            )
+            for item in certificates
         ],
         rule=plan.method_level,
     )
