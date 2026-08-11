@@ -165,7 +165,8 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Evaluate policy fields on authenticated reconstruction images. "
-            "Selected and training-support image sets must be identical."
+            "Selected images must be an ordered subset of the complete "
+            "training-support image set."
         ),
     )
     parser.add_argument(
@@ -216,10 +217,21 @@ def _manifest_mode_contract(
                 "held-out and training-support diagnostic images overlap"
             )
         return MANIFEST_SCHEMA_VERSION, "heldout_diagnostic_fields"
-    if selected_images != training_support_images:
+    positions = {name: index for index, name in enumerate(training_support_images)}
+    try:
+        selected_positions = [positions[name] for name in selected_images]
+    except KeyError as error:
         raise ValueError(
-            "M8 reconstruction fields require identical ordered "
-            "selected and training-support image sets"
+            "M8 reconstruction field image is absent from training support"
+        ) from error
+    if (
+        not selected_images
+        or len(selected_images) != len(set(selected_images))
+        or selected_positions != sorted(selected_positions)
+    ):
+        raise ValueError(
+            "M8 reconstruction fields require a unique ordered subset of "
+            "the training-support image set"
         )
     return (
         M8_RECONSTRUCTION_MANIFEST_SCHEMA_VERSION,

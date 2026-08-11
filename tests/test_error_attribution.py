@@ -86,18 +86,18 @@ def test_manifest_contract_records_threshold_and_raw_field_version() -> None:
     assert DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD > 0.0
 
 
-def test_m8_reconstruction_mode_requires_identical_ordered_images() -> None:
+def test_m8_reconstruction_mode_requires_ordered_training_subset() -> None:
     assert _manifest_mode_contract(
         m8_reconstruction_fields=True,
-        selected_images=["a.png", "b.png"],
-        training_support_images=["a.png", "b.png"],
+        selected_images=["a.png", "c.png"],
+        training_support_images=["a.png", "b.png", "c.png"],
     ) == (6, "m8_reconstruction_policy_fields")
 
-    with pytest.raises(ValueError, match="identical ordered"):
+    with pytest.raises(ValueError, match="ordered subset"):
         _manifest_mode_contract(
             m8_reconstruction_fields=True,
-            selected_images=["a.png", "b.png"],
-            training_support_images=["b.png", "a.png"],
+            selected_images=["c.png", "a.png"],
+            training_support_images=["a.png", "b.png", "c.png"],
         )
 
 
