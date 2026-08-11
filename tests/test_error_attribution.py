@@ -16,6 +16,7 @@ from render_error_splats import (
     _counterfactual_cohorts,
     _manifest_mode_contract,
     _suppressed_density_cohort,
+    _view_index_contract,
     _write_raw_field,
 )
 from threedgrut.error_attribution import (
@@ -38,6 +39,29 @@ from threedgrut.split_membership import (
     training_membership_provenance,
     use_dataset_membership,
 )
+
+
+def test_native_direct_views_can_cover_all_attribution_views() -> None:
+    """M8 can estimate direct fields on all views while probing eight."""
+    attribution, direct = _view_index_contract(
+        count=17,
+        attribution_maximum=8,
+        native_maximum=0,
+    )
+
+    assert attribution == {0, 2, 5, 7, 9, 11, 14, 16}
+    assert direct == set(range(17))
+
+
+def test_native_direct_views_follow_legacy_sampling_when_unspecified() -> None:
+    """Existing callers retain the prior single-subset behavior."""
+    attribution, direct = _view_index_contract(
+        count=17,
+        attribution_maximum=8,
+        native_maximum=None,
+    )
+
+    assert direct == attribution
 
 
 def test_error_splat_manifest_paths_are_scene_relative(

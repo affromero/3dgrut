@@ -112,6 +112,15 @@ def _parse_args() -> argparse.Namespace:
         help="0 evaluates every held-out view; positive values sample evenly.",
     )
     parser.add_argument(
+        "--native-max-views",
+        type=int,
+        default=None,
+        help=(
+            "Native direct-field view limit. Omit to follow --max-views; "
+            "0 evaluates every view independently of attribution sampling."
+        ),
+    )
+    parser.add_argument(
         "--training-support-max-views",
         type=int,
         default=0,
@@ -237,6 +246,18 @@ def _manifest_mode_contract(
         M8_RECONSTRUCTION_MANIFEST_SCHEMA_VERSION,
         "m8_reconstruction_policy_fields",
     )
+
+
+def _view_index_contract(
+    *, count: int, attribution_maximum: int, native_maximum: int | None
+) -> tuple[set[int], set[int]]:
+    """Select attribution and direct-field views independently."""
+    attribution = _sample_indices(count, attribution_maximum)
+    native = _sample_indices(
+        count,
+        attribution_maximum if native_maximum is None else native_maximum,
+    )
+    return attribution, native
 
 
 def _write_raw_field(
@@ -486,6 +507,8 @@ def main() -> None:
     args = _parse_args()
     if args.max_views < 0:
         raise ValueError("--max-views must be non-negative.")
+    if args.native_max_views is not None and args.native_max_views < 0:
+        raise ValueError("--native-max-views must be non-negative.")
     if args.training_support_max_views < 0:
         raise ValueError("--training-support-max-views must be non-negative.")
     if args.attribution_probes <= 0:
@@ -581,9 +604,10 @@ def main() -> None:
         probe_count=args.attribution_probes,
         seed=args.attribution_seed,
     )
-    selected_indices = _sample_indices(
-        len(renderer.dataloader),
-        args.max_views,
+    selected_indices, native_indices = _view_index_contract(
+        count=len(renderer.dataloader),
+        attribution_maximum=args.max_views,
+        native_maximum=args.native_max_views,
     )
     native_contributor_scores = {
         "heldout_native_ownership": torch.zeros_like(
@@ -608,45 +632,61 @@ def main() -> None:
         ),
     }
     selected_names: list[str] = []
+    native_names: list[str] = []
     logger.info("Computing ray-attributed error fields for " f"{len(selected_indices)} held-out views.")
     for index, batch in enumerate(renderer.dataloader):
-        if index not in selected_indices:
+        if index not in selected_indices and index not in native_indices:
             continue
         gpu_batch = renderer.dataset.get_gpu_batch_with_intrinsics(batch)
         outputs = model(gpu_batch, train=False)
-        losses = accumulator.accumulate(
-            outputs=outputs,
-            target=gpu_batch.rgb_gt,
-            mask=gpu_batch.mask,
-        )
         image_name = path_basename(str(gpu_batch.image_path))
-        selected_names.append(image_name)
-        native_evidence = _write_native_evidence_map(
-            output_dir=output_dir,
-            image_name=image_name,
-            outputs=outputs,
-        )
-        _accumulate_native_contributor_fields(
-            model=model,
-            gpu_batch=gpu_batch,
-            evidence=native_evidence,
-            scores=native_contributor_scores,
-        )
-        residual_mse = (outputs["pred_rgb"] - gpu_batch.rgb_gt).square().mean(dim=-1)
-        if gpu_batch.mask is not None:
-            residual_mse = residual_mse * gpu_batch.mask.squeeze(-1)
-        residual_weighted_sum = model.render_responsibility(
-            gpu_batch,
-            residual_mse.squeeze(0).float(),
-        )["diagnostic_weighted_sum"]
-        native_contributor_scores["residual_mse_exposure"] += (
-            residual_weighted_sum.detach().float().cpu().reshape_as(native_contributor_scores["residual_mse_exposure"])
-        )
-        rendered_losses = ", ".join(f"{name}={value:.6f}" for name, value in losses.items())
-        logger.info(
-            f"Attribution view {len(selected_names)}/{len(selected_indices)}: "
-            f"{selected_names[-1]} ({rendered_losses})"
-        )
+        if index in selected_indices:
+            losses = accumulator.accumulate(
+                outputs=outputs,
+                target=gpu_batch.rgb_gt,
+                mask=gpu_batch.mask,
+            )
+            selected_names.append(image_name)
+            rendered_losses = ", ".join(
+                f"{name}={value:.6f}" for name, value in losses.items()
+            )
+            logger.info(
+                f"Attribution view {len(selected_names)}/"
+                f"{len(selected_indices)}: {selected_names[-1]} "
+                f"({rendered_losses})"
+            )
+        if index in native_indices:
+            native_names.append(image_name)
+            native_evidence = _write_native_evidence_map(
+                output_dir=output_dir,
+                image_name=image_name,
+                outputs=outputs,
+            )
+            _accumulate_native_contributor_fields(
+                model=model,
+                gpu_batch=gpu_batch,
+                evidence=native_evidence,
+                scores=native_contributor_scores,
+            )
+            residual_mse = (
+                (outputs["pred_rgb"] - gpu_batch.rgb_gt)
+                .square()
+                .mean(dim=-1)
+            )
+            if gpu_batch.mask is not None:
+                residual_mse = residual_mse * gpu_batch.mask.squeeze(-1)
+            residual_weighted_sum = model.render_responsibility(
+                gpu_batch,
+                residual_mse.squeeze(0).float(),
+            )["diagnostic_weighted_sum"]
+            native_contributor_scores["residual_mse_exposure"] += (
+                residual_weighted_sum.detach()
+                .float()
+                .cpu()
+                .reshape_as(
+                    native_contributor_scores["residual_mse_exposure"]
+                )
+            )
 
     rms_scores = accumulator.rms_scores()
     rms_standard_errors = accumulator.rms_standard_errors()
@@ -967,6 +1007,8 @@ def main() -> None:
         "native_depth_opacity_floor": DEFAULT_NATIVE_OPACITY_FLOOR,
         "visibility_threshold": args.visibility_threshold,
         "selected_images": selected_names,
+        "native_direct_view_count": len(native_names),
+        "native_direct_images": native_names,
         "training_support_view_count": training_support_view_count,
         "training_support_images": training_support_images,
         "training_membership": training_membership_provenance(
