@@ -39,6 +39,7 @@ class ErrorAttributionMetric(StrEnum):
     SSIM = "ssim"
     LPIPS = "lpips"
     LOW_FREQUENCY = "lowfreq_frac"
+    REGISTERED_LOSS = "registered_loss"
 
 
 class ErrorAttributionParameter(StrEnum):
@@ -383,6 +384,49 @@ def _ssim_components(
     return field.mean(dim=1, keepdim=True)
 
 
+def _full_frame_ssim_components(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> torch.Tensor:
+    """Return one local one-minus-SSIM component per image pixel."""
+    prediction_bchw = prediction.permute(0, 3, 1, 2)
+    target_bchw = target.permute(0, 3, 1, 2)
+    channels = prediction_bchw.shape[1]
+    kernel = _gaussian_kernel(
+        radius=5,
+        sigma=1.5,
+        device=prediction.device,
+        dtype=prediction.dtype,
+    )
+    window = torch.outer(kernel, kernel).reshape(1, 1, 11, 11)
+    window = window.expand(channels, 1, 11, 11)
+
+    def filter_image(image: torch.Tensor) -> torch.Tensor:
+        padded = F.pad(image, (5, 5, 5, 5), mode="reflect")
+        return F.conv2d(padded, window, groups=channels)
+
+    mu_prediction = filter_image(prediction_bchw)
+    mu_target = filter_image(target_bchw)
+    mu_prediction_sq = mu_prediction.square()
+    mu_target_sq = mu_target.square()
+    mu_product = mu_prediction * mu_target
+    sigma_prediction = (
+        filter_image(prediction_bchw.square()) - mu_prediction_sq
+    ).clamp_min(0.0)
+    sigma_target = (
+        filter_image(target_bchw.square()) - mu_target_sq
+    ).clamp_min(0.0)
+    sigma_product = filter_image(prediction_bchw * target_bchw) - mu_product
+    numerator = (2.0 * mu_product + 0.01**2) * (
+        2.0 * sigma_product + 0.03**2
+    )
+    denominator = (mu_prediction_sq + mu_target_sq + 0.01**2) * (
+        sigma_prediction + sigma_target + 0.03**2
+    )
+    field = 1.0 - numerator / denominator.clamp_min(1e-12)
+    return field.mean(dim=1).unsqueeze(-1)
+
+
 def attribution_components(
     metric: ErrorAttributionMetric,
     prediction: torch.Tensor,
@@ -410,6 +454,21 @@ def attribution_components(
         return residual.square().mean(
             dim=-1, keepdim=True
         ) * weights, valid_count
+
+    if metric == ErrorAttributionMetric.REGISTERED_LOSS:
+        if valid_count <= 0.0:
+            raise ValueError(
+                "Registered-loss attribution mask has no valid pixels."
+            )
+        masked_prediction = _masked_prediction(prediction, target, weights)
+        local_l1 = (masked_prediction - target).abs().mean(
+            dim=-1, keepdim=True
+        )
+        local_ssim = _full_frame_ssim_components(
+            masked_prediction,
+            target,
+        )
+        return (0.8 * local_l1 + 0.2 * local_ssim) * weights, valid_count
 
     masked_prediction = _masked_prediction(prediction, target, weights)
     if metric == ErrorAttributionMetric.SSIM:

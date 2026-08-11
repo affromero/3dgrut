@@ -224,6 +224,7 @@ def _field_label(metric: str, parameter: str) -> str:
         "ssim": "SSIM loss",
         "lpips": "LPIPS",
         "lowfreq_frac": "Doctor low-frequency residual",
+        "registered_loss": "Registered 0.8 L1 + 0.2 one-minus-SSIM loss",
     }
     parameter_labels = {
         "sh_dc_rgb": "SH DC RGB coefficients",

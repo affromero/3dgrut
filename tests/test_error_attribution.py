@@ -209,6 +209,43 @@ def test_mse_components_reduce_rgb_to_one_scalar_per_valid_pixel() -> None:
     ).item() == pytest.approx(14.0 / 3.0)
 
 
+def test_registered_loss_has_one_finite_component_per_pixel() -> None:
+    """The registered L1/SSIM objective preserves a full-frame domain."""
+    prediction = torch.full((1, 12, 13, 3), 0.5)
+    target = torch.zeros_like(prediction)
+
+    components, component_count = attribution_components(
+        ErrorAttributionMetric.REGISTERED_LOSS,
+        prediction,
+        target,
+        None,
+    )
+
+    assert components.shape == (1, 12, 13, 1)
+    assert component_count == pytest.approx(12 * 13)
+    assert torch.isfinite(components).all()
+    assert torch.all(components > 0)
+    assert attribution_loss(
+        ErrorAttributionMetric.REGISTERED_LOSS,
+        prediction,
+        target,
+        None,
+    ).item() == pytest.approx(float(components.mean()))
+
+
+def test_registered_loss_rejects_empty_mask() -> None:
+    """Registered-loss sensitivity abstains without reconstruction pixels."""
+    image = torch.zeros((1, 12, 12, 3))
+
+    with pytest.raises(ValueError, match="no valid pixels"):
+        attribution_components(
+            ErrorAttributionMetric.REGISTERED_LOSS,
+            image,
+            image,
+            torch.zeros((1, 12, 12, 1)),
+        )
+
+
 def test_empty_pixel_mask_is_rejected() -> None:
     """A sensitivity field cannot assign a score with no valid pixels."""
     image = torch.zeros((1, 1, 1, 3))
