@@ -3,12 +3,13 @@
 
 """Ray-attributed Gaussian error fields for offline diagnosis.
 
-Each score estimates a view-balanced root-mean-square of local metric-
+Local diagnostic scores estimate a view-balanced root-mean-square of metric-
 component derivatives with respect to one Gaussian parameter. Rademacher
 probes avoid reducing signed pixel, window, or feature-cell derivatives before
-squaring. The 3DGRUT backward pass includes the renderer's front-to-back
-transmittance and every Gaussian that contributed to a pixel; this is
-deliberately not a nearest-point or winner-id approximation.
+squaring. Registered-loss sensitivity instead differentiates the exact scalar
+training image loss once per view. The 3DGRUT backward pass includes the
+renderer front-to-back transmittance and every Gaussian that contributed to a
+pixel.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from jaxtyping import Float, jaxtyped
 from plyfile import PlyData, PlyElement
 
 from threedgrut.model.geometry import nearest_neighbors
+from threedgrut.model.losses import ssim
 from threedgrut.utils.grad_viz import (
     scale_grad_norms,
     viridis_rgb_from_scalars,
@@ -460,15 +462,15 @@ def attribution_components(
             raise ValueError(
                 "Registered-loss attribution mask has no valid pixels."
             )
-        masked_prediction = _masked_prediction(prediction, target, weights)
-        local_l1 = (masked_prediction - target).abs().mean(
-            dim=-1, keepdim=True
+        masked_prediction = prediction * weights
+        masked_target = target * weights
+        denominator = weights.sum().clamp_min(1.0) * prediction.shape[-1]
+        loss_l1 = (masked_prediction - masked_target).abs().sum() / denominator
+        loss_ssim = 1.0 - ssim(
+            masked_prediction.permute(0, 3, 1, 2),
+            masked_target.permute(0, 3, 1, 2),
         )
-        local_ssim = _full_frame_ssim_components(
-            masked_prediction,
-            target,
-        )
-        return (0.8 * local_l1 + 0.2 * local_ssim) * weights, valid_count
+        return (0.8 * loss_l1 + 0.2 * loss_ssim).reshape(1), 1.0
 
     masked_prediction = _masked_prediction(prediction, target, weights)
     if metric == ErrorAttributionMetric.SSIM:
@@ -501,11 +503,13 @@ def attribution_components(
 
 
 class ErrorAttributionAccumulator:
-    """Estimate view-balanced non-cancelling component-gradient energy.
+    """Estimate view-balanced parameter-gradient energy.
 
     For view ``v`` with ``K_v`` scalar local components, each reported score
-    estimates ``sqrt(mean_v(mean_k(||d ell_vk / d theta_i||^2)))``. The root
-    is taken after averaging component energy over views.
+    local-metric score estimates
+    ``sqrt(mean_v(mean_k(||d ell_vk / d theta_i||^2)))``. Registered-loss
+    sensitivity is ``sqrt(mean_v(||d L_v / d theta_i||^2))`` for the exact
+    scalar 3DGRUT image objective ``L_v = 0.8 L1 + 0.2 (1 - SSIM_valid)``.
     """
 
     def __init__(
@@ -580,7 +584,12 @@ class ErrorAttributionAccumulator:
             )
             for metric in self.metrics
         }
-        total_probes = len(self.metrics) * self.probe_count
+        total_probes = sum(
+            1
+            if metric is ErrorAttributionMetric.REGISTERED_LOSS
+            else self.probe_count
+            for metric in self.metrics
+        )
         completed_probes = 0
         for metric_index, metric in enumerate(self.metrics):
             components, component_count = component_fields[metric]
@@ -589,6 +598,35 @@ class ErrorAttributionAccumulator:
             view_losses[metric.value] = loss_value
             self._loss_sums[metric.value] += loss_value
             self._component_counts[metric.value].append(component_count)
+            if metric is ErrorAttributionMetric.REGISTERED_LOSS:
+                completed_probes += 1
+                gradients = torch.autograd.grad(
+                    loss,
+                    model_parameters,
+                    retain_graph=completed_probes < total_probes,
+                    allow_unused=True,
+                )
+                for parameter, gradient in zip(
+                    self.parameters,
+                    gradients,
+                    strict=True,
+                ):
+                    if gradient is None:
+                        continue
+                    key = f"{metric.value}:{parameter.value}"
+                    energy = (
+                        gradient.detach()
+                        .reshape(gradient.shape[0], -1)
+                        .float()
+                        .square()
+                        .sum(dim=1)
+                        .cpu()
+                    )
+                    previous = self._energy_sums.get(key)
+                    self._energy_sums[key] = (
+                        energy if previous is None else previous + energy
+                    )
+                continue
             generator = torch.Generator(device=components.device)
             generator.manual_seed(
                 self.seed + self.view_count * 104729 + metric_index * 1009
@@ -692,7 +730,7 @@ class ErrorAttributionAccumulator:
             ErrorAttributionMetric.MAE.value: "valid_rgb_mean_pixel",
             ErrorAttributionMetric.MSE.value: "valid_rgb_mean_pixel",
             ErrorAttributionMetric.REGISTERED_LOSS.value: (
-                "valid_rgb_mean_pixel_with_reflect_padded_local_ssim"
+                "scalar_0.8_l1_plus_0.2_valid_padding_dssim"
             ),
             ErrorAttributionMetric.SSIM.value: "channel_mean_window_center",
             ErrorAttributionMetric.LPIPS.value: "spatial_feature_cell",
@@ -706,6 +744,17 @@ class ErrorAttributionAccumulator:
                 "per_view_effective_counts": self._component_counts[
                     metric.value
                 ],
+                "estimator": (
+                    "sqrt(mean_views(squared_scalar_loss_gradient_norm))"
+                    if metric is ErrorAttributionMetric.REGISTERED_LOSS
+                    else "sqrt(mean_views(mean_local_components("
+                    "squared_parameter_block_gradient_norm)))"
+                ),
+                "uncertainty": (
+                    "none_exact_gradient"
+                    if metric is ErrorAttributionMetric.REGISTERED_LOSS
+                    else "rademacher_delta_method_standard_error"
+                ),
             }
             for metric in self.metrics
         }

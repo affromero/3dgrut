@@ -34,6 +34,7 @@ from threedgrut.error_attribution import (
     recolor_gaussian_ply,
 )
 from threedgrut.export_utils import scene_relative_path
+from threedgrut.model.losses import ssim
 from threedgrut.split_membership import (
     dataset_membership,
     training_membership_provenance,
@@ -260,9 +261,10 @@ def test_mse_components_reduce_rgb_to_one_scalar_per_valid_pixel() -> None:
     ).item() == pytest.approx(14.0 / 3.0)
 
 
-def test_registered_loss_has_one_finite_component_per_pixel() -> None:
-    """The registered L1/SSIM objective preserves a full-frame domain."""
-    prediction = torch.full((1, 12, 13, 3), 0.5)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused SSIM requires CUDA")
+def test_registered_loss_matches_frozen_training_image_objective() -> None:
+    """Registered sensitivity uses the exact scalar training image loss."""
+    prediction = torch.full((1, 12, 13, 3), 0.5, device="cuda")
     target = torch.zeros_like(prediction)
 
     components, component_count = attribution_components(
@@ -272,16 +274,23 @@ def test_registered_loss_has_one_finite_component_per_pixel() -> None:
         None,
     )
 
-    assert components.shape == (1, 12, 13, 1)
-    assert component_count == pytest.approx(12 * 13)
+    expected = 0.8 * (prediction - target).abs().mean() + 0.2 * (
+        1.0
+        - ssim(
+            prediction.permute(0, 3, 1, 2),
+            target.permute(0, 3, 1, 2),
+        )
+    )
+    assert components.shape == (1,)
+    assert component_count == pytest.approx(1.0)
     assert torch.isfinite(components).all()
-    assert torch.all(components > 0)
+    assert components.item() == pytest.approx(expected.item())
     assert attribution_loss(
         ErrorAttributionMetric.REGISTERED_LOSS,
         prediction,
         target,
         None,
-    ).item() == pytest.approx(float(components.mean()))
+    ).item() == pytest.approx(expected.item())
 
 
 def test_registered_loss_rejects_empty_mask() -> None:
@@ -307,12 +316,53 @@ def test_registered_loss_component_metadata_is_serializable() -> None:
 
     assert accumulator.component_metadata() == {
         "registered_loss": {
-            "domain": (
-                "valid_rgb_mean_pixel_with_reflect_padded_local_ssim"
-            ),
+            "domain": "scalar_0.8_l1_plus_0.2_valid_padding_dssim",
             "per_view_effective_counts": [],
+            "estimator": (
+                "sqrt(mean_views(squared_scalar_loss_gradient_norm))"
+            ),
+            "uncertainty": "none_exact_gradient",
         }
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused SSIM requires CUDA")
+def test_registered_loss_sensitivity_is_exact_scalar_gradient() -> None:
+    """Registered-loss sensitivity has no probe approximation or uncertainty."""
+    model = _TwoPixelModel().cuda()
+    prediction = model.features_albedo.reshape(1, 1, 1, 1).expand(
+        1, 12, 12, 3
+    )
+    target = torch.full_like(prediction, 0.25)
+    accumulator = ErrorAttributionAccumulator(
+        model=model,
+        metrics=(ErrorAttributionMetric.REGISTERED_LOSS,),
+        parameters=(ErrorAttributionParameter.APPEARANCE,),
+        probe_count=8,
+    )
+
+    loss = attribution_loss(
+        ErrorAttributionMetric.REGISTERED_LOSS,
+        prediction,
+        target,
+        None,
+    )
+    expected_gradient = torch.autograd.grad(
+        loss,
+        model.features_albedo,
+        retain_graph=True,
+    )[0].abs()
+    accumulator.accumulate(
+        outputs={"pred_rgb": prediction},
+        target=target,
+        mask=None,
+    )
+
+    assert torch.allclose(
+        accumulator.rms_scores()["registered_loss:sh_dc_rgb"],
+        expected_gradient.reshape(1).cpu(),
+    )
+    assert accumulator.rms_standard_errors() == {}
 
 
 def test_empty_pixel_mask_is_rejected() -> None:

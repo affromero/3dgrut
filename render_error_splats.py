@@ -1000,7 +1000,9 @@ def main() -> None:
         "view_count": accumulator.view_count,
         "attribution_probes": args.attribution_probes,
         "attribution_seed": args.attribution_seed,
-        "attribution_estimator": ("sqrt(mean_views(mean_local_components(" "squared_parameter_block_gradient_norm)))"),
+        "attribution_estimator": (
+            "metric_specific_as_declared_in_attribution_components"
+        ),
         "attribution_components": accumulator.component_metadata(),
         "ownership_support_threshold": args.ownership_support_threshold,
         "ownership_support_threshold_units": "mean T*alpha per rendered ray",
