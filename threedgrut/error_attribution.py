@@ -691,6 +691,9 @@ class ErrorAttributionAccumulator:
         domains = {
             ErrorAttributionMetric.MAE.value: "valid_rgb_mean_pixel",
             ErrorAttributionMetric.MSE.value: "valid_rgb_mean_pixel",
+            ErrorAttributionMetric.REGISTERED_LOSS.value: (
+                "valid_rgb_mean_pixel_with_reflect_padded_local_ssim"
+            ),
             ErrorAttributionMetric.SSIM.value: "channel_mean_window_center",
             ErrorAttributionMetric.LPIPS.value: "spatial_feature_cell",
             ErrorAttributionMetric.LOW_FREQUENCY.value: (

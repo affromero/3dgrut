@@ -273,6 +273,24 @@ def test_registered_loss_rejects_empty_mask() -> None:
         )
 
 
+def test_registered_loss_component_metadata_is_serializable() -> None:
+    """The registered objective carries its sealed component domain."""
+    accumulator = ErrorAttributionAccumulator(
+        model=_TwoPixelModel(),
+        metrics=(ErrorAttributionMetric.REGISTERED_LOSS,),
+        parameters=(ErrorAttributionParameter.APPEARANCE,),
+    )
+
+    assert accumulator.component_metadata() == {
+        "registered_loss": {
+            "domain": (
+                "valid_rgb_mean_pixel_with_reflect_padded_local_ssim"
+            ),
+            "per_view_effective_counts": [],
+        }
+    }
+
+
 def test_empty_pixel_mask_is_rejected() -> None:
     """A sensitivity field cannot assign a score with no valid pixels."""
     image = torch.zeros((1, 1, 1, 3))
