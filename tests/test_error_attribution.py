@@ -12,7 +12,9 @@ from render_error_splats import (
     DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD,
     DEFAULT_VISIBILITY_THRESHOLD,
     MANIFEST_SCHEMA_VERSION,
+    M8_RECONSTRUCTION_MANIFEST_SCHEMA_VERSION,
     _counterfactual_cohorts,
+    _manifest_mode_contract,
     _suppressed_density_cohort,
     _write_raw_field,
 )
@@ -80,7 +82,32 @@ class _IndependentPixelModel(torch.nn.Module):
 def test_manifest_contract_records_threshold_and_raw_field_version() -> None:
     """New exports use the explicit support and raw-field manifest contract."""
     assert MANIFEST_SCHEMA_VERSION == 5
+    assert M8_RECONSTRUCTION_MANIFEST_SCHEMA_VERSION == 6
     assert DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD > 0.0
+
+
+def test_m8_reconstruction_mode_requires_identical_ordered_images() -> None:
+    assert _manifest_mode_contract(
+        m8_reconstruction_fields=True,
+        selected_images=["a.png", "b.png"],
+        training_support_images=["a.png", "b.png"],
+    ) == (6, "m8_reconstruction_policy_fields")
+
+    with pytest.raises(ValueError, match="identical ordered"):
+        _manifest_mode_contract(
+            m8_reconstruction_fields=True,
+            selected_images=["a.png", "b.png"],
+            training_support_images=["b.png", "a.png"],
+        )
+
+
+def test_heldout_mode_rejects_training_overlap() -> None:
+    with pytest.raises(ValueError, match="overlap"):
+        _manifest_mode_contract(
+            m8_reconstruction_fields=False,
+            selected_images=["a.png"],
+            training_support_images=["a.png"],
+        )
 
 
 def test_training_support_temporarily_restores_checkpoint_membership() -> None:

@@ -46,6 +46,7 @@ DEFAULT_VISIBILITY_THRESHOLD = 0.0
 DEFAULT_OWNERSHIP_SUPPORT_THRESHOLD = 1e-6
 DEFAULT_NATIVE_OPACITY_FLOOR = 1e-4
 MANIFEST_SCHEMA_VERSION = 5
+M8_RECONSTRUCTION_MANIFEST_SCHEMA_VERSION = 6
 
 _counterfactual_cohorts = intervention_study.counterfactual_cohorts
 _evaluate_density_counterfactuals = intervention_study.evaluate_density_counterfactuals
@@ -160,6 +161,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--m8-reconstruction-fields",
+        action="store_true",
+        help=(
+            "Evaluate policy fields on authenticated reconstruction images. "
+            "Selected and training-support image sets must be identical."
+        ),
+    )
+    parser.add_argument(
         "--counterfactual-suppression-logit",
         type=float,
         default=-20.0,
@@ -192,6 +201,30 @@ def _sha256(path: str) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _manifest_mode_contract(
+    *,
+    m8_reconstruction_fields: bool,
+    selected_images: list[str],
+    training_support_images: list[str],
+) -> tuple[int, str]:
+    """Validate the image-domain contract for one diagnostic manifest."""
+    if not m8_reconstruction_fields:
+        if set(selected_images).intersection(training_support_images):
+            raise ValueError(
+                "held-out and training-support diagnostic images overlap"
+            )
+        return MANIFEST_SCHEMA_VERSION, "heldout_diagnostic_fields"
+    if selected_images != training_support_images:
+        raise ValueError(
+            "M8 reconstruction fields require identical ordered "
+            "selected and training-support image sets"
+        )
+    return (
+        M8_RECONSTRUCTION_MANIFEST_SCHEMA_VERSION,
+        "m8_reconstruction_policy_fields",
+    )
 
 
 def _write_raw_field(
@@ -890,8 +923,14 @@ def main() -> None:
         study_path = path_join(output_dir, "intervention_study.json")
         with open(study_path, "w", encoding="utf-8") as handle:
             json.dump(intervention_study, handle, indent=2, sort_keys=True)
+    schema_version, evaluation_role = _manifest_mode_contract(
+        m8_reconstruction_fields=args.m8_reconstruction_fields,
+        selected_images=selected_names,
+        training_support_images=training_support_images,
+    )
     manifest = {
-        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "schema_version": schema_version,
+        "evaluation_role": evaluation_role,
         "source_checkpoint": _scene_relative_path(
             checkpoint_path,
             scene_root,
