@@ -156,10 +156,8 @@ struct GUTRenderer::GutRenderForwardContext {
                 logger);
             CHECK_STATUS_RETURN(sortingWorkingBuffer.resize(sortingWorkingBufferSize, queueHandle, logger));
         }
-        if (numKeys) {
-            CHECK_STATUS_RETURN(sortedTileRangeIndices.resize(sizeof(uvec2) * tileGrid.x * tileGrid.y, queueHandle, logger));
-            CUDA_CHECK_RETURN(cudaMemsetAsync(sortedTileRangeIndices.data(), 0, tileGrid.x * tileGrid.y * sizeof(uvec2), stream), logger);
-        }
+        CHECK_STATUS_RETURN(sortedTileRangeIndices.resize(sizeof(uvec2) * tileGrid.x * tileGrid.y, queueHandle, logger));
+        CUDA_CHECK_RETURN(cudaMemsetAsync(sortedTileRangeIndices.data(), 0, tileGrid.x * tileGrid.y * sizeof(uvec2), stream), logger);
         return Status();
     }
 
@@ -382,13 +380,14 @@ threedgut::Status threedgut::GUTRenderer::renderForward(const RenderParameters& 
             static_cast<unsigned long long>(maxParticleTileIntersections));
     }
 
-    if (numParticleTileIntersections == 0) {
-        return Status();
-    }
-
     // sorting buffers allocation
     CHECK_STATUS_RETURN(
         m_forwardContext->updateTileSortingBuffers(tileGrid, numParticleTileIntersections, cudaStream, m_logger));
+
+    if (numParticleTileIntersections == 0) {
+        deviceLaunchesLogger.pop("render::prepare-expand");
+        return Status();
+    }
 
     deviceLaunchesLogger.pop("render::prepare-expand");
 

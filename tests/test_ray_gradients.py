@@ -421,6 +421,142 @@ def test_ray_gradient_finite_differences() -> None:
     ) >= 0.8
 
 
+def _assert_zero_intersection_backward(*, warm_raster: bool) -> None:
+    """Render an empty view and require background-only zero derivatives."""
+    device = torch.device("cuda")
+    config = _build_jit_config()
+    plugin = setup_3dgut(config)
+    raster = plugin.SplatRaster(OmegaConf.to_container(config))
+
+    height = 16
+    width = 16
+    num_particles = 8
+    particle_density = torch.zeros(num_particles, 12, device=device)
+    particle_density[:, 2] = 1.0
+    particle_density[:, 3] = 10.0
+    particle_density[:, 4] = 1.0
+    particle_density[:, 8:11] = 0.15
+    particle_radiance = torch.zeros(num_particles, 48, device=device)
+
+    ray_origin = torch.zeros(1, height, width, 3, device=device)
+    ray_origin[..., 2] = 2.0
+    ray_direction = torch.zeros_like(ray_origin)
+    for row in range(height):
+        for column in range(width):
+            direction = torch.tensor(
+                [
+                    (column - width / 2) / width,
+                    (row - height / 2) / height,
+                    -1.0,
+                ],
+                device=device,
+            )
+            ray_direction[0, row, column] = direction / direction.norm()
+    ray_time = torch.zeros(
+        1,
+        height,
+        width,
+        1,
+        dtype=torch.long,
+        device=device,
+    )
+    sensor = _make_sensor(
+        plugin,
+        width=width,
+        height=height,
+        shutter=plugin.ShutterType.GLOBAL,
+    )
+    pose = _identity_pose(device)
+
+    if warm_raster:
+        visible_result = raster.trace(
+            0,
+            1,
+            particle_density,
+            particle_radiance,
+            ray_origin,
+            ray_direction,
+            ray_time,
+            sensor,
+            0,
+            0,
+            pose,
+            pose,
+        )
+        assert visible_result[8].gt(0).any()
+
+    offscreen_density = particle_density.clone()
+    offscreen_density[:, 0] = 1_000.0
+    result = raster.trace(
+        1,
+        1,
+        offscreen_density,
+        particle_radiance,
+        ray_origin,
+        ray_direction,
+        ray_time,
+        sensor,
+        0,
+        0,
+        pose,
+        pose,
+    )
+
+    assert torch.count_nonzero(result[2]) == 0
+    assert torch.count_nonzero(result[8]) == 0
+    assert torch.isfinite(result[0]).all()
+    assert torch.isfinite(result[1]).all()
+    torch.testing.assert_close(result[0], torch.zeros_like(result[0]))
+    torch.testing.assert_close(
+        result[1],
+        torch.full_like(result[1], 1.0e6),
+    )
+
+    output_gradient = torch.ones_like(result[0])
+    hit_distance_gradient = torch.ones_like(result[1])
+    absolute_position_gradient = torch.zeros(
+        num_particles,
+        3,
+        device=device,
+    )
+    gradients = raster.trace_bwd_with_abs(
+        1,
+        1,
+        offscreen_density,
+        particle_radiance,
+        ray_origin,
+        ray_direction,
+        ray_time,
+        sensor,
+        0,
+        0,
+        pose,
+        pose,
+        result[0],
+        output_gradient,
+        result[1],
+        hit_distance_gradient,
+        absolute_position_gradient,
+    )
+    for gradient in gradients:
+        assert torch.isfinite(gradient).all()
+        torch.testing.assert_close(gradient, torch.zeros_like(gradient))
+    torch.testing.assert_close(
+        absolute_position_gradient,
+        torch.zeros_like(absolute_position_gradient),
+    )
+
+
+def test_zero_intersection_backward_on_fresh_raster() -> None:
+    """A fresh empty view must not dereference absent sorting buffers."""
+    _assert_zero_intersection_backward(warm_raster=False)
+
+
+def test_zero_intersection_backward_clears_prior_tile_ranges() -> None:
+    """An empty view after a visible view must not reuse stale tile ranges."""
+    _assert_zero_intersection_backward(warm_raster=True)
+
+
 def test_precomputed_sh_camera_center_gradients_match_finite_differences() -> None:
     """Validate camera-center gradients for all precomputed SH degrees."""
     device = torch.device("cuda")
