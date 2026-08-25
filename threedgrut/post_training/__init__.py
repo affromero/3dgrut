@@ -1,1 +1,0 @@
-"""Post-training study support."""
